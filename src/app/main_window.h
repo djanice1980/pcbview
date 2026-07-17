@@ -1,0 +1,129 @@
+#pragma once
+
+#include <QLabel>
+#include <QMainWindow>
+#include <QStackedWidget>
+#include <QStringList>
+#include <QTreeWidget>
+
+#include <array>
+#include <functional>
+#include <memory>
+
+class QDockWidget;
+class QImage;
+
+#include "app/vulkan_window.h"
+#include "geom/tessellate.h"
+#include "model/board.h"
+
+namespace pcbview::app {
+
+// "Pro CAD" shell: menu bar, icon toolbar, stackup tree on the left, properties
+// on the right, coordinate/validation status along the bottom. Dense on purpose
+// -- every control visible without hunting.
+//
+// Owns the board and mesh by value. It used to hold const references to data
+// owned by main(), which made File->Open impossible: there was nothing to load
+// into.
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+
+public:
+    explicit MainWindow(const QString& path = {});
+
+    // Import + tessellate + upload. Returns false and shows a dialog on failure,
+    // leaving any previously loaded board untouched.
+    bool loadBoard(const QString& path);
+
+protected:
+    void dragEnterEvent(QDragEnterEvent*) override;
+    void dropEvent(QDropEvent*) override;
+
+private slots:
+    void onLayerToggled(QTreeWidgetItem* item, int column);
+    void onLayerSelected();
+    void onRenderScaleChanged(int sliderValue);
+    void onFrameRendered();
+    void onOpen();
+    void onOpenFolder();
+    void onReload();
+
+private:
+    void buildMenus();
+
+    // Grab the next rendered frame as a QImage (async: the capture lands one
+    // frame later), then invoke `then`. Used by screenshot and print.
+    void grabFrame(std::function<void(const QImage&)> then);
+    void onSaveScreenshot();
+    // mode: 0 = as shown on screen, 1 = flat overhead (top orthographic),
+    // 2 = flat overhead printed at the board's true physical size (1:1).
+    void printView(int mode);
+    void sendToPrinter(const QImage& img, bool originalSize, double mmPerPixel);
+
+    void buildToolbar();
+    void buildStackupDock();
+    void buildPropertiesDock();
+    void buildStatusBar();
+    void showAbout();
+    void showAppearanceDialog();
+
+    void populateStackup();
+    void populateProperties();
+    void updateStatus();
+    void rememberRecent(const QString& path);
+    void rebuildRecentMenu();
+
+    void reassemble();  // rebuild mesh_ from baseArt_ + current thickness override
+
+    // Append the cached component parts onto mesh_ (fresh copies, so repeated
+    // reassembles don't accumulate), shifting top-mounted parts to sit on the
+    // current surface when a thickness override moves it. Also grows the bounds.
+    void appendComponents();
+
+    // Owned, so a reload can replace them wholesale. `board_` is only populated
+    // for a .kicad_pcb; `fromGerber_` gates the semantics-dependent UI
+    // (validation, pad counts). `baseArt_` is the untouched stackup for BOTH
+    // paths -- a thickness override re-derives from it.
+    BoardModel board_;
+    geom::LayerArt baseArt_;
+    geom::BoardMesh mesh_;
+    // Component bodies (Material::Component), in world space at the design
+    // thickness. Sourced once per load via kicad-cli; re-appended to mesh_ on
+    // every reassemble so a thickness change keeps them. Empty on the Gerber
+    // path -- gerbers carry no component identity.
+    std::vector<geom::Part> componentParts_;
+    QString path_;
+    bool loaded_ = false;
+    bool fromGerber_ = false;
+
+    double thicknessOverride_ = 0.0;  // 0 = use the design's own thickness
+
+    // Substrate appearance lives here, not only in the renderer, because the
+    // renderer does not exist until first expose. Pushed to it on boardUploaded.
+    std::array<float, 3> subColor_ = {0.72f, 0.61f, 0.38f};
+    float subOpacity_ = 1.0f;
+    std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};
+    void applyAppearance();  // push colours/opacity if the renderer exists
+
+    VulkanWindow* viewport_ = nullptr;
+    QStackedWidget* stack_ = nullptr;
+    QLabel* placeholder_ = nullptr;
+    QTreeWidget* stackup_ = nullptr;
+    QTreeWidget* properties_ = nullptr;
+    QDockWidget* stackupDock_ = nullptr;
+    QDockWidget* propertiesDock_ = nullptr;
+    QMenu* recentMenu_ = nullptr;
+
+    QLabel* statusFile_ = nullptr;
+    QLabel* statusBoard_ = nullptr;
+    QLabel* statusChecks_ = nullptr;
+    QLabel* statusPerf_ = nullptr;
+    QLabel* toolbarInfo_ = nullptr;
+    QLabel* scaleLabel_ = nullptr;
+    QLabel* explodeLabel_ = nullptr;
+
+    int frameCounter_ = 0;
+};
+
+}  // namespace pcbview::app

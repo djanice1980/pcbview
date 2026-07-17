@@ -1,0 +1,22 @@
+# Build output (CMake, FetchContent deps, deployed Qt DLLs, compiled shaders)
+/build/
+/out/
+/cmake-build-*/
+
+# CMake bits if configured in-tree
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
