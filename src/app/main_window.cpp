@@ -32,7 +32,9 @@
 #include <QStatusBar>
 #include <QTimer>
 #include <QToolBar>
+#include <QVBoxLayout>
 #include <QWidget>
+#include <QWidgetAction>
 
 #include <algorithm>
 #include <cmath>
@@ -377,6 +379,8 @@ void MainWindow::applyAppearance() {
                                                   subColor_[2], subOpacity_);
     viewport_->renderer()->setMaskColor(maskColor_[0], maskColor_[1],
                                         maskColor_[2], maskOpacity_);
+    viewport_->renderer()->setComponentShine(fxComponentShine_ / 100.0f);
+    viewport_->renderer()->setPadShine(fxPadShine_ / 100.0f);
     viewport_->requestUpdate();
 }
 
@@ -737,13 +741,21 @@ void MainWindow::buildMenus() {
     // (first expose), so fill these in each time the menu opens.
     connect(render, &QMenu::aboutToShow, this, [this, rt, pt, oidn, gpuMenu] {
         const bool avail = viewport_->renderer() && viewport_->rtAvailable();
-        rt->setEnabled(avail);
+        const bool ptOn = viewport_->pathTracing();
+        // RT shadows are a RASTER enhancement. While path tracing owns the
+        // frame the toggle has no effect at all, so grey it out -- otherwise
+        // both read "on" at once and imply they compose. The checked state is
+        // kept, so it comes back when path tracing is switched off.
+        rt->setEnabled(avail && !ptOn);
         pt->setEnabled(avail);
-        oidn->setEnabled(avail && viewport_->pathTracing());
-        rt->setToolTip(avail
-                           ? "Contact shadows + ambient occlusion, ray-traced "
-                             "(shown on the assembled board, not while exploded)"
-                           : "This GPU does not expose ray_query");
+        oidn->setEnabled(avail && ptOn);
+        rt->setToolTip(!avail
+                           ? "This GPU does not expose ray_query"
+                       : ptOn
+                           ? "Not applicable while path tracing is on -- the "
+                             "path tracer computes full-scene lighting itself"
+                           : "Contact shadows + ambient occlusion, ray-traced "
+                             "(shown on the assembled board, not while exploded)");
         pt->setToolTip(avail ? "Full progressive path tracing — accurate global "
                                "illumination; converges while the view is still"
                              : "This GPU does not expose ray_query");
@@ -782,6 +794,51 @@ void MainWindow::buildMenus() {
             connect(a, &QAction::triggered, this,
                     [this, name] { viewport_->setPreferredGpu(name); });
         }
+    });
+
+    // --- Effects: stylised looks, deliberately NOT physically accurate ---
+    // Component reflections turn IC/cap bodies chrome-like so they mirror the
+    // board around them in the path tracer -- showing off what PT can do.
+    fxComponentShine_ = QSettings().value("fxComponentShine", 0).toInt();
+    fxPadShine_ = QSettings().value("fxPadShine", 94).toInt();
+    if (qEnvironmentVariableIsSet("PCBVIEW_FX_COMPONENT"))
+        fxComponentShine_ = qEnvironmentVariable("PCBVIEW_FX_COMPONENT").toInt();
+    if (qEnvironmentVariableIsSet("PCBVIEW_FX_PADS"))
+        fxPadShine_ = qEnvironmentVariable("PCBVIEW_FX_PADS").toInt();
+
+    QMenu* effects = menuBar()->addMenu("&Effects");
+    const auto addFxSlider = [&](const QString& label, int initial,
+                                 const std::function<void(int)>& apply) {
+        auto* box = new QWidget(effects);
+        auto* lay = new QVBoxLayout(box);
+        lay->setContentsMargins(12, 6, 12, 6);
+        lay->setSpacing(2);
+        auto* text = new QLabel(label, box);
+        auto* slider = new QSlider(Qt::Horizontal, box);
+        slider->setRange(0, 100);
+        slider->setValue(initial);
+        slider->setMinimumWidth(200);
+        lay->addWidget(text);
+        lay->addWidget(slider);
+        auto* action = new QWidgetAction(effects);
+        action->setDefaultWidget(box);
+        effects->addAction(action);
+        connect(slider, &QSlider::valueChanged, this, apply);
+    };
+    addFxSlider("Component reflections (mirror finish)", fxComponentShine_,
+                [this](int v) {
+                    fxComponentShine_ = v;
+                    QSettings().setValue("fxComponentShine", v);
+                    if (viewport_->renderer())
+                        viewport_->renderer()->setComponentShine(v / 100.0f);
+                    viewport_->requestUpdate();
+                });
+    addFxSlider("Pad shine", fxPadShine_, [this](int v) {
+        fxPadShine_ = v;
+        QSettings().setValue("fxPadShine", v);
+        if (viewport_->renderer())
+            viewport_->renderer()->setPadShine(v / 100.0f);
+        viewport_->requestUpdate();
     });
 
     QMenu* help = menuBar()->addMenu("&Help");
@@ -1270,7 +1327,7 @@ void MainWindow::showAbout() {
     // copyright must appear here and the user must be directed to the licences.
     QMessageBox::about(
         this, "About pcbview",
-        "<h3>pcbview 1.10</h3>"
+        "<h3>pcbview 1.11</h3>"
         "<p>Standalone 3D PCB viewer. Renders what the fab will build.</p>"
         "<p>Copyright © 2026 pcbview contributors.<br>"
         "pcbview is free software under the <b>GNU General Public License "

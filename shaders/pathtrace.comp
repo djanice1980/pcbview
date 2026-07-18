@@ -119,7 +119,15 @@ void main() {
     if (px.x >= pc.dim.x || px.y >= pc.dim.y) return;
 
     uint sampleIndex = uint(pc.eye.w);
-    g_rng = hashu(px.x + hashu(px.y + hashu(pc.dim.w + sampleIndex)));
+    // XOR-chained hash stages, NOT additive mixing: `hashu(px.x + hashu(px.y +
+    // ...))` builds correlation planes (an additive lattice), which showed up as
+    // faint screen-anchored lines/squares of biased stochastic-alpha outcomes
+    // that survived convergence -- the same columns got the same mask-lottery
+    // luck at every sample. Chaining through the finalizer with XOR between
+    // stages decorrelates the pixel grid properly.
+    uint h = hashu(px.x);
+    h = hashu(h ^ px.y);
+    g_rng = hashu(h ^ (pc.dim.w + sampleIndex));
 
     // Jittered primary ray through the pixel.
     vec2 jitter = vec2(rnd(), rnd());
@@ -145,6 +153,14 @@ void main() {
         // stepping (a step-past approach tunnelled through the 0.01mm films and
         // shaded masked copper from inside). Film primitive indices are
         // geometry-local; re-base by counts.x.
+        // Nearest translucent film crossed by the PRIMARY ray, tracked so the
+        // denoiser's albedo guide can use the ANALYTIC film blend instead of
+        // this sample's lottery outcome -- per-sample guide variance is what
+        // the denoiser turns into faint blotches over every masked area.
+        float coatT = 1.0e30;
+        vec3 coatAlbedo = vec3(0.0);
+        float coatAlpha = 0.0;
+
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoneEXT, 0xFF, origin,
                               0.02, dir, 1.0e5);
@@ -159,6 +175,14 @@ void main() {
             vec3 fng = cross(vpos(idx[3u*cp+1u]) - vpos(idx[3u*cp]),
                              vpos(idx[3u*cp+2u]) - vpos(idx[3u*cp]));
             bool entering = dot(dir, fng) < 0.0;
+            if (entering && depth == 0u) {
+                float ct = rayQueryGetIntersectionTEXT(rq, false);
+                if (ct < coatT) {
+                    coatT = ct;
+                    coatAlbedo = mats[triMat[cp]].albedo.rgb;
+                    coatAlpha = effAlpha(cp);
+                }
+            }
             if (entering && rnd() < effAlpha(cp)) rayQueryConfirmIntersectionEXT(rq);
         }
 
@@ -188,7 +212,16 @@ void main() {
         vec3 albedo = m.albedo.rgb;
         float metallic = m.params.y;
 
-        if (depth == 0u) { firstAlbedo = albedo; firstNormal = n; }
+        if (depth == 0u) {
+            // Albedo GUIDE: when a translucent film sat in front of this hit,
+            // record the ANALYTIC blend rather than this sample's lottery
+            // outcome -- the guide converges with near-zero variance, so the
+            // denoiser stops treating stochastic-alpha noise as edges.
+            vec3 ga = albedo;
+            if (coatT < tHit - 1.0e-4) ga = mix(ga, coatAlbedo, coatAlpha);
+            firstAlbedo = ga;
+            firstNormal = n;
+        }
 
         // Next-event estimation: direct sun, diffuse PLUS a specular glint. The
         // glint is what makes copper read as metal under the deliberately dim

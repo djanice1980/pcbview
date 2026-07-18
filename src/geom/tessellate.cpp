@@ -824,9 +824,20 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             Clipper64 diff;
             diff.AddSubject(outer);
             if (!inner.empty()) diff.AddClip(inner);
-            PolyTree64 tree;
+            Paths64 rings;
             diff.Execute(inner.empty() ? ClipType::Union : ClipType::Difference,
-                         FillRule::NonZero, tree);
+                         FillRule::NonZero, rings);
+
+            // Clip the barrels to the BOARD. A castellated hole sits ON the
+            // outline: the routed edge cuts the plated hole in half, so the fab
+            // plates a HALF-barrel hugging the edge -- the outboard half must
+            // not hang in space. (art.outline carries the internal cutouts as
+            // opposite-wound holes, so barrels are clipped at those edges too.)
+            Clipper64 clip;
+            clip.AddSubject(rings);
+            clip.AddClip(art.outline);
+            PolyTree64 tree;
+            clip.Execute(ClipType::Intersection, FillRule::NonZero, tree);
 
             std::vector<Shape> shapes;
             collectShapes(tree, shapes);

@@ -134,6 +134,13 @@ Intel Open Image Denoise.
   a huge value on a dark IC lid; capping per-sample radiance (`min(rad, 8)`) is the
   difference between grainy and clean — OIDN preserves un-clamped sparkle as
   "detail".
+- **The RNG seed hash is load-bearing.** Pixel coordinates are XOR-chained
+  through the hash finalizer, never mixed ADDITIVELY: `hashu(px.x + hashu(px.y
+  + …))` builds correlation planes, which showed up as faint screen-anchored
+  lines/squares of biased stochastic-alpha outcomes that SURVIVED CONVERGENCE
+  (fixed columns got the same mask-lottery luck at every sample). The
+  accumulation generation is also mixed into the seed so a restart gets a fresh
+  stream instead of repainting the identical pattern.
 - **OIDN denoise** (Apache-2.0, GPL-3-clean): a continuous ASYNCHRONOUS state
   machine (`Renderer::denoiseTick`, ticked every PT frame): a fenced GPU→host
   readback is submitted and *polled* — never waited — then a worker thread packs
@@ -997,6 +1004,10 @@ interactive run. All are opt-in. Grouped by purpose:
 - `PCBVIEW_NO_COMPONENTS=1` — skip 3D component bodies.
 - `PCBVIEW_KICAD_CLI=<path>` — override the `kicad-cli` used to tessellate STEP
   models into the cached GLB.
+
+**Effects (stylised)**
+- `PCBVIEW_FX_COMPONENT=<0-100>` — component reflections (mirror finish).
+- `PCBVIEW_FX_PADS=<0-100>` — pad/copper shine.
 
 ### Verifying the GUI on a scaled display
 

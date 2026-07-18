@@ -105,6 +105,9 @@ private:
     float subOpacity_ = 1.0f;
     std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};
     float maskOpacity_ = 0.72f;
+    // Effects menu (stylised, persisted; 0-100 slider values).
+    int fxComponentShine_ = 0;
+    int fxPadShine_ = 94;
     void applyAppearance();  // push colours/opacity if the renderer exists
 
     VulkanWindow* viewport_ = nullptr;

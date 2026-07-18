@@ -679,11 +679,16 @@ void Renderer::destroyPathTracer() {
         dnFence_ = VK_NULL_HANDLE;
     }
     if (oidnFilter_) oidnReleaseFilter(static_cast<OIDNFilter>(oidnFilter_));
+    if (oidnAlbedoFilter_)
+        oidnReleaseFilter(static_cast<OIDNFilter>(oidnAlbedoFilter_));
+    if (oidnNormalFilter_)
+        oidnReleaseFilter(static_cast<OIDNFilter>(oidnNormalFilter_));
     if (oidnColorBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnColorBuf_));
     if (oidnAlbedoBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnAlbedoBuf_));
     if (oidnNormalBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnNormalBuf_));
     if (oidnOutBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnOutBuf_));
-    oidnFilter_ = oidnColorBuf_ = oidnAlbedoBuf_ = oidnNormalBuf_ = oidnOutBuf_ = nullptr;
+    oidnFilter_ = oidnAlbedoFilter_ = oidnNormalFilter_ = nullptr;
+    oidnColorBuf_ = oidnAlbedoBuf_ = oidnNormalBuf_ = oidnOutBuf_ = nullptr;
     oidnW_ = oidnH_ = 0;
     if (oidnDevice_) {
         oidnReleaseDevice(static_cast<OIDNDevice>(oidnDevice_));
@@ -822,7 +827,12 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             p.dim[0] = sceneExtent_.width;
             p.dim[1] = sceneExtent_.height;
             p.dim[2] = 5;  // max bounce depth
-            p.dim[3] = static_cast<uint32_t>(ptSampleCount_) * 9781u + 1u;
+            // Mix the accumulation GENERATION into the seed: without it the
+            // random stream at a pixel is identical after every restart, so any
+            // residual sampling structure sits at the same screen positions
+            // forever (it read as a fixed pattern painted on the glass).
+            p.dim[3] = static_cast<uint32_t>(ptSampleCount_) * 9781u + 1u +
+                       ptGeneration_ * 2654435761u;
             // Normalised peel 0..1 (matches board.vert's push.params.w) so the
             // substrate fades translucent while exploding, revealing inner copper.
             p.misc[0] = (maxRank_ > 0.0f)
@@ -1001,6 +1011,10 @@ void Renderer::denoiseWorker(uint32_t w, uint32_t h, int samples) {
     const size_t rgbBytes = n * 3 * sizeof(float);
     if (oidnW_ != w || oidnH_ != h || oidnFilter_ == nullptr) {
         if (oidnFilter_) oidnReleaseFilter(static_cast<OIDNFilter>(oidnFilter_));
+        if (oidnAlbedoFilter_)
+            oidnReleaseFilter(static_cast<OIDNFilter>(oidnAlbedoFilter_));
+        if (oidnNormalFilter_)
+            oidnReleaseFilter(static_cast<OIDNFilter>(oidnNormalFilter_));
         if (oidnColorBuf_)
             oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnColorBuf_));
         if (oidnAlbedoBuf_)
@@ -1013,13 +1027,36 @@ void Renderer::denoiseWorker(uint32_t w, uint32_t h, int samples) {
         OIDNBuffer ba = oidnNewBuffer(dev, rgbBytes);
         OIDNBuffer bn = oidnNewBuffer(dev, rgbBytes);
         OIDNBuffer bo = oidnNewBuffer(dev, rgbBytes);
-        OIDNFilter f = oidnNewFilter(dev, "RT");
         const size_t px = sizeof(float) * 3, row = px * w;
+
+        // Aux PREFILTERS (OIDN's official noisy-guide mode): the stochastic
+        // mask alpha leaves residual noise in the guides, and a filter fed
+        // noisy guides reproduces that noise as blotches. Each aux image is
+        // denoised in place first, and the main filter is told the aux are
+        // clean (cleanAux).
+        OIDNFilter fa = oidnNewFilter(dev, "RT");
+        oidnSetFilterImage(fa, "albedo", ba, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterImage(fa, "output", ba, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterInt(fa, "maxMemoryMB", 4096);
+        oidnCommitFilter(fa);
+        OIDNFilter fn = oidnNewFilter(dev, "RT");
+        oidnSetFilterImage(fn, "normal", bn, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterImage(fn, "output", bn, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterInt(fn, "maxMemoryMB", 4096);
+        oidnCommitFilter(fn);
+
+        OIDNFilter f = oidnNewFilter(dev, "RT");
         oidnSetFilterImage(f, "color", bc, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterImage(f, "albedo", ba, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterImage(f, "normal", bn, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterImage(f, "output", bo, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterBool(f, "hdr", true);
+        oidnSetFilterBool(f, "cleanAux", true);
+        // A generous memory budget keeps OIDN from processing the image in
+        // internal TILES -- tile seams surface as a faint, screen-anchored, even
+        // square grid over noisy content (worst on large boards that fill the
+        // frame).
+        oidnSetFilterInt(f, "maxMemoryMB", 4096);
         oidnCommitFilter(f);
 
         oidnColorBuf_ = bc;
@@ -1027,6 +1064,8 @@ void Renderer::denoiseWorker(uint32_t w, uint32_t h, int samples) {
         oidnNormalBuf_ = bn;
         oidnOutBuf_ = bo;
         oidnFilter_ = f;
+        oidnAlbedoFilter_ = fa;
+        oidnNormalFilter_ = fn;
         oidnW_ = w;
         oidnH_ = h;
     }
@@ -1037,6 +1076,8 @@ void Renderer::denoiseWorker(uint32_t w, uint32_t h, int samples) {
                     alb.data());
     oidnWriteBuffer(static_cast<OIDNBuffer>(oidnNormalBuf_), 0, rgbBytes,
                     nor.data());
+    oidnExecuteFilter(static_cast<OIDNFilter>(oidnAlbedoFilter_));
+    oidnExecuteFilter(static_cast<OIDNFilter>(oidnNormalFilter_));
     oidnExecuteFilter(static_cast<OIDNFilter>(oidnFilter_));
     oidnReadBuffer(static_cast<OIDNBuffer>(oidnOutBuf_), 0, rgbBytes,
                    out.data());
@@ -1849,6 +1890,7 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         info.triangles = static_cast<uint32_t>(part.mesh.triangleCount());
         info.blended = item.blended;
         info.visible = true;
+        info.material = part.material;
         parts_.push_back(std::move(info));
 
         // params: roughness, metallic, explode rank (filled below), fade flag.
@@ -2100,6 +2142,41 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     setSubstrateAppearance(substrateColor_[0], substrateColor_[1],
                            substrateColor_[2], substrateOpacity_);
     setMaskColor(maskColor_[0], maskColor_[1], maskColor_[2], maskOpacity_);
+    setComponentShine(componentShine_);
+    setPadShine(padShine_);
+}
+
+void Renderer::setComponentShine(float s01) {
+    componentShine_ = std::clamp(s01, 0.0f, 1.0f);
+    if (materials_.empty() || !materialBuffer_.handle) return;
+    for (size_t i = 0; i < parts_.size() && i < materials_.size(); ++i) {
+        if (parts_[i].material != geom::Material::Component) continue;
+        // 0 -> the stock semi-matte plastic (rough 0.55, metallic 0.10);
+        // 1 -> chrome (rough 0.04, metallic 1.0): in the path tracer the glossy
+        // lobe becomes a near-mirror, so component bodies reflect the board and
+        // their neighbours. Deliberately stylised, not physically accurate.
+        materials_[i].params[0] = 0.55f - 0.51f * componentShine_;
+        materials_[i].params[1] = 0.10f + 0.90f * componentShine_;
+    }
+    vkDeviceWaitIdle(device_.handle);
+    uploadViaStaging(materialBuffer_, materials_.data(),
+                     materials_.size() * sizeof(MaterialGpu));
+    resetAccumulation();
+}
+
+void Renderer::setPadShine(float s01) {
+    padShine_ = std::clamp(s01, 0.0f, 1.0f);
+    if (materials_.empty() || !materialBuffer_.handle) return;
+    for (size_t i = 0; i < parts_.size() && i < materials_.size(); ++i) {
+        if (parts_[i].material != geom::Material::Copper) continue;
+        // Copper stays fully metallic; the slider polishes it: rough 0.5 (dull
+        // brushed) down to 0.02 (mirror plate).
+        materials_[i].params[0] = 0.5f - 0.48f * padShine_;
+    }
+    vkDeviceWaitIdle(device_.handle);
+    uploadViaStaging(materialBuffer_, materials_.data(),
+                     materials_.size() * sizeof(MaterialGpu));
+    resetAccumulation();
 }
 
 void Renderer::setMaskColor(float r, float g, float b, float opacity) {

@@ -49,6 +49,9 @@ struct PartInfo {
     uint32_t triangles = 0;
     bool visible = true;
     bool blended = false;
+    // What the part is made of -- lets appearance/effects setters find e.g. all
+    // Component or all Copper parts without name games.
+    geom::Material material = geom::Material::Copper;
 };
 
 class Renderer {
@@ -93,6 +96,12 @@ public:
     // mask reads as a translucent film regardless of tint. Same live-update,
     // no-retessellate path as the substrate.
     void setMaskColor(float r, float g, float b, float opacity);
+    // Stylised "effects" (deliberately not physically accurate). Component
+    // reflections: 0 = matte plastic (default), 1 = chrome -- component bodies
+    // mirror the board and their neighbours, showing off what the path tracer
+    // can do. Pad shine: how polished the exposed copper/pads are.
+    void setComponentShine(float s01);
+    void setPadShine(float s01);
 
     // Exploded view, peeled outside-in.
     //
@@ -305,6 +314,8 @@ private:
     float substrateOpacity_ = 1.0f;
     std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};  // green
     float maskOpacity_ = 0.72f;  // mask albedo.a; drives raster blend + PT show-through
+    float componentShine_ = 0.0f;  // 0 matte .. 1 chrome (stylised effect)
+    float padShine_ = 0.94f;       // maps to copper roughness 0.5 .. 0.02
     std::string capturePath_;
 
     // Ray-query RT. Built only when the device advertised ray_query. `blas_` is a
@@ -345,6 +356,8 @@ private:
     // COMMITTING a filter every call reloads/recompiles the network to the GPU --
     // seconds each -- so they persist and only rebuild when the resolution changes.
     void* oidnFilter_ = nullptr;
+    void* oidnAlbedoFilter_ = nullptr;  // aux prefilters (cleanAux mode)
+    void* oidnNormalFilter_ = nullptr;
     void* oidnColorBuf_ = nullptr;
     void* oidnAlbedoBuf_ = nullptr;
     void* oidnNormalBuf_ = nullptr;
