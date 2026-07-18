@@ -104,6 +104,7 @@ private:
     std::array<float, 3> subColor_ = {0.72f, 0.61f, 0.38f};
     float subOpacity_ = 1.0f;
     std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};
+    float maskOpacity_ = 0.72f;
     void applyAppearance();  // push colours/opacity if the renderer exists
 
     VulkanWindow* viewport_ = nullptr;

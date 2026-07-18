@@ -25,10 +25,20 @@ struct GpuInfo {
     bool hasDeferredHostOperations = false;
     bool hasBufferDeviceAddress = false;
     bool hasDescriptorIndexing = false;
+    bool hasRayQuery = false;
 
-    // True only when every prerequisite for phase 4 is present.
+    // True only when every prerequisite for the RT-pipeline path is present.
     bool rayTracingReady() const {
         return hasRayTracingPipeline && hasAccelerationStructure &&
+               hasDeferredHostOperations && hasBufferDeviceAddress &&
+               hasDescriptorIndexing;
+    }
+
+    // The lighter path pcbview actually uses: ray queries issued from the
+    // fragment shader (RT shadows / AO). Needs acceleration structures and buffer
+    // device address, but not the full RT pipeline / SBT machinery.
+    bool rayQueryReady() const {
+        return hasRayQuery && hasAccelerationStructure &&
                hasDeferredHostOperations && hasBufferDeviceAddress &&
                hasDescriptorIndexing;
     }
@@ -46,6 +56,7 @@ struct Device {
     // Set at creation: whether RT extensions were actually enabled, not merely
     // advertised. Renderers gate the RT path on this.
     bool rayTracingEnabled = false;
+    bool rayQueryEnabled = false;
 };
 
 // `extensions` lets the window layer add its surface extensions (GLFW supplies
@@ -64,6 +75,12 @@ std::vector<GpuInfo> enumerateGpus(VkInstance instance);
 // Prefers discrete + ray-tracing-ready. This box has an RTX 5070 Ti alongside a
 // Radeon iGPU, so index 0 is never a safe assumption.
 const GpuInfo* pickBestGpu(const std::vector<GpuInfo>& gpus);
+
+// Honour a user preference: if `preferNameSubstring` (case-insensitive) matches a
+// usable GPU's name, return that; otherwise fall back to pickBestGpu. Empty
+// preference is just pickBestGpu.
+const GpuInfo* selectGpu(const std::vector<GpuInfo>& gpus,
+                         const std::string& preferNameSubstring);
 
 // Enables RT extensions when the GPU supports them, and cleanly does not when it
 // doesn't. Never fails just because RT is absent.

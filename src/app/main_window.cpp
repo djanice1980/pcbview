@@ -1,6 +1,7 @@
 #include "app/main_window.h"
 
 #include <QAction>
+#include <QActionGroup>
 #include <QApplication>
 #include <QColorDialog>
 #include <QComboBox>
@@ -37,6 +38,8 @@
 #include <cmath>
 #include <cstdio>
 #include <exception>
+#include <fstream>
+#include <limits>
 
 #include "app/collapsible_dock.h"
 #include "app/component_import.h"
@@ -187,8 +190,9 @@ MainWindow::MainWindow(const QString& path) {
     }
     if (qEnvironmentVariableIsSet("PCBVIEW_MASK")) {
         const QStringList p = qEnvironmentVariable("PCBVIEW_MASK").split(',');
-        if (p.size() == 3)
+        if (p.size() >= 3)
             maskColor_ = {p[0].toFloat(), p[1].toFloat(), p[2].toFloat()};
+        if (p.size() == 4) maskOpacity_ = p[3].toFloat();  // r,g,b,opacity
     }
     applyAppearance();  // no-op if renderer absent; boardUploaded retries
 
@@ -198,7 +202,12 @@ MainWindow::MainWindow(const QString& path) {
     // and any explode easing has settled before the grab.
     if (qEnvironmentVariableIsSet("PCBVIEW_CAPTURE")) {
         const QString cap = qEnvironmentVariable("PCBVIEW_CAPTURE");
-        QTimer::singleShot(1500, this, [this, cap] {
+        // Default 1500ms lets the swapchain settle; a longer delay lets the path
+        // tracer accumulate and denoise several times before the grab.
+        const int delay = qEnvironmentVariableIsSet("PCBVIEW_CAPTURE_DELAY_MS")
+                              ? qEnvironmentVariable("PCBVIEW_CAPTURE_DELAY_MS").toInt()
+                              : 1500;
+        QTimer::singleShot(delay, this, [this, cap] {
             if (viewport_->renderer())
                 viewport_->renderer()->requestCapture(cap.toStdString());
             viewport_->requestUpdate();
@@ -247,6 +256,52 @@ bool MainWindow::loadBoard(const QString& path) {
     baseArt_ = std::move(art);
     path_ = path;
     loaded_ = true;
+
+    // PCBVIEW_ART_DUMP=<file>: write outline/drill/layer stats for a headless
+    // sanity check (counts, areas, bounding boxes). Diagnostic only.
+    if (qEnvironmentVariableIsSet("PCBVIEW_ART_DUMP")) {
+        std::ofstream d(
+            qEnvironmentVariable("PCBVIEW_ART_DUMP").toStdString());
+        auto bbox = [](const Clipper2Lib::Paths64& ps) {
+            long long xmin = std::numeric_limits<long long>::max();
+            long long ymin = std::numeric_limits<long long>::max();
+            long long xmax = std::numeric_limits<long long>::min();
+            long long ymax = std::numeric_limits<long long>::min();
+            for (const auto& p : ps)
+                for (const auto& pt : p) {
+                    xmin = std::min<long long>(xmin, pt.x);
+                    xmax = std::max<long long>(xmax, pt.x);
+                    ymin = std::min<long long>(ymin, pt.y);
+                    ymax = std::max<long long>(ymax, pt.y);
+                }
+            char buf[160];
+            std::snprintf(buf, sizeof buf,
+                          "bbox[%.2f,%.2f .. %.2f,%.2f]mm",
+                          xmin / 1e6, ymin / 1e6, xmax / 1e6, ymax / 1e6);
+            return std::string(buf);
+        };
+        d << "outline paths=" << baseArt_.outline.size()
+          << " area=" << Clipper2Lib::Area(baseArt_.outline) / 1e12 << "mm2 "
+          << bbox(baseArt_.outline) << "\n";
+        for (size_t i = 0; i < baseArt_.outline.size(); ++i) {
+            const auto& p = baseArt_.outline[i];
+            Clipper2Lib::Paths64 one{p};
+            d << "  outline[" << i << "] pts=" << p.size()
+              << " area=" << Clipper2Lib::Area(p) / 1e12 << "mm2 "
+              << bbox(one) << "\n";
+        }
+        d << "drills paths=" << baseArt_.drills.size()
+          << " area=" << Clipper2Lib::Area(baseArt_.drills) / 1e12 << "mm2 "
+          << bbox(baseArt_.drills) << "\n";
+        d << "barrels paths=" << baseArt_.barrels.size()
+          << " area=" << Clipper2Lib::Area(baseArt_.barrels) / 1e12 << "mm2\n";
+        for (const auto& al : baseArt_.layers)
+            d << "layer " << al.name << " kind=" << int(al.kind)
+              << " z=" << al.z << " paths=" << al.art.size()
+              << " area=" << Clipper2Lib::Area(al.art) / 1e12 << "mm2 "
+              << bbox(al.art) << "\n";
+        for (const auto& w : baseArt_.warnings) d << "warn: " << w << "\n";
+    }
 
     // A new board keeps any thickness override the user set, unless it is now
     // nonsensical; the override applies on top of baseArt_.
@@ -321,7 +376,7 @@ void MainWindow::applyAppearance() {
     viewport_->renderer()->setSubstrateAppearance(subColor_[0], subColor_[1],
                                                   subColor_[2], subOpacity_);
     viewport_->renderer()->setMaskColor(maskColor_[0], maskColor_[1],
-                                        maskColor_[2]);
+                                        maskColor_[2], maskOpacity_);
     viewport_->requestUpdate();
 }
 
@@ -660,7 +715,74 @@ void MainWindow::buildMenus() {
     render->addAction("&Board appearance…", this,
                       &MainWindow::showAppearanceDialog);
     render->addSeparator();
-    render->addAction("Ray tracing (phase 4)")->setEnabled(false);
+
+    QAction* rt = render->addAction("&Ray-traced shadows + AO");
+    rt->setCheckable(true);
+    connect(rt, &QAction::toggled, this,
+            [this](bool on) { viewport_->setRayTracing(on); });
+
+    QAction* pt = render->addAction("&Path tracing (full-scene lighting)");
+    pt->setCheckable(true);
+    connect(pt, &QAction::toggled, this,
+            [this](bool on) { viewport_->setPathTracing(on); });
+
+    QAction* oidn = render->addAction("Neural &denoise (Open Image Denoise)");
+    oidn->setCheckable(true);
+    connect(oidn, &QAction::toggled, this,
+            [this](bool on) { viewport_->setDenoising(on); });
+
+    QMenu* gpuMenu = render->addMenu("&Graphics device");
+
+    // The GPU list and RT capability are known only after the renderer exists
+    // (first expose), so fill these in each time the menu opens.
+    connect(render, &QMenu::aboutToShow, this, [this, rt, pt, oidn, gpuMenu] {
+        const bool avail = viewport_->renderer() && viewport_->rtAvailable();
+        rt->setEnabled(avail);
+        pt->setEnabled(avail);
+        oidn->setEnabled(avail && viewport_->pathTracing());
+        rt->setToolTip(avail
+                           ? "Contact shadows + ambient occlusion, ray-traced "
+                             "(shown on the assembled board, not while exploded)"
+                           : "This GPU does not expose ray_query");
+        pt->setToolTip(avail ? "Full progressive path tracing — accurate global "
+                               "illumination; converges while the view is still"
+                             : "This GPU does not expose ray_query");
+        oidn->setToolTip("Intel Open Image Denoise — clean the path-traced image "
+                         "in a fraction of the samples");
+        {
+            const QSignalBlocker b1(rt), b2(pt), b3(oidn);
+            rt->setChecked(viewport_->rayTracing());
+            pt->setChecked(viewport_->pathTracing());
+            oidn->setChecked(viewport_->denoising());
+        }
+
+        gpuMenu->clear();
+        if (!viewport_->renderer()) {
+            gpuMenu->addAction("(initialising…)")->setEnabled(false);
+            return;
+        }
+        const bool autoPick = QSettings().value("gpuName").toString().isEmpty();
+        const QString active = viewport_->activeGpuName();
+        auto* group = new QActionGroup(gpuMenu);
+        group->setExclusive(true);
+
+        QAction* autoAct = gpuMenu->addAction("Automatic (discrete + RT preferred)");
+        autoAct->setCheckable(true);
+        autoAct->setChecked(autoPick);
+        group->addAction(autoAct);
+        connect(autoAct, &QAction::triggered, this,
+                [this] { viewport_->setPreferredGpu(QString()); });
+        gpuMenu->addSeparator();
+
+        for (const QString& name : viewport_->availableGpuNames()) {
+            QAction* a = gpuMenu->addAction(name);
+            a->setCheckable(true);
+            a->setChecked(!autoPick && name == active);
+            group->addAction(a);
+            connect(a, &QAction::triggered, this,
+                    [this, name] { viewport_->setPreferredGpu(name); });
+        }
+    });
 
     QMenu* help = menuBar()->addMenu("&Help");
     help->addAction("&About pcbview…", this, &MainWindow::showAbout);
@@ -1066,6 +1188,15 @@ void MainWindow::showAppearanceDialog() {
     paintMask(maskCurrent);
     form->addRow("Soldermask colour", maskBtn);
 
+    auto* maskOp = new QSlider(Qt::Horizontal);
+    maskOp->setRange(15, 100);
+    maskOp->setValue(static_cast<int>(maskOpacity_ * 100.0f + 0.5f));
+    auto* maskOpVal = new QLabel(QString::number(maskOp->value()) + "%");
+    auto* maskOpRow = new QHBoxLayout;
+    maskOpRow->addWidget(maskOp);
+    maskOpRow->addWidget(maskOpVal);
+    form->addRow("Soldermask opacity", maskOpRow);
+
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
     form->addRow(buttons);
 
@@ -1122,6 +1253,12 @@ void MainWindow::showAppearanceDialog() {
                     applyAppearance();
                 }
             });
+    connect(maskOp, &QSlider::valueChanged, this,
+            [this, maskOpVal](int v) {
+                maskOpVal->setText(QString::number(v) + "%");
+                maskOpacity_ = v / 100.0f;
+                applyAppearance();
+            });
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::accept);
 
     dlg.exec();
@@ -1132,7 +1269,7 @@ void MainWindow::showAbout() {
     // copyright must appear here and the user must be directed to the licences.
     QMessageBox::about(
         this, "About pcbview",
-        "<h3>pcbview</h3>"
+        "<h3>pcbview 1.09</h3>"
         "<p>Standalone 3D PCB viewer. Renders what the fab will build.</p>"
         "<p>Copyright © 2026 pcbview contributors.<br>"
         "pcbview is free software under the <b>GNU General Public License "

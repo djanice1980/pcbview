@@ -1,4 +1,5 @@
 #include "geom/tessellate.h"
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -343,16 +344,36 @@ Paths64 graphicPaths(const Graphic& g, int segments, BoardModel* warnings) {
             Path64 poly;
             for (const Vec2& p : g.points) poly.push_back(toClipper(p));
             if (poly.size() < 3) break;
-            if (g.filled) out.push_back(poly);
-            if (halfWidth > 0.0) {
-                // Closed outline: EndType::Joined strokes the loop rather than
-                // treating it as an open run with caps.
-                ClipperOffset co;
-                co.ArcTolerance(kScale * 0.001);
-                co.AddPath(poly, JoinType::Round, EndType::Joined);
-                Paths64 grown;
-                co.Execute(halfWidth * kScale, grown);
-                out.insert(out.end(), grown.begin(), grown.end());
+            if (g.filled) {
+                out.push_back(poly);
+            } else if (halfWidth > 0.0) {
+                // An UNFILLED outline is a frame: the polygon grown by halfWidth
+                // minus the polygon shrunk by halfWidth. Built explicitly as
+                // outer + reversed inner (like the ring case above) so the
+                // caller's NonZero union carves the hole. EndType::Joined was
+                // wrong here -- it strokes a closed loop into two SAME-wound
+                // contours, so the union filled the interior solid (a large
+                // fill-no silk rectangle came out as a white box).
+                ClipperOffset coOut;
+                coOut.ArcTolerance(kScale * 0.001);
+                coOut.AddPath(poly, JoinType::Miter, EndType::Polygon);
+                Paths64 outer;
+                coOut.Execute(halfWidth * kScale, outer);
+
+                ClipperOffset coIn;
+                coIn.ArcTolerance(kScale * 0.001);
+                coIn.AddPath(poly, JoinType::Miter, EndType::Polygon);
+                Paths64 inner;
+                coIn.Execute(-halfWidth * kScale, inner);
+
+                for (Path64& p : outer) {
+                    if (Area(p) < 0) std::reverse(p.begin(), p.end());
+                    out.push_back(std::move(p));
+                }
+                for (Path64& p : inner) {
+                    if (Area(p) > 0) std::reverse(p.begin(), p.end());
+                    out.push_back(std::move(p));
+                }
             }
             break;
         }
@@ -404,6 +425,12 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
     art.silkThickness = board.silkThickness;
     art.warnings = board.warnings;
     art.drills = drillPaths(board, opts.circleSegments);
+    for (const Drill& drill : board.drills) {
+        if (drill.plated)
+            art.barrels.push_back(
+                circlePath(drill.at, drill.diameter * 0.5, opts.circleSegments));
+    }
+    normalizeWinding(art.barrels);
 
     // The bare profile, drills still intact. assemble() subtracts them, because
     // soldermask must tent ACROSS a drill and so needs the un-drilled outline.
@@ -562,16 +589,19 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
             }
             if (ink.empty()) continue;
 
-            // Rings rely on opposite winding to carve their hole, so union with
-            // NonZero BEFORE normalising -- normalising first would fill them
-            // in. This is the exact opposite of the copper rule above, and it is
-            // why the union happens HERE rather than in assemble(): by the time
-            // art crosses the LayerArt boundary it must already be normalised.
+            // Union the strokes/fills with NonZero, and DO NOT normalise winding:
+            // a real enclosed hole (an unfilled rectangle/polygon frame, a ring)
+            // comes out of the union as a negative-wound inner contour, and
+            // assemble() clips silk with NonZero -- which keeps the hole only while
+            // that contour stays negative. normalizeWinding() flips it positive and
+            // the NonZero fill then fills the hole solid (a `fill no` silk box came
+            // out as a white block). Stroked TEXT has no enclosed contours, so it
+            // was unaffected and hid the bug. The union already yields Clipper's
+            // canonical winding (outers +, holes -), which is exactly what we want.
             Clipper64 unite;
             unite.AddSubject(ink);
             Paths64 united;
             unite.Execute(ClipType::Union, FillRule::NonZero, united);
-            normalizeWinding(united);
 
             ArtLayer al;
             al.name = name;
@@ -756,6 +786,58 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             extrude(shape, al.z, al.z + al.thickness, part.mesh);
         }
         if (!part.mesh.indices.empty()) out.parts.push_back(std::move(part));
+    }
+
+    // --- Via barrels: each plated hole lined with a copper tube spanning the
+    // whole copper stack, collected into ONE part ("vias"). A via is a single
+    // plated barrel through the board; the renderer pins this part to explode
+    // rank 0 so it stays intact and centred while the layers peel around it,
+    // instead of being sliced like the substrate. ---
+    if (!art.barrels.empty()) {
+        double botZ = 1e18, topZ = -1e18;
+        for (const ArtLayer& al : art.layers) {
+            if (al.kind != LayerKind::Copper) continue;
+            botZ = std::min(botZ, al.z);
+            topZ = std::max(topZ, al.z + al.thickness);
+        }
+        if (botZ < topZ) {
+            // The barrel sits JUST INSIDE the drilled wall (radial `gap`), not on
+            // it: the copper and substrate hole edges are exactly at the drill
+            // radius, so a barrel of that radius shares a wall with every layer at
+            // every via and z-fights into heavy speckle (bad on via-dense boards).
+            // Insetting puts both the outer and inner barrel walls inside the bore,
+            // where nothing else lives. A tube = inset(gap) minus inset(gap+wall);
+            // holes too small for the void just render as a solid plug.
+            const double gap = 0.03;   // clearance from the drilled wall (mm)
+            const double wall = 0.15;  // plating thickness shown (mm)
+            const auto inset = [&](double d) {
+                ClipperOffset co;
+                co.ArcTolerance(kScale * 0.001);
+                co.AddPaths(art.barrels, JoinType::Round, EndType::Polygon);
+                Paths64 r;
+                co.Execute(-d * kScale, r);
+                return r;
+            };
+            const Paths64 outer = inset(gap);
+            const Paths64 inner = inset(gap + wall);
+
+            Clipper64 diff;
+            diff.AddSubject(outer);
+            if (!inner.empty()) diff.AddClip(inner);
+            PolyTree64 tree;
+            diff.Execute(inner.empty() ? ClipType::Union : ClipType::Difference,
+                         FillRule::NonZero, tree);
+
+            std::vector<Shape> shapes;
+            collectShapes(tree, shapes);
+
+            Part part;
+            part.material = Material::Copper;
+            part.name = "vias";
+            for (const Shape& shape : shapes)
+                extrude(shape, botZ, topZ, part.mesh);
+            if (!part.mesh.indices.empty()) out.parts.push_back(std::move(part));
+        }
     }
 
     // --- Bounds ---

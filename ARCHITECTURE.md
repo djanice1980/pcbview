@@ -66,6 +66,119 @@ rules that constrain code:
 - **Blender pipelines** (pcb2blender, gerber2blend) are minutes-per-frame Cycles
   renders, not viewers. Worth mining for technique, not code.
 
+## Ray tracing (built) — ray-query shadows + AO
+
+RT is implemented as **ray queries issued from the fragment shader**, not a
+separate RT pipeline / SBT. It layers ray-traced contact shadows and ambient
+occlusion on top of the raster shading, which is the biggest visual win for board
+inspection (components read as *seated* instead of floating) at a fraction of the
+machinery. The three readiness rules below paid off: it built over the existing
+buffers and material table without reworking the asset layer.
+
+- **Device.** `VK_KHR_ray_query` + `VK_KHR_acceleration_structure` (+ deferred host
+  ops) enabled when present (`GpuInfo::rayQueryReady()`, `Device::rayQueryEnabled`).
+  Both this box's GPUs qualify (RTX 5070 Ti and the Radeon 8060S / Strix Halo iGPU).
+  Absent → raster fallback, no failure.
+- **Acceleration structures** (`Renderer::buildAccelerationStructures`): one BLAS
+  over the board's vertex/index buffers (already `SHADER_DEVICE_ADDRESS` +
+  accel-build usage — rule 2), one TLAS with a single identity instance. Rebuilt
+  each `uploadBoard`. Scratch is over-allocated by the alignment and the device
+  address rounded up to `minAccelerationStructureScratchOffsetAlignment`.
+- **Shader.** A *separate* `board_rt.frag` carries the `RayQueryKHR` capability
+  (a non-RT device could not load it), selected at pipeline build when the device
+  has ray_query. It is byte-identical to `board.frag` plus a shadow ray to the key
+  light and a 6-tap hemisphere AO kernel. **Gotcha: ray query needs `#version 460`
+  — 450 fails with "`rayQueryEXT` undeclared".** The TLAS binds at set 0, binding 1.
+- **Gated to the collapsed board.** The BLAS is over the *un-exploded* geometry, so
+  RT is traced only at rest (`explodeProgress_ < 0.01`); a peeling stack falls back
+  to raster (its geometry is displaced in the vertex shader, not in the buffers).
+  Toggled per-frame via `cameraPos.w` — no pipeline switch. `PCBVIEW_RT=1` forces
+  it for a headless capture.
+- **GPU selection.** `selectGpu(name-substring)` overrides the discrete+RT default;
+  driven by `PCBVIEW_GPU`, the persisted `gpuName` setting, or the Render →
+  Graphics device menu, which tears the device+renderer down and rebuilds on the
+  chosen GPU (instance + surface kept, camera preserved). `PCBVIEW_GPU_REPORT=<file>`
+  dumps the chosen device for verification.
+
+## Path tracing + neural denoise (built)
+
+An optional full render mode (`RenderMode::PathTraced`, `pathtrace.comp`): a
+progressive Monte-Carlo path tracer for true global illumination, cleaned by
+Intel Open Image Denoise.
+
+- **Compute path tracer.** Cosine-weighted diffuse + a metallic mirror lobe,
+  multi-bounce with Russian roulette, lit by a sky-dome + directional sun (rays
+  that escape sample the environment -- that *is* the lighting). Accumulates one
+  sample/frame into an RGBA32F image while the camera is still; the CPU resets on
+  any camera/scene change. A fullscreen graphics pass tonemaps the average into
+  `sceneColor_`, so the existing blit + UI present it.
+  - **The tonemap must be identity below its knee** (`tonemap.frag`): the raster
+    path never tonemaps — `board.frag` writes lit colour straight to the SRGB
+    target — so any curve here is a colour DIFFERENCE between the modes. The
+    original per-channel ACES lifted midtones ~40% and desaturated saturated
+    colours (small channels rise proportionally more than the dominant one):
+    the recurring "PT looks washed out / blown out" complaint was mostly ACES,
+    not the lighting. Now: fixed exposure 0.85 (PT's sun+sky is ~1.1–1.25×
+    albedo on a lit face vs raster's ≤1.0 rig), then a hue-preserving Reinhard
+    shoulder on the MAX component from knee 0.8 — everything below the knee
+    passes through linear, sun glints roll smoothly to 1 with no hue shift.
+- **Hit shading fetches geometry itself** — rule 3 realised fully. `rayQuery`
+  gives the primitive index + barycentrics; the shader reads the vertex/index
+  SSBOs and a per-triangle material-index buffer (built in `uploadBoard`) to
+  interpolate the normal and look up the material. **This is why the index buffer
+  is GLOBAL** (indices rebased, `vertexOffset = 0`): one BLAS + the tracer address
+  one flat vertex buffer. A per-part `vertexOffset` with local indices left the
+  BLAS referencing the wrong vertices for every part but the first — it made the
+  RT-shadow BLAS wrong too, undetected until the path tracer exposed it.
+- **Firefly clamp is load-bearing.** A single specular bounce into the sun returns
+  a huge value on a dark IC lid; capping per-sample radiance (`min(rad, 8)`) is the
+  difference between grainy and clean — OIDN preserves un-clamped sparkle as
+  "detail".
+- **OIDN denoise** (Apache-2.0, GPL-3-clean): a synchronous step (`Renderer::denoise`).
+  Reads back the averaged colour + first-hit albedo + normal guides, runs the `RT`
+  filter (hdr), writes the result to `ptDenoised_`; the tonemap reads it via a push
+  flag. Triggered at growing sample milestones (16, 64, 256, …) so the image cleans
+  progressively. The license-clean stand-in for DLSS Ray Reconstruction (which is
+  NVIDIA-proprietary and GPL-incompatible).
+  - **Device:** `OIDN_DEVICE_TYPE_DEFAULT` picks the fastest present — CUDA on the
+    RTX 5070 Ti, HIP on the Radeon, else CPU (fallback on commit failure). GPU
+    denoise is ~2.5× the CPU. **Must go through OIDN device buffers**
+    (`oidnNewBuffer` + `oidnWriteBuffer`/`oidnReadBuffer`), not shared host
+    pointers: a mapped Vulkan host buffer is not device-accessible for a CUDA/HIP
+    device. The CPU + CUDA + HIP device DLLs are staged by CMake post-build.
+- **Translucency = stochastic alpha via CANDIDATE traversal, one query.** The
+  soldermask (and the substrate while it peels) commits only on its ENTERING face
+  with probability `effAlpha`; opaque prims always commit; exit faces never do.
+  Over samples a pixel converges to the raster blend `alpha*film +
+  (1-alpha)*beneath`, with no epsilon-stepping — stepping past a film tunnelled
+  through the 0.010 mm-thick layers (the mask bottom is COINCIDENT with the
+  copper top it coats) and shaded masked traces from inside the copper.
+  - **The BLAS is TWO geometry ranges** over one index buffer: uploadBoard emits
+    opaque parts' triangles first, the translucent films (mask, substrate) last,
+    and only the film range omits `VK_GEOMETRY_OPAQUE_BIT_KHR`. Opaque geometry
+    traverses entirely on the hardware fast path; only film hits reach the
+    candidate loop. (The first working version forced `gl_RayFlagsNoOpaqueEXT`
+    on an all-opaque BLAS instead — correct but it pushed EVERY triangle through
+    the shader, the single biggest PT cost.) Primitive indices are
+    geometry-LOCAL: geometry 1's are re-based by `opaqueTriCount_`
+    (`pc.counts.x`) before indexing idx/triMat — miss that and every film hit
+    shades with the wrong material. Shadow rays add `TerminateOnFirstHitEXT`
+    (occlusion is a boolean; closest-hit search was waste). Underlying trap,
+    still true: with the OPAQUE geometry flag and `gl_RayFlagsNoneEXT`, hits
+    auto-commit and `rayQueryProceedEXT` never yields candidates — a candidate
+    filter on opaque-flagged geometry is silently dead code (bit us once).
+  - GI bounce rays start `0.03` off the surface, which skips the thin films
+    entirely — alpha only matters on camera/shadow rays, which is fine.
+- **Denoiser guides are ACCUMULATED, not sampled once.** With stochastic alpha, a
+  single sample's first-hit albedo is a coin flip (film colour vs what's
+  beneath); writing the guide from sample 0 alone hands OIDN a per-pixel noise
+  mosaic that it edge-stops on and preserves — ghosted silk, hazy masked traces.
+  Albedo + normal accumulate like the colour; `denoise()` divides by the sample
+  count and re-normalises the normal.
+- Env hooks: `PCBVIEW_PT=1`, `PCBVIEW_OIDN=1`, `PCBVIEW_PT_SPP=<n>`. Explode
+  works: the BLAS is rebuilt from peel-baked vertices when the peel changes
+  (`rebuildTracedGeometry`). Menu: Render → Path tracing / Neural denoise.
+
 ## The three RT-readiness rules
 
 Phase 4 is only additive if phase 1 obeys these. All three are free in raster mode.
@@ -182,8 +295,23 @@ KiCad path. Both of the founding input formats now work.
   .gbrjob manifest first, then each file's `%TF.FileFunction`, then filename
   heuristics with a warning. The manifest also carries the **real stackup
   thicknesses**, which closes the "we derive the stackup" fab-truth gap for
-  gerber input. Excellon drills parsed separately. Board outline is the filled
-  outer boundary of the stroked Profile layer.
+  gerber input. Excellon drills parsed separately (see below). Board outline
+  (`boardFromProfile`) unions the stroked Profile into ribbons, keeps each
+  ribbon's OUTER boundary (one orientation via `Area()` sign) and **even-odd
+  fills them** — so every closed loop on Edge_Cuts becomes a cutout: the
+  perimeter fills solid, an enclosed mounting-hole/slot/void is enclosed twice
+  and empties, an island inside a cutout three times and fills, to any depth.
+  (The earlier "keep top-level outers, drop children" left every internal cutout
+  filled — mounting holes weren't cut.) **Do NOT `normalizeWinding` the result:**
+  it forces every path positive, flipping the even-odd holes into solid islands
+  that merge into the board under assemble()'s NonZero union — the holes silently
+  vanish. `assemble()` consumes the opposite-wound (negative) holes correctly.
+- **Excellon drills** (`parseDrills`): round hits `X..Y..` become circles;
+  **G85 routed slots** `X<x1>Y<y1>G85X<x2>Y<y2>` become obrounds (two tool-radius
+  semicircle caps joined by straight sides, built with trig — no offset library).
+  The G85 form is tested BEFORE the plain-hole regex, which would otherwise match
+  its leading coordinate and cut a single dot at one end (the original "slots not
+  cut" bug). METRIC/INCH + decimal coords; tool table from `T<n>C<dia>`.
 
 ### Cross-validation: two independent paths, same board
 
@@ -218,6 +346,13 @@ rendered boards diff at 3.4% of pixels, all at pad edges (faceting/antialiasing)
 - **FileFunction is case-inconsistent in KiCad itself:** a file's X2 attribute
   says `Soldermask` while the same board's .gbrjob says `SolderMask`. Compare
   case-insensitively or masks get dropped as unclassified.
+- **X2 attributes come in TWO forms; parse both.** With "Use extended X2 format"
+  ON, KiCad writes `%TF.FileFunction,Profile,NP*%` (an extended `%…*%` block); with
+  it OFF, the SAME attribute is a G04 comment: `G04 #@! TF.FileFunction,Profile,NP*`.
+  A package with no `.gbrjob` and X2-off (e.g. the COSAM Neptune export) then has
+  NO recognised Profile, and the import fails with "no board outline". `word()`
+  detects the `#@!` marker and routes the payload to the same handler as a `%TF`
+  block, so file classification works for either export style.
 
 ### Consequence for the UI
 
@@ -434,6 +569,18 @@ Silkscreen sits **on** the mask, i.e. outside `(general (thickness ...))`. KiCad
 gerber job file lists it in the stackup with no thickness at all, so the 0.010mm
 we give it is a rendering nicety, not a fab dimension. It is why Z spans
 −0.010..1.610 on a 1.600mm board.
+
+**An unfilled (`fill no`) silk rectangle/polygon must render as a hollow FRAME,
+and real holes must keep negative winding.** Two bugs conspired here (a `fill no`
+gr_rect came out as a solid white box): (1) `graphicPaths` stroked the closed
+outline with `EndType::Joined`, which yields two SAME-wound contours — build the
+frame explicitly as outer-offset + reversed inner-offset instead (like the ring
+case). (2) `buildLayerArt` then called `normalizeWinding()` on the unioned silk,
+flipping the hole's inner contour positive so `assemble()`'s NonZero clip filled
+it solid — **do not normalise silk**; the union already yields Clipper's canonical
+winding (outers +, holes −), which is what NonZero needs. Stroked **text** has no
+enclosed contours (its "holes" are just uncovered space), so it rendered fine and
+masked both bugs.
 
 `fill` and `width` are independent in KiCad's model: `fill` fills the interior and
 `width` strokes the outline on top. An unfilled circle with width is a ring; a
@@ -785,6 +932,55 @@ what the GPU rendered rather than what a screen scraper saw. This is how
 component rendering was verified (top iso / explode / bottom). Combine with
 `PCBVIEW_OPEN`, `PCBVIEW_START_VIEW`, `PCBVIEW_START_EXPLODE`, `PCBVIEW_THICKNESS`.
 
+**Launch headless with `Start-Process -Wait`, not the PowerShell `&` call
+operator.** `&` does not block on a windowed-subsystem app, so a follow-up
+`Stop-Process` (or the next loop iteration) can kill it mid-load — which looks
+exactly like a nondeterministic startup crash but is a harness artifact.
+
+### Environment variables (headless + diagnostics) — full reference
+
+Every hook is read once at startup / board load; none affects a normal
+interactive run. All are opt-in. Grouped by purpose:
+
+**Load & camera**
+- `PCBVIEW_OPEN=<path>` — load a board (.kicad_pcb, .zip, folder, .gbrjob) the
+  CLI arg can't express; the honest way to drive a headless load.
+- `PCBVIEW_START_VIEW=top|bottom|iso` — set the opening camera without input
+  synthesis (see the SendKeys warning above).
+- `PCBVIEW_START_EXPLODE=<progress>` — open with the stack peeled to `progress`
+  (0 = collapsed; up to `maxRank`, ~mid+1 with components), snapped not animated.
+
+**Appearance (mirror the Appearance dialog, which input synthesis can't drive)**
+- `PCBVIEW_THICKNESS=<mm>` — finished-board thickness override.
+- `PCBVIEW_SUBSTRATE=r,g,b,opacity` — substrate colour + translucency (0..1 each).
+- `PCBVIEW_MASK=r,g,b[,opacity]` — soldermask colour, optionally its opacity
+  (drives both the raster blend and the path tracer's show-through).
+
+**Render mode / GPU**
+- `PCBVIEW_RT=1|0` — force ray-traced raster shadows+AO on/off (else persisted).
+- `PCBVIEW_PT=1|0` — force path-traced mode on/off (else persisted).
+- `PCBVIEW_OIDN=1|0` — force neural denoise on/off (else persisted, default on).
+- `PCBVIEW_PT_SPP=<n>` — path-tracer sample cap (convergence target).
+- `PCBVIEW_GPU=<name-substring>` — pick the GPU by name substring (else the
+  persisted `gpuName`, else discrete+RT-ready).
+
+**Capture / verification**
+- `PCBVIEW_CAPTURE=<out.bmp>` — grab the presented Vulkan frame after a settle
+  delay, then quit.
+- `PCBVIEW_CAPTURE_DELAY_MS=<ms>` — override the pre-grab settle delay (default
+  1500); raise it so the path tracer can converge + denoise before the grab.
+- `PCBVIEW_GPU_REPORT=<file>` — write the chosen device + ray-query/OIDN state to
+  a file (console output is uncapturable on the Windows subsystem).
+- `PCBVIEW_ART_DUMP=<file>` — write LayerArt geometry stats (outline/drills/layer
+  path counts, areas, bounding boxes). Surfaced the G85-slot and mounting-hole
+  bugs by making "holes not cut" a measurable number, not a pixel judgement.
+- `PCBVIEW_VK_LOG=<file>` — capture Vulkan validation-layer output to a file.
+
+**Components (KiCad only)**
+- `PCBVIEW_NO_COMPONENTS=1` — skip 3D component bodies.
+- `PCBVIEW_KICAD_CLI=<path>` — override the `kicad-cli` used to tessellate STEP
+  models into the cached GLB.
+
 ### Verifying the GUI on a scaled display
 
 Qt reports `devicePixelRatio = 2.00` on this machine. Any screenshot tool must be
@@ -878,7 +1074,8 @@ colour/side group at once.
 - **Phase 3** — soldermask, silkscreen, real materials. **Done.** Components
   **Done** but via kicad-cli GLB, not WRL (KiCad 10 ships STEP-only — see
   "Component rendering" above).
-- **Phase 4** — RT mode.
+- **Phase 4** — **Done.** Ray-query RT: contact shadows + ambient occlusion from
+  the fragment shader, GPU selectable. See "Ray tracing (built)" above.
 
 ## Test corpus
 

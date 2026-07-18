@@ -85,7 +85,10 @@ void printGpu(const pcbview::GpuInfo& gpu, bool selected) {
                 mark(gpu.hasBufferDeviceAddress));
     std::printf("       descriptor_indexing     %s   (RT rule 3)\n",
                 mark(gpu.hasDescriptorIndexing));
-    std::printf("       => ray tracing ready:   %s\n",
+    std::printf("       ray_query               %s\n", mark(gpu.hasRayQuery));
+    std::printf("       => ray-query ready:     %s   (pcbview RT path)\n",
+                gpu.rayQueryReady() ? "YES" : "no");
+    std::printf("       => rt-pipeline ready:   %s\n",
                 gpu.rayTracingReady() ? "YES" : "no");
 }
 
@@ -114,9 +117,9 @@ int gpuReport() {
 
     pcbview::Device device = pcbview::createDevice(*best);
     std::printf("Created device on: %s\n", device.gpu.name.c_str());
-    std::printf("RT mode available: %s\n",
-                device.rayTracingEnabled
-                    ? "yes -- phase 4 path is unblocked"
+    std::printf("Ray-query RT mode: %s\n",
+                device.rayQueryEnabled
+                    ? "yes -- ray-traced shadows/AO available"
                     : "no -- raster only, which is a supported fallback");
 
     pcbview::destroyDevice(device);

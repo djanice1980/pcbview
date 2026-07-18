@@ -37,6 +37,10 @@ struct FrameStats {
     uint32_t trianglesTotal = 0; // uploaded
 };
 
+// How the scene is shaded. Raster is the default (with optional RT shadows);
+// PathTraced is the progressive path tracer.
+enum class RenderMode { Raster, PathTraced };
+
 // One toggleable piece of the board, surfaced for the UI.
 struct PartInfo {
     std::string name;
@@ -86,7 +90,7 @@ public:
     // Soldermask colour (both sides). Opacity is kept at its film default -- the
     // mask reads as a translucent film regardless of tint. Same live-update,
     // no-retessellate path as the substrate.
-    void setMaskColor(float r, float g, float b);
+    void setMaskColor(float r, float g, float b, float opacity);
 
     // Exploded view, peeled outside-in.
     //
@@ -113,6 +117,36 @@ public:
     const Device& device() const { return device_; }
     VkFormat colorFormat() const { return colorFormat_; }
     uint32_t imageCount() const { return static_cast<uint32_t>(images_.size()); }
+
+    // Ray-traced contact shadows + ambient occlusion, traced with ray queries
+    // from the fragment shader against an acceleration structure over the board.
+    // A no-op if the device has no ray_query support (checked at construction).
+    // Toggled per-frame via a push constant -- no pipeline switch.
+    void setRayTracing(bool on) { rtRequested_ = on; }
+    bool rayTracingSupported() const { return rtSupported_; }
+
+    // Path tracing. Needs the same ray_query support as RT shadows. The camera ray
+    // basis is pushed each frame (setRayCamera); accumulation resets whenever the
+    // camera or scene changes. `accumulatedSamples()`/`maxSamples()` drive the
+    // "keep rendering until converged" loop and a progress readout.
+    void setRenderMode(RenderMode m);
+    RenderMode renderMode() const { return mode_; }
+    bool pathTracingSupported() const { return rtSupported_; }
+    void setRayCamera(const float eye[3], const float fwd[3],
+                      const float right[3], const float up[3]);
+    void resetAccumulation() { ptSampleCount_ = 0; ptDenoisedValid_ = false; }
+    int accumulatedSamples() const { return ptSampleCount_; }
+    int maxSamples() const { return ptMaxSamples_; }
+    void setMaxSamples(int n) { ptMaxSamples_ = n < 1 ? 1 : n; }
+
+    // Intel Open Image Denoise on the accumulated result. Denoising is a
+    // synchronous GPU->CPU->GPU step the caller triggers (denoise()) when it wants
+    // a clean frame -- typically at sample-count milestones. No-op if OIDN is off.
+    void setDenoising(bool on);
+    bool denoising() const { return denoisingEnabled_; }
+    void denoise();
+    // OIDN device actually selected: "CPU", "CUDA", "HIP", "SYCL", … (or "none").
+    std::string oidnDeviceName() const;
 
     // Write the next presented frame to a BMP. Exists so the Vulkan path can be
     // verified without a human watching a window -- the same reason the software
@@ -149,6 +183,20 @@ private:
         VkImageView view = VK_NULL_HANDLE;
     };
 
+    // Ray-query acceleration structures over the board mesh. See the .cpp.
+    void loadRtFunctions();
+    void buildAccelerationStructures(uint32_t vertexCount, uint32_t indexCount);
+    void destroyAccelerationStructures();
+    VkDeviceAddress bufferAddress(const Buffer& b) const;
+
+    // Path tracer: a compute pipeline that fills an HDR accumulation image, and a
+    // fullscreen tonemap pass that resolves it into the scene colour target so the
+    // existing blit + UI present it. Descriptors are (re)written on upload/resize.
+    void createPathTracer();
+    void destroyPathTracer();
+    void updatePathTraceDescriptors();
+    void recordPathTrace(VkCommandBuffer cmd);
+
     void createSwapchain(uint32_t width, uint32_t height);
     void destroySwapchain();
     void createSceneTargets();
@@ -163,9 +211,15 @@ private:
 
     Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
                         VkMemoryPropertyFlags props);
+    // Host buffer the CPU reads back. Prefers HOST_CACHED memory (strided reads
+    // from uncached/write-combined mapped memory are ~100x slower and were the
+    // whole cost of denoising), falling back to plain coherent if unavailable.
+    Buffer createReadbackBuffer(VkDeviceSize size);
     void destroyBuffer(Buffer& buffer);
     void uploadViaStaging(Buffer& dst, const void* data, VkDeviceSize size);
     uint32_t findMemoryType(uint32_t filter, VkMemoryPropertyFlags props) const;
+    // Non-throwing variant: returns -1 when no memory type matches.
+    int findMemoryTypeOrNeg(uint32_t filter, VkMemoryPropertyFlags props) const;
 
     Device& device_;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
@@ -208,13 +262,89 @@ private:
     Buffer vertexBuffer_;
     Buffer indexBuffer_;
     Buffer materialBuffer_;
+    Buffer triMaterialBuffer_;  // per-triangle material index, for the path tracer
+    // The BLAS is built from these EXPLODED positions rather than vertexBuffer_
+    // (the rest geometry the raster path holds). At rest it is a copy of the rest
+    // vertices; in path-traced mode it is re-baked whenever the peel changes so the
+    // ray tracer sees the exploded stack. See rebuildTracedGeometry.
+    Buffer tracedVertexBuffer_;
+    std::vector<geom::Vertex> restVertices_;  // CPU copy, for re-baking the peel
+    std::vector<float> vertexRank_;           // per-vertex explode rank
+    float tracedExplode_ = 0.0f;              // peel currently baked into the BLAS
+    uint32_t asVertexCount_ = 0;              // counts the BLAS/TLAS were built with
+    uint32_t asIndexCount_ = 0;
+    // Triangles [0, opaqueTriCount_) are opaque parts; [opaqueTriCount_, end) are
+    // the translucent films (mask, substrate). uploadBoard emits them in that
+    // order so the BLAS can carry two geometry ranges: the opaque one traverses
+    // on the hardware fast path, only the films yield candidates for the path
+    // tracer's stochastic alpha. The shader maps geometry-local primitive indices
+    // back to global with this base.
+    uint32_t opaqueTriCount_ = 0;
+    // Re-bake tracedVertexBuffer_ to the given peel and rebuild the BLAS/TLAS over
+    // it, then rebind the ray-tracing descriptors. Path-traced mode only.
+    void bakeExplode(float progress);
+    void rebuildTracedGeometry(float progress);
     std::vector<DrawItem> draws_;
     std::vector<PartInfo> parts_;
     std::vector<MaterialGpu> materials_;  // CPU copy, for live appearance edits
     std::array<float, 3> substrateColor_ = {0.72f, 0.61f, 0.38f};  // FR4 tan
     float substrateOpacity_ = 1.0f;
     std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};  // green
+    float maskOpacity_ = 0.72f;  // mask albedo.a; drives raster blend + PT show-through
     std::string capturePath_;
+
+    // Ray-query RT. Built only when the device advertised ray_query. `blas_` is a
+    // bottom-level accel structure over the board's vertex/index buffers; `tlas_`
+    // holds one identity instance of it. Traced from board_rt.frag for shadows/AO,
+    // gated per-frame by rtRequested_ (and only at rest -- the BLAS is over the
+    // un-exploded geometry). See ARCHITECTURE.md "Ray tracing".
+    bool rtSupported_ = false;
+    bool rtRequested_ = false;
+    Buffer blasBuffer_;
+    Buffer tlasBuffer_;
+    Buffer instanceBuffer_;
+    VkAccelerationStructureKHR blas_ = VK_NULL_HANDLE;
+    VkAccelerationStructureKHR tlas_ = VK_NULL_HANDLE;
+    PFN_vkGetAccelerationStructureBuildSizesKHR pfnAccelSizes_ = nullptr;
+    PFN_vkCreateAccelerationStructureKHR pfnCreateAccel_ = nullptr;
+    PFN_vkDestroyAccelerationStructureKHR pfnDestroyAccel_ = nullptr;
+    PFN_vkCmdBuildAccelerationStructuresKHR pfnCmdBuildAccel_ = nullptr;
+    PFN_vkGetAccelerationStructureDeviceAddressKHR pfnAccelAddress_ = nullptr;
+
+    // Path tracer.
+    RenderMode mode_ = RenderMode::Raster;
+    int ptSampleCount_ = 0;     // samples accumulated at the current camera
+    int ptMaxSamples_ = 512;    // stop accumulating past this
+    float rayEye_[3] = {0, 0, 0};
+    float rayFwd_[3] = {0, 0, 1};
+    float rayRight_[3] = {1, 0, 0};
+    float rayUp_[3] = {0, 1, 0};
+    Image ptAccum_;             // RGBA32F running radiance sum
+    Image ptAlbedo_;            // first-hit albedo (denoiser guide)
+    Image ptNormal_;            // first-hit normal (denoiser guide)
+    Image ptDenoised_;          // OIDN output, shown when valid
+    bool ptImagesInitialised_ = false;  // GENERAL-layout transition done
+    bool denoisingEnabled_ = false;
+    bool ptDenoisedValid_ = false;      // ptDenoised_ holds the current view
+    void* oidnDevice_ = nullptr;        // OIDNDevice (opaque; kept out of the header)
+    // Cached OIDN filter + device buffers, reused across denoises. Creating and
+    // COMMITTING a filter every call reloads/recompiles the network to the GPU --
+    // seconds each -- so they persist and only rebuild when the resolution changes.
+    void* oidnFilter_ = nullptr;
+    void* oidnColorBuf_ = nullptr;
+    void* oidnAlbedoBuf_ = nullptr;
+    void* oidnNormalBuf_ = nullptr;
+    void* oidnOutBuf_ = nullptr;
+    uint32_t oidnW_ = 0, oidnH_ = 0;
+    VkDescriptorSetLayout ptSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout tonemapSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool ptPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet ptSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet tonemapSet_ = VK_NULL_HANDLE;
+    VkPipelineLayout ptLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout tonemapLayout_ = VK_NULL_HANDLE;
+    VkPipeline ptPipeline_ = VK_NULL_HANDLE;
+    VkPipeline tonemapPipeline_ = VK_NULL_HANDLE;
 
     FrameStats stats_;
 };

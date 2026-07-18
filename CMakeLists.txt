@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(pcbview LANGUAGES CXX)
+project(pcbview VERSION 1.09 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -73,6 +73,15 @@ FetchContent_Declare(cgltf
 )
 FetchContent_MakeAvailable(cgltf)
 
+# Intel Open Image Denoise: the neural denoiser for the path tracer (Apache-2.0,
+# GPL-3-compatible). Prebuilt binary package -- header + import lib + runtime DLLs.
+FetchContent_Declare(oidn
+    URL https://github.com/RenderKit/oidn/releases/download/v2.5.0/oidn-2.5.0.x64.windows.zip
+    URL_HASH SHA256=6ae0474ef7606d68647c1e2c2842832d6af01128ee84a523d30368a91013b707
+)
+FetchContent_MakeAvailable(oidn)
+set(OIDN_DIR "${oidn_SOURCE_DIR}")
+
 # ---------------------------------------------------------------------------
 # Qt -- the GUI. Used under LGPL-3.0 via option 4(d)(1): DYNAMIC LINKING ONLY.
 #
@@ -127,6 +136,10 @@ endfunction()
 
 pcbview_add_shader(board.vert)
 pcbview_add_shader(board.frag)
+pcbview_add_shader(board_rt.frag)
+pcbview_add_shader(pathtrace.comp)
+pcbview_add_shader(fullscreen.vert)
+pcbview_add_shader(tonemap.frag)
 
 add_executable(pcbview WIN32
     src/main.cpp
@@ -157,6 +170,7 @@ target_include_directories(pcbview PRIVATE
     ${glm_SOURCE_DIR}
     ${miniz_SOURCE_DIR}
     ${cgltf_SOURCE_DIR}
+    ${OIDN_DIR}/include
     ${SHADER_INCLUDE_DIR}
 )
 
@@ -178,6 +192,25 @@ target_link_libraries(pcbview PRIVATE
     Vulkan::Vulkan
     Clipper2
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::PrintSupport
+    ${OIDN_DIR}/lib/OpenImageDenoise.lib
+)
+
+# Stage the OIDN runtime beside the exe: the CPU device plus the CUDA (NVIDIA) and
+# HIP (AMD) GPU devices. OIDN picks the fastest present at runtime -- a GPU when
+# its driver is installed, else the CPU. The CUDA/HIP device DLLs need only the
+# GPU driver (already on any machine with that GPU), not a toolkit. SYCL is not
+# bundled (it drags in several more DLLs).
+add_custom_command(TARGET pcbview POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${OIDN_DIR}/bin/OpenImageDenoise.dll
+            ${OIDN_DIR}/bin/OpenImageDenoise_core.dll
+            ${OIDN_DIR}/bin/OpenImageDenoise_device_cpu.dll
+            ${OIDN_DIR}/bin/OpenImageDenoise_device_cuda.dll
+            ${OIDN_DIR}/bin/OpenImageDenoise_device_hip.dll
+            ${OIDN_DIR}/bin/tbb12.dll
+            $<TARGET_FILE_DIR:pcbview>
+    COMMENT "Staging Open Image Denoise runtime (CPU + CUDA + HIP) beside the executable"
+    VERBATIM
 )
 
 if(MSVC)

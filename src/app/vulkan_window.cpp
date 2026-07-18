@@ -1,9 +1,11 @@
 #include "app/vulkan_window.h"
 
 #include <QElapsedTimer>
+#include <QFile>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPlatformSurfaceEvent>
+#include <QSettings>
 #include <QWheelEvent>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE  // Vulkan clip space, not OpenGL's
@@ -193,51 +195,173 @@ void VulkanWindow::initialise() {
     }
     setVulkanInstance(&qtInstance_);
 
-    VkSurfaceKHR surface = QVulkanInstance::surfaceForWindow(this);
-    if (surface == VK_NULL_HANDLE) {
+    surface_ = QVulkanInstance::surfaceForWindow(this);
+    if (surface_ == VK_NULL_HANDLE) {
         throw std::runtime_error("Qt produced no VkSurfaceKHR for this window");
     }
 
-    const auto gpus = enumerateGpus(instance_);
-    const GpuInfo* best = pickBestGpu(gpus);
-    if (!best) throw std::runtime_error("no usable Vulkan device");
+    // Device preference: an explicit env override wins, else the persisted pick.
+    const QByteArray envGpu = qgetenv("PCBVIEW_GPU");
+    preferredGpu_ = !envGpu.isEmpty() ? QString::fromLocal8Bit(envGpu)
+                                      : QSettings().value("gpuName").toString();
+    // PCBVIEW_RT=1/0 forces the ray-traced path for a headless capture; otherwise
+    // the persisted setting decides.
+    rtEnabled_ = qEnvironmentVariableIsSet("PCBVIEW_RT")
+                     ? qgetenv("PCBVIEW_RT").toInt() != 0
+                     : QSettings().value("rayTracing", false).toBool();
+    ptEnabled_ = qEnvironmentVariableIsSet("PCBVIEW_PT")
+                     ? qgetenv("PCBVIEW_PT").toInt() != 0
+                     : QSettings().value("pathTracing", false).toBool();
+    oidnEnabled_ = qEnvironmentVariableIsSet("PCBVIEW_OIDN")
+                       ? qgetenv("PCBVIEW_OIDN").toInt() != 0
+                       : QSettings().value("denoising", true).toBool();
 
-    VkBool32 canPresent = VK_FALSE;
-    vkGetPhysicalDeviceSurfaceSupportKHR(best->handle, best->graphicsQueueFamily,
-                                         surface, &canPresent);
-    if (!canPresent) {
-        throw std::runtime_error(
-            "selected GPU's graphics queue cannot present to this surface");
-    }
-
-    device_ = createDevice(*best, {VK_KHR_SWAPCHAIN_EXTENSION_NAME});
-
-    const qreal dpr = devicePixelRatio();
-    renderer_ = std::make_unique<vk::Renderer>(
-        device_, surface, static_cast<uint32_t>(width() * dpr),
-        static_cast<uint32_t>(height() * dpr));
-    if (mesh_) renderer_->uploadBoard(*mesh_);
+    createDeviceAndRenderer();
 
     frameBoard(/*snap=*/true);
     initialised_ = true;
 
     // Re-apply state configured before the renderer existed. The renderer is
     // only created on first expose, so anything MainWindow set during
-    // construction went to a null pointer and was dropped. This must run AFTER
-    // initialised_ is set, and it is also where the maxRank clamp finally
-    // applies. Snap rather than animate -- the board should not peel itself open
-    // on startup.
+    // construction went to a null pointer and was dropped. Snap rather than
+    // animate -- the board should not peel itself open on startup.
     setExplodeProgress(explodeTarget_, /*snap=*/true);
-
-    emit statusMessage(QString("%1  |  RT %2  |  %3 triangles")
-                           .arg(QString::fromStdString(device_.gpu.name))
-                           .arg(device_.rayTracingEnabled ? "ready" : "unavailable")
-                           .arg(renderer_->stats().trianglesTotal));
     emit boardUploaded();
+}
+
+void VulkanWindow::createDeviceAndRenderer() {
+    // Enumerate every usable GPU (for the picker) and choose one by preference,
+    // falling back to discrete + RT-ready.
+    const auto gpus = enumerateGpus(instance_);
+    gpuNames_.clear();
+    for (const GpuInfo& g : gpus) {
+        if (g.usable()) gpuNames_ << QString::fromStdString(g.name);
+    }
+    const GpuInfo* pick = selectGpu(gpus, preferredGpu_.toStdString());
+    if (!pick) throw std::runtime_error("no usable Vulkan device");
+
+    VkBool32 canPresent = VK_FALSE;
+    vkGetPhysicalDeviceSurfaceSupportKHR(pick->handle, pick->graphicsQueueFamily,
+                                         surface_, &canPresent);
+    if (!canPresent) {
+        throw std::runtime_error(
+            "selected GPU's graphics queue cannot present to this surface");
+    }
+
+    device_ = createDevice(*pick, {VK_KHR_SWAPCHAIN_EXTENSION_NAME});
+
+    const qreal dpr = devicePixelRatio();
+    renderer_ = std::make_unique<vk::Renderer>(
+        device_, surface_, static_cast<uint32_t>(width() * dpr),
+        static_cast<uint32_t>(height() * dpr));
+    renderer_->setRayTracing(rtEnabled_ && device_.rayQueryEnabled);
+    if (qEnvironmentVariableIsSet("PCBVIEW_PT_SPP"))
+        renderer_->setMaxSamples(qgetenv("PCBVIEW_PT_SPP").toInt());
+    renderer_->setRenderMode(ptEnabled_ && device_.rayQueryEnabled
+                                 ? vk::RenderMode::PathTraced
+                                 : vk::RenderMode::Raster);
+    renderer_->setDenoising(oidnEnabled_);
+    if (mesh_) renderer_->uploadBoard(*mesh_);
+
+    emit statusMessage(
+        QString("%1  |  ray tracing: %2  |  %3 triangles")
+            .arg(QString::fromStdString(device_.gpu.name))
+            .arg(!device_.rayQueryEnabled ? "unsupported"
+                 : rtEnabled_             ? "ON"
+                                          : "available (off)")
+            .arg(renderer_->stats().trianglesTotal));
+
+    // Headless verification hook: dump the chosen device + RT state to a file so
+    // GPU selection can be confirmed without reading the status bar.
+    const QByteArray reportPath = qgetenv("PCBVIEW_GPU_REPORT");
+    if (!reportPath.isEmpty()) {
+        QFile f(QString::fromLocal8Bit(reportPath));
+        if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            f.write(QString("device=%1\nrayQuery=%2\nrtRequested=%3\noidnDevice=%4\n")
+                        .arg(QString::fromStdString(device_.gpu.name))
+                        .arg(device_.rayQueryEnabled ? "yes" : "no")
+                        .arg(rtEnabled_ ? "yes" : "no")
+                        .arg(QString::fromStdString(renderer_->oidnDeviceName()))
+                        .toUtf8());
+        }
+    }
+}
+
+QString VulkanWindow::activeGpuName() const {
+    return QString::fromStdString(device_.gpu.name);
+}
+
+bool VulkanWindow::rtAvailable() const { return device_.rayQueryEnabled; }
+
+void VulkanWindow::setPreferredGpu(const QString& nameSubstring) {
+    preferredGpu_ = nameSubstring;
+    QSettings().setValue("gpuName", nameSubstring);
+    if (!initialised_ || !renderer_) return;
+
+    // Rebuild the device and renderer on the chosen GPU. Instance and surface are
+    // kept; the camera and explode state persist across the swap.
+    renderer_->waitIdle();
+    renderer_.reset();
+    if (device_.handle != VK_NULL_HANDLE) {
+        vkDestroyDevice(device_.handle, nullptr);
+        device_ = {};
+    }
+    createDeviceAndRenderer();
+    setExplodeProgress(explodeTarget_, /*snap=*/true);
+    emit boardUploaded();
+    requestUpdate();
+}
+
+void VulkanWindow::setRayTracing(bool on) {
+    rtEnabled_ = on;
+    QSettings().setValue("rayTracing", on);
+    if (renderer_) renderer_->setRayTracing(on && device_.rayQueryEnabled);
+    emit statusMessage(QString("Ray tracing %1")
+                           .arg(!rtAvailable() ? "unsupported on this GPU"
+                                : on            ? "ON"
+                                                : "off"));
+    requestUpdate();
+}
+
+void VulkanWindow::setPathTracing(bool on) {
+    ptEnabled_ = on;
+    QSettings().setValue("pathTracing", on);
+    if (renderer_) {
+        renderer_->setRenderMode(on && device_.rayQueryEnabled
+                                     ? vk::RenderMode::PathTraced
+                                     : vk::RenderMode::Raster);
+    }
+    emit statusMessage(QString("Path tracing %1")
+                           .arg(!rtAvailable() ? "unsupported on this GPU"
+                                : on            ? "ON — accumulating…"
+                                                : "off"));
+    requestUpdate();
+}
+
+int VulkanWindow::ptSamples() const {
+    return renderer_ ? renderer_->accumulatedSamples() : 0;
+}
+int VulkanWindow::ptMaxSamples() const {
+    return renderer_ ? renderer_->maxSamples() : 0;
+}
+
+void VulkanWindow::setDenoising(bool on) {
+    oidnEnabled_ = on;
+    QSettings().setValue("denoising", on);
+    if (renderer_) renderer_->setDenoising(on);
+    nextDenoiseAt_ = 16;
+    const QString dev =
+        renderer_ ? QString::fromStdString(renderer_->oidnDeviceName()) : "?";
+    emit statusMessage(QString("Neural denoise %1%2")
+                           .arg(on ? "ON" : "off")
+                           .arg(on ? "  |  OIDN device: " + dev : QString()));
+    requestUpdate();
 }
 
 void VulkanWindow::setViewTarget(const Camera& dest, bool snap) {
     viewTarget_ = dest;
+    // A view preset owns the distance now; a leftover wheel glide would fight it.
+    zoomAnimating_ = false;
     // Orthographic and FOV switch immediately -- they are not eased as scalars.
     camera_.orthographic = dest.orthographic;
     camera_.fovDegrees = dest.fovDegrees;
@@ -313,7 +437,8 @@ void VulkanWindow::render() {
     // animation. When it settles, the loop stops and the GPU goes idle again.
     const bool exploding = stepExplodeAnimation();
     const bool gliding = stepCameraAnimation();
-    const bool stillAnimating = exploding || gliding;
+    const bool zooming = stepZoomAnimation();
+    const bool stillAnimating = exploding || gliding || zooming;
 
     QElapsedTimer timer;
     timer.start();
@@ -345,6 +470,17 @@ void VulkanWindow::render() {
     proj[1][1] *= -1.0f;  // Vulkan's Y is flipped relative to GL
     const glm::mat4 viewProj = proj * view;
 
+    // Path tracer needs the camera as a ray basis (eye + pixel-plane spans), not
+    // a matrix. Setting it resets accumulation whenever the view changed.
+    if (renderer_->renderMode() == vk::RenderMode::PathTraced) {
+        const float tanY = std::tan(glm::radians(camera_.fovDegrees) * 0.5f);
+        const float tanX = tanY * (w / h);
+        const glm::vec3 fwd = glm::normalize(basis.forward);
+        const glm::vec3 right = basis.right * tanX;
+        const glm::vec3 up = basis.up * tanY;
+        renderer_->setRayCamera(&eye[0], &fwd[0], &right[0], &up[0]);
+    }
+
     if (!renderer_->drawFrame(&viewProj[0][0], &eye[0])) {
         renderer_->resize(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
     }
@@ -353,8 +489,27 @@ void VulkanWindow::render() {
     frameMs_ = (frameMs_ == 0.0) ? ms : frameMs_ * 0.9 + ms * 0.1;
     emit frameRendered();
 
-    // Keep the loop alive only while the peel is still moving.
-    if (stillAnimating) requestUpdate();
+    // Neural denoise at growing sample-count milestones (and at convergence), so
+    // the image cleans up progressively rather than only at the very end. The
+    // denoise is a synchronous readback + CPU filter, hence milestone-gated.
+    if (renderer_->renderMode() == vk::RenderMode::PathTraced && oidnEnabled_) {
+        const int s = renderer_->accumulatedSamples();
+        if (s < lastPtSamples_) nextDenoiseAt_ = 16;  // accumulation restarted
+        lastPtSamples_ = s;
+        const bool converged = s >= renderer_->maxSamples();
+        if (s > 0 && (s >= nextDenoiseAt_ || converged)) {
+            renderer_->denoise();
+            nextDenoiseAt_ = s * 4;
+            requestUpdate();  // re-tonemap showing the denoised result
+        }
+    }
+
+    // Keep the loop alive while the peel moves OR the path tracer is still
+    // accumulating samples toward convergence.
+    const bool accumulating =
+        renderer_->renderMode() == vk::RenderMode::PathTraced &&
+        renderer_->accumulatedSamples() < renderer_->maxSamples();
+    if (stillAnimating || accumulating) requestUpdate();
 }
 
 void VulkanWindow::exposeEvent(QExposeEvent*) {
@@ -444,9 +599,42 @@ void VulkanWindow::wheelEvent(QWheelEvent* e) {
         return;
     }
 
-    camera_.distance *= std::pow(0.88f, steps);
-    camera_.distance = std::clamp(camera_.distance, 0.5f, 5000.0f);
+    // Accumulate into a TARGET and glide there (stepZoomAnimation) instead of
+    // stepping the camera per click. Rapid wheel clicks compound into one smooth
+    // dolly -- the same exponential-approach feel as the exploding view.
+    if (!zoomAnimating_) {
+        zoomTarget_ = camera_.distance;
+        zoomAnimating_ = true;
+        zoomClock_.restart();
+    }
+    zoomTarget_ *= std::pow(0.88f, steps);
+    zoomTarget_ = std::clamp(zoomTarget_, 0.5f, 5000.0f);
+    // If a view preset is mid-glide it also eases distance; keep both targets
+    // agreed so the two animations pull the same way instead of fighting.
+    if (cameraAnimating_) viewTarget_.distance = zoomTarget_;
     requestUpdate();
+}
+
+bool VulkanWindow::stepZoomAnimation() {
+    if (!zoomAnimating_) return false;
+
+    const double dt =
+        std::min(static_cast<double>(zoomClock_.restart()) / 1000.0, 0.1);
+
+    // Approach in LOG space: zoom is multiplicative, so a linear approach would
+    // rush the far end and crawl the near end of a long glide. A log approach
+    // moves at a constant perceptual rate at any distance. Same time constant
+    // as the peel, so the two gestures feel related.
+    const float ratio = zoomTarget_ / camera_.distance;
+    if (std::abs(ratio - 1.0f) < 1e-3f) {
+        camera_.distance = zoomTarget_;
+        zoomAnimating_ = false;
+    } else {
+        constexpr double kTimeConstant = 0.07;
+        const float k = 1.0f - static_cast<float>(std::exp(-dt / kTimeConstant));
+        camera_.distance *= std::pow(ratio, k);
+    }
+    return zoomAnimating_;
 }
 
 void VulkanWindow::setExplodeProgress(float progress, bool snap) {

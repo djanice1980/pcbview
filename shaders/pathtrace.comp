@@ -1,0 +1,255 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// Progressive path tracer. One sample per pixel per dispatch, accumulated into an
+// HDR image across frames while the camera is still; the CPU resets accumulation
+// on any camera/scene change. Full-scene lighting: a sky dome + a directional sun,
+// multi-bounce diffuse/metallic GI, soft shadows via the same TLAS the raster path
+// uses. Also writes first-hit albedo + normal guide images for the OIDN denoiser.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+// Geometry as flat arrays: vertex = 6 floats (pos.xyz, normal.xyz); index = uint.
+layout(std430, set = 0, binding = 1) readonly buffer Verts { float vtx[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Idx { uint idx[]; };
+layout(std430, set = 0, binding = 3) readonly buffer TriMat { uint triMat[]; };
+// params: x roughness, y metallic, z explode rank, w = 1 if it fades on peel.
+struct Mat { vec4 albedo; vec4 params; };
+layout(std430, set = 0, binding = 4) readonly buffer Mats { Mat mats[]; };
+layout(rgba32f, set = 0, binding = 5) uniform image2D accumImg;
+layout(rgba32f, set = 0, binding = 6) uniform image2D albedoImg;
+layout(rgba32f, set = 0, binding = 7) uniform image2D normalImg;
+
+layout(push_constant) uniform Push {
+    vec4 eye;    // xyz eye,      w = sampleIndex (0 overwrites the accum buffer)
+    vec4 fwd;    // xyz forward ray (pixel-centre direction, unnormalised)
+    vec4 right;  // xyz right * tan(halfFovX)
+    vec4 up;     // xyz up    * tan(halfFovY)
+    uvec4 dim;   // x width, y height, z maxDepth, w frameSeed
+    vec4 misc;   // x = peel amount 0..1 (substrate fade)
+    // x = first translucent-film triangle. The BLAS is two geometry ranges:
+    // geometry 0 (opaque, hardware fast path) and geometry 1 (the films, which
+    // yield candidates). Primitive indices are geometry-LOCAL, so geometry 1's
+    // must be re-based by counts.x before indexing idx/triMat.
+    uvec4 counts;
+} pc;
+
+const float PI = 3.14159265359;
+
+// --- RNG: hash-based, seeded per pixel + sample so frames decorrelate ---
+uint hashu(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+uint g_rng;
+float rnd() {
+    g_rng = g_rng * 747796405u + 2891336453u;
+    uint r = ((g_rng >> ((g_rng >> 28) + 4u)) ^ g_rng) * 277803737u;
+    r = (r >> 22) ^ r;
+    return float(r) * (1.0 / 4294967296.0);
+}
+
+vec3 vpos(uint i) { return vec3(vtx[6u*i], vtx[6u*i+1u], vtx[6u*i+2u]); }
+vec3 vnrm(uint i) { return vec3(vtx[6u*i+3u], vtx[6u*i+4u], vtx[6u*i+5u]); }
+
+// A subdued studio environment: a soft sky above fading to a darker ground, plus
+// a contained sun. Rays that escape sample this -- that IS the lighting. Kept
+// deliberately dim so the physically-accumulated board reads rich and matte
+// rather than washed out (path tracing blows out fast under a bright dome).
+const vec3 kSunDir = normalize(vec3(0.35, 0.25, 1.0));
+const vec3 kSunColor = vec3(1.0, 0.95, 0.88) * 2.6;
+vec3 sky(vec3 d) {
+    float t = clamp(d.z * 0.5 + 0.5, 0.0, 1.0);
+    vec3 env = mix(vec3(0.11, 0.12, 0.15), vec3(0.42, 0.44, 0.49), t);
+    float sun = pow(max(dot(d, kSunDir), 0.0), 350.0);
+    return env + kSunColor * sun;
+}
+
+// Cosine-weighted hemisphere sample around n.
+vec3 cosineHemisphere(vec3 n) {
+    float r = sqrt(rnd());
+    float phi = 2.0 * PI * rnd();
+    vec3 up = abs(n.z) < 0.99 ? vec3(0, 0, 1) : vec3(1, 0, 0);
+    vec3 t = normalize(cross(up, n));
+    vec3 b = cross(n, t);
+    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(1.0 - r * r));
+}
+
+// The substrate's translucency at a full peel (matches the raster shader), so the
+// laminate fades to reveal inner copper as the stack explodes.
+const float kSubstratePeelAlpha = 0.42;
+
+// Effective opacity of a hit. The soldermask is a fixed translucent coating;
+// the substrate (params.w > 0.5) is opaque at rest and fades toward
+// kSubstratePeelAlpha as the board peels (pc.misc.x).
+float effAlpha(uint prim) {
+    Mat m = mats[triMat[prim]];
+    float a = m.albedo.a;
+    if (m.params.w > 0.5) a = mix(a, kSubstratePeelAlpha, pc.misc.x);
+    return a;
+}
+bool opaquePrim(uint prim) { return effAlpha(prim) >= 0.99; }
+
+// Shadow test that ignores the translucent coating -- the thin mask must not cast
+// a shadow on the copper it sits on, or every masked trace goes dim.
+//
+// The geometry split does the heavy lifting: opaque geometry auto-commits in
+// hardware, and TerminateOnFirstHit ends traversal at the first commit --
+// occlusion is a boolean, so hunting for the CLOSEST hit was wasted work. Only
+// film candidates (geometry 1) reach the loop, where a translucent one is left
+// unconfirmed so the shadow ray passes through it.
+bool occluded(vec3 o, vec3 d, float tmax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, o,
+                          0.02, d, tmax);
+    while (rayQueryProceedEXT(rq)) {
+        uint cp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+        if (rayQueryGetIntersectionGeometryIndexEXT(rq, false) == 1)
+            cp += pc.counts.x;
+        if (opaquePrim(cp)) rayQueryConfirmIntersectionEXT(rq);
+        // translucent candidate: leave uncommitted so the ray passes through.
+    }
+    return rayQueryGetIntersectionTypeEXT(rq, true) !=
+           gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+void main() {
+    uvec2 px = gl_GlobalInvocationID.xy;
+    if (px.x >= pc.dim.x || px.y >= pc.dim.y) return;
+
+    uint sampleIndex = uint(pc.eye.w);
+    g_rng = hashu(px.x + hashu(px.y + hashu(pc.dim.w + sampleIndex)));
+
+    // Jittered primary ray through the pixel.
+    vec2 jitter = vec2(rnd(), rnd());
+    vec2 uv = (vec2(px) + jitter) / vec2(pc.dim.xy);
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec3 dir = normalize(pc.fwd.xyz + ndc.x * pc.right.xyz - ndc.y * pc.up.xyz);
+    vec3 origin = pc.eye.xyz;
+
+    vec3 radiance = vec3(0.0);
+    vec3 throughput = vec3(1.0);
+    vec3 firstAlbedo = vec3(1.0);
+    vec3 firstNormal = vec3(0.0);
+
+    uint maxDepth = pc.dim.z;
+    for (uint depth = 0u; depth <= maxDepth; ++depth) {
+        // ONE ray query, candidate traversal (stochastic alpha). Opaque geometry
+        // (BLAS geometry 0, OPAQUE flag) commits ENTIRELY in hardware -- only the
+        // translucent films (geometry 1) reach this loop, where an ENTERING face
+        // commits with probability effAlpha, so over many samples the pixel
+        // converges to the raster blend alpha*film + (1-alpha)*beneath. Exit
+        // faces and pass-through samples are simply never confirmed -- the ray
+        // continues to whatever lies beyond with NO re-shooting and NO epsilon
+        // stepping (a step-past approach tunnelled through the 0.01mm films and
+        // shaded masked copper from inside). Film primitive indices are
+        // geometry-local; re-base by counts.x.
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, tlas, gl_RayFlagsNoneEXT, 0xFF, origin,
+                              0.02, dir, 1.0e5);
+        while (rayQueryProceedEXT(rq)) {
+            uint cp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+            if (rayQueryGetIntersectionGeometryIndexEXT(rq, false) == 1)
+                cp += pc.counts.x;
+            if (opaquePrim(cp)) {
+                rayQueryConfirmIntersectionEXT(rq);
+                continue;
+            }
+            vec3 fng = cross(vpos(idx[3u*cp+1u]) - vpos(idx[3u*cp]),
+                             vpos(idx[3u*cp+2u]) - vpos(idx[3u*cp]));
+            bool entering = dot(dir, fng) < 0.0;
+            if (entering && rnd() < effAlpha(cp)) rayQueryConfirmIntersectionEXT(rq);
+        }
+
+        if (rayQueryGetIntersectionTypeEXT(rq, true) ==
+            gl_RayQueryCommittedIntersectionNoneEXT) {
+            radiance += throughput * sky(dir);
+            if (depth == 0u) { firstAlbedo = sky(dir); firstNormal = -dir; }
+            break;
+        }
+
+        uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+        if (rayQueryGetIntersectionGeometryIndexEXT(rq, true) == 1)
+            prim += pc.counts.x;
+        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        float tHit = rayQueryGetIntersectionTEXT(rq, true);
+        vec3 p = origin + dir * tHit;
+
+        uint i0 = idx[3u*prim], i1 = idx[3u*prim+1u], i2 = idx[3u*prim+2u];
+        vec3 ng = normalize(cross(vpos(i1) - vpos(i0), vpos(i2) - vpos(i0)));
+        vec3 ns = normalize(vnrm(i0) * (1.0 - bary.x - bary.y) +
+                            vnrm(i1) * bary.x + vnrm(i2) * bary.y);
+        if (dot(ns, ng) < 0.0) ng = -ng;
+        vec3 n = dot(ns, -dir) < 0.0 ? -ns : ns;
+        vec3 gn = dot(ng, -dir) < 0.0 ? -ng : ng;
+
+        Mat m = mats[triMat[prim]];
+        vec3 albedo = m.albedo.rgb;
+        float metallic = m.params.y;
+
+        if (depth == 0u) { firstAlbedo = albedo; firstNormal = n; }
+
+        // Next-event estimation: direct sun, diffuse PLUS a specular glint. The
+        // glint is what makes copper read as metal under the deliberately dim
+        // dome -- a pure mirror there just reflects the dark sky and looks dead.
+        // The highlight is tinted by the metal's own colour (gold), so traces and
+        // pads catch a warm sheen instead of a lifeless grey reflection.
+        float ndl = max(dot(n, kSunDir), 0.0);
+        if (ndl > 0.0 && !occluded(p + gn * 0.03, kSunDir, 1.0e5)) {
+            const float rough = clamp(m.params.x, 0.04, 1.0);
+            const vec3 h = normalize(kSunDir - dir);  // -dir = view direction
+            const float spec = pow(max(dot(n, h), 0.0), 2.0 / (rough * rough) - 2.0);
+            const vec3 specCol = mix(vec3(0.04), albedo, metallic);
+            radiance += throughput *
+                        (albedo * (1.0 / PI) + specCol * spec) * kSunColor * ndl;
+        }
+
+        // Next direction: metallic -> glossy reflection tinted by the metal's
+        // colour, else cosine diffuse. The reflection is roughened so a thin
+        // trace shows a soft sheen rather than a hard mirror of the dim sky.
+        origin = p + gn * 0.03;
+        if (rnd() < metallic) {
+            const float rough = clamp(m.params.x, 0.04, 1.0);
+            vec3 refl = reflect(dir, n);
+            vec3 glossy = normalize(refl + rough * cosineHemisphere(n));
+            dir = (dot(glossy, gn) > 0.0) ? glossy : refl;
+            throughput *= albedo;  // a metal reflects its own colour
+        } else {
+            dir = cosineHemisphere(n);
+            throughput *= albedo;  // cosine pdf cancels the 1/pi and cos terms
+        }
+
+        // Russian roulette once a path has some depth.
+        if (depth >= 3u) {
+            float q = max(throughput.r, max(throughput.g, throughput.b));
+            if (rnd() > q) break;
+            throughput /= max(q, 1e-4);
+        }
+    }
+
+    // Firefly clamp: a single specular bounce into the sun can return a huge
+    // value on an otherwise dark surface (IC lids), which reads as sparkle the
+    // denoiser preserves as "detail". Capping per-sample radiance trades a hair
+    // of bias for far less variance -- the difference between grainy and clean.
+    radiance = min(radiance, vec3(8.0));
+
+    ivec2 coord = ivec2(px);
+    vec3 prev = (sampleIndex == 0u) ? vec3(0.0)
+                                    : imageLoad(accumImg, coord).rgb;
+    imageStore(accumImg, coord, vec4(prev + radiance, 1.0));
+
+    // The denoiser guides are ACCUMULATED like the colour, not sampled once.
+    // With stochastic mask alpha, one sample's first-hit albedo is a coin flip
+    // (mask colour vs the copper beneath); a single-sample guide is therefore a
+    // per-pixel noise mosaic that OIDN edge-stops on and preserves as "detail" --
+    // the ghosted/hazy silk and traces. Averaged over samples the guide converges
+    // to the true blend and the denoise comes out clean. denoise() divides by the
+    // sample count (and re-normalises the normal).
+    vec3 prevA = (sampleIndex == 0u) ? vec3(0.0)
+                                     : imageLoad(albedoImg, coord).rgb;
+    imageStore(albedoImg, coord, vec4(prevA + firstAlbedo, 1.0));
+    vec3 prevN = (sampleIndex == 0u) ? vec3(0.0)
+                                     : imageLoad(normalImg, coord).rgb;
+    imageStore(normalImg, coord, vec4(prevN + firstNormal, 1.0));
+}

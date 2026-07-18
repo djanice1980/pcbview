@@ -1,0 +1,134 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// Raster shading + ray-traced contact shadows and ambient occlusion.
+//
+// Byte-identical to board.frag except for the ray-query block: it traces against
+// a TLAS over the board (bound at set 0, binding 1) to darken points the key
+// light cannot reach and crevices under/between components. Tracing is gated by
+// push.cameraPos.w (the CPU sets it only on a device with ray_query, with RT
+// toggled on, and only at rest -- the acceleration structure is over the
+// un-exploded geometry). When the gate is 0 this shades exactly like board.frag.
+
+layout(location = 0) in vec3 inNormal;
+layout(location = 1) in vec3 inWorldPos;
+layout(location = 2) flat in uint inMaterial;
+
+layout(location = 0) out vec4 outColor;
+
+struct Material {
+    vec4 albedo;
+    vec4 params;  // x roughness, y metallic, z explode rank, w fades-on-peel
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Materials {
+    Material materials[];
+} materialTable;
+
+layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
+
+layout(push_constant) uniform Push {
+    mat4 viewProj;
+    vec4 cameraPos;  // .w = RT enable
+    vec4 params;
+} push;
+
+const float kSubstratePeelAlpha = 0.42;
+
+// True if anything opaque lies between `origin` and `origin + dir*tmax`.
+bool occluded(vec3 origin, vec3 dir, float tmax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, tlas,
+                          gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+                          0xFF, origin, 0.02, dir, tmax);
+    while (rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true) !=
+           gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// Fraction of a short hemisphere around the normal that is open. 1 = fully open,
+// 0 = fully enclosed. A fixed kernel biased toward the normal -- no per-pixel
+// randomness, so it is temporally stable (no shimmer).
+float ambientOcclusion(vec3 p, vec3 n) {
+    const vec3 k[6] = vec3[](
+        vec3(0.0, 0.0, 1.0),
+        vec3(0.60, 0.0, 0.80),
+        vec3(-0.60, 0.0, 0.80),
+        vec3(0.0, 0.60, 0.80),
+        vec3(0.0, -0.60, 0.80),
+        vec3(0.42, 0.42, 0.80));
+    // Tangent basis from the normal.
+    vec3 up = abs(n.z) < 0.99 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t = normalize(cross(up, n));
+    vec3 b = cross(n, t);
+    const float radius = 2.5;  // mm; contact-shadow scale under small parts
+    float open = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        vec3 s = normalize(k[i]);
+        vec3 dir = t * s.x + b * s.y + n * s.z;
+        if (!occluded(p + n * 0.05, dir, radius)) open += 1.0;
+    }
+    return open / 6.0;
+}
+
+void main() {
+    Material m = materialTable.materials[inMaterial];
+
+    vec3 n = normalize(inNormal);
+    vec3 viewDir = normalize(push.cameraPos.xyz - inWorldPos);
+    if (dot(n, viewDir) < 0.0) n = -n;
+
+    vec3 camRight = normalize(cross(viewDir, vec3(0.0, 0.0, 1.0)));
+    if (length(camRight) < 0.01) camRight = vec3(1.0, 0.0, 0.0);
+    vec3 camUp = cross(camRight, viewDir);
+
+    float viewDist = length(push.cameraPos.xyz - inWorldPos);
+    vec3 keyPos = push.cameraPos.xyz + (camRight * 0.55 + camUp * 0.55) * viewDist;
+    vec3 keyDir = normalize(keyPos - inWorldPos);
+    vec3 fillDir = normalize(viewDir - camRight * 0.5 - camUp * 0.25);
+
+    float key = max(dot(n, keyDir), 0.0);
+    float fill = max(dot(n, fillDir), 0.0);
+
+    // Ray-traced shadow + AO, only when the gate is set.
+    float shadow = 1.0;
+    float ao = 1.0;
+    if (push.cameraPos.w > 0.5) {
+        if (!occluded(inWorldPos + n * 0.05, keyDir, length(keyPos - inWorldPos)))
+            shadow = 1.0;
+        else
+            shadow = 0.0;
+        ao = ambientOcclusion(inWorldPos, n);
+    }
+
+    // Shadowed key drops to a soft floor rather than black (there is fill + sky);
+    // AO darkens ambient and crevices.
+    float shadowedKey = key * mix(0.30, 1.0, shadow);
+    float diffuse = 0.15 * mix(0.4, 1.0, ao) + 0.65 * shadowedKey + 0.20 * fill;
+    diffuse *= mix(0.7, 1.0, ao);
+
+    vec3 h = normalize(keyDir + viewDir);
+    float roughness = clamp(m.params.x, 0.05, 1.0);
+    float specPower = 2.0 / (roughness * roughness) - 2.0;
+    float spec = pow(max(dot(n, h), 0.0), specPower) * (1.0 - roughness) * shadow;
+
+    float fresnel = pow(1.0 - max(dot(n, viewDir), 0.0), 4.0);
+
+    // Metals reflect their own colour, much brighter than dielectrics.
+    vec3 specTint = mix(vec3(1.0), m.albedo.rgb, m.params.y);
+    // Cheap metallic environment reflection so flat pads facing up read as shiny
+    // from any angle (weighted by metallic -- matte IC bodies stay matte).
+    vec3 refl = reflect(-viewDir, n);
+    float envUp = clamp(refl.z * 0.5 + 0.5, 0.0, 1.0);
+    vec3 env = mix(vec3(0.22), vec3(1.05), envUp);
+    vec3 lit = m.albedo.rgb * diffuse
+             + specTint * spec * mix(0.12, 1.3, m.params.y)
+             + specTint * env * (m.params.y * 0.35)
+             + vec3(fresnel) * 0.08;
+
+    float alpha = mix(m.albedo.a,
+                      mix(m.albedo.a, kSubstratePeelAlpha, push.params.w),
+                      m.params.w);
+
+    outColor = vec4(lit, alpha);
+}

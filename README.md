@@ -42,6 +42,15 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   auto-hiding side panels (pin, or peek-on-hover).
 - **Print & export.** Print as-shown, flat (overhead orthographic), or **flat at
   true 1:1 physical size**, with a print preview. Save a PNG/JPG screenshot.
+- **Ray-traced lighting.** On a GPU with `ray_query` (most modern discrete cards
+  and many iGPUs), an optional mode traces contact shadows and ambient occlusion
+  from the fragment shader, so components read as *seated* on the board. Pick which
+  GPU renders (Render → Graphics device) — pcbview defaults to a discrete, RT-ready
+  card.
+- **Path tracing + neural denoise.** A full progressive path tracer (global
+  illumination, soft area-light shadows, colour bleeding) that converges while the
+  view is still, cleaned in a fraction of the samples by **Intel Open Image
+  Denoise** — the license-clean, cross-vendor neural denoiser.
 - **Smooth navigation.** Orbit / pan / zoom, animated view presets (top / bottom /
   iso / fit), orthographic toggle, drag-and-drop, and recent-file history.
 
@@ -59,6 +68,15 @@ The exploded view slices the dielectric between copper planes so every inner
 trace layer is shown where it actually lives in the stack:
 
 ![Sliced dielectric with inner copper between the slabs](docs/images/flex.png)
+
+With ray tracing on, components gain traced contact shadows and ambient occlusion:
+
+![Ray-traced shadows and ambient occlusion](docs/images/raytracing.png)
+
+Full path tracing with the neural denoiser — global illumination and colour bleed,
+clean:
+
+![Path-traced, OIDN-denoised](docs/images/pathtracing.png)
 
 ## Controls
 
@@ -137,9 +155,11 @@ are incompatible with GPL-2.0. Full third-party attributions are in
 ## Roadmap
 
 - **Done:** KiCad + Gerber import, tessellation, soldermask & silkscreen, the Qt
-  "pro-CAD" GUI, exploded view, board appearance, 3D components, print/export.
-- **Next:** hardware ray-traced lighting — the renderer already carries the
-  extension, buffer, and material conventions for it.
+  "pro-CAD" GUI, exploded view, board appearance, 3D components, print/export,
+  ray-query ray tracing (contact shadows + AO) with GPU selection, and a full
+  path-tracing mode with Intel OIDN neural denoising.
+- **Next:** RT/PT during the exploded view (rebuild the acceleration structure per
+  stage), GPU-device OIDN, and a Linux build.
 
 ## Author & support
 

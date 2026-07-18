@@ -104,6 +104,12 @@ struct LayerArt {
     Clipper2Lib::Paths64 outline;
     Clipper2Lib::Paths64 drills;
 
+    // Plated drills only (PTH / vias). assemble() lines these with a copper barrel
+    // that spans the whole copper stack as ONE intact part -- a via is a single
+    // plated tube through the board, not something the exploded view should slice
+    // into per-layer pieces. Non-plated (NPTH) holes get no barrel.
+    Clipper2Lib::Paths64 barrels;
+
     std::vector<ArtLayer> layers;
     std::vector<std::string> warnings;
 };

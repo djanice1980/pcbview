@@ -1,6 +1,8 @@
 #include "render/common/device.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -66,6 +68,15 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(
                             ? "WARNING"
                             : "info";
     std::fprintf(stderr, "[vulkan %s] %s\n", level, data->pMessage);
+    // PCBVIEW_VK_LOG=<file> also appends messages to a file -- the only way to see
+    // validation output on a Windows-subsystem build whose stderr goes to a
+    // console the launcher cannot capture.
+    if (const char* path = std::getenv("PCBVIEW_VK_LOG")) {
+        if (FILE* f = std::fopen(path, "a")) {
+            std::fprintf(f, "[vulkan %s] %s\n", level, data->pMessage);
+            std::fclose(f);
+        }
+    }
     return VK_FALSE;
 }
 
@@ -173,6 +184,7 @@ std::vector<GpuInfo> enumerateGpus(VkInstance instance) {
             hasExtension(exts, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         info.hasDeferredHostOperations =
             hasExtension(exts, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+        info.hasRayQuery = hasExtension(exts, VK_KHR_RAY_QUERY_EXTENSION_NAME);
 
         // Core since 1.2, but confirm the features are actually on -- an
         // extension being listed is not the same as the feature being enabled.
@@ -211,30 +223,54 @@ const GpuInfo* pickBestGpu(const std::vector<GpuInfo>& gpus) {
     return best;
 }
 
+const GpuInfo* selectGpu(const std::vector<GpuInfo>& gpus,
+                         const std::string& preferNameSubstring) {
+    if (!preferNameSubstring.empty()) {
+        std::string want = preferNameSubstring;
+        std::transform(want.begin(), want.end(), want.begin(), ::tolower);
+        for (const GpuInfo& gpu : gpus) {
+            if (!gpu.usable()) continue;
+            std::string name = gpu.name;
+            std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+            if (name.find(want) != std::string::npos) return &gpu;
+        }
+    }
+    return pickBestGpu(gpus);
+}
+
 Device createDevice(const GpuInfo& gpu,
                     const std::vector<const char*>& requested) {
     if (!gpu.usable()) {
         throw std::runtime_error("GPU has no graphics queue family");
     }
 
-    // Rule 1: enable RT when present, proceed without it when absent.
+    // Rule 1: enable RT when present, proceed without it when absent. pcbview's
+    // RT path is ray queries from the fragment shader (rayQueryReady), not the
+    // full RT pipeline -- but enable the pipeline too when the GPU offers it, at
+    // no cost, so a future RT-pipeline mode is a shader away.
     const bool wantRt = gpu.rayTracingReady();
+    const bool wantRq = gpu.rayQueryReady();
+    const bool wantAccel = wantRt || wantRq;
 
     std::vector<const char*> extensions = requested;
-    if (wantRt) {
+    if (wantAccel) {
         extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-        extensions.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
         extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     }
+    if (wantRt) extensions.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+    if (wantRq) extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
 
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipeline{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
     rtPipeline.rayTracingPipeline = VK_TRUE;
 
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQuery{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    rayQuery.rayQuery = VK_TRUE;
+
     VkPhysicalDeviceAccelerationStructureFeaturesKHR accel{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     accel.accelerationStructure = VK_TRUE;
-    accel.pNext = &rtPipeline;
 
     // Dynamic rendering and synchronization2 are 1.3 core; both remove a lot of
     // boilerplate and neither conflicts with the RT path.
@@ -242,7 +278,22 @@ Device createDevice(const GpuInfo& gpu,
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.dynamicRendering = VK_TRUE;
     v13.synchronization2 = VK_TRUE;
-    if (wantRt) v13.pNext = &accel;
+
+    // Chain the RT feature structs after v13, only the ones we're enabling:
+    // v13 -> accel -> [rtPipeline] -> [rayQuery].
+    if (wantAccel) {
+        VkBaseOutStructure* tail = reinterpret_cast<VkBaseOutStructure*>(&accel);
+        v13.pNext = &accel;
+        if (wantRt) {
+            tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&rtPipeline);
+            tail = reinterpret_cast<VkBaseOutStructure*>(&rtPipeline);
+        }
+        if (wantRq) {
+            tail->pNext = reinterpret_cast<VkBaseOutStructure*>(&rayQuery);
+            tail = reinterpret_cast<VkBaseOutStructure*>(&rayQuery);
+        }
+        tail->pNext = nullptr;
+    }
 
     // Rules 2 and 3 both need these on from the very first device we create:
     // buffer device address for RT vertex fetch, descriptor indexing for the
@@ -278,6 +329,7 @@ Device createDevice(const GpuInfo& gpu,
     Device device;
     device.gpu = gpu;
     device.rayTracingEnabled = wantRt;
+    device.rayQueryEnabled = wantRq;
     check(vkCreateDevice(gpu.handle, &info, nullptr, &device.handle),
           "vkCreateDevice");
     vkGetDeviceQueue(device.handle, gpu.graphicsQueueFamily, 0,

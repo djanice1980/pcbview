@@ -549,6 +549,18 @@ private:
     void word(const std::string& w) {
         if (w.empty()) return;
 
+        // KiCad embeds X2 attributes as G04 comments -- "G04 #@! TF.FileFunction,
+        // Profile,NP*" -- when "Use extended X2 format" is OFF (the %TF...*% form
+        // is only written when it is ON). Route the payload after the "#@!" marker
+        // to the same handler as a real %TF block, so file classification (and
+        // thus finding the board outline) works for either export style. Without
+        // this, an X2-off export has no recognised Profile and cannot be placed.
+        const size_t marker = w.find("#@!");
+        if (marker != std::string::npos) {
+            extended(w.substr(marker + 3));
+            return;
+        }
+
         // Parse leading G / D codes and coordinates.
         // A line can be like: G01X123Y456D01  or  D10  or  G36
         size_t i = 0;

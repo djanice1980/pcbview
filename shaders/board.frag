@@ -84,7 +84,21 @@ void main() {
     // instead of a hard tone step, and lifts flat dark parts off the background.
     float fresnel = pow(1.0 - max(dot(n, viewDir), 0.0), 4.0);
 
-    vec3 lit = m.albedo.rgb * diffuse + vec3(spec) * mix(0.1, 0.6, m.params.y)
+    // Metals reflect their own colour and much more strongly than dielectrics, so
+    // the specular is tinted toward the albedo and weighted up by metallic.
+    vec3 specTint = mix(vec3(1.0), m.albedo.rgb, m.params.y);
+
+    // Cheap environment reflection for metals: the reflected ray looking "up"
+    // sees a bright sky, so a flat pad facing up reads as shiny plated metal from
+    // any angle, not only where the key highlight happens to land. Weighted by
+    // metallic, so gold pads pop while the matte IC bodies stay matte.
+    vec3 refl = reflect(-viewDir, n);
+    float envUp = clamp(refl.z * 0.5 + 0.5, 0.0, 1.0);
+    vec3 env = mix(vec3(0.22), vec3(1.05), envUp);
+
+    vec3 lit = m.albedo.rgb * diffuse
+             + specTint * spec * mix(0.12, 1.3, m.params.y)
+             + specTint * env * (m.params.y * 0.35)
              + vec3(fresnel) * 0.08;
 
     // Materials flagged to fade (the substrate) go from fully solid at rest to

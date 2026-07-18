@@ -27,6 +27,7 @@ mutually compatible at GPL-3:
 | earcut.hpp | ISC | permissive |
 | glm | MIT | permissive |
 | cgltf | MIT | permissive |
+| Intel Open Image Denoise | Apache-2.0 | compatible with GPL-3; **incompatible with GPL-2** |
 
 Both Qt's LGPL-3 and Apache-2.0 are **incompatible with GPL-2**. Relicensing
 pcbview to GPL-2 would therefore be legally impossible while keeping Qt and
@@ -114,6 +115,13 @@ here.
 | glm | MIT |
 | miniz | MIT |
 | cgltf | MIT |
+| Intel Open Image Denoise | Apache-2.0 |
+
+The `OpenImageDenoise*.dll` and `tbb12.dll` files staged beside the executable are
+the Intel Open Image Denoise runtime (Apache-2.0), used for neural denoising of the
+path-traced image. Apache-2.0 is GPL-3-compatible. The CPU, CUDA (NVIDIA) and HIP
+(AMD) device runtimes are bundled; OIDN selects the fastest available GPU at
+runtime, falling back to the CPU. The SYCL device is not bundled.
 | Vulkan SDK | Apache-2.0 |
 
 All permissive and GPL-3-compatible.

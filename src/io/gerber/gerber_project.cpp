@@ -12,6 +12,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <cstdlib>
 
 #include "io/gerber/gerber_parser.h"
 
@@ -178,17 +179,53 @@ JobManifest parseJob(const std::string& text) {
 
 // ---- Excellon drills -----------------------------------------------------
 
-Paths64 parseDrills(const std::string& text, int segments) {
+// Parses every hole. If platedOut is given, PLATED holes (PTH / vias) are also
+// appended there -- read per TOOL from the Excellon `TA.AperFunction,Plated/
+// NonPlated` comments, so a single MERGED (MixedPlating) drill program is split
+// correctly instead of being taken as all-one-kind by a file-level guess. The
+// `TF.FileFunction` header sets the file-level DEFAULT (an NPTH program with no
+// per-tool attributes must not default to plated and grow barrels in its
+// mounting holes). Anything this parser cannot represent lands in `warnings`
+// rather than failing silently -- silent wrong guesses are how the mounting-hole
+// and barrel bugs happened.
+Paths64 parseDrills(const std::string& text, int segments,
+                    Paths64* platedOut = nullptr,
+                    std::vector<std::string>* warnings = nullptr) {
     Paths64 holes;
     std::map<int, double> tools;  // tool number -> diameter (mm)
+    std::map<int, bool> toolPlated;
+    bool currentPlated = true;    // refined by FileFunction / AperFunction below
     double unitScale = 1.0;       // to mm
     int currentTool = -1;
+    size_t modalSkipped = 0;      // X-only / Y-only hits we cannot place
+    size_t integerCoords = 0;     // decimal-less coords (implied-decimal format)
+    bool dotsSeen = false;        // decimal format legitimately allows "X152Y-90",
+                                  // so only an ALL-integer file is implied-decimal
+
+    const auto emitPlated = [&](const Path64& p) {
+        const bool plated = toolPlated.count(currentTool) ? toolPlated[currentTool]
+                                                          : currentPlated;
+        if (plated && platedOut) platedOut->push_back(p);
+    };
 
     std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
+
+        // File-level plating default. KiCad: `TF.FileFunction,NonPlated,...`
+        // (NPTH), `,Plated,...` (PTH) or `,MixedPlating,...` (merged; per-tool
+        // attributes then refine).
+        if (line.find("FileFunction") != std::string::npos) {
+            if (line.find("NonPlated") != std::string::npos) currentPlated = false;
+            continue;
+        }
+        // Per-tool plating attribute (applies to the tools defined after it).
+        if (line.find("AperFunction") != std::string::npos) {
+            currentPlated = line.find("NonPlated") == std::string::npos;
+            continue;
+        }
 
         if (line.rfind("METRIC", 0) == 0 || line == "M71") unitScale = 1.0;
         else if (line.rfind("INCH", 0) == 0 || line == "M72") unitScale = 25.4;
@@ -197,7 +234,9 @@ Paths64 parseDrills(const std::string& text, int segments) {
         std::smatch m;
         if (std::regex_search(line, m,
                               std::regex("^T(\\d+)C([\\d.]+)"))) {
-            tools[std::stoi(m[1])] = std::atof(m[2].str().c_str()) * unitScale;
+            const int t = std::stoi(m[1]);
+            tools[t] = std::atof(m[2].str().c_str()) * unitScale;
+            toolPlated[t] = currentPlated;
             continue;
         }
         // Tool select on its own line: T<n>
@@ -205,10 +244,65 @@ Paths64 parseDrills(const std::string& text, int segments) {
             currentTool = std::stoi(m[1]);
             continue;
         }
-        // A drill hit: X..Y.. (decimal, KiCad's format). Y already up-positive,
-        // matching gerber and our world -- no flip.
+        // An Excellon routed slot: X<x1>Y<y1>G85X<x2>Y<y2>. The tool is swept
+        // from A to B, so the hole is an obround (the Minkowski sum of the
+        // segment with a disc of the tool radius), not a point. This MUST be
+        // tested before the plain-hole case: a plain X..Y.. search matches the
+        // slot's leading coordinate and would cut only a dot at one end --
+        // exactly the "holes not cut" symptom on KiCad boards with oblong pads.
+        std::smatch g85;
+        if (std::regex_search(
+                line, g85,
+                std::regex("^X([-\\d.]+)Y([-\\d.]+)G85X([-\\d.]+)Y([-\\d.]+)"))) {
+            auto it = tools.find(currentTool);
+            const double r = (it != tools.end() ? it->second : 0.0) * 0.5;
+            if (r > 0.0) {
+                const double x1 = std::atof(g85[1].str().c_str()) * unitScale;
+                const double y1 = std::atof(g85[2].str().c_str()) * unitScale;
+                const double x2 = std::atof(g85[3].str().c_str()) * unitScale;
+                const double y2 = std::atof(g85[4].str().c_str()) * unitScale;
+                // Obround = a rounded-rectangle capsule: a semicircle cap of
+                // radius r centred on each endpoint, joined by the two straight
+                // sides. Built directly (no offset library) so a 2-point slot
+                // can never trip an edge case in ClipperOffset.
+                const double a = std::atan2(y2 - y1, x2 - x1);
+                const int caps = std::max(3, segments / 2);
+                Path64 poly;
+                poly.reserve(2 * (caps + 1));
+                // Leading cap around B, sweeping a-90deg .. a+90deg.
+                for (int i = 0; i <= caps; ++i) {
+                    const double t = a - std::numbers::pi / 2 +
+                                     std::numbers::pi * i / caps;
+                    poly.push_back(Point64{geom::toInt(x2 + r * std::cos(t)),
+                                           geom::toInt(y2 + r * std::sin(t))});
+                }
+                // Trailing cap around A, sweeping a+90deg .. a+270deg.
+                for (int i = 0; i <= caps; ++i) {
+                    const double t = a + std::numbers::pi / 2 +
+                                     std::numbers::pi * i / caps;
+                    poly.push_back(Point64{geom::toInt(x1 + r * std::cos(t)),
+                                           geom::toInt(y1 + r * std::sin(t))});
+                }
+                emitPlated(poly);
+                holes.push_back(std::move(poly));
+            }
+            continue;
+        }
+        // A round drill hit: X..Y.. (decimal, KiCad's format). Y already
+        // up-positive, matching gerber and our world -- no flip.
         if (std::regex_search(line, m,
                               std::regex("^X([-\\d.]+)Y([-\\d.]+)"))) {
+            // Decimal-less coordinates MAY mean an implied-decimal Excellon
+            // format (leading/trailing-zero suppressed), where parsing them as
+            // plain numbers places holes at absurd positions. Decimal format
+            // also legitimately emits integer values, so this only becomes a
+            // warning if the WHOLE file never shows a decimal point.
+            if (m[1].str().find('.') == std::string::npos &&
+                m[2].str().find('.') == std::string::npos) {
+                ++integerCoords;
+            } else {
+                dotsSeen = true;
+            }
             const double x = std::atof(m[1].str().c_str()) * unitScale;
             const double y = std::atof(m[2].str().c_str()) * unitScale;
             auto it = tools.find(currentTool);
@@ -220,8 +314,29 @@ Paths64 parseDrills(const std::string& text, int segments) {
                     c.push_back(Point64{geom::toInt(x + r * std::cos(t)),
                                         geom::toInt(y + r * std::sin(t))});
                 }
+                emitPlated(c);
                 holes.push_back(std::move(c));
             }
+        } else if (line[0] == 'X' || line[0] == 'Y') {
+            // An X-only or Y-only hit: Excellon MODAL coordinates (the missing
+            // axis repeats the previous value). Not supported -- count it so the
+            // user learns holes are missing instead of never noticing.
+            ++modalSkipped;
+        }
+    }
+
+    if (warnings) {
+        if (modalSkipped > 0) {
+            warnings->push_back(
+                std::to_string(modalSkipped) +
+                " drill hits use modal (X-only/Y-only) coordinates and were "
+                "SKIPPED -- these holes are missing");
+        }
+        if (integerCoords > 0 && !dotsSeen) {
+            warnings->push_back(
+                std::to_string(integerCoords) +
+                " drill hits use implied-decimal (integer) coordinates, which "
+                "are not supported -- hole positions are likely WRONG");
         }
     }
     return holes;
@@ -229,26 +344,43 @@ Paths64 parseDrills(const std::string& text, int segments) {
 
 // ---- board outline from a stroked Profile layer --------------------------
 //
-// The Profile gerber is drawn as a thin stroked line, not a filled region. The
-// board is the area it encloses, so fill the OUTER boundary of the stroke and
-// discard its interior hole. This oversizes the board by half the stroke width
-// (~0.05mm on a 0.1mm pen) -- negligible on a 50mm board and invisible once
-// copper is clipped to it.
+// The Profile gerber is drawn as thin stroked lines, not filled regions -- one
+// closed loop for the board perimeter, plus one for every internal cutout drawn
+// on Edge_Cuts (mounting holes, slots, voids). The board is the perimeter's area
+// MINUS every cutout, so a single perimeter-outer fill (dropping the rest) leaves
+// mounting holes uncut.
+//
+// Union the strokes into ribbons, then keep each ribbon's OUTER boundary and
+// even-odd fill them: Clipper orients nested boundaries alternately, so all outer
+// boundaries (perimeter + every cutout) share one sign while the inner boundaries
+// take the other. Even-odd filling the outers gives the board with cutouts
+// removed -- a point inside the perimeter alone is enclosed once (solid), inside a
+// mounting hole twice (empty), inside an island within a cutout three times
+// (solid), and so on to any depth. Oversizes every edge by half the pen width
+// (~0.05mm) -- negligible, and invisible once copper is clipped to it.
 Paths64 boardFromProfile(const Paths64& profileDark) {
-    Clipper64 clipper;
-    clipper.AddSubject(profileDark);
-    PolyTree64 tree;
-    clipper.Execute(ClipType::Union, FillRule::NonZero, tree);
+    const Paths64 ribbons = Union(profileDark, FillRule::NonZero);
 
-    Paths64 out;
-    // Top-level polygons are the outer boundaries; their children are the frame
-    // interiors, which we intentionally drop.
-    for (size_t i = 0; i < tree.Count(); ++i) {
-        const PolyPath64* child = tree.Child(i);
-        if (!child->IsHole()) out.push_back(child->Polygon());
+    // The perimeter is the largest-area contour; its orientation defines "outer".
+    double maxAbs = 0.0, perimeterArea = 1.0;
+    for (const Path64& p : ribbons) {
+        const double a = Area(p);
+        if (std::abs(a) > maxAbs) { maxAbs = std::abs(a); perimeterArea = a; }
     }
-    geom::normalizeWinding(out);
-    return out;
+    const bool perimeterPositive = perimeterArea > 0.0;
+
+    Paths64 outers;
+    for (const Path64& p : ribbons) {
+        const double a = Area(p);
+        if (a != 0.0 && (a > 0.0) == perimeterPositive) outers.push_back(p);
+    }
+
+    // Even-odd fill yields the board as a polygon-WITH-HOLES: outer boundaries
+    // positive, cutouts negative. Do NOT normalizeWinding here -- that forces
+    // every path positive, which turns the holes back into solid islands (they
+    // then merge into the board under assemble()'s NonZero union and the mounting
+    // holes vanish). assemble() consumes the opposite-wound holes correctly.
+    return Union(outers, FillRule::EvenOdd);
 }
 
 bool endsWithNoCase(const std::string& s, const std::string& suffix) {
@@ -358,14 +490,44 @@ geom::LayerArt importPackage(const std::string& path) {
     }
     art.outline = boardFromProfile(profileDark);
 
-    // 4) Drills.
-    for (const NamedFile& f : files) {
-        if (looksLikeDrill(f.name)) {
-            Paths64 h = parseDrills(f.text, 32);
-            art.drills.insert(art.drills.end(), h.begin(), h.end());
+    // Sanity: a healthy board fills a large share of its bounding box. If the
+    // Edge_Cuts strokes do not CLOSE, the fill degenerates to the thin stroke
+    // ribbon itself -- a sliver of area -- and everything downstream quietly
+    // clips to almost nothing. Warn instead of letting that fail silently.
+    {
+        int64_t xmin = INT64_MAX, ymin = INT64_MAX;
+        int64_t xmax = INT64_MIN, ymax = INT64_MIN;
+        for (const Path64& p : art.outline)
+            for (const Point64& pt : p) {
+                xmin = std::min(xmin, pt.x); xmax = std::max(xmax, pt.x);
+                ymin = std::min(ymin, pt.y); ymax = std::max(ymax, pt.y);
+            }
+        const double bboxArea = static_cast<double>(xmax - xmin) *
+                                static_cast<double>(ymax - ymin);
+        if (bboxArea > 0.0 && Area(art.outline) < 0.05 * bboxArea) {
+            art.warnings.push_back(
+                "board outline fills <5% of its bounding box -- the Profile "
+                "strokes may not form a closed loop");
         }
     }
+
+    // 4) Drills. Every hole is subtracted from the board; PLATED holes (PTH /
+    // vias) additionally get a copper barrel (see assemble()). Plated vs not is
+    // read from the Excellon FileFunction header, falling back to the filename
+    // (NPTH = non-plated) -- KiCad emits separate PTH and NPTH programs.
+    for (const NamedFile& f : files) {
+        if (!looksLikeDrill(f.name)) continue;
+        // Per-tool plating (handles merged MixedPlating programs); a filename that
+        // says NPTH forces the whole file non-plated as a fallback for files with
+        // no AperFunction attributes.
+        Paths64 plated;
+        Paths64 h = parseDrills(f.text, 32, &plated, &art.warnings);
+        art.drills.insert(art.drills.end(), h.begin(), h.end());
+        if (toLower(f.name).find("npth") == std::string::npos)
+            art.barrels.insert(art.barrels.end(), plated.begin(), plated.end());
+    }
     geom::normalizeWinding(art.drills);
+    geom::normalizeWinding(art.barrels);
 
     // 5) Stackup Z. Prefer the manifest's real thicknesses; else fall back to
     // KiCad defaults and an even split, exactly like the KiCad importer.

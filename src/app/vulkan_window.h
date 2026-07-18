@@ -15,6 +15,8 @@
 #include <vulkan/vulkan.h>
 
 #include <QElapsedTimer>
+#include <QString>
+#include <QStringList>
 #include <QVulkanInstance>
 #include <QWindow>
 
@@ -49,6 +51,32 @@ public:
 
     vk::Renderer* renderer() { return renderer_.get(); }
     Camera& camera() { return camera_; }
+
+    // Graphics-device selection. Names of every usable GPU, the one currently
+    // rendering, and whether it is running the ray-traced path. Switching tears
+    // the device+renderer down and rebuilds them on the chosen GPU (the instance
+    // and surface are kept), then persists the choice.
+    QStringList availableGpuNames() const { return gpuNames_; }
+    QString activeGpuName() const;
+    bool rtAvailable() const;   // the active device can do ray queries
+    void setPreferredGpu(const QString& nameSubstring);
+
+    // Ray-traced shadows/AO on top of the raster shading. No-op if the device
+    // has no ray-query support. Persisted.
+    void setRayTracing(bool on);
+    bool rayTracing() const { return rtEnabled_; }
+
+    // Full path-tracing mode. Progressive: accumulates while the camera is still.
+    // No-op without ray_query. Persisted.
+    void setPathTracing(bool on);
+    bool pathTracing() const { return ptEnabled_; }
+    // Accumulated / target sample counts, for a progress readout.
+    int ptSamples() const;
+    int ptMaxSamples() const;
+
+    // Intel OIDN neural denoising of the path-traced result. Persisted.
+    void setDenoising(bool on);
+    bool denoising() const { return oidnEnabled_; }
 
     // Frame the whole board. Animates unless snap=true (board load/reload should
     // not swoop the camera).
@@ -107,6 +135,7 @@ protected:
 
 private:
     void initialise();
+    void createDeviceAndRenderer();  // (re)build device + renderer on the chosen GPU
     void render();
 
     // Advance the peel toward its target. Returns true while still moving, which
@@ -130,8 +159,16 @@ private:
     QVulkanInstance qtInstance_;
     VkInstance instance_ = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
+    VkSurfaceKHR surface_ = VK_NULL_HANDLE;  // owned by the instance, kept across device swaps
     Device device_;
     std::unique_ptr<vk::Renderer> renderer_;
+    QStringList gpuNames_;         // every usable GPU, for the picker
+    QString preferredGpu_;         // name substring; empty = auto (discrete + RT)
+    bool rtEnabled_ = false;       // ray-traced shadows/AO requested
+    bool ptEnabled_ = false;       // path-tracing mode requested
+    bool oidnEnabled_ = false;     // neural denoising requested
+    int nextDenoiseAt_ = 16;       // next sample-count milestone to denoise at
+    int lastPtSamples_ = 0;        // detect accumulation restarts
 
     Camera camera_;
     Camera viewTarget_;             // where a view preset / Fit is gliding to
@@ -141,6 +178,14 @@ private:
     float explodeTarget_ = 0.0f;    // where the wheel put it
     bool explodeAnimating_ = false;
     QElapsedTimer explodeClock_;
+
+    // Wheel zoom glides to a target distance instead of stepping -- same
+    // exponential-approach treatment as the peel, so rapid clicks compound into
+    // one smooth dolly rather than a stutter of jumps.
+    float zoomTarget_ = 0.0f;
+    bool zoomAnimating_ = false;
+    QElapsedTimer zoomClock_;
+    bool stepZoomAnimation();
     bool initialised_ = false;
     bool dragging_ = false;
     bool panning_ = false;

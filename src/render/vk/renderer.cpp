@@ -1,6 +1,10 @@
 #include "render/vk/renderer.h"
 
+#include <OpenImageDenoise/oidn.h>
+
 #include <algorithm>
+#include <cmath>
+#include <vector>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -15,8 +19,45 @@ const uint32_t kBoardVert[] =
 const uint32_t kBoardFrag[] =
 #include "shaders/board.frag.inc"
     ;
+// Raster + ray-query shadows/AO. Used instead of kBoardFrag when the device has
+// ray_query; it declares the RayQueryKHR capability, which a non-RT device could
+// not load -- hence a separate module rather than one branchy shader.
+const uint32_t kBoardFragRt[] =
+#include "shaders/board_rt.frag.inc"
+    ;
+const uint32_t kPathTrace[] =
+#include "shaders/pathtrace.comp.inc"
+    ;
+const uint32_t kFullscreenVert[] =
+#include "shaders/fullscreen.vert.inc"
+    ;
+const uint32_t kTonemapFrag[] =
+#include "shaders/tonemap.frag.inc"
+    ;
 
 constexpr uint32_t kFramesInFlight = 2;
+
+struct PtPush {
+    float eye[4];    // xyz, w = sampleIndex
+    float fwd[4];
+    float right[4];
+    float up[4];
+    uint32_t dim[4]; // width, height, maxDepth, frameSeed
+    float misc[4];   // x = peel amount 0..1 (substrate fade), yzw unused
+    // x = first translucent-film triangle (global index) -- the shader re-bases
+    // BLAS geometry 1's geometry-local primitive indices with this.
+    uint32_t counts[4];
+};
+struct TonemapPush {
+    uint32_t dim[2];
+    uint32_t sampleCount;
+    uint32_t flags;
+};
+
+// Round `v` up to a multiple of `a` (a power of two).
+inline VkDeviceSize alignUp(VkDeviceSize v, VkDeviceSize a) {
+    return (v + a - 1) & ~(a - 1);
+}
 
 void check(VkResult r, const char* what) {
     if (r != VK_SUCCESS) {
@@ -39,10 +80,17 @@ namespace pcbview::vk {
 Renderer::Renderer(Device& device, VkSurfaceKHR surface, uint32_t width,
                    uint32_t height)
     : device_(device), surface_(surface) {
+    // RT support is fixed for this device's lifetime; it decides the descriptor
+    // layout (a TLAS binding) and which fragment shader the pipelines use, so it
+    // must be known before createDescriptors()/createPipeline().
+    rtSupported_ = device_.rayQueryEnabled;
+    if (rtSupported_) loadRtFunctions();
+
     createSwapchain(width, height);
     createSceneTargets();
     createDescriptors();
     createPipeline();
+    if (rtSupported_) createPathTracer();
     createSyncAndCommands();
 }
 
@@ -50,9 +98,13 @@ Renderer::~Renderer() {
     if (device_.handle == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(device_.handle);
 
+    if (rtSupported_) destroyPathTracer();
+    destroyAccelerationStructures();
     destroyBuffer(vertexBuffer_);
     destroyBuffer(indexBuffer_);
     destroyBuffer(materialBuffer_);
+    destroyBuffer(triMaterialBuffer_);
+    destroyBuffer(tracedVertexBuffer_);
     destroySceneTargets();
 
     for (VkSemaphore s : imageAvailable_) vkDestroySemaphore(device_.handle, s, nullptr);
@@ -69,17 +121,954 @@ Renderer::~Renderer() {
     destroySwapchain();
 }
 
-uint32_t Renderer::findMemoryType(uint32_t filter,
+void Renderer::loadRtFunctions() {
+    auto load = [&](const char* name) {
+        return vkGetDeviceProcAddr(device_.handle, name);
+    };
+    pfnAccelSizes_ =
+        reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
+            load("vkGetAccelerationStructureBuildSizesKHR"));
+    pfnCreateAccel_ = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
+        load("vkCreateAccelerationStructureKHR"));
+    pfnDestroyAccel_ = reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(
+        load("vkDestroyAccelerationStructureKHR"));
+    pfnCmdBuildAccel_ =
+        reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
+            load("vkCmdBuildAccelerationStructuresKHR"));
+    pfnAccelAddress_ =
+        reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
+            load("vkGetAccelerationStructureDeviceAddressKHR"));
+
+    // If any pointer failed to resolve, disable RT rather than crash later.
+    if (!pfnAccelSizes_ || !pfnCreateAccel_ || !pfnDestroyAccel_ ||
+        !pfnCmdBuildAccel_ || !pfnAccelAddress_) {
+        rtSupported_ = false;
+    }
+}
+
+VkDeviceAddress Renderer::bufferAddress(const Buffer& b) const {
+    VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    info.buffer = b.handle;
+    return vkGetBufferDeviceAddress(device_.handle, &info);
+}
+
+void Renderer::destroyAccelerationStructures() {
+    if (tlas_) { pfnDestroyAccel_(device_.handle, tlas_, nullptr); tlas_ = VK_NULL_HANDLE; }
+    if (blas_) { pfnDestroyAccel_(device_.handle, blas_, nullptr); blas_ = VK_NULL_HANDLE; }
+    destroyBuffer(tlasBuffer_);
+    destroyBuffer(blasBuffer_);
+    destroyBuffer(instanceBuffer_);
+}
+
+// Build a BLAS over the board's vertex/index buffers and a TLAS with one identity
+// instance of it. The board is static per upload, so this is a full rebuild each
+// uploadBoard rather than an animated refit -- the exploded view instead gates RT
+// off (its geometry is displaced in the vertex shader, not in these buffers).
+void Renderer::buildAccelerationStructures(uint32_t vertexCount,
+                                           uint32_t indexCount) {
+    if (!rtSupported_ || indexCount < 3) return;
+    asVertexCount_ = vertexCount;
+    asIndexCount_ = indexCount;
+    destroyAccelerationStructures();
+
+    // Scratch must be aligned to this device-specific value.
+    VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+    VkPhysicalDeviceProperties2 props2{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props2.pNext = &asProps;
+    vkGetPhysicalDeviceProperties2(device_.gpu.handle, &props2);
+    const VkDeviceSize scratchAlign =
+        std::max<VkDeviceSize>(asProps.minAccelerationStructureScratchOffsetAlignment, 256);
+
+    const VkBufferUsageFlags asStore =
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    const VkBufferUsageFlags scratchUsage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+    auto oneTime = [&](const std::function<void(VkCommandBuffer)>& record) {
+        VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        a.commandPool = commandPool_;
+        a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        a.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        check(vkAllocateCommandBuffers(device_.handle, &a, &cmd), "alloc(as)");
+        VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &b);
+        record(cmd);
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        s.commandBufferCount = 1;
+        s.pCommandBuffers = &cmd;
+        check(vkQueueSubmit(device_.graphicsQueue, 1, &s, VK_NULL_HANDLE), "submit(as)");
+        vkQueueWaitIdle(device_.graphicsQueue);
+        vkFreeCommandBuffers(device_.handle, commandPool_, 1, &cmd);
+    };
+
+    // ---- BLAS: TWO geometry ranges over the same buffers ----
+    //
+    // uploadBoard emits opaque parts' triangles first, the translucent films
+    // (mask, substrate) last, so one contiguous split serves both worlds:
+    // geometry 0 carries VK_GEOMETRY_OPAQUE_BIT_KHR and traverses entirely on
+    // the hardware fast path; geometry 1 (the films) omits it, so ONLY film
+    // hits reach the path tracer's candidate loop for stochastic alpha. The
+    // earlier all-in-one opaque geometry forced gl_RayFlagsNoOpaqueEXT in the
+    // shader, which pushed EVERY triangle along every ray through the shader --
+    // the single biggest PT cost, for identical output. Primitive indices are
+    // geometry-LOCAL; the shader re-bases geometry 1 by opaqueTriCount_.
+    const uint32_t totalTris = indexCount / 3;
+    const uint32_t opaqueTris = std::min(opaqueTriCount_, totalTris);
+    const uint32_t filmTris = totalTris - opaqueTris;
+
+    VkAccelerationStructureGeometryKHR geoms[2]{};
+    VkAccelerationStructureBuildRangeInfoKHR blasRanges[2]{};
+    uint32_t maxPrims[2]{};
+    uint32_t geomCount = 0;
+    const auto addGeometry = [&](VkGeometryFlagsKHR flags, uint32_t firstTri,
+                                 uint32_t triCount) {
+        if (triCount == 0) return;
+        VkAccelerationStructureGeometryKHR& g = geoms[geomCount];
+        g = {VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+        g.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        g.flags = flags;
+        auto& t = g.geometry.triangles;
+        t.sType =
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        t.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+        // Built from the exploded copy, not vertexBuffer_ (the rest geometry). At
+        // rest the two are identical; rebuildTracedGeometry re-bakes on peel.
+        t.vertexData.deviceAddress = bufferAddress(tracedVertexBuffer_);
+        t.vertexStride = sizeof(geom::Vertex);
+        t.maxVertex = vertexCount - 1;
+        t.indexType = VK_INDEX_TYPE_UINT32;
+        t.indexData.deviceAddress = bufferAddress(indexBuffer_);
+        blasRanges[geomCount].primitiveCount = triCount;
+        // For indexed triangles this is a BYTE offset into the index buffer.
+        blasRanges[geomCount].primitiveOffset =
+            firstTri * 3u * static_cast<uint32_t>(sizeof(uint32_t));
+        maxPrims[geomCount] = triCount;
+        ++geomCount;
+    };
+    addGeometry(VK_GEOMETRY_OPAQUE_BIT_KHR, 0, opaqueTris);
+    addGeometry(0, opaqueTris, filmTris);
+    if (geomCount == 0) return;
+
+    VkAccelerationStructureBuildGeometryInfoKHR blasBuild{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    blasBuild.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    blasBuild.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    blasBuild.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    blasBuild.geometryCount = geomCount;
+    blasBuild.pGeometries = geoms;
+
+    VkAccelerationStructureBuildSizesInfoKHR blasSizes{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    pfnAccelSizes_(device_.handle,
+                   VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &blasBuild,
+                   maxPrims, &blasSizes);
+
+    blasBuffer_ = createBuffer(blasSizes.accelerationStructureSize, asStore,
+                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkAccelerationStructureCreateInfoKHR blasCreate{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+    blasCreate.buffer = blasBuffer_.handle;
+    blasCreate.size = blasSizes.accelerationStructureSize;
+    blasCreate.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    check(pfnCreateAccel_(device_.handle, &blasCreate, nullptr, &blas_),
+          "vkCreateAccelerationStructureKHR(blas)");
+
+    Buffer blasScratch = createBuffer(blasSizes.buildScratchSize + scratchAlign,
+                                      scratchUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    blasBuild.dstAccelerationStructure = blas_;
+    blasBuild.scratchData.deviceAddress =
+        alignUp(bufferAddress(blasScratch), scratchAlign);
+
+    const VkAccelerationStructureBuildRangeInfoKHR* pBlasRange = blasRanges;
+    oneTime([&](VkCommandBuffer cmd) {
+        pfnCmdBuildAccel_(cmd, 1, &blasBuild, &pBlasRange);
+    });
+    destroyBuffer(blasScratch);
+
+    // ---- TLAS: one identity instance ----
+    VkAccelerationStructureDeviceAddressInfoKHR addrInfo{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+    addrInfo.accelerationStructure = blas_;
+    const VkDeviceAddress blasAddr =
+        pfnAccelAddress_(device_.handle, &addrInfo);
+
+    VkAccelerationStructureInstanceKHR inst{};
+    inst.transform.matrix[0][0] = 1.0f;
+    inst.transform.matrix[1][1] = 1.0f;
+    inst.transform.matrix[2][2] = 1.0f;
+    inst.mask = 0xFF;
+    inst.accelerationStructureReference = blasAddr;
+
+    instanceBuffer_ = createBuffer(
+        sizeof(inst),
+        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    uploadViaStaging(instanceBuffer_, &inst, sizeof(inst));
+
+    VkAccelerationStructureGeometryKHR tlasGeom{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+    tlasGeom.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    tlasGeom.geometry.instances.sType =
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    tlasGeom.geometry.instances.data.deviceAddress = bufferAddress(instanceBuffer_);
+
+    VkAccelerationStructureBuildGeometryInfoKHR tlasBuild{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
+    tlasBuild.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    tlasBuild.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    tlasBuild.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    tlasBuild.geometryCount = 1;
+    tlasBuild.pGeometries = &tlasGeom;
+
+    const uint32_t instCount = 1;
+    VkAccelerationStructureBuildSizesInfoKHR tlasSizes{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    pfnAccelSizes_(device_.handle,
+                   VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &tlasBuild,
+                   &instCount, &tlasSizes);
+
+    tlasBuffer_ = createBuffer(tlasSizes.accelerationStructureSize, asStore,
+                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkAccelerationStructureCreateInfoKHR tlasCreate{
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+    tlasCreate.buffer = tlasBuffer_.handle;
+    tlasCreate.size = tlasSizes.accelerationStructureSize;
+    tlasCreate.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    check(pfnCreateAccel_(device_.handle, &tlasCreate, nullptr, &tlas_),
+          "vkCreateAccelerationStructureKHR(tlas)");
+
+    Buffer tlasScratch = createBuffer(tlasSizes.buildScratchSize + scratchAlign,
+                                      scratchUsage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    tlasBuild.dstAccelerationStructure = tlas_;
+    tlasBuild.scratchData.deviceAddress =
+        alignUp(bufferAddress(tlasScratch), scratchAlign);
+
+    VkAccelerationStructureBuildRangeInfoKHR tlasRange{};
+    tlasRange.primitiveCount = instCount;
+    const VkAccelerationStructureBuildRangeInfoKHR* pTlasRange = &tlasRange;
+    oneTime([&](VkCommandBuffer cmd) {
+        pfnCmdBuildAccel_(cmd, 1, &tlasBuild, &pTlasRange);
+    });
+    destroyBuffer(tlasScratch);
+}
+
+// Re-bake tracedVertexBuffer_ to `progress`: apply each vertex's rigid peel
+// offset (identical to board.vert's travel()) on the CPU and stage it up. Cheap
+// enough that path tracing can rebuild the BLAS from it on every peel change.
+void Renderer::bakeExplode(float progress) {
+    if (restVertices_.empty() || vertexRank_.size() != restVertices_.size())
+        return;
+    std::vector<geom::Vertex> exploded = restVertices_;
+    for (size_t i = 0; i < exploded.size(); ++i) {
+        const float rank = vertexRank_[i];
+        const float ring = std::abs(rank);
+        const float travel =
+            std::max(progress - (maxRank_ - ring), 0.0f) * explodeStep_;
+        const float sign = rank > 0.0f ? 1.0f : (rank < 0.0f ? -1.0f : 0.0f);
+        exploded[i].position[2] += sign * travel;
+    }
+    uploadViaStaging(tracedVertexBuffer_, exploded.data(),
+                     exploded.size() * sizeof(geom::Vertex));
+}
+
+// Bake the peel into the traced geometry, rebuild the BLAS/TLAS over it, and
+// rebind the ray-tracing descriptors. Path-traced mode calls this whenever the
+// peel changes so the ray tracer sees the exploded stack (the raster path
+// explodes in its vertex shader instead, and RT-raster shadows stay gated at
+// rest -- rebuilding the AS every frame is only affordable for non-real-time PT).
+void Renderer::rebuildTracedGeometry(float progress) {
+    if (!rtSupported_ || restVertices_.empty()) return;
+    // The BLAS/TLAS may still be referenced by an in-flight frame; the build
+    // below destroys and recreates them, so drain the device first.
+    vkDeviceWaitIdle(device_.handle);
+
+    bakeExplode(progress);
+    buildAccelerationStructures(asVertexCount_, asIndexCount_);
+    tracedExplode_ = progress;
+
+    // Rebind the new TLAS handle everywhere it is referenced: the raster RT
+    // fragment shader (material set, binding 1) and the path tracer.
+    if (tlas_ != VK_NULL_HANDLE) {
+        VkWriteDescriptorSetAccelerationStructureKHR asInfo{
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+        asInfo.accelerationStructureCount = 1;
+        asInfo.pAccelerationStructures = &tlas_;
+        VkWriteDescriptorSet asWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        asWrite.pNext = &asInfo;
+        asWrite.dstSet = materialSet_;
+        asWrite.dstBinding = 1;
+        asWrite.descriptorCount = 1;
+        asWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        vkUpdateDescriptorSets(device_.handle, 1, &asWrite, 0, nullptr);
+    }
+    updatePathTraceDescriptors();  // rebinds PT TLAS + resets accumulation
+}
+
+void Renderer::setRenderMode(RenderMode m) {
+    if (m == mode_) return;
+    mode_ = m;
+    ptSampleCount_ = 0;
+}
+
+void Renderer::setRayCamera(const float eye[3], const float fwd[3],
+                            const float right[3], const float up[3]) {
+    // Any camera change restarts accumulation.
+    auto diff = [](const float a[3], const float b[3]) {
+        return std::abs(a[0]-b[0]) + std::abs(a[1]-b[1]) + std::abs(a[2]-b[2]) > 1e-5f;
+    };
+    if (diff(eye, rayEye_) || diff(fwd, rayFwd_) || diff(right, rayRight_) ||
+        diff(up, rayUp_)) {
+        ptSampleCount_ = 0;
+        // Crucial: also drop the denoised frame. Otherwise the tonemap keeps
+        // showing the last (now stale) denoised image while the camera moves --
+        // the screen freezes on it and only updates when the next denoise lands,
+        // which reads as a slideshow. Clearing it makes movement show the live
+        // (noisy but real-time) accumulation, and denoise resumes once still.
+        ptDenoisedValid_ = false;
+    }
+    for (int i = 0; i < 3; ++i) {
+        rayEye_[i] = eye[i]; rayFwd_[i] = fwd[i];
+        rayRight_[i] = right[i]; rayUp_[i] = up[i];
+    }
+}
+
+namespace {
+VkShaderModule makeModule(VkDevice dev, const uint32_t* code, size_t bytes) {
+    VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    info.codeSize = bytes;
+    info.pCode = code;
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(dev, &info, nullptr, &m) != VK_SUCCESS)
+        throw std::runtime_error("vkCreateShaderModule (path tracer)");
+    return m;
+}
+}  // namespace
+
+void Renderer::createPathTracer() {
+    // Compute set: 0 TLAS, 1 vtx, 2 idx, 3 triMat, 4 mats, 5 accum, 6 albedo,
+    // 7 normal.
+    VkDescriptorSetLayoutBinding b[8]{};
+    for (uint32_t i = 0; i < 8; ++i) {
+        b[i].binding = i;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    for (int i = 1; i <= 4; ++i) b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    for (int i = 5; i <= 7; ++i) b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    VkDescriptorSetLayoutCreateInfo li{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = 8;
+    li.pBindings = b;
+    check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr, &ptSetLayout_),
+          "pt set layout");
+
+    // Tonemap reads binding 0 (raw accumulation) or 1 (OIDN-denoised); a push
+    // flag chooses.
+    VkDescriptorSetLayoutBinding tb[2]{};
+    for (int i = 0; i < 2; ++i) {
+        tb[i].binding = i;
+        tb[i].descriptorCount = 1;
+        tb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        tb[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo tli{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    tli.bindingCount = 2;
+    tli.pBindings = tb;
+    check(vkCreateDescriptorSetLayout(device_.handle, &tli, nullptr,
+                                      &tonemapSetLayout_),
+          "tonemap set layout");
+
+    VkDescriptorPoolSize sizes[] = {
+        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5}};  // 3 pt + 2 tonemap
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 2;
+    pi.poolSizeCount = 3;
+    pi.pPoolSizes = sizes;
+    check(vkCreateDescriptorPool(device_.handle, &pi, nullptr, &ptPool_), "pt pool");
+
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = ptPool_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &ptSetLayout_;
+    check(vkAllocateDescriptorSets(device_.handle, &ai, &ptSet_), "pt set");
+    ai.pSetLayouts = &tonemapSetLayout_;
+    check(vkAllocateDescriptorSets(device_.handle, &ai, &tonemapSet_), "tonemap set");
+
+    // Compute pipeline.
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PtPush)};
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &ptSetLayout_;
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
+    check(vkCreatePipelineLayout(device_.handle, &pl, nullptr, &ptLayout_),
+          "pt pipeline layout");
+
+    VkShaderModule cs = makeModule(device_.handle, kPathTrace, sizeof(kPathTrace));
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = cs;
+    cpi.stage.pName = "main";
+    cpi.layout = ptLayout_;
+    check(vkCreateComputePipelines(device_.handle, VK_NULL_HANDLE, 1, &cpi, nullptr,
+                                   &ptPipeline_),
+          "pt compute pipeline");
+    vkDestroyShaderModule(device_.handle, cs, nullptr);
+
+    // Tonemap graphics pipeline: fullscreen triangle, no vertex input, no depth,
+    // dynamic rendering into the scene colour format.
+    VkPushConstantRange tpc{VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(TonemapPush)};
+    VkPipelineLayoutCreateInfo tpl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    tpl.setLayoutCount = 1;
+    tpl.pSetLayouts = &tonemapSetLayout_;
+    tpl.pushConstantRangeCount = 1;
+    tpl.pPushConstantRanges = &tpc;
+    check(vkCreatePipelineLayout(device_.handle, &tpl, nullptr, &tonemapLayout_),
+          "tonemap pipeline layout");
+
+    VkShaderModule vs = makeModule(device_.handle, kFullscreenVert, sizeof(kFullscreenVert));
+    VkShaderModule fs = makeModule(device_.handle, kTonemapFrag, sizeof(kTonemapFrag));
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vin{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds{
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = 2;
+    ds.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo rend{
+        VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rend.colorAttachmentCount = 1;
+    rend.pColorAttachmentFormats = &colorFormat_;
+
+    VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpi.pNext = &rend;
+    gpi.stageCount = 2;
+    gpi.pStages = stages;
+    gpi.pVertexInputState = &vin;
+    gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vp;
+    gpi.pRasterizationState = &rs;
+    gpi.pMultisampleState = &ms;
+    gpi.pColorBlendState = &cb;
+    gpi.pDynamicState = &ds;
+    gpi.layout = tonemapLayout_;
+    check(vkCreateGraphicsPipelines(device_.handle, VK_NULL_HANDLE, 1, &gpi, nullptr,
+                                    &tonemapPipeline_),
+          "tonemap pipeline");
+    vkDestroyShaderModule(device_.handle, vs, nullptr);
+    vkDestroyShaderModule(device_.handle, fs, nullptr);
+
+    // OIDN device for denoising. DEFAULT picks the fastest available -- a GPU
+    // (CUDA on NVIDIA, HIP on AMD) when its device DLL + driver are present, else
+    // the CPU. If a GPU device fails to commit, fall back to CPU so denoising
+    // still works. Kept around for the process; filters are per-call.
+    OIDNDevice dev = oidnNewDevice(OIDN_DEVICE_TYPE_DEFAULT);
+    oidnCommitDevice(dev);
+    const char* err = nullptr;
+    if (oidnGetDeviceError(dev, &err) != OIDN_ERROR_NONE) {
+        oidnReleaseDevice(dev);
+        dev = oidnNewDevice(OIDN_DEVICE_TYPE_CPU);
+        oidnCommitDevice(dev);
+    }
+    oidnDevice_ = dev;
+}
+
+void Renderer::destroyPathTracer() {
+    if (oidnFilter_) oidnReleaseFilter(static_cast<OIDNFilter>(oidnFilter_));
+    if (oidnColorBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnColorBuf_));
+    if (oidnAlbedoBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnAlbedoBuf_));
+    if (oidnNormalBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnNormalBuf_));
+    if (oidnOutBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnOutBuf_));
+    oidnFilter_ = oidnColorBuf_ = oidnAlbedoBuf_ = oidnNormalBuf_ = oidnOutBuf_ = nullptr;
+    oidnW_ = oidnH_ = 0;
+    if (oidnDevice_) {
+        oidnReleaseDevice(static_cast<OIDNDevice>(oidnDevice_));
+        oidnDevice_ = nullptr;
+    }
+    if (ptPipeline_) vkDestroyPipeline(device_.handle, ptPipeline_, nullptr);
+    if (tonemapPipeline_) vkDestroyPipeline(device_.handle, tonemapPipeline_, nullptr);
+    if (ptLayout_) vkDestroyPipelineLayout(device_.handle, ptLayout_, nullptr);
+    if (tonemapLayout_) vkDestroyPipelineLayout(device_.handle, tonemapLayout_, nullptr);
+    if (ptPool_) vkDestroyDescriptorPool(device_.handle, ptPool_, nullptr);
+    if (ptSetLayout_) vkDestroyDescriptorSetLayout(device_.handle, ptSetLayout_, nullptr);
+    if (tonemapSetLayout_) vkDestroyDescriptorSetLayout(device_.handle, tonemapSetLayout_, nullptr);
+    ptPipeline_ = tonemapPipeline_ = VK_NULL_HANDLE;
+    ptLayout_ = tonemapLayout_ = VK_NULL_HANDLE;
+    ptPool_ = VK_NULL_HANDLE;
+    ptSetLayout_ = tonemapSetLayout_ = VK_NULL_HANDLE;
+    destroyImage(ptAccum_);
+    destroyImage(ptAlbedo_);
+    destroyImage(ptNormal_);
+    destroyImage(ptDenoised_);
+}
+
+void Renderer::updatePathTraceDescriptors() {
+    if (!ptSet_ || vertexBuffer_.handle == VK_NULL_HANDLE) return;
+
+    VkWriteDescriptorSetAccelerationStructureKHR asInfo{
+        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+    asInfo.accelerationStructureCount = 1;
+    asInfo.pAccelerationStructures = &tlas_;
+
+    VkDescriptorBufferInfo vtx{vertexBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo idx{indexBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo tri{triMaterialBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo mat{materialBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkDescriptorImageInfo acc{VK_NULL_HANDLE, ptAccum_.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
+
+    VkWriteDescriptorSet w[8]{};
+    for (int i = 0; i < 8; ++i) {
+        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstSet = ptSet_;
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+    }
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    w[0].pNext = &asInfo;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[1].pBufferInfo = &vtx;
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[2].pBufferInfo = &idx;
+    w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[3].pBufferInfo = &tri;
+    w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[4].pBufferInfo = &mat;
+    w[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[5].pImageInfo = &acc;
+    w[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[6].pImageInfo = &alb;
+    w[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[7].pImageInfo = &nrm;
+    vkUpdateDescriptorSets(device_.handle, 8, w, 0, nullptr);
+
+    VkDescriptorImageInfo den{VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet tw[2]{};
+    for (int i = 0; i < 2; ++i) {
+        tw[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        tw[i].dstSet = tonemapSet_;
+        tw[i].dstBinding = i;
+        tw[i].descriptorCount = 1;
+        tw[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    tw[0].pImageInfo = &acc;
+    tw[1].pImageInfo = &den;
+    vkUpdateDescriptorSets(device_.handle, 2, tw, 0, nullptr);
+    ptSampleCount_ = 0;
+    ptDenoisedValid_ = false;
+}
+
+void Renderer::recordPathTrace(VkCommandBuffer cmd) {
+    const auto barrier = [&](VkImageMemoryBarrier2* b, uint32_t count) {
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.imageMemoryBarrierCount = count;
+        d.pImageMemoryBarriers = b;
+        vkCmdPipelineBarrier2(cmd, &d);
+    };
+
+    // First use: UNDEFINED -> GENERAL for the storage images.
+    if (!ptImagesInitialised_) {
+        Image* imgs[4] = {&ptAccum_, &ptAlbedo_, &ptNormal_, &ptDenoised_};
+        VkImageMemoryBarrier2 tb[4]{};
+        for (int i = 0; i < 4; ++i) {
+            tb[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            tb[i].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            tb[i].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            tb[i].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                  VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            tb[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            tb[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            tb[i].image = imgs[i]->handle;
+            tb[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        }
+        barrier(tb, 4);
+        ptImagesInitialised_ = true;
+    }
+
+    // Accumulate one more sample until converged.
+    if (ptSampleCount_ < ptMaxSamples_) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ptPipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ptLayout_, 0,
+                                1, &ptSet_, 0, nullptr);
+
+        // Several samples per frame ONCE THE CAMERA HAS SETTLED: the per-frame
+        // overhead (tonemap, blit, UI, present) is then paid once per batch
+        // instead of once per sample. While interacting (accumulation just
+        // restarted) the batch stays at 1 so the view keeps full frame rate.
+        // Same samples either way -- pure wall-clock, zero quality change.
+        const int remaining = ptMaxSamples_ - ptSampleCount_;
+        const int batch = std::min(remaining, ptSampleCount_ < 4 ? 1 : 4);
+
+        for (int s = 0; s < batch; ++s) {
+            if (s > 0) {
+                // The accumulation images are read-modify-write; order the
+                // batch's dispatches.
+                VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+                mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                d.memoryBarrierCount = 1;
+                d.pMemoryBarriers = &mb;
+                vkCmdPipelineBarrier2(cmd, &d);
+            }
+
+            PtPush p{};
+            for (int i = 0; i < 3; ++i) {
+                p.eye[i] = rayEye_[i]; p.fwd[i] = rayFwd_[i];
+                p.right[i] = rayRight_[i]; p.up[i] = rayUp_[i];
+            }
+            p.eye[3] = static_cast<float>(ptSampleCount_);
+            p.dim[0] = sceneExtent_.width;
+            p.dim[1] = sceneExtent_.height;
+            p.dim[2] = 5;  // max bounce depth
+            p.dim[3] = static_cast<uint32_t>(ptSampleCount_) * 9781u + 1u;
+            // Normalised peel 0..1 (matches board.vert's push.params.w) so the
+            // substrate fades translucent while exploding, revealing inner copper.
+            p.misc[0] = (maxRank_ > 0.0f)
+                            ? std::clamp(explodeProgress_ / maxRank_, 0.0f, 1.0f)
+                            : 0.0f;
+            p.counts[0] = opaqueTriCount_;
+            vkCmdPushConstants(cmd, ptLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                               sizeof(p), &p);
+            vkCmdDispatch(cmd, (sceneExtent_.width + 7) / 8,
+                          (sceneExtent_.height + 7) / 8, 1);
+            ++ptSampleCount_;
+        }
+
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.image = ptAccum_.handle;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier(&b, 1);
+    }
+
+    // Tonemap into sceneColor_ (an SRGB attachment -> gamma on store).
+    VkImageMemoryBarrier2 sc{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    sc.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    sc.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    sc.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    sc.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    sc.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    sc.image = sceneColor_.handle;
+    sc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier(&sc, 1);
+
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = sceneColor_.view;
+    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo r{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    r.renderArea = {{0, 0}, sceneExtent_};
+    r.layerCount = 1;
+    r.colorAttachmentCount = 1;
+    r.pColorAttachments = &color;
+    vkCmdBeginRendering(cmd, &r);
+    VkViewport vp{0.0f, 0.0f, static_cast<float>(sceneExtent_.width),
+                  static_cast<float>(sceneExtent_.height), 0.0f, 1.0f};
+    VkRect2D scissor{{0, 0}, sceneExtent_};
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tonemapPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tonemapLayout_, 0,
+                            1, &tonemapSet_, 0, nullptr);
+    TonemapPush tp{};
+    tp.dim[0] = sceneExtent_.width;
+    tp.dim[1] = sceneExtent_.height;
+    const bool showDenoised = denoisingEnabled_ && ptDenoisedValid_;
+    // The denoised image already holds averaged colour, so it is divided by 1.
+    tp.sampleCount = showDenoised ? 1u
+                                  : static_cast<uint32_t>(std::max(ptSampleCount_, 1));
+    tp.flags = showDenoised ? 1u : 0u;
+    vkCmdPushConstants(cmd, tonemapLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(tp), &tp);
+    vkCmdDraw(cmd, 3, 1, 0, 0);
+    vkCmdEndRendering(cmd);
+
+    stats_.drawCalls = 1;
+    stats_.triangles = 0;
+}
+
+void Renderer::setDenoising(bool on) {
+    denoisingEnabled_ = on;
+    if (!on) ptDenoisedValid_ = false;
+}
+
+std::string Renderer::oidnDeviceName() const {
+    if (!oidnDevice_) return "none";
+    switch (oidnGetDeviceInt(static_cast<OIDNDevice>(oidnDevice_), "type")) {
+        case OIDN_DEVICE_TYPE_CPU:   return "CPU";
+        case OIDN_DEVICE_TYPE_SYCL:  return "SYCL";
+        case OIDN_DEVICE_TYPE_CUDA:  return "CUDA (GPU)";
+        case OIDN_DEVICE_TYPE_HIP:   return "HIP (GPU)";
+        case OIDN_DEVICE_TYPE_METAL: return "Metal (GPU)";
+        default:                     return "unknown";
+    }
+}
+
+void Renderer::denoise() {
+    if (!oidnDevice_ || !rtSupported_ || ptSampleCount_ == 0 ||
+        ptAccum_.handle == VK_NULL_HANDLE) {
+        return;
+    }
+    const uint32_t w = sceneExtent_.width, h = sceneExtent_.height;
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 16;  // RGBA32F
+
+    // cbuf/abuf/nbuf are read back on the CPU (the pack loop) -> cached memory.
+    // obuf is only written by the CPU then DMA'd to the GPU, so coherent
+    // write-combined is ideal for it (fast sequential writes).
+    Buffer cbuf = createReadbackBuffer(bytes);
+    Buffer abuf = createReadbackBuffer(bytes);
+    Buffer nbuf = createReadbackBuffer(bytes);
+    Buffer obuf = createBuffer(bytes,
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    auto oneTime = [&](const std::function<void(VkCommandBuffer)>& rec) {
+        VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        a.commandPool = commandPool_;
+        a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        a.commandBufferCount = 1;
+        VkCommandBuffer c = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(device_.handle, &a, &c);
+        VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(c, &b);
+        rec(c);
+        vkEndCommandBuffer(c);
+        VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        s.commandBufferCount = 1;
+        s.pCommandBuffers = &c;
+        vkQueueSubmit(device_.graphicsQueue, 1, &s, VK_NULL_HANDLE);
+        vkQueueWaitIdle(device_.graphicsQueue);
+        vkFreeCommandBuffers(device_.handle, commandPool_, 1, &c);
+    };
+
+    // GPU -> host: the accumulation and the two guides.
+    oneTime([&](VkCommandBuffer c) {
+        auto copy = [&](Image& img, Buffer& buf) {
+            VkBufferImageCopy r{};
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            r.imageExtent = {w, h, 1};
+            vkCmdCopyImageToBuffer(c, img.handle, VK_IMAGE_LAYOUT_GENERAL,
+                                   buf.handle, 1, &r);
+        };
+        copy(ptAccum_, cbuf);
+        copy(ptAlbedo_, abuf);
+        copy(ptNormal_, nbuf);
+    });
+
+    const size_t n = static_cast<size_t>(w) * h;
+    void* cptr = nullptr; void* aptr = nullptr; void* nptr = nullptr; void* optr = nullptr;
+    vkMapMemory(device_.handle, cbuf.memory, 0, bytes, 0, &cptr);
+    vkMapMemory(device_.handle, abuf.memory, 0, bytes, 0, &aptr);
+    vkMapMemory(device_.handle, nbuf.memory, 0, bytes, 0, &nptr);
+    vkMapMemory(device_.handle, obuf.memory, 0, bytes, 0, &optr);
+
+    // Pack the mapped RGBA readbacks into tight FLOAT3 arrays for OIDN. ALL
+    // three are accumulated SUMS (the guides too -- a single-sample albedo guide
+    // is a stochastic-alpha coin flip per pixel, which the denoiser preserves as
+    // noise), so each divides by the sample count; the averaged normal is
+    // re-normalised.
+    const float* rc = static_cast<const float*>(cptr);
+    const float* ra = static_cast<const float*>(aptr);
+    const float* rn = static_cast<const float*>(nptr);
+    std::vector<float> col(n * 3), alb(n * 3), nor(n * 3), out(n * 3);
+    const float inv = 1.0f / static_cast<float>(ptSampleCount_);
+    for (size_t i = 0; i < n; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            col[i * 3 + k] = rc[i * 4 + k] * inv;
+            // OIDN wants albedo in [0,1]; sky pixels accumulate sky(dir), whose
+            // sun term exceeds 1 and would degrade the denoise around it.
+            alb[i * 3 + k] = std::clamp(ra[i * 4 + k] * inv, 0.0f, 1.0f);
+        }
+        float nx = rn[i * 4 + 0] * inv;
+        float ny = rn[i * 4 + 1] * inv;
+        float nz = rn[i * 4 + 2] * inv;
+        const float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+        if (len > 1e-6f) { nx /= len; ny /= len; nz /= len; }
+        nor[i * 3 + 0] = nx;
+        nor[i * 3 + 1] = ny;
+        nor[i * 3 + 2] = nz;
+    }
+
+    // Denoise through device buffers, which work on both CPU and GPU OIDN devices
+    // (a mapped Vulkan host pointer is not device-accessible for a CUDA/HIP device).
+    // The filter + buffers are CACHED and only (re)built when the resolution
+    // changes -- oidnCommitFilter recompiles the network to the GPU (~0.4s), so
+    // doing it per frame added up. (The dominant cost was the readback pack loop
+    // above; see createReadbackBuffer. The OIDN inference itself is ~20ms.)
+    OIDNDevice dev = static_cast<OIDNDevice>(oidnDevice_);
+    const size_t rgbBytes = n * 3 * sizeof(float);
+    if (oidnW_ != w || oidnH_ != h || oidnFilter_ == nullptr) {
+        if (oidnFilter_) oidnReleaseFilter(static_cast<OIDNFilter>(oidnFilter_));
+        if (oidnColorBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnColorBuf_));
+        if (oidnAlbedoBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnAlbedoBuf_));
+        if (oidnNormalBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnNormalBuf_));
+        if (oidnOutBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnOutBuf_));
+
+        OIDNBuffer bc = oidnNewBuffer(dev, rgbBytes);
+        OIDNBuffer ba = oidnNewBuffer(dev, rgbBytes);
+        OIDNBuffer bn = oidnNewBuffer(dev, rgbBytes);
+        OIDNBuffer bo = oidnNewBuffer(dev, rgbBytes);
+        OIDNFilter f = oidnNewFilter(dev, "RT");
+        const size_t px = sizeof(float) * 3, row = px * w;
+        oidnSetFilterImage(f, "color", bc, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterImage(f, "albedo", ba, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterImage(f, "normal", bn, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterImage(f, "output", bo, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterBool(f, "hdr", true);
+        oidnCommitFilter(f);  // the expensive part -- done once per resolution
+
+        oidnColorBuf_ = bc; oidnAlbedoBuf_ = ba; oidnNormalBuf_ = bn;
+        oidnOutBuf_ = bo; oidnFilter_ = f;
+        oidnW_ = w; oidnH_ = h;
+    }
+
+    OIDNBuffer bc = static_cast<OIDNBuffer>(oidnColorBuf_);
+    OIDNBuffer ba = static_cast<OIDNBuffer>(oidnAlbedoBuf_);
+    OIDNBuffer bn = static_cast<OIDNBuffer>(oidnNormalBuf_);
+    OIDNBuffer bo = static_cast<OIDNBuffer>(oidnOutBuf_);
+    oidnWriteBuffer(bc, 0, rgbBytes, col.data());
+    oidnWriteBuffer(ba, 0, rgbBytes, alb.data());
+    oidnWriteBuffer(bn, 0, rgbBytes, nor.data());
+    oidnExecuteFilter(static_cast<OIDNFilter>(oidnFilter_));
+    oidnReadBuffer(bo, 0, rgbBytes, out.data());
+
+    // Expand the denoised RGB back into the RGBA write-back buffer.
+    float* op = static_cast<float*>(optr);
+    for (size_t i = 0; i < n; ++i) {
+        op[i * 4 + 0] = out[i * 3 + 0];
+        op[i * 4 + 1] = out[i * 3 + 1];
+        op[i * 4 + 2] = out[i * 3 + 2];
+        op[i * 4 + 3] = 1.0f;
+    }
+
+    vkUnmapMemory(device_.handle, cbuf.memory);
+    vkUnmapMemory(device_.handle, abuf.memory);
+    vkUnmapMemory(device_.handle, nbuf.memory);
+    vkUnmapMemory(device_.handle, obuf.memory);
+
+    // Host -> GPU: the denoised result.
+    oneTime([&](VkCommandBuffer c) {
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(c, obuf.handle, ptDenoised_.handle,
+                               VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    });
+
+    destroyBuffer(cbuf);
+    destroyBuffer(abuf);
+    destroyBuffer(nbuf);
+    destroyBuffer(obuf);
+    ptDenoisedValid_ = true;
+}
+
+int Renderer::findMemoryTypeOrNeg(uint32_t filter,
                                   VkMemoryPropertyFlags props) const {
     VkPhysicalDeviceMemoryProperties mem{};
     vkGetPhysicalDeviceMemoryProperties(device_.gpu.handle, &mem);
     for (uint32_t i = 0; i < mem.memoryTypeCount; ++i) {
         if ((filter & (1u << i)) &&
             (mem.memoryTypes[i].propertyFlags & props) == props) {
-            return i;
+            return static_cast<int>(i);
         }
     }
-    throw std::runtime_error("no suitable memory type");
+    return -1;
+}
+
+uint32_t Renderer::findMemoryType(uint32_t filter,
+                                  VkMemoryPropertyFlags props) const {
+    const int t = findMemoryTypeOrNeg(filter, props);
+    if (t < 0) throw std::runtime_error("no suitable memory type");
+    return static_cast<uint32_t>(t);
+}
+
+Renderer::Buffer Renderer::createReadbackBuffer(VkDeviceSize size) {
+    Buffer buffer;
+    buffer.size = size;
+
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = size;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    check(vkCreateBuffer(device_.handle, &info, nullptr, &buffer.handle),
+          "vkCreateBuffer");
+
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(device_.handle, buffer.handle, &req);
+
+    const VkMemoryPropertyFlags coherent =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    // HOST_CACHED + HOST_COHERENT gives fast strided CPU reads with no manual
+    // cache invalidation. Fall back to plain coherent (write-combined) if the
+    // device has no cached-coherent type.
+    int type =
+        findMemoryTypeOrNeg(req.memoryTypeBits,
+                            coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    if (type < 0) type = findMemoryTypeOrNeg(req.memoryTypeBits, coherent);
+    if (type < 0) throw std::runtime_error("no host-visible memory type");
+
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = static_cast<uint32_t>(type);
+    check(vkAllocateMemory(device_.handle, &alloc, nullptr, &buffer.memory),
+          "vkAllocateMemory");
+    check(vkBindBufferMemory(device_.handle, buffer.handle, buffer.memory, 0),
+          "vkBindBufferMemory");
+    return buffer;
 }
 
 Renderer::Buffer Renderer::createBuffer(VkDeviceSize size,
@@ -307,6 +1296,32 @@ void Renderer::createSceneTargets() {
     sceneDepth_ = createImage(sceneExtent_, depthFormat_,
                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                               VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    // Path-tracer targets, at the same resolution. HDR accumulation + the two
+    // denoiser guides, all storage images kept in GENERAL layout.
+    if (rtSupported_) {
+        destroyImage(ptAccum_);
+        destroyImage(ptAlbedo_);
+        destroyImage(ptNormal_);
+        destroyImage(ptDenoised_);
+        // STORAGE for compute R/W, TRANSFER_SRC/DST for the denoise readback and
+        // write-back copies.
+        const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ptAccum_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                               VK_IMAGE_ASPECT_COLOR_BIT);
+        ptAlbedo_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+        ptNormal_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+        ptDenoised_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                                  VK_IMAGE_ASPECT_COLOR_BIT);
+        ptImagesInitialised_ = false;  // need the UNDEFINED->GENERAL transition
+        ptDenoisedValid_ = false;
+        ptSampleCount_ = 0;            // resolution changed; restart accumulation
+        if (ptSet_) updatePathTraceDescriptors();
+    }
 }
 
 void Renderer::destroySceneTargets() {
@@ -326,27 +1341,41 @@ void Renderer::setRenderScale(float scale) {
 void Renderer::createDescriptors() {
     // Rule 3: one bindless SSBO of materials, indexed by instance ID. Not a
     // descriptor set per draw -- a closest-hit shader cannot rebind.
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    binding.descriptorCount = 1;
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    VkDescriptorSetLayoutBinding mat{};
+    mat.binding = 0;
+    mat.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    mat.descriptorCount = 1;
     // Vertex too: it reads the per-part explode rank from the same table.
-    binding.stageFlags =
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    mat.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    bindings.push_back(mat);
+
+    if (rtSupported_) {
+        // binding 1: the TLAS the fragment shader traces against for RT shadows/AO.
+        VkDescriptorSetLayoutBinding as{};
+        as.binding = 1;
+        as.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+        as.descriptorCount = 1;
+        as.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings.push_back(as);
+    }
 
     VkDescriptorSetLayoutCreateInfo info{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    info.bindingCount = 1;
-    info.pBindings = &binding;
+    info.bindingCount = static_cast<uint32_t>(bindings.size());
+    info.pBindings = bindings.data();
     check(vkCreateDescriptorSetLayout(device_.handle, &info, nullptr, &setLayout_),
           "vkCreateDescriptorSetLayout");
 
-    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+    std::vector<VkDescriptorPoolSize> sizes{
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    if (rtSupported_)
+        sizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1});
     VkDescriptorPoolCreateInfo pool{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pool.maxSets = 1;
-    pool.poolSizeCount = 1;
-    pool.pPoolSizes = &size;
+    pool.poolSizeCount = static_cast<uint32_t>(sizes.size());
+    pool.pPoolSizes = sizes.data();
     check(vkCreateDescriptorPool(device_.handle, &pool, nullptr, &descriptorPool_),
           "vkCreateDescriptorPool");
 
@@ -367,9 +1396,12 @@ void Renderer::createPipeline() {
     check(vkCreateShaderModule(device_.handle, &vsInfo, nullptr, &vs),
           "vkCreateShaderModule(vert)");
 
+    // RT device gets the ray-query fragment shader; everything else the plain
+    // raster one. The RT shader still runs when RT is toggled off -- an rtOn push
+    // constant gates the tracing -- so there is no pipeline to switch at runtime.
     VkShaderModuleCreateInfo fsInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    fsInfo.codeSize = sizeof(kBoardFrag);
-    fsInfo.pCode = kBoardFrag;
+    fsInfo.codeSize = rtSupported_ ? sizeof(kBoardFragRt) : sizeof(kBoardFrag);
+    fsInfo.pCode = rtSupported_ ? kBoardFragRt : kBoardFrag;
     VkShaderModule fs = VK_NULL_HANDLE;
     check(vkCreateShaderModule(device_.handle, &fsInfo, nullptr, &fs),
           "vkCreateShaderModule(frag)");
@@ -569,6 +1601,8 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     std::vector<geom::Vertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<MaterialGpu> materials;
+    std::vector<uint32_t> triMaterial;  // per global triangle: material index (path tracer)
+    std::vector<uint32_t> vertexMat;    // per global vertex: material index (explode bake)
     std::vector<float> centreZ;  // per material, for explode ranking
     std::vector<int> mount;      // per material: 0 board layer, +/-1 component side
     draws_.clear();
@@ -576,13 +1610,42 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
 
     stats_.trianglesTotal = 0;
 
-    for (const geom::Part& part : mesh.parts) {
-        if (part.mesh.indices.empty()) continue;
+    // Opaque parts FIRST, translucent films (mask, substrate) LAST. The BLAS is
+    // built as two geometry ranges over this very index buffer -- [0, N) opaque
+    // (hardware fast-path traversal), [N, end) candidate-traversed for the path
+    // tracer's stochastic alpha -- and a range must be contiguous. Raster draws
+    // by explicit per-part offsets, so the order is free to serve the tracer.
+    // (Cosmetic side effect: the parts list shows films after the copper.)
+    const auto isFilm = [](const geom::Part& p) {
+        return p.material == geom::Material::Soldermask ||
+               p.material == geom::Material::Substrate;
+    };
+    std::vector<const geom::Part*> ordered;
+    ordered.reserve(mesh.parts.size());
+    for (const geom::Part& p : mesh.parts)
+        if (!p.mesh.indices.empty() && !isFilm(p)) ordered.push_back(&p);
+    const size_t firstFilm = ordered.size();
+    for (const geom::Part& p : mesh.parts)
+        if (!p.mesh.indices.empty() && isFilm(p)) ordered.push_back(&p);
+
+    opaqueTriCount_ = 0;
+    size_t orderedIdx = 0;
+    for (const geom::Part* orderedPart : ordered) {
+        const geom::Part& part = *orderedPart;
+        const bool opaquePart = orderedIdx++ < firstFilm;
+        if (opaquePart)
+            opaqueTriCount_ +=
+                static_cast<uint32_t>(part.mesh.indices.size() / 3);
 
         DrawItem item;
         item.indexOffset = static_cast<uint32_t>(indices.size());
         item.indexCount = static_cast<uint32_t>(part.mesh.indices.size());
-        item.vertexOffset = static_cast<int32_t>(vertices.size());
+        // Indices are rebased to GLOBAL (see the insert below) so a single BLAS
+        // and the path tracer address one flat vertex buffer correctly; the raster
+        // draw therefore uses vertexOffset 0. A per-part vertexOffset with local
+        // indices would leave the acceleration structure referencing the wrong
+        // vertices for every part but the first.
+        item.vertexOffset = 0;
         item.material = static_cast<uint32_t>(materials.size());
         item.blended = (part.material == geom::Material::Soldermask);
         // The laminate is what hides the copper, so it fades once the stack
@@ -594,7 +1657,7 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         // dielectric's. Hide it until the board peels open -- see drawFrame.
         item.hideWhenCollapsed =
             part.material == geom::Material::Copper && part.name != "F.Cu" &&
-            part.name != "B.Cu";
+            part.name != "B.Cu" && part.name != "vias";
         item.part = static_cast<uint32_t>(parts_.size());
 
         PartInfo info;
@@ -625,7 +1688,11 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
                      {0.55f, 0.1f, 0.0f, 0.0f}};
                 break;
             default:
-                m = {{0.90f, 0.66f, 0.24f, 1.0f}, {0.25f, 1.0f, 0.0f, 0.0f}};
+                // Copper / exposed pads: gold ENIG finish, near-mirror roughness
+                // so pads read as polished plate -- a tight sharp highlight in
+                // raster, a near-specular reflection + sun glint in the path
+                // tracer (user request: pads more mirror than the chip sides).
+                m = {{0.94f, 0.70f, 0.28f, 1.0f}, {0.05f, 1.0f, 0.0f, 0.0f}};
                 break;
         }
         materials.push_back(m);
@@ -645,10 +1712,20 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         mount.push_back(part.material == geom::Material::Component ? part.mountSide
                                                                    : 0);
 
+        const uint32_t vbase = static_cast<uint32_t>(vertices.size());
         vertices.insert(vertices.end(), part.mesh.vertices.begin(),
                         part.mesh.vertices.end());
-        indices.insert(indices.end(), part.mesh.indices.begin(),
-                       part.mesh.indices.end());
+        // Remember which draw item (hence material, hence rank) each vertex belongs
+        // to, as a flat parallel array. Filled with the real rank after ranks are
+        // computed below -- for now record the material index.
+        vertexMat.insert(vertexMat.end(), part.mesh.vertices.size(), item.material);
+        indices.reserve(indices.size() + part.mesh.indices.size());
+        for (uint32_t li : part.mesh.indices) indices.push_back(vbase + li);
+
+        // Per-triangle material index, in the same global triangle order as the
+        // index buffer -- the path tracer looks material up by primitive index.
+        for (uint32_t t = 0; t < item.indexCount / 3; ++t)
+            triMaterial.push_back(item.material);
 
         stats_.trianglesTotal += static_cast<uint32_t>(part.mesh.triangleCount());
         draws_.push_back(item);
@@ -670,10 +1747,14 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         // to the outer ring below, so a populated board explodes into the same
         // number of stages as a bare one -- the ICs float off with the top (or
         // bottom) copper instead of each claiming a stage of their own.
+        // Via barrels are excluded: they are one intact plated tube through the
+        // whole stack, not a layer, so they claim no stage and keep rank 0 (their
+        // copper material's default) -- staying put while the board peels.
         std::vector<std::pair<float, size_t>> byHeight;
         byHeight.reserve(centreZ.size());
         for (size_t m = 0; m < centreZ.size(); ++m) {
-            if (mount[m] == 0) byHeight.emplace_back(centreZ[m], m);
+            const bool isVia = m < parts_.size() && parts_[m].name == "vias";
+            if (mount[m] == 0 && !isVia) byHeight.emplace_back(centreZ[m], m);
         }
         std::sort(byHeight.begin(), byHeight.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -697,6 +1778,25 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         }
         if (haveComponents) maxRank_ = mid + 1.0f;
 
+        // Via barrels get their OWN peel plane (user request): a barrel is one
+        // intact plated tube, and sharing a level with a substrate slab leaves it
+        // poking through the laminate mid-explode. Layer ranks are consecutive
+        // integers centred on 0, so 0 itself is taken exactly when the layer
+        // count is odd; in that case park the barrels at +0.5 -- squarely between
+        // two rings, on no one else's plane. (This was reverted once over what
+        // turned out to be a capture-aliasing phantom; the logic is sound.)
+        {
+            const auto rankTaken = [&](float r) {
+                for (const auto& bh : byHeight)
+                    if (std::abs(materials[bh.second].params[2] - r) < 1e-3f)
+                        return true;
+                return false;
+            };
+            const float barrelRank = rankTaken(0.0f) ? 0.5f : 0.0f;
+            for (size_t m = 0; m < parts_.size() && m < materials.size(); ++m)
+                if (parts_[m].name == "vias") materials[m].params[2] = barrelRank;
+        }
+
         // Mid-plane of the stack in Z, for the translucent sort's view-side test.
         if (!byHeight.empty()) {
             boardMidZ_ = 0.5f * (byHeight.front().first + byHeight.back().first);
@@ -710,14 +1810,18 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     }
 
     // Rule 2: these usage flags cost nothing today and mean phase 4 builds its
-    // acceleration structures over these very buffers.
+    // acceleration structures over these very buffers. STORAGE too, so the path
+    // tracer can read vertices/indices as SSBOs to shade a ray hit.
     const VkBufferUsageFlags rtReady =
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
 
     destroyBuffer(vertexBuffer_);
     destroyBuffer(indexBuffer_);
     destroyBuffer(materialBuffer_);
+    destroyBuffer(triMaterialBuffer_);
+    destroyBuffer(tracedVertexBuffer_);
 
     const VkDeviceSize vsize = vertices.size() * sizeof(geom::Vertex);
     vertexBuffer_ = createBuffer(vsize,
@@ -726,12 +1830,37 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     uploadViaStaging(vertexBuffer_, vertices.data(), vsize);
 
+    // Exploded copy the BLAS builds from. Starts identical to the rest geometry;
+    // rebuildTracedGeometry re-bakes it when the peel changes in path-traced mode.
+    tracedVertexBuffer_ =
+        createBuffer(vsize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | rtReady,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    uploadViaStaging(tracedVertexBuffer_, vertices.data(), vsize);
+
+    // Keep the rest geometry and a per-vertex rank on the CPU so the peel can be
+    // re-baked without the mesh. vertexMat currently holds each vertex's material
+    // index; resolve it to the material's explode rank now that ranks are known.
+    restVertices_ = vertices;
+    vertexRank_.resize(vertexMat.size());
+    for (size_t i = 0; i < vertexMat.size(); ++i)
+        vertexRank_[i] = materials[vertexMat[i]].params[2];
+    tracedExplode_ = 0.0f;
+
     const VkDeviceSize isize = indices.size() * sizeof(uint32_t);
     indexBuffer_ = createBuffer(isize,
                                 VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT | rtReady,
                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     uploadViaStaging(indexBuffer_, indices.data(), isize);
+
+    if (!triMaterial.empty()) {
+        const VkDeviceSize tsize = triMaterial.size() * sizeof(uint32_t);
+        triMaterialBuffer_ = createBuffer(
+            tsize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        uploadViaStaging(triMaterialBuffer_, triMaterial.data(), tsize);
+    }
 
     const VkDeviceSize msize = materials.size() * sizeof(MaterialGpu);
     materialBuffer_ = createBuffer(msize,
@@ -750,17 +1879,41 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     write.pBufferInfo = &bufferInfo;
     vkUpdateDescriptorSets(device_.handle, 1, &write, 0, nullptr);
 
+    // Build the RT acceleration structure over this geometry and point binding 1
+    // at it. Rebuilt every upload -- a new board / thickness changes the buffers.
+    if (rtSupported_) {
+        buildAccelerationStructures(static_cast<uint32_t>(vertices.size()),
+                                    static_cast<uint32_t>(indices.size()));
+        if (tlas_ != VK_NULL_HANDLE) {
+            VkWriteDescriptorSetAccelerationStructureKHR asInfo{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+            asInfo.accelerationStructureCount = 1;
+            asInfo.pAccelerationStructures = &tlas_;
+            VkWriteDescriptorSet asWrite{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            asWrite.pNext = &asInfo;
+            asWrite.dstSet = materialSet_;
+            asWrite.dstBinding = 1;
+            asWrite.descriptorCount = 1;
+            asWrite.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+            vkUpdateDescriptorSets(device_.handle, 1, &asWrite, 0, nullptr);
+        }
+        // Point the path tracer's descriptors at the new geometry + TLAS.
+        updatePathTraceDescriptors();
+    }
+
     // Keep a CPU copy so appearance edits re-write the table without rebuilding
     // geometry. Re-apply the current substrate override so it survives a board
     // reload rather than snapping back to default tan.
     materials_ = std::move(materials);
     setSubstrateAppearance(substrateColor_[0], substrateColor_[1],
                            substrateColor_[2], substrateOpacity_);
-    setMaskColor(maskColor_[0], maskColor_[1], maskColor_[2]);
+    setMaskColor(maskColor_[0], maskColor_[1], maskColor_[2], maskOpacity_);
 }
 
-void Renderer::setMaskColor(float r, float g, float b) {
+void Renderer::setMaskColor(float r, float g, float b, float opacity) {
     maskColor_ = {r, g, b};
+    const float a = std::clamp(opacity, 0.05f, 1.0f);
+    maskOpacity_ = a;
     if (materials_.empty() || !materialBuffer_.handle) return;
     for (size_t i = 0; i < parts_.size() && i < materials_.size(); ++i) {
         // Both F.Mask and B.Mask.
@@ -771,11 +1924,17 @@ void Renderer::setMaskColor(float r, float g, float b) {
         materials_[i].albedo[0] = r;
         materials_[i].albedo[1] = g;
         materials_[i].albedo[2] = b;
-        // albedo[3] (opacity) left untouched -- the film stays translucent.
+        // albedo.a drives the raster blend AND the path tracer's show-through
+        // (passProb = 1 - alpha): lower it to let more copper read through.
+        materials_[i].albedo[3] = a;
     }
     vkDeviceWaitIdle(device_.handle);
     uploadViaStaging(materialBuffer_, materials_.data(),
                      materials_.size() * sizeof(MaterialGpu));
+    // Path tracing accumulates a static image; a colour edit must restart it or
+    // the change only appears once the camera next moves.
+    ptSampleCount_ = 0;
+    ptDenoisedValid_ = false;
 }
 
 void Renderer::setSubstrateAppearance(float r, float g, float b, float opacity) {
@@ -807,6 +1966,9 @@ void Renderer::setSubstrateAppearance(float r, float g, float b, float opacity) 
     vkDeviceWaitIdle(device_.handle);
     uploadViaStaging(materialBuffer_, materials_.data(),
                      materials_.size() * sizeof(MaterialGpu));
+    // Restart path-trace accumulation so the new appearance shows immediately.
+    ptSampleCount_ = 0;
+    ptDenoisedValid_ = false;
 }
 
 bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
@@ -824,12 +1986,30 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
 
     vkResetFences(device_.handle, 1, &inFlight_[frame_]);
 
+    // Path-traced mode traces the exploded geometry: if the peel moved since the
+    // BLAS was last baked, rebuild it before recording (a synchronous AS build,
+    // so it must not run inside the command buffer). Raster/RT-raster explode in
+    // the vertex shader and never need this. No cost at rest (peel == baked).
+    if (mode_ == RenderMode::PathTraced && rtSupported_ &&
+        std::abs(explodeProgress_ - tracedExplode_) > 1.0e-4f) {
+        rebuildTracedGeometry(explodeProgress_);
+    }
+
     VkCommandBuffer cmd = commandBuffers_[frame_];
     vkResetCommandBuffer(cmd, 0);
 
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd, &begin);
 
+    // Shared by the scene pass and the later blit/UI barriers.
+    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+
+  if (mode_ == RenderMode::PathTraced && rtSupported_ &&
+      tlas_ != VK_NULL_HANDLE) {
+    // Path-trace + tonemap into sceneColor_ (left COLOR_ATTACHMENT_OPTIMAL), so
+    // the shared blit + UI below present it exactly like the raster scene.
+    recordPathTrace(cmd);
+  } else {
     // --- Pass 1: the board, into the offscreen target at sceneExtent_ ---
     //
     // Depth is transitioned from UNDEFINED every frame: it is cleared on load, so
@@ -856,7 +2036,6 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     barriers[1].image = sceneDepth_.handle;
     barriers[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
 
-    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dep.imageMemoryBarrierCount = 2;
     dep.pImageMemoryBarriers = barriers;
     vkCmdPipelineBarrier2(cmd, &dep);
@@ -896,7 +2075,12 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     push.cameraPos[0] = cameraPos[0];
     push.cameraPos[1] = cameraPos[1];
     push.cameraPos[2] = cameraPos[2];
-    push.cameraPos[3] = 1.0f;
+    // cameraPos.w carries the RT toggle for board_rt.frag. Only trace at rest:
+    // the BLAS is over the un-exploded geometry, so shadows would be wrong once
+    // the stack starts peeling.
+    const bool rtOn = rtRequested_ && rtSupported_ &&
+                      tlas_ != VK_NULL_HANDLE && explodeProgress_ < 0.01f;
+    push.cameraPos[3] = rtOn ? 1.0f : 0.0f;
     push.params[0] = explodeStep_;
     push.params[1] = explodeProgress_;
     push.params[2] = maxRank_;
@@ -998,6 +2182,7 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     }
 
     vkCmdEndRendering(cmd);
+  }  // end raster-vs-pathtrace branch
 
     // --- Blit the scene up (or down) onto the swapchain ---
     VkImageMemoryBarrier2 toBlit[2]{};
