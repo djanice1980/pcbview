@@ -1061,9 +1061,10 @@ void MainWindow::onLayerToggled(QTreeWidgetItem* item, int column) {
     if (name.isEmpty()) return;
 
     const bool on = (item->checkState(0) == Qt::Checked);
-    for (vk::PartInfo& p : viewport_->renderer()->parts()) {
-        if (QString::fromStdString(p.name) == name) p.visible = on;
-    }
+    // Through the setter, not a raw PartInfo::visible write: the traced
+    // geometry (path tracing + RT shadows) bakes visibility into the BLAS and
+    // must be told to rebuild.
+    viewport_->renderer()->setPartVisible(name.toStdString(), on);
     viewport_->requestUpdate();
 }
 
@@ -1269,7 +1270,7 @@ void MainWindow::showAbout() {
     // copyright must appear here and the user must be directed to the licences.
     QMessageBox::about(
         this, "About pcbview",
-        "<h3>pcbview 1.09</h3>"
+        "<h3>pcbview 1.10</h3>"
         "<p>Standalone 3D PCB viewer. Renders what the fab will build.</p>"
         "<p>Copyright © 2026 pcbview contributors.<br>"
         "pcbview is free software under the <b>GNU General Public License "

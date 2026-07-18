@@ -167,8 +167,6 @@ private:
     bool rtEnabled_ = false;       // ray-traced shadows/AO requested
     bool ptEnabled_ = false;       // path-tracing mode requested
     bool oidnEnabled_ = false;     // neural denoising requested
-    int nextDenoiseAt_ = 16;       // next sample-count milestone to denoise at
-    int lastPtSamples_ = 0;        // detect accumulation restarts
 
     Camera camera_;
     Camera viewTarget_;             // where a view preset / Fit is gliding to

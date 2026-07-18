@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <vector>
 #include <cstring>
 #include <fstream>
@@ -366,8 +367,32 @@ void Renderer::buildAccelerationStructures(uint32_t vertexCount,
 void Renderer::bakeExplode(float progress) {
     if (restVertices_.empty() || vertexRank_.size() != restVertices_.size())
         return;
+
+    // Effective traced visibility per part: the user's stackup toggles PLUS the
+    // collapsed-board rule the raster path applies (inner copper hidden at rest
+    // while the substrate is opaque). Baking the same rule keeps PT and RT
+    // shadows in lockstep with what raster actually draws.
+    std::vector<uint8_t> vis(parts_.size(), 1);
+    const bool peeling = progress > 0.0f;
+    const bool substrateOpaque = substrateOpacity_ >= 0.999f;
+    for (const DrawItem& item : draws_) {
+        bool v = item.part < parts_.size() ? parts_[item.part].visible : true;
+        if (item.hideWhenCollapsed && !peeling && substrateOpaque) v = false;
+        if (item.material < vis.size()) vis[item.material] = v ? 1 : 0;
+    }
+
+    // A hidden part's vertices are set to NaN: the Vulkan spec defines a
+    // triangle with a NaN vertex X as INACTIVE, so the BLAS build simply drops
+    // it -- no index surgery, no shader change, and the geometry ranges (and
+    // therefore the primitive re-basing) stay exactly as uploadBoard laid them.
+    const float kHide = std::numeric_limits<float>::quiet_NaN();
     std::vector<geom::Vertex> exploded = restVertices_;
     for (size_t i = 0; i < exploded.size(); ++i) {
+        const uint32_t part = vertexPart_[i];
+        if (part < vis.size() && !vis[part]) {
+            exploded[i].position[0] = kHide;
+            continue;
+        }
         const float rank = vertexRank_[i];
         const float ring = std::abs(rank);
         const float travel =
@@ -377,6 +402,23 @@ void Renderer::bakeExplode(float progress) {
     }
     uploadViaStaging(tracedVertexBuffer_, exploded.data(),
                      exploded.size() * sizeof(geom::Vertex));
+}
+
+void Renderer::setPartVisible(const std::string& name, bool visible) {
+    bool changed = false;
+    for (PartInfo& p : parts_) {
+        if (p.name == name && p.visible != visible) {
+            p.visible = visible;
+            changed = true;
+        }
+    }
+    if (!changed) return;
+    // The traced geometry (PT and RT shadows) bakes visibility into the BLAS;
+    // rebuild on the next traced frame, and restart the path-trace accumulation
+    // so the change shows immediately rather than after the next camera move.
+    tracedVisDirty_ = true;
+    resetAccumulation();
+    ptDenoisedValid_ = false;
 }
 
 // Bake the peel into the traced geometry, rebuild the BLAS/TLAS over it, and
@@ -415,7 +457,7 @@ void Renderer::rebuildTracedGeometry(float progress) {
 void Renderer::setRenderMode(RenderMode m) {
     if (m == mode_) return;
     mode_ = m;
-    ptSampleCount_ = 0;
+    resetAccumulation();
 }
 
 void Renderer::setRayCamera(const float eye[3], const float fwd[3],
@@ -426,7 +468,7 @@ void Renderer::setRayCamera(const float eye[3], const float fwd[3],
     };
     if (diff(eye, rayEye_) || diff(fwd, rayFwd_) || diff(right, rayRight_) ||
         diff(up, rayUp_)) {
-        ptSampleCount_ = 0;
+        resetAccumulation();
         // Crucial: also drop the denoised frame. Otherwise the tonemap keeps
         // showing the last (now stale) denoised image while the camera moves --
         // the screen freezes on it and only updates when the next denoise lands,
@@ -619,6 +661,23 @@ void Renderer::createPathTracer() {
 }
 
 void Renderer::destroyPathTracer() {
+    // Drain the async denoise BEFORE touching anything it uses: the worker
+    // thread owns the OIDN objects while running, and the fenced readback
+    // references the pt images and host buffers.
+    abortDenoise();
+    const auto destroyMapped = [&](Buffer& b, void*& p) {
+        if (p) { vkUnmapMemory(device_.handle, b.memory); p = nullptr; }
+        destroyBuffer(b);
+    };
+    destroyMapped(dnColorBuf_, dnColorPtr_);
+    destroyMapped(dnAlbedoBuf_, dnAlbedoPtr_);
+    destroyMapped(dnNormalBuf_, dnNormalPtr_);
+    destroyMapped(dnOutBuf_, dnOutPtr_);
+    dnW_ = dnH_ = 0;
+    if (dnFence_) {
+        vkDestroyFence(device_.handle, dnFence_, nullptr);
+        dnFence_ = VK_NULL_HANDLE;
+    }
     if (oidnFilter_) oidnReleaseFilter(static_cast<OIDNFilter>(oidnFilter_));
     if (oidnColorBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnColorBuf_));
     if (oidnAlbedoBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnAlbedoBuf_));
@@ -693,7 +752,7 @@ void Renderer::updatePathTraceDescriptors() {
     tw[0].pImageInfo = &acc;
     tw[1].pImageInfo = &den;
     vkUpdateDescriptorSets(device_.handle, 2, tw, 0, nullptr);
-    ptSampleCount_ = 0;
+    resetAccumulation();
     ptDenoisedValid_ = false;
 }
 
@@ -838,7 +897,10 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
 
 void Renderer::setDenoising(bool on) {
     denoisingEnabled_ = on;
-    if (!on) ptDenoisedValid_ = false;
+    if (!on) {
+        abortDenoise();
+        ptDenoisedValid_ = false;
+    }
 }
 
 std::string Renderer::oidnDeviceName() const {
@@ -853,77 +915,68 @@ std::string Renderer::oidnDeviceName() const {
     }
 }
 
-void Renderer::denoise() {
-    if (!oidnDevice_ || !rtSupported_ || ptSampleCount_ == 0 ||
-        ptAccum_.handle == VK_NULL_HANDLE) {
-        return;
-    }
-    const uint32_t w = sceneExtent_.width, h = sceneExtent_.height;
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 16;  // RGBA32F
+// ---- Asynchronous denoise --------------------------------------------------
+//
+// Replaces the old milestone-gated SYNCHRONOUS denoise, which blocked the UI
+// ~175ms per pass and left raw grain on screen between milestones. Now: a
+// fenced GPU->host readback is submitted (never waited), a worker thread packs
+// the guides and runs OIDN (including the expensive first-run filter commit),
+// and the result is written back when it lands -- the frame loop never stalls,
+// and the image refines continuously while the camera is still. During motion
+// the accumulation resets every frame so the sample count never reaches the
+// kickoff threshold: no denoise of a moving image, hence no ghosting.
 
-    // cbuf/abuf/nbuf are read back on the CPU (the pack loop) -> cached memory.
-    // obuf is only written by the CPU then DMA'd to the GPU, so coherent
-    // write-combined is ideal for it (fast sequential writes).
-    Buffer cbuf = createReadbackBuffer(bytes);
-    Buffer abuf = createReadbackBuffer(bytes);
-    Buffer nbuf = createReadbackBuffer(bytes);
-    Buffer obuf = createBuffer(bytes,
-                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                   VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-    auto oneTime = [&](const std::function<void(VkCommandBuffer)>& rec) {
-        VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        a.commandPool = commandPool_;
-        a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        a.commandBufferCount = 1;
-        VkCommandBuffer c = VK_NULL_HANDLE;
-        vkAllocateCommandBuffers(device_.handle, &a, &c);
-        VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(c, &b);
-        rec(c);
-        vkEndCommandBuffer(c);
-        VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        s.commandBufferCount = 1;
-        s.pCommandBuffers = &c;
-        vkQueueSubmit(device_.graphicsQueue, 1, &s, VK_NULL_HANDLE);
-        vkQueueWaitIdle(device_.graphicsQueue);
-        vkFreeCommandBuffers(device_.handle, commandPool_, 1, &c);
+void Renderer::ensureDenoiseBuffers(uint32_t w, uint32_t h) {
+    if (dnW_ == w && dnH_ == h && dnColorBuf_.handle != VK_NULL_HANDLE) return;
+    abortDenoise();
+    const auto destroyMapped = [&](Buffer& b, void*& p) {
+        if (p) { vkUnmapMemory(device_.handle, b.memory); p = nullptr; }
+        destroyBuffer(b);
     };
+    destroyMapped(dnColorBuf_, dnColorPtr_);
+    destroyMapped(dnAlbedoBuf_, dnAlbedoPtr_);
+    destroyMapped(dnNormalBuf_, dnNormalPtr_);
+    destroyMapped(dnOutBuf_, dnOutPtr_);
 
-    // GPU -> host: the accumulation and the two guides.
-    oneTime([&](VkCommandBuffer c) {
-        auto copy = [&](Image& img, Buffer& buf) {
-            VkBufferImageCopy r{};
-            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            r.imageExtent = {w, h, 1};
-            vkCmdCopyImageToBuffer(c, img.handle, VK_IMAGE_LAYOUT_GENERAL,
-                                   buf.handle, 1, &r);
-        };
-        copy(ptAccum_, cbuf);
-        copy(ptAlbedo_, abuf);
-        copy(ptNormal_, nbuf);
-    });
+    const VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 16;  // RGBA32F
+    // The three CPU-read buffers are HOST_CACHED (strided reads from
+    // write-combined memory were the original 5s denoise); the output is only
+    // written by the CPU, so plain coherent is right for it.
+    dnColorBuf_ = createReadbackBuffer(bytes);
+    dnAlbedoBuf_ = createReadbackBuffer(bytes);
+    dnNormalBuf_ = createReadbackBuffer(bytes);
+    dnOutBuf_ = createBuffer(bytes,
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                 VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    check(vkMapMemory(device_.handle, dnColorBuf_.memory, 0, bytes, 0,
+                      &dnColorPtr_),
+          "vkMapMemory(dnColor)");
+    check(vkMapMemory(device_.handle, dnAlbedoBuf_.memory, 0, bytes, 0,
+                      &dnAlbedoPtr_),
+          "vkMapMemory(dnAlbedo)");
+    check(vkMapMemory(device_.handle, dnNormalBuf_.memory, 0, bytes, 0,
+                      &dnNormalPtr_),
+          "vkMapMemory(dnNormal)");
+    check(vkMapMemory(device_.handle, dnOutBuf_.memory, 0, bytes, 0, &dnOutPtr_),
+          "vkMapMemory(dnOut)");
+    dnW_ = w;
+    dnH_ = h;
+}
 
+// Runs ENTIRELY on the worker thread: pack the readbacks into tight float3
+// arrays, (re)build the cached OIDN filter if the resolution changed, filter,
+// and expand the result into the mapped output buffer. All OIDN access lives
+// here; the main thread only touches OIDN in destroyPathTracer, after
+// abortDenoise() has joined the worker.
+void Renderer::denoiseWorker(uint32_t w, uint32_t h, int samples) {
     const size_t n = static_cast<size_t>(w) * h;
-    void* cptr = nullptr; void* aptr = nullptr; void* nptr = nullptr; void* optr = nullptr;
-    vkMapMemory(device_.handle, cbuf.memory, 0, bytes, 0, &cptr);
-    vkMapMemory(device_.handle, abuf.memory, 0, bytes, 0, &aptr);
-    vkMapMemory(device_.handle, nbuf.memory, 0, bytes, 0, &nptr);
-    vkMapMemory(device_.handle, obuf.memory, 0, bytes, 0, &optr);
-
-    // Pack the mapped RGBA readbacks into tight FLOAT3 arrays for OIDN. ALL
-    // three are accumulated SUMS (the guides too -- a single-sample albedo guide
-    // is a stochastic-alpha coin flip per pixel, which the denoiser preserves as
-    // noise), so each divides by the sample count; the averaged normal is
-    // re-normalised.
-    const float* rc = static_cast<const float*>(cptr);
-    const float* ra = static_cast<const float*>(aptr);
-    const float* rn = static_cast<const float*>(nptr);
+    const float* rc = static_cast<const float*>(dnColorPtr_);
+    const float* ra = static_cast<const float*>(dnAlbedoPtr_);
+    const float* rn = static_cast<const float*>(dnNormalPtr_);
     std::vector<float> col(n * 3), alb(n * 3), nor(n * 3), out(n * 3);
-    const float inv = 1.0f / static_cast<float>(ptSampleCount_);
+    const float inv = 1.0f / static_cast<float>(std::max(samples, 1));
     for (size_t i = 0; i < n; ++i) {
         for (int k = 0; k < 3; ++k) {
             col[i * 3 + k] = rc[i * 4 + k] * inv;
@@ -941,19 +994,19 @@ void Renderer::denoise() {
         nor[i * 3 + 2] = nz;
     }
 
-    // Denoise through device buffers, which work on both CPU and GPU OIDN devices
-    // (a mapped Vulkan host pointer is not device-accessible for a CUDA/HIP device).
-    // The filter + buffers are CACHED and only (re)built when the resolution
-    // changes -- oidnCommitFilter recompiles the network to the GPU (~0.4s), so
-    // doing it per frame added up. (The dominant cost was the readback pack loop
-    // above; see createReadbackBuffer. The OIDN inference itself is ~20ms.)
+    // Cached OIDN filter + device buffers; only (re)built when the resolution
+    // changes -- oidnCommitFilter recompiles the network to the GPU (~0.4s),
+    // which on this thread costs the UI nothing.
     OIDNDevice dev = static_cast<OIDNDevice>(oidnDevice_);
     const size_t rgbBytes = n * 3 * sizeof(float);
     if (oidnW_ != w || oidnH_ != h || oidnFilter_ == nullptr) {
         if (oidnFilter_) oidnReleaseFilter(static_cast<OIDNFilter>(oidnFilter_));
-        if (oidnColorBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnColorBuf_));
-        if (oidnAlbedoBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnAlbedoBuf_));
-        if (oidnNormalBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnNormalBuf_));
+        if (oidnColorBuf_)
+            oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnColorBuf_));
+        if (oidnAlbedoBuf_)
+            oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnAlbedoBuf_));
+        if (oidnNormalBuf_)
+            oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnNormalBuf_));
         if (oidnOutBuf_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnOutBuf_));
 
         OIDNBuffer bc = oidnNewBuffer(dev, rgbBytes);
@@ -967,52 +1020,180 @@ void Renderer::denoise() {
         oidnSetFilterImage(f, "normal", bn, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterImage(f, "output", bo, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterBool(f, "hdr", true);
-        oidnCommitFilter(f);  // the expensive part -- done once per resolution
+        oidnCommitFilter(f);
 
-        oidnColorBuf_ = bc; oidnAlbedoBuf_ = ba; oidnNormalBuf_ = bn;
-        oidnOutBuf_ = bo; oidnFilter_ = f;
-        oidnW_ = w; oidnH_ = h;
+        oidnColorBuf_ = bc;
+        oidnAlbedoBuf_ = ba;
+        oidnNormalBuf_ = bn;
+        oidnOutBuf_ = bo;
+        oidnFilter_ = f;
+        oidnW_ = w;
+        oidnH_ = h;
     }
 
-    OIDNBuffer bc = static_cast<OIDNBuffer>(oidnColorBuf_);
-    OIDNBuffer ba = static_cast<OIDNBuffer>(oidnAlbedoBuf_);
-    OIDNBuffer bn = static_cast<OIDNBuffer>(oidnNormalBuf_);
-    OIDNBuffer bo = static_cast<OIDNBuffer>(oidnOutBuf_);
-    oidnWriteBuffer(bc, 0, rgbBytes, col.data());
-    oidnWriteBuffer(ba, 0, rgbBytes, alb.data());
-    oidnWriteBuffer(bn, 0, rgbBytes, nor.data());
+    oidnWriteBuffer(static_cast<OIDNBuffer>(oidnColorBuf_), 0, rgbBytes,
+                    col.data());
+    oidnWriteBuffer(static_cast<OIDNBuffer>(oidnAlbedoBuf_), 0, rgbBytes,
+                    alb.data());
+    oidnWriteBuffer(static_cast<OIDNBuffer>(oidnNormalBuf_), 0, rgbBytes,
+                    nor.data());
     oidnExecuteFilter(static_cast<OIDNFilter>(oidnFilter_));
-    oidnReadBuffer(bo, 0, rgbBytes, out.data());
+    oidnReadBuffer(static_cast<OIDNBuffer>(oidnOutBuf_), 0, rgbBytes,
+                   out.data());
 
-    // Expand the denoised RGB back into the RGBA write-back buffer.
-    float* op = static_cast<float*>(optr);
+    // Expand the denoised RGB into the mapped RGBA write-back buffer.
+    float* op = static_cast<float*>(dnOutPtr_);
     for (size_t i = 0; i < n; ++i) {
         op[i * 4 + 0] = out[i * 3 + 0];
         op[i * 4 + 1] = out[i * 3 + 1];
         op[i * 4 + 2] = out[i * 3 + 2];
         op[i * 4 + 3] = 1.0f;
     }
-
-    vkUnmapMemory(device_.handle, cbuf.memory);
-    vkUnmapMemory(device_.handle, abuf.memory);
-    vkUnmapMemory(device_.handle, nbuf.memory);
-    vkUnmapMemory(device_.handle, obuf.memory);
-
-    // Host -> GPU: the denoised result.
-    oneTime([&](VkCommandBuffer c) {
-        VkBufferImageCopy r{};
-        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        r.imageExtent = {w, h, 1};
-        vkCmdCopyBufferToImage(c, obuf.handle, ptDenoised_.handle,
-                               VK_IMAGE_LAYOUT_GENERAL, 1, &r);
-    });
-
-    destroyBuffer(cbuf);
-    destroyBuffer(abuf);
-    destroyBuffer(nbuf);
-    destroyBuffer(obuf);
-    ptDenoisedValid_ = true;
 }
+
+void Renderer::abortDenoise() {
+    if (dnState_ == DenoiseState::Reading) {
+        vkWaitForFences(device_.handle, 1, &dnFence_, VK_TRUE, UINT64_MAX);
+        vkResetFences(device_.handle, 1, &dnFence_);
+        if (dnCmd_) {
+            vkFreeCommandBuffers(device_.handle, commandPool_, 1, &dnCmd_);
+            dnCmd_ = VK_NULL_HANDLE;
+        }
+    } else if (dnState_ == DenoiseState::Filtering) {
+        if (dnThread_.joinable()) dnThread_.join();
+    }
+    dnState_ = DenoiseState::Idle;
+}
+
+bool Renderer::denoiseTick() {
+    if (!oidnDevice_ || !rtSupported_ || !denoisingEnabled_ ||
+        ptAccum_.handle == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    switch (dnState_) {
+        case DenoiseState::Idle: {
+            // Two samples minimum: a 1spp guide is too thin, and during camera
+            // motion the count resets every frame and never reaches 2 -- which
+            // is exactly the "never denoise a moving image" gate.
+            if (ptSampleCount_ < 2 || ptSampleCount_ == dnDisplayed_)
+                return false;
+            const uint32_t w = sceneExtent_.width, h = sceneExtent_.height;
+            ensureDenoiseBuffers(w, h);
+            if (dnFence_ == VK_NULL_HANDLE) {
+                VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                check(vkCreateFence(device_.handle, &fi, nullptr, &dnFence_),
+                      "vkCreateFence(denoise)");
+            }
+
+            VkCommandBufferAllocateInfo a{
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            a.commandPool = commandPool_;
+            a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            a.commandBufferCount = 1;
+            check(vkAllocateCommandBuffers(device_.handle, &a, &dnCmd_),
+                  "vkAllocateCommandBuffers(denoise)");
+            VkCommandBufferBeginInfo b{
+                VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(dnCmd_, &b);
+
+            // The path tracer wrote these via storage this frame; make the
+            // writes visible to the transfer reads.
+            VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.memoryBarrierCount = 1;
+            dep.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(dnCmd_, &dep);
+
+            const auto copy = [&](Image& img, Buffer& buf) {
+                VkBufferImageCopy r{};
+                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                r.imageExtent = {w, h, 1};
+                vkCmdCopyImageToBuffer(dnCmd_, img.handle,
+                                       VK_IMAGE_LAYOUT_GENERAL, buf.handle, 1,
+                                       &r);
+            };
+            copy(ptAccum_, dnColorBuf_);
+            copy(ptAlbedo_, dnAlbedoBuf_);
+            copy(ptNormal_, dnNormalBuf_);
+            vkEndCommandBuffer(dnCmd_);
+
+            VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            s.commandBufferCount = 1;
+            s.pCommandBuffers = &dnCmd_;
+            check(vkQueueSubmit(device_.graphicsQueue, 1, &s, dnFence_),
+                  "vkQueueSubmit(denoise readback)");
+
+            dnSamples_ = ptSampleCount_;
+            dnGen_ = ptGeneration_;
+            dnState_ = DenoiseState::Reading;
+            return true;
+        }
+
+        case DenoiseState::Reading: {
+            if (vkGetFenceStatus(device_.handle, dnFence_) != VK_SUCCESS)
+                return true;  // still copying; come back next frame
+            vkResetFences(device_.handle, 1, &dnFence_);
+            vkFreeCommandBuffers(device_.handle, commandPool_, 1, &dnCmd_);
+            dnCmd_ = VK_NULL_HANDLE;
+            if (dnGen_ != ptGeneration_) {
+                dnState_ = DenoiseState::Idle;  // view changed mid-copy: discard
+                return true;
+            }
+            dnThreadDone_.store(false);
+            const uint32_t w = dnW_, h = dnH_;
+            const int samples = dnSamples_;
+            dnThread_ = std::thread([this, w, h, samples] {
+                denoiseWorker(w, h, samples);
+                dnThreadDone_.store(true);
+            });
+            dnState_ = DenoiseState::Filtering;
+            return true;
+        }
+
+        case DenoiseState::Filtering: {
+            if (!dnThreadDone_.load()) return true;  // OIDN still running
+            dnThread_.join();
+            if (dnGen_ == ptGeneration_) {
+                // Host -> GPU: the denoised result. Small synchronous copy.
+                VkCommandBufferAllocateInfo a{
+                    VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                a.commandPool = commandPool_;
+                a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                a.commandBufferCount = 1;
+                VkCommandBuffer c = VK_NULL_HANDLE;
+                vkAllocateCommandBuffers(device_.handle, &a, &c);
+                VkCommandBufferBeginInfo b{
+                    VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(c, &b);
+                VkBufferImageCopy r{};
+                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                r.imageExtent = {dnW_, dnH_, 1};
+                vkCmdCopyBufferToImage(c, dnOutBuf_.handle, ptDenoised_.handle,
+                                       VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+                vkEndCommandBuffer(c);
+                VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                s.commandBufferCount = 1;
+                s.pCommandBuffers = &c;
+                vkQueueSubmit(device_.graphicsQueue, 1, &s, VK_NULL_HANDLE);
+                vkQueueWaitIdle(device_.graphicsQueue);
+                vkFreeCommandBuffers(device_.handle, commandPool_, 1, &c);
+                ptDenoisedValid_ = true;
+                dnDisplayed_ = dnSamples_;
+            }
+            dnState_ = DenoiseState::Idle;
+            return true;
+        }
+    }
+    return false;
+}
+
 
 int Renderer::findMemoryTypeOrNeg(uint32_t filter,
                                   VkMemoryPropertyFlags props) const {
@@ -1300,6 +1481,9 @@ void Renderer::createSceneTargets() {
     // Path-tracer targets, at the same resolution. HDR accumulation + the two
     // denoiser guides, all storage images kept in GENERAL layout.
     if (rtSupported_) {
+        // The async denoise's fenced readback references these images; drain it
+        // before they go away.
+        abortDenoise();
         destroyImage(ptAccum_);
         destroyImage(ptAlbedo_);
         destroyImage(ptNormal_);
@@ -1319,7 +1503,7 @@ void Renderer::createSceneTargets() {
                                   VK_IMAGE_ASPECT_COLOR_BIT);
         ptImagesInitialised_ = false;  // need the UNDEFINED->GENERAL transition
         ptDenoisedValid_ = false;
-        ptSampleCount_ = 0;            // resolution changed; restart accumulation
+        resetAccumulation();            // resolution changed; restart accumulation
         if (ptSet_) updatePathTraceDescriptors();
     }
 }
@@ -1830,21 +2014,29 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     uploadViaStaging(vertexBuffer_, vertices.data(), vsize);
 
-    // Exploded copy the BLAS builds from. Starts identical to the rest geometry;
-    // rebuildTracedGeometry re-bakes it when the peel changes in path-traced mode.
+    // Exploded/visibility-baked copy the BLAS builds from; bakeExplode fills it
+    // below and rebuildTracedGeometry re-bakes on peel or visibility changes.
     tracedVertexBuffer_ =
         createBuffer(vsize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | rtReady,
                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    uploadViaStaging(tracedVertexBuffer_, vertices.data(), vsize);
 
-    // Keep the rest geometry and a per-vertex rank on the CPU so the peel can be
-    // re-baked without the mesh. vertexMat currently holds each vertex's material
-    // index; resolve it to the material's explode rank now that ranks are known.
+    // Keep the rest geometry, a per-vertex rank and a per-vertex part index on
+    // the CPU so the traced copy can be re-baked without the mesh. vertexMat
+    // holds each vertex's material index (== part index); resolve rank now that
+    // ranks are known, and keep the part index for the visibility bake.
     restVertices_ = vertices;
     vertexRank_.resize(vertexMat.size());
     for (size_t i = 0; i < vertexMat.size(); ++i)
         vertexRank_[i] = materials[vertexMat[i]].params[2];
-    tracedExplode_ = 0.0f;
+    vertexPart_ = std::move(vertexMat);
+
+    // Bake through the SAME path every later re-bake uses, so the very first
+    // traced frame already honours the current peel and the collapsed-board
+    // hide rule (a raw copy left inner copper in the BLAS until something
+    // triggered a re-bake).
+    bakeExplode(explodeProgress_);
+    tracedExplode_ = explodeProgress_;
+    tracedVisDirty_ = false;
 
     const VkDeviceSize isize = indices.size() * sizeof(uint32_t);
     indexBuffer_ = createBuffer(isize,
@@ -1933,7 +2125,7 @@ void Renderer::setMaskColor(float r, float g, float b, float opacity) {
                      materials_.size() * sizeof(MaterialGpu));
     // Path tracing accumulates a static image; a colour edit must restart it or
     // the change only appears once the camera next moves.
-    ptSampleCount_ = 0;
+    resetAccumulation();
     ptDenoisedValid_ = false;
 }
 
@@ -1967,7 +2159,7 @@ void Renderer::setSubstrateAppearance(float r, float g, float b, float opacity) 
     uploadViaStaging(materialBuffer_, materials_.data(),
                      materials_.size() * sizeof(MaterialGpu));
     // Restart path-trace accumulation so the new appearance shows immediately.
-    ptSampleCount_ = 0;
+    resetAccumulation();
     ptDenoisedValid_ = false;
 }
 
@@ -1986,13 +2178,21 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
 
     vkResetFences(device_.handle, 1, &inFlight_[frame_]);
 
-    // Path-traced mode traces the exploded geometry: if the peel moved since the
-    // BLAS was last baked, rebuild it before recording (a synchronous AS build,
-    // so it must not run inside the command buffer). Raster/RT-raster explode in
-    // the vertex shader and never need this. No cost at rest (peel == baked).
-    if (mode_ == RenderMode::PathTraced && rtSupported_ &&
-        std::abs(explodeProgress_ - tracedExplode_) > 1.0e-4f) {
+    // Keep the traced geometry (BLAS) in sync with whoever is about to trace
+    // it: the path tracer always, the raster RT shadows only at rest (their
+    // gate). Rebuild before recording (a synchronous AS build must not run
+    // inside the command buffer) when the peel moved since the last bake OR the
+    // baked-in visibility changed. Costs nothing when nothing changed, and the
+    // raster explode animation itself never rebuilds -- it displaces in the
+    // vertex shader while the RT gate is closed anyway.
+    const bool tracingThisFrame =
+        mode_ == RenderMode::PathTraced ||
+        (rtRequested_ && explodeProgress_ < 0.01f);
+    if (rtSupported_ && tracingThisFrame &&
+        (std::abs(explodeProgress_ - tracedExplode_) > 1.0e-4f ||
+         tracedVisDirty_)) {
         rebuildTracedGeometry(explodeProgress_);
+        tracedVisDirty_ = false;
     }
 
     VkCommandBuffer cmd = commandBuffers_[frame_];

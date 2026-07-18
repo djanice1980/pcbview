@@ -15,9 +15,11 @@
 #include <vulkan/vulkan.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "geom/tessellate.h"
@@ -112,8 +114,11 @@ public:
     VkExtent2D sceneExtent() const { return sceneExtent_; }
     VkExtent2D windowExtent() const { return extent_; }
 
-    // UI mutates PartInfo::visible directly.
+    // Read access for the UI tree. Visibility changes must go through
+    // setPartVisible so the traced geometry (PT + RT shadows) follows -- a raw
+    // PartInfo::visible write only affects the raster draws.
     std::vector<PartInfo>& parts() { return parts_; }
+    void setPartVisible(const std::string& name, bool visible);
     const Device& device() const { return device_; }
     VkFormat colorFormat() const { return colorFormat_; }
     uint32_t imageCount() const { return static_cast<uint32_t>(images_.size()); }
@@ -134,17 +139,21 @@ public:
     bool pathTracingSupported() const { return rtSupported_; }
     void setRayCamera(const float eye[3], const float fwd[3],
                       const float right[3], const float up[3]);
-    void resetAccumulation() { ptSampleCount_ = 0; ptDenoisedValid_ = false; }
     int accumulatedSamples() const { return ptSampleCount_; }
     int maxSamples() const { return ptMaxSamples_; }
     void setMaxSamples(int n) { ptMaxSamples_ = n < 1 ? 1 : n; }
 
     // Intel Open Image Denoise on the accumulated result. Denoising is a
     // synchronous GPU->CPU->GPU step the caller triggers (denoise()) when it wants
-    // a clean frame -- typically at sample-count milestones. No-op if OIDN is off.
+    // a clean frame. No-op if OIDN is off.
     void setDenoising(bool on);
     bool denoising() const { return denoisingEnabled_; }
-    void denoise();
+    // Advance the continuous asynchronous denoise: kick a pass when the (still)
+    // camera has fresh samples, poll the fenced readback, hand OIDN to a worker
+    // thread, display the result when it lands. Never blocks the caller beyond
+    // a few ms. Returns true while a pass is in flight or was just displayed --
+    // the caller should keep frames coming so the state machine advances.
+    bool denoiseTick();
     // OIDN device actually selected: "CPU", "CUDA", "HIP", "SYCL", … (or "none").
     std::string oidnDeviceName() const;
 
@@ -270,6 +279,11 @@ private:
     Buffer tracedVertexBuffer_;
     std::vector<geom::Vertex> restVertices_;  // CPU copy, for re-baking the peel
     std::vector<float> vertexRank_;           // per-vertex explode rank
+    std::vector<uint32_t> vertexPart_;        // per-vertex part index (visibility bake)
+    // Set when part visibility (or anything else the traced geometry bakes in)
+    // changes; the next traced frame rebuilds the BLAS so PT and RT shadows stop
+    // rendering hidden parts.
+    bool tracedVisDirty_ = false;
     float tracedExplode_ = 0.0f;              // peel currently baked into the BLAS
     uint32_t asVertexCount_ = 0;              // counts the BLAS/TLAS were built with
     uint32_t asIndexCount_ = 0;
@@ -336,6 +350,40 @@ private:
     void* oidnNormalBuf_ = nullptr;
     void* oidnOutBuf_ = nullptr;
     uint32_t oidnW_ = 0, oidnH_ = 0;
+
+    // --- Asynchronous denoise state machine --------------------------------
+    // Idle -> (fenced GPU->host readback submitted, NOT waited) Reading ->
+    // (worker thread packs guides + runs OIDN) Filtering -> writeback ->
+    // Idle. ptGeneration_ stamps a pass at kickoff: if the accumulation
+    // restarts (camera moved) before the pass lands, the stale result is
+    // DISCARDED instead of ghosting the old view onto the new one.
+    enum class DenoiseState { Idle, Reading, Filtering };
+    DenoiseState dnState_ = DenoiseState::Idle;
+    VkFence dnFence_ = VK_NULL_HANDLE;
+    VkCommandBuffer dnCmd_ = VK_NULL_HANDLE;
+    Buffer dnColorBuf_, dnAlbedoBuf_, dnNormalBuf_, dnOutBuf_;
+    void* dnColorPtr_ = nullptr;   // persistent maps of the four host buffers
+    void* dnAlbedoPtr_ = nullptr;
+    void* dnNormalPtr_ = nullptr;
+    void* dnOutPtr_ = nullptr;
+    uint32_t dnW_ = 0, dnH_ = 0;
+    int dnSamples_ = 0;    // sample count captured at kickoff
+    int dnDisplayed_ = 0;  // sample count of the pass currently on screen
+    uint32_t dnGen_ = 0;
+    uint32_t ptGeneration_ = 0;
+    std::thread dnThread_;
+    std::atomic<bool> dnThreadDone_{false};
+    void ensureDenoiseBuffers(uint32_t w, uint32_t h);
+    void denoiseWorker(uint32_t w, uint32_t h, int samples);
+    void abortDenoise();  // wait/join and discard any in-flight pass
+    // Every accumulation restart goes through here so in-flight denoises know
+    // their input became stale.
+    void resetAccumulation() {
+        ptSampleCount_ = 0;
+        ptDenoisedValid_ = false;
+        dnDisplayed_ = 0;
+        ++ptGeneration_;
+    }
     VkDescriptorSetLayout ptSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout tonemapSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool ptPool_ = VK_NULL_HANDLE;

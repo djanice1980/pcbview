@@ -134,12 +134,19 @@ Intel Open Image Denoise.
   a huge value on a dark IC lid; capping per-sample radiance (`min(rad, 8)`) is the
   difference between grainy and clean — OIDN preserves un-clamped sparkle as
   "detail".
-- **OIDN denoise** (Apache-2.0, GPL-3-clean): a synchronous step (`Renderer::denoise`).
-  Reads back the averaged colour + first-hit albedo + normal guides, runs the `RT`
-  filter (hdr), writes the result to `ptDenoised_`; the tonemap reads it via a push
-  flag. Triggered at growing sample milestones (16, 64, 256, …) so the image cleans
-  progressively. The license-clean stand-in for DLSS Ray Reconstruction (which is
-  NVIDIA-proprietary and GPL-incompatible).
+- **OIDN denoise** (Apache-2.0, GPL-3-clean): a continuous ASYNCHRONOUS state
+  machine (`Renderer::denoiseTick`, ticked every PT frame): a fenced GPU→host
+  readback is submitted and *polled* — never waited — then a worker thread packs
+  the guides and runs all of OIDN (including the ~0.4 s first-run filter
+  commit), and the result lands in `ptDenoised_` when ready. The UI never
+  stalls, and the image refines every ~150 ms while the camera is still. A
+  kickoff needs ≥2 accumulated samples, which motion never reaches (accumulation
+  resets per frame) — so a moving image is never denoised, hence no ghosting;
+  `ptGeneration_` (bumped by `resetAccumulation()`, the single choke point for
+  accumulation resets) additionally discards passes whose input went stale
+  mid-flight. `abortDenoise()` drains the pass before anything it references is
+  destroyed (shutdown, resize, denoise-off). The license-clean stand-in for DLSS
+  Ray Reconstruction (which is NVIDIA-proprietary and GPL-incompatible).
   - **Device:** `OIDN_DEVICE_TYPE_DEFAULT` picks the fastest present — CUDA on the
     RTX 5070 Ti, HIP on the Radeon, else CPU (fallback on commit failure). GPU
     denoise is ~2.5× the CPU. **Must go through OIDN device buffers**
@@ -175,6 +182,16 @@ Intel Open Image Denoise.
   mosaic that it edge-stops on and preserves — ghosted silk, hazy masked traces.
   Albedo + normal accumulate like the colour; `denoise()` divides by the sample
   count and re-normalises the normal.
+- **Visibility is BAKED into the traced geometry.** A hidden part's vertices are
+  set to NaN in `bakeExplode` — the spec defines a NaN-vertex triangle as
+  *inactive*, so the BLAS drops it with no index surgery and the geometry
+  ranges / primitive re-basing stay untouched. The bake also applies raster's
+  collapsed-board rule (inner copper hidden at rest under an opaque substrate),
+  so PT traces exactly raster's visible set. Visibility changes MUST go through
+  `Renderer::setPartVisible` — a raw `PartInfo::visible` write only affects the
+  raster draws. The rebuild trigger in drawFrame syncs the traced geometry for
+  whichever consumer is about to trace (PT always; raster RT shadows at rest),
+  which also cured a stale-exploded-TLAS bug for RT shadows.
 - Env hooks: `PCBVIEW_PT=1`, `PCBVIEW_OIDN=1`, `PCBVIEW_PT_SPP=<n>`. Explode
   works: the BLAS is rebuilt from peel-baked vertices when the peel changes
   (`rebuildTracedGeometry`). Menu: Render → Path tracing / Neural denoise.

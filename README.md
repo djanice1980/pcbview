@@ -34,10 +34,16 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
 - **Exploded view.** `Ctrl` + scroll peels the stack outside-in, one ring at a
   time, dwelling between stages. The **dielectric is sliced between copper layers**,
   so inner trace layers separate into their true positions instead of sliding
-  through one block. Components lift off onto their own plane.
+  through one block. Components lift off onto their own plane — and so do the
+  **via barrels**, which stay intact as single plated tubes instead of being
+  sliced with the layers.
+- **Via barrels.** Every plated hole is lined with a copper barrel. Excellon
+  plating is read **per tool**, so merged (MixedPlating) drill programs split
+  plated from non-plated correctly; mounting holes stay bare.
 - **Adjustable appearance.** Override the finished thickness (preview a flex build
   at 0.1–0.8 mm), make the substrate translucent, and recolor the substrate and the
-  soldermask live.
+  soldermask — including the **mask opacity**, which drives how strongly traces
+  read through the film in both render modes.
 - **Layer control.** Per-layer visibility, a one-click components toggle, and
   auto-hiding side panels (pin, or peek-on-hover).
 - **Print & export.** Print as-shown, flat (overhead orthographic), or **flat at
@@ -48,11 +54,16 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   GPU renders (Render → Graphics device) — pcbview defaults to a discrete, RT-ready
   card.
 - **Path tracing + neural denoise.** A full progressive path tracer (global
-  illumination, soft area-light shadows, colour bleeding) that converges while the
-  view is still, cleaned in a fraction of the samples by **Intel Open Image
-  Denoise** — the license-clean, cross-vendor neural denoiser.
-- **Smooth navigation.** Orbit / pan / zoom, animated view presets (top / bottom /
-  iso / fit), orthographic toggle, drag-and-drop, and recent-file history.
+  illumination, soft area-light shadows, colour bleeding, a translucent
+  soldermask the traces read through) that converges while the view is still —
+  **including the exploded view** — cleaned by **Intel Open Image Denoise**
+  running GPU-accelerated (CUDA/HIP) on a background thread: the image snaps
+  clean within a couple of frames of the camera stopping and keeps refining,
+  with no UI stalls. Colours match the raster view (hue-preserving tonemap),
+  and layer/component visibility toggles apply in both modes.
+- **Smooth navigation.** Orbit / pan / glide-zoom, animated view presets (top /
+  bottom / iso / fit), orthographic toggle, drag-and-drop, and recent-file
+  history.
 
 ## Screenshots
 
@@ -77,6 +88,16 @@ Full path tracing with the neural denoiser — global illumination and colour bl
 clean:
 
 ![Path-traced, OIDN-denoised](docs/images/pathtracing.png)
+
+Path tracing works on populated boards — 3D component bodies with traced
+shadows and GI:
+
+![Path-traced board with 3D components](docs/images/pathtraced_components.png)
+
+…and in the exploded view, where the fading dielectric reveals the inner copper
+between the slabs:
+
+![Path-traced exploded view](docs/images/pathtraced_exploded.png)
 
 ## Controls
 
@@ -156,10 +177,12 @@ are incompatible with GPL-2.0. Full third-party attributions are in
 
 - **Done:** KiCad + Gerber import, tessellation, soldermask & silkscreen, the Qt
   "pro-CAD" GUI, exploded view, board appearance, 3D components, print/export,
-  ray-query ray tracing (contact shadows + AO) with GPU selection, and a full
-  path-tracing mode with Intel OIDN neural denoising.
-- **Next:** RT/PT during the exploded view (rebuild the acceleration structure per
-  stage), GPU-device OIDN, and a Linux build.
+  ray-query ray tracing (contact shadows + AO) with GPU selection, full
+  path tracing (translucent mask, exploded view, visibility toggles) with
+  GPU-accelerated Intel OIDN denoising on a background thread, via barrels with
+  per-tool Excellon plating, and mounting-hole / slot cutouts from Edge_Cuts.
+- **Next:** a Linux build, blind/buried via spans, and Excellon
+  routed-slot (`G00`/`G01`) support.
 
 ## Author & support
 

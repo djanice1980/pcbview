@@ -349,7 +349,6 @@ void VulkanWindow::setDenoising(bool on) {
     oidnEnabled_ = on;
     QSettings().setValue("denoising", on);
     if (renderer_) renderer_->setDenoising(on);
-    nextDenoiseAt_ = 16;
     const QString dev =
         renderer_ ? QString::fromStdString(renderer_->oidnDeviceName()) : "?";
     emit statusMessage(QString("Neural denoise %1%2")
@@ -489,19 +488,14 @@ void VulkanWindow::render() {
     frameMs_ = (frameMs_ == 0.0) ? ms : frameMs_ * 0.9 + ms * 0.1;
     emit frameRendered();
 
-    // Neural denoise at growing sample-count milestones (and at convergence), so
-    // the image cleans up progressively rather than only at the very end. The
-    // denoise is a synchronous readback + CPU filter, hence milestone-gated.
+    // Continuous asynchronous denoise: whenever the still camera has fresh
+    // samples, a pass is read back (fenced, never waited), filtered on a worker
+    // thread, and displayed when it lands. No milestones, no UI stalls -- the
+    // image cleans up within a couple of frames of the camera stopping and then
+    // refines continuously. Keep frames coming while a pass is in flight so the
+    // state machine advances.
     if (renderer_->renderMode() == vk::RenderMode::PathTraced && oidnEnabled_) {
-        const int s = renderer_->accumulatedSamples();
-        if (s < lastPtSamples_) nextDenoiseAt_ = 16;  // accumulation restarted
-        lastPtSamples_ = s;
-        const bool converged = s >= renderer_->maxSamples();
-        if (s > 0 && (s >= nextDenoiseAt_ || converged)) {
-            renderer_->denoise();
-            nextDenoiseAt_ = s * 4;
-            requestUpdate();  // re-tonemap showing the denoised result
-        }
+        if (renderer_->denoiseTick()) requestUpdate();
     }
 
     // Keep the loop alive while the peel moves OR the path tracer is still
