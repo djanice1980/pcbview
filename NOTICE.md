@@ -28,6 +28,7 @@ mutually compatible at GPL-3:
 | glm | MIT | permissive |
 | cgltf | MIT | permissive |
 | Intel Open Image Denoise | Apache-2.0 | compatible with GPL-3; **incompatible with GPL-2** |
+| Intel Embree | Apache-2.0 | compatible with GPL-3; **incompatible with GPL-2** |
 
 Both Qt's LGPL-3 and Apache-2.0 are **incompatible with GPL-2**. Relicensing
 pcbview to GPL-2 would therefore be legally impossible while keeping Qt and
@@ -116,12 +117,29 @@ here.
 | miniz | MIT |
 | cgltf | MIT |
 | Intel Open Image Denoise | Apache-2.0 |
+| Intel Embree | Apache-2.0 |
+| Mesa (lavapipe) | MIT |
+| Vulkan SDK | Apache-2.0 |
 
 The `OpenImageDenoise*.dll` and `tbb12.dll` files staged beside the executable are
 the Intel Open Image Denoise runtime (Apache-2.0), used for neural denoising of the
 path-traced image. Apache-2.0 is GPL-3-compatible. The CPU, CUDA (NVIDIA) and HIP
 (AMD) device runtimes are bundled; OIDN selects the fastest available GPU at
 runtime, falling back to the CPU. The SYCL device is not bundled.
-| Vulkan SDK | Apache-2.0 |
+
+The `embree4.dll`, `tbb12.dll` and `tbbmalloc.dll` files staged beside the
+executable are **Intel Embree** (Apache-2.0) and its oneTBB runtime (also
+Apache-2.0), used for CPU ray tracing: when the CPU rendering device is
+selected, both the ray-traced preview and the path tracer run their ray
+traversal through Embree instead of the GPU's ray-query hardware. Apache-2.0 is
+GPL-3-compatible.
+
+The `vulkan_lvp.dll` file (with `lvp_icd.x86_64.json`) staged beside the executable
+is Mesa's **lavapipe**, a software (CPU) Vulkan driver, so the board can be rendered
+without a capable GPU. It is a prebuilt package from the
+[mesa-dist-win](https://github.com/pal1000/mesa-dist-win) project; Mesa is
+MIT-licensed and GPL-3-compatible. pcbview registers it additively at startup, so
+it appears as an optional "llvmpipe" CPU device alongside any hardware GPUs and is
+never chosen automatically.
 
 All permissive and GPL-3-compatible.

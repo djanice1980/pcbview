@@ -6,6 +6,8 @@
 #include <QMouseEvent>
 #include <QPlatformSurfaceEvent>
 #include <QSettings>
+
+#include "app/settings.h"
 #include <QWheelEvent>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE  // Vulkan clip space, not OpenGL's
@@ -173,27 +175,32 @@ void VulkanWindow::releaseResources() {
 void VulkanWindow::initialise() {
     if (initialised_) return;
 
-    // Surface extensions for this platform. Qt will create the surface, but the
-    // instance is ours, so we must enable them ourselves.
-    std::vector<const char*> extensions{VK_KHR_SURFACE_EXTENSION_NAME};
+    // The instance is created ONCE and kept for the window's lifetime; a device
+    // switch may recreate the platform surface (see setPreferredGpu) and re-enter
+    // initialise(), but must not build a second instance.
+    if (instance_ == VK_NULL_HANDLE) {
+        // Surface extensions for this platform. Qt will create the surface, but
+        // the instance is ours, so we must enable them ourselves.
+        std::vector<const char*> extensions{VK_KHR_SURFACE_EXTENSION_NAME};
 #ifdef Q_OS_WIN
-    extensions.push_back("VK_KHR_win32_surface");
+        extensions.push_back("VK_KHR_win32_surface");
 #elif defined(Q_OS_LINUX)
-    extensions.push_back("VK_KHR_xcb_surface");
+        extensions.push_back("VK_KHR_xcb_surface");
 #endif
 
-    instance_ = createInstance(/*enableValidation=*/true, extensions);
-    messenger_ = createDebugMessenger(instance_);
+        instance_ = createInstance(/*enableValidation=*/true, extensions);
+        messenger_ = createDebugMessenger(instance_);
 
-    // Hand Qt OUR instance rather than letting it make one. This is what keeps
-    // the RT extension setup ours.
-    qtInstance_.setVkInstance(instance_);
-    if (!qtInstance_.create()) {
-        throw std::runtime_error(
-            "QVulkanInstance::create() failed: " +
-            std::to_string(qtInstance_.errorCode()));
+        // Hand Qt OUR instance rather than letting it make one. This is what
+        // keeps the RT extension setup ours.
+        qtInstance_.setVkInstance(instance_);
+        if (!qtInstance_.create()) {
+            throw std::runtime_error(
+                "QVulkanInstance::create() failed: " +
+                std::to_string(qtInstance_.errorCode()));
+        }
+        setVulkanInstance(&qtInstance_);
     }
-    setVulkanInstance(&qtInstance_);
 
     surface_ = QVulkanInstance::surfaceForWindow(this);
     if (surface_ == VK_NULL_HANDLE) {
@@ -203,18 +210,20 @@ void VulkanWindow::initialise() {
     // Device preference: an explicit env override wins, else the persisted pick.
     const QByteArray envGpu = qgetenv("PCBVIEW_GPU");
     preferredGpu_ = !envGpu.isEmpty() ? QString::fromLocal8Bit(envGpu)
-                                      : QSettings().value("gpuName").toString();
+                                      : appSettings().value("gpuName").toString();
     // PCBVIEW_RT=1/0 forces the ray-traced path for a headless capture; otherwise
     // the persisted setting decides.
     rtEnabled_ = qEnvironmentVariableIsSet("PCBVIEW_RT")
                      ? qgetenv("PCBVIEW_RT").toInt() != 0
-                     : QSettings().value("rayTracing", false).toBool();
+                     : appSettings().value("rayTracing", false).toBool();
     ptEnabled_ = qEnvironmentVariableIsSet("PCBVIEW_PT")
                      ? qgetenv("PCBVIEW_PT").toInt() != 0
-                     : QSettings().value("pathTracing", false).toBool();
+                     : appSettings().value("pathTracing", false).toBool();
     oidnEnabled_ = qEnvironmentVariableIsSet("PCBVIEW_OIDN")
                        ? qgetenv("PCBVIEW_OIDN").toInt() != 0
-                       : QSettings().value("denoising", true).toBool();
+                       : appSettings().value("denoising", true).toBool();
+    // fastMove_ is loaded in createDeviceAndRenderer -- its default depends on
+    // the device (on for the CPU renderer, off for a GPU).
 
     createDeviceAndRenderer();
 
@@ -254,19 +263,41 @@ void VulkanWindow::createDeviceAndRenderer() {
     renderer_ = std::make_unique<vk::Renderer>(
         device_, surface_, static_cast<uint32_t>(width() * dpr),
         static_cast<uint32_t>(height() * dpr));
-    renderer_->setRayTracing(rtEnabled_ && device_.rayQueryEnabled);
+    renderer_->setRayTracing(rtEnabled_ && rtAvailable());
     if (qEnvironmentVariableIsSet("PCBVIEW_PT_SPP"))
         renderer_->setMaxSamples(qgetenv("PCBVIEW_PT_SPP").toInt());
-    renderer_->setRenderMode(ptEnabled_ && device_.rayQueryEnabled
+    // Headless hook for the internal-resolution slider -- exists because some
+    // artifacts (OIDN tiling seams) only appear above a pixel-count threshold
+    // that the default headless window never reaches.
+    if (qEnvironmentVariableIsSet("PCBVIEW_RENDER_SCALE"))
+        renderer_->setRenderScale(qgetenv("PCBVIEW_RENDER_SCALE").toFloat());
+
+    // Fast-movement default is DEVICE-dependent: on for the CPU renderer (path
+    // tracing there is far too slow to orbit under), off for a GPU. Persisted
+    // per device class; an env override wins. A device swap re-evaluates it.
+    if (qEnvironmentVariableIsSet("PCBVIEW_FAST_MOVE"))
+        fastMove_ = qgetenv("PCBVIEW_FAST_MOVE").toInt() != 0;
+    else
+        fastMove_ = appSettings()
+                        .value(cpuRender() ? "fastMovementCpu" : "fastMovementGpu",
+                               cpuRender())
+                        .toBool();
+    // A fresh renderer starts in whatever mode we set below; clear any stale
+    // motion-downgrade latch from the previous device so the two agree.
+    motionDowngraded_ = false;
+
+    renderer_->setRenderMode(ptEnabled_ && ptAvailable()
                                  ? vk::RenderMode::PathTraced
                                  : vk::RenderMode::Raster);
     renderer_->setDenoising(oidnEnabled_);
     if (mesh_) renderer_->uploadBoard(*mesh_);
 
+    const bool isCpu = device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_CPU;
     emit statusMessage(
         QString("%1  |  ray tracing: %2  |  %3 triangles")
             .arg(QString::fromStdString(device_.gpu.name))
-            .arg(!device_.rayQueryEnabled ? "unsupported"
+            .arg(isCpu                   ? "RT + path tracing via Embree (CPU)"
+                 : !device_.rayQueryEnabled ? "unsupported"
                  : rtEnabled_             ? "ON"
                                           : "available (off)")
             .arg(renderer_->stats().trianglesTotal));
@@ -291,15 +322,42 @@ QString VulkanWindow::activeGpuName() const {
     return QString::fromStdString(device_.gpu.name);
 }
 
-bool VulkanWindow::rtAvailable() const { return device_.rayQueryEnabled; }
+bool VulkanWindow::cpuRender() const {
+    return device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_CPU;
+}
+
+// RT (shadows + AO on the raster look) runs via Vulkan ray queries on a GPU,
+// and via the Embree preview integrator on the CPU device.
+bool VulkanWindow::rtAvailable() const {
+    return device_.rayQueryEnabled || cpuRender();
+}
+
+// Path tracing: Vulkan ray query on a GPU, Embree on the CPU device.
+bool VulkanWindow::ptAvailable() const {
+    return device_.rayQueryEnabled || cpuRender();
+}
 
 void VulkanWindow::setPreferredGpu(const QString& nameSubstring) {
     preferredGpu_ = nameSubstring;
-    QSettings().setValue("gpuName", nameSubstring);
+    appSettings().setValue("gpuName", nameSubstring);
     if (!initialised_ || !renderer_) return;
 
-    // Rebuild the device and renderer on the chosen GPU. Instance and surface are
-    // kept; the camera and explode state persist across the swap.
+    // Whether this swap involves the software CPU device. Switching the
+    // PRESENTING driver (a hardware GPU <-> Mesa lavapipe) on the SAME native
+    // window leaves the Windows compositor stuck on the old swapchain -- frames
+    // render (the FPS counter keeps ticking) but nothing new reaches the screen.
+    // The cure is a whole new native window, and since this QWindow lives inside
+    // a QWidget::createWindowContainer, only the OWNER can rebuild that pair --
+    // recreating the platform window in place detaches the container (tried:
+    // blank viewport). GPU<->GPU swaps have no such problem and keep the cheap
+    // in-place device swap.
+    const bool oldWasCpu = device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    const bool newIsCpu = nameSubstring.contains("llvmpipe", Qt::CaseInsensitive);
+    if (oldWasCpu || newIsCpu) {
+        emit viewportRebuildRequired();  // queued; MainWindow replaces us
+        return;
+    }
+
     renderer_->waitIdle();
     renderer_.reset();
     if (device_.handle != VK_NULL_HANDLE) {
@@ -314,27 +372,29 @@ void VulkanWindow::setPreferredGpu(const QString& nameSubstring) {
 
 void VulkanWindow::setRayTracing(bool on) {
     rtEnabled_ = on;
-    QSettings().setValue("rayTracing", on);
-    if (renderer_) renderer_->setRayTracing(on && device_.rayQueryEnabled);
+    appSettings().setValue("rayTracing", on);
+    if (renderer_) renderer_->setRayTracing(on && rtAvailable());
     emit statusMessage(QString("Ray tracing %1")
-                           .arg(!rtAvailable() ? "unsupported on this GPU"
-                                : on            ? "ON"
-                                                : "off"));
+                           .arg(!rtAvailable() ? "unsupported on this device"
+                                : on ? (cpuRender() ? "ON — CPU (Embree preview)"
+                                                    : "ON")
+                                     : "off"));
     requestUpdate();
 }
 
 void VulkanWindow::setPathTracing(bool on) {
     ptEnabled_ = on;
-    QSettings().setValue("pathTracing", on);
+    appSettings().setValue("pathTracing", on);
     if (renderer_) {
-        renderer_->setRenderMode(on && device_.rayQueryEnabled
+        renderer_->setRenderMode(on && ptAvailable()
                                      ? vk::RenderMode::PathTraced
                                      : vk::RenderMode::Raster);
     }
     emit statusMessage(QString("Path tracing %1")
-                           .arg(!rtAvailable() ? "unsupported on this GPU"
-                                : on            ? "ON — accumulating…"
-                                                : "off"));
+                           .arg(!ptAvailable() ? "unsupported on this device"
+                                : on ? (cpuRender() ? "ON — CPU (Embree), accumulating…"
+                                                    : "ON — accumulating…")
+                                     : "off"));
     requestUpdate();
 }
 
@@ -345,9 +405,43 @@ int VulkanWindow::ptMaxSamples() const {
     return renderer_ ? renderer_->maxSamples() : 0;
 }
 
+void VulkanWindow::setFastMovement(bool on) {
+    fastMove_ = on;
+    // Persist per device class so the CPU and GPU keep independent defaults.
+    appSettings().setValue(cpuRender() ? "fastMovementCpu" : "fastMovementGpu", on);
+    // If motion is not active, nothing to change now; if it turned off mid-drag,
+    // the next frame's applyMotionQuality restores full quality.
+    if (!on && motionDowngraded_) requestUpdate();
+    emit statusMessage(QString("Fast movement (raster while moving) %1")
+                           .arg(on ? "ON" : "off"));
+}
+
+void VulkanWindow::applyMotionQuality(bool moving) {
+    if (!renderer_) return;
+    // Path tracing at CPU (Embree) speed is a slideshow while moving, so the
+    // downgrade must fire for the CPU device too -- ptAvailable(), not just the
+    // Vulkan ray-query flag.
+    const bool downgrade = fastMove_ && moving &&
+                           ((ptEnabled_ && ptAvailable()) ||
+                            (rtEnabled_ && rtAvailable()));
+    if (downgrade == motionDowngraded_) return;  // no transition -> no thrash
+    motionDowngraded_ = downgrade;
+    if (downgrade) {
+        // Force plain raster for the duration of the motion. The user's ptEnabled_
+        // / rtEnabled_ intents are untouched, so restore is exact.
+        renderer_->setRenderMode(vk::RenderMode::Raster);
+        renderer_->setRayTracing(false);
+    } else {
+        renderer_->setRenderMode(ptEnabled_ && ptAvailable()
+                                     ? vk::RenderMode::PathTraced
+                                     : vk::RenderMode::Raster);
+        renderer_->setRayTracing(rtEnabled_ && rtAvailable());
+    }
+}
+
 void VulkanWindow::setDenoising(bool on) {
     oidnEnabled_ = on;
-    QSettings().setValue("denoising", on);
+    appSettings().setValue("denoising", on);
     if (renderer_) renderer_->setDenoising(on);
     const QString dev =
         renderer_ ? QString::fromStdString(renderer_->oidnDeviceName()) : "?";
@@ -439,6 +533,12 @@ void VulkanWindow::render() {
     const bool zooming = stepZoomAnimation();
     const bool stillAnimating = exploding || gliding || zooming;
 
+    // Fast-movement: a drag, pan, or any in-flight animation counts as motion.
+    // While moving, render plain raster; restore the requested mode when it
+    // stops. The animation flags double as the settle timer -- they stay true
+    // until the ease reaches its target, and a mouse drag restores on release.
+    applyMotionQuality(dragging_ || draggingInv_ || panning_ || stillAnimating);
+
     QElapsedTimer timer;
     timer.start();
 
@@ -469,15 +569,28 @@ void VulkanWindow::render() {
     proj[1][1] *= -1.0f;  // Vulkan's Y is flipped relative to GL
     const glm::mat4 viewProj = proj * view;
 
-    // Path tracer needs the camera as a ray basis (eye + pixel-plane spans), not
-    // a matrix. Setting it resets accumulation whenever the view changed.
-    if (renderer_->renderMode() == vk::RenderMode::PathTraced) {
-        const float tanY = std::tan(glm::radians(camera_.fovDegrees) * 0.5f);
-        const float tanX = tanY * (w / h);
+    // Tracers need the camera as a ray basis (eye + pixel-plane spans), not a
+    // matrix. Setting it resets accumulation whenever the view changed. The CPU
+    // RT preview traces from this basis too, so feed it in raster mode when the
+    // RT toggle is live on the CPU device.
+    if (renderer_->renderMode() == vk::RenderMode::PathTraced ||
+        (cpuRender() && rtEnabled_)) {
         const glm::vec3 fwd = glm::normalize(basis.forward);
-        const glm::vec3 right = basis.right * tanX;
-        const glm::vec3 up = basis.up * tanY;
-        renderer_->setRayCamera(&eye[0], &fwd[0], &right[0], &up[0]);
+        glm::vec3 right, up;
+        if (camera_.orthographic) {
+            // Half-extents in mm, mirroring the raster ortho projection.
+            const float halfH = camera_.distance * 0.5f;
+            const float halfW = halfH * (w / h);
+            right = basis.right * halfW;
+            up = basis.up * halfH;
+        } else {
+            const float tanY = std::tan(glm::radians(camera_.fovDegrees) * 0.5f);
+            const float tanX = tanY * (w / h);
+            right = basis.right * tanX;
+            up = basis.up * tanY;
+        }
+        renderer_->setRayCamera(&eye[0], &fwd[0], &right[0], &up[0],
+                                camera_.orthographic);
     }
 
     if (!renderer_->drawFrame(&viewProj[0][0], &eye[0])) {
@@ -498,12 +611,9 @@ void VulkanWindow::render() {
         if (renderer_->denoiseTick()) requestUpdate();
     }
 
-    // Keep the loop alive while the peel moves OR the path tracer is still
-    // accumulating samples toward convergence.
-    const bool accumulating =
-        renderer_->renderMode() == vk::RenderMode::PathTraced &&
-        renderer_->accumulatedSamples() < renderer_->maxSamples();
-    if (stillAnimating || accumulating) requestUpdate();
+    // Keep the loop alive while the peel moves OR a progressive tracer (GPU PT,
+    // CPU PT, or the CPU RT preview) is still accumulating toward convergence.
+    if (stillAnimating || renderer_->accumulating()) requestUpdate();
 }
 
 void VulkanWindow::exposeEvent(QExposeEvent*) {
@@ -546,28 +656,34 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
     cameraAnimating_ = false;
     lastPos_ = e->position();
     if (e->button() == Qt::LeftButton) dragging_ = true;
-    if (e->button() == Qt::RightButton || e->button() == Qt::MiddleButton) {
-        panning_ = true;
-    }
+    // Right-drag rotates INVERSELY to left-drag (mirror directions); middle
+    // pans. User request: with pan on the middle button, the right button is
+    // free to be the "other way round" orbit.
+    if (e->button() == Qt::RightButton) draggingInv_ = true;
+    if (e->button() == Qt::MiddleButton) panning_ = true;
 }
 
 void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
     if (e->button() == Qt::LeftButton) dragging_ = false;
-    if (e->button() == Qt::RightButton || e->button() == Qt::MiddleButton) {
-        panning_ = false;
-    }
+    if (e->button() == Qt::RightButton) draggingInv_ = false;
+    if (e->button() == Qt::MiddleButton) panning_ = false;
+    // A drag has no easing animation to keep the loop alive, so without this the
+    // fast-movement downgrade would never get the frame that restores PT/RT once
+    // the button comes up.
+    if (!dragging_ && !draggingInv_ && !panning_) requestUpdate();
 }
 
 void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
     const QPointF delta = e->position() - lastPos_;
     lastPos_ = e->position();
 
-    if (dragging_) {
-        camera_.yaw = wrapPi(camera_.yaw + static_cast<float>(delta.x()) * 0.008f);
+    if (dragging_ || draggingInv_) {
+        const float s = dragging_ ? 0.008f : -0.008f;  // right button mirrors
+        camera_.yaw = wrapPi(camera_.yaw + static_cast<float>(delta.x()) * s);
         // No clamp: the basis is pole-safe, so pitch rotates through and keeps
         // going. Past vertical the view inverts, which is correct.
         camera_.pitch =
-            wrapPi(camera_.pitch + static_cast<float>(delta.y()) * 0.008f);
+            wrapPi(camera_.pitch + static_cast<float>(delta.y()) * s);
         requestUpdate();
     } else if (panning_) {
         // Pan across the SCREEN plane, using the camera's own right/up. Using

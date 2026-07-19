@@ -810,10 +810,29 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             // holes too small for the void just render as a solid plug.
             const double gap = 0.03;   // clearance from the drilled wall (mm)
             const double wall = 0.15;  // plating thickness shown (mm)
+
+            // Castellated holes -- drills the routed board edge cuts through --
+            // get NO barrel at all: only drills FULLY inside the outline keep
+            // their plating tube. (Half-barrels looked wrong; the user wants
+            // the milled half-holes bare.)
+            Paths64 fullBarrels;
+            fullBarrels.reserve(art.barrels.size());
+            for (const Path64& b : art.barrels) {
+                Clipper64 t;
+                t.AddSubject(Paths64{b});
+                t.AddClip(art.outline);
+                Paths64 inside;
+                t.Execute(ClipType::Intersection, FillRule::NonZero, inside);
+                double insideArea = 0.0;
+                for (const Path64& p : inside) insideArea += Area(p);
+                if (insideArea >= std::abs(Area(b)) * 0.999)
+                    fullBarrels.push_back(b);
+            }
+
             const auto inset = [&](double d) {
                 ClipperOffset co;
                 co.ArcTolerance(kScale * 0.001);
-                co.AddPaths(art.barrels, JoinType::Round, EndType::Polygon);
+                co.AddPaths(fullBarrels, JoinType::Round, EndType::Polygon);
                 Paths64 r;
                 co.Execute(-d * kScale, r);
                 return r;

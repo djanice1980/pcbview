@@ -1,5 +1,7 @@
 #include "app/main_window.h"
 
+#include "app/settings.h"
+
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
@@ -83,11 +85,6 @@ MainWindow::MainWindow(const QString& path) {
     resize(1600, 950);
     setAcceptDrops(true);
 
-    viewport_ = new VulkanWindow(nullptr);
-    QWidget* container = QWidget::createWindowContainer(viewport_, this);
-    container->setMinimumSize(480, 360);
-    container->setFocusPolicy(Qt::StrongFocus);
-
     // A native QWindow draws over any Qt widget in the same area, so an overlaid
     // "no board" hint would be invisible. Stack them and swap instead.
     placeholder_ = new QLabel(
@@ -102,7 +99,7 @@ MainWindow::MainWindow(const QString& path) {
 
     stack_ = new QStackedWidget;
     stack_->addWidget(placeholder_);  // index 0
-    stack_->addWidget(container);     // index 1
+    buildViewport();                  // index 1: viewport container
     setCentralWidget(stack_);
 
     buildMenus();
@@ -110,46 +107,6 @@ MainWindow::MainWindow(const QString& path) {
     buildStackupDock();
     buildPropertiesDock();
     buildStatusBar();
-
-    connect(viewport_, &VulkanWindow::frameRendered, this,
-            &MainWindow::onFrameRendered);
-    connect(viewport_, &VulkanWindow::statusMessage, this,
-            [this](const QString& t) { toolbarInfo_->setText(t); });
-    // The renderer's parts only exist after upload, so reconcile then -- and
-    // push the substrate appearance, which the renderer resets to default tan on
-    // every uploadBoard.
-    connect(viewport_, &VulkanWindow::boardUploaded, this, [this] {
-        populateStackup();
-        applyAppearance();
-    });
-    connect(viewport_, &VulkanWindow::explodeChanged, this,
-            [this](float progress, float maxProgress) {
-                if (progress <= 0.0f || maxProgress <= 0.0f) {
-                    explodeLabel_->setText("off");
-                } else {
-                    // Round up: part-way through lifting ring 2 still reads
-                    // "2 / 5", which matches what you are looking at.
-                    explodeLabel_->setText(
-                        QString("%1 / %2")
-                            .arg(static_cast<int>(std::ceil(progress)))
-                            .arg(static_cast<int>(std::ceil(maxProgress))));
-                }
-                explodeLabel_->setStyleSheet(
-                    QString("color:%1")
-                        .arg(progress > 0.0f ? theme::kText : theme::kTextDim));
-            });
-
-    // The viewport is a native QWindow, so its keys never reach the QAction
-    // shortcut machinery. It forwards what it does not consume; we match the
-    // menu shortcuts here. No double-firing: when focus is on a real widget the
-    // QAction fires and this signal is never emitted.
-    connect(viewport_, &VulkanWindow::unhandledKey, this,
-            [this](int key, Qt::KeyboardModifiers mods) {
-                const QKeySequence seq(key | static_cast<int>(mods.toInt()));
-                if (seq == QKeySequence(QKeySequence::Open)) onOpen();
-                else if (seq == QKeySequence(QKeySequence::Refresh)) onReload();
-                else if (seq == QKeySequence(QKeySequence::Quit)) close();
-            });
 
     rebuildRecentMenu();
     // PCBVIEW_OPEN lets a headless run load a package the CLI arg can't express
@@ -170,6 +127,23 @@ MainWindow::MainWindow(const QString& path) {
     if (startView == "top") viewport_->setViewTop();
     else if (startView == "bottom") viewport_->setViewBottom();
     else if (startView == "iso") viewport_->setViewIso();
+
+    // Headless orthographic-projection hook (the O toggle can't be driven by
+    // synthetic input; exists to verify ortho in the traced modes).
+    if (qEnvironmentVariable("PCBVIEW_START_ORTHO").toInt() != 0)
+        viewport_->camera().orthographic = true;
+
+    // Headless close-up: set the orbit distance AFTER first expose --
+    // initialise()'s frameBoard() would clobber a pre-expose value (the usual
+    // before-first-frame trap). Needed to reproduce artifacts that only show
+    // when zoomed tight (the camera cannot be driven by synthetic input).
+    if (qEnvironmentVariableIsSet("PCBVIEW_START_DISTANCE")) {
+        const float d = qEnvironmentVariable("PCBVIEW_START_DISTANCE").toFloat();
+        QTimer::singleShot(600, this, [this, d] {
+            viewport_->camera().distance = d;
+            viewport_->requestUpdate();
+        });
+    }
 
     if (qEnvironmentVariableIsSet("PCBVIEW_START_EXPLODE")) {
         viewport_->setExplodeProgress(
@@ -216,6 +190,98 @@ MainWindow::MainWindow(const QString& path) {
             QTimer::singleShot(1000, qApp, &QApplication::quit);
         });
     }
+}
+
+void MainWindow::buildViewport() {
+    viewport_ = new VulkanWindow(loaded_ ? &mesh_ : nullptr);
+    viewportContainer_ = QWidget::createWindowContainer(viewport_, this);
+    viewportContainer_->setMinimumSize(480, 360);
+    viewportContainer_->setFocusPolicy(Qt::StrongFocus);
+    stack_->insertWidget(1, viewportContainer_);  // placeholder stays index 0
+
+    connect(viewport_, &VulkanWindow::frameRendered, this,
+            &MainWindow::onFrameRendered);
+    connect(viewport_, &VulkanWindow::statusMessage, this,
+            [this](const QString& t) { toolbarInfo_->setText(t); });
+    // The renderer's parts only exist after upload, so reconcile then -- and
+    // push the substrate appearance, which the renderer resets to default tan on
+    // every uploadBoard.
+    connect(viewport_, &VulkanWindow::boardUploaded, this, [this] {
+        populateStackup();
+        applyAppearance();
+    });
+    connect(viewport_, &VulkanWindow::explodeChanged, this,
+            [this](float progress, float maxProgress) {
+                if (progress <= 0.0f || maxProgress <= 0.0f) {
+                    explodeLabel_->setText("off");
+                } else {
+                    // Round up: part-way through lifting ring 2 still reads
+                    // "2 / 5", which matches what you are looking at.
+                    explodeLabel_->setText(
+                        QString("%1 / %2")
+                            .arg(static_cast<int>(std::ceil(progress)))
+                            .arg(static_cast<int>(std::ceil(maxProgress))));
+                }
+                explodeLabel_->setStyleSheet(
+                    QString("color:%1")
+                        .arg(progress > 0.0f ? theme::kText : theme::kTextDim));
+            });
+
+    // The viewport is a native QWindow, so its keys never reach the QAction
+    // shortcut machinery. It forwards what it does not consume; we match the
+    // menu shortcuts here. No double-firing: when focus is on a real widget the
+    // QAction fires and this signal is never emitted.
+    connect(viewport_, &VulkanWindow::unhandledKey, this,
+            [this](int key, Qt::KeyboardModifiers mods) {
+                const QKeySequence seq(key | static_cast<int>(mods.toInt()));
+                if (seq == QKeySequence(QKeySequence::Open)) onOpen();
+                else if (seq == QKeySequence(QKeySequence::Refresh)) onReload();
+                else if (seq == QKeySequence(QKeySequence::Quit)) close();
+            });
+
+    // QUEUED: the request is emitted from inside the viewport's own method, and
+    // the rebuild deletes that viewport -- it must not die under its own stack
+    // frame.
+    connect(viewport_, &VulkanWindow::viewportRebuildRequired, this,
+            &MainWindow::rebuildViewport, Qt::QueuedConnection);
+}
+
+void MainWindow::rebuildViewport() {
+    // Carry the view over; every toggle/preference reloads from the persisted
+    // settings inside the new window's initialise().
+    const Camera cam = viewport_->camera();
+    const float explode = viewport_->explodeProgress();
+
+    VulkanWindow* oldViewport = viewport_;
+    QWidget* oldContainer = viewportContainer_;
+    stack_->removeWidget(oldContainer);
+
+    buildViewport();
+    if (loaded_) stack_->setCurrentWidget(viewportContainer_);
+
+    // The new window frames the board on first expose (frameBoard snaps), which
+    // would clobber the carried-over camera -- restore it after the first
+    // upload. One-shot connection.
+    auto* conn = new QMetaObject::Connection;
+    *conn = connect(viewport_, &VulkanWindow::boardUploaded, this,
+                    [this, cam, explode, conn] {
+                        disconnect(*conn);
+                        delete conn;
+                        viewport_->camera() = cam;
+                        viewport_->setExplodeProgress(explode, /*snap=*/true);
+                        viewport_->requestUpdate();
+                    });
+
+    // The old device's numbers must not linger on screen -- an on-demand raster
+    // can go idle before the every-15th-frame refresh fires, leaving the CPU
+    // device's frame time displayed under a GPU render (or vice versa).
+    statusPerf_->setText(QString());
+    frameCounter_ = 14;  // next rendered frame refreshes the readout
+
+    // The container owns the QWindow; deleting it tears down the old surface,
+    // swapchain and device with it (releaseResources via PlatformSurface).
+    oldContainer->deleteLater();
+    Q_UNUSED(oldViewport);
 }
 
 bool MainWindow::loadBoard(const QString& path) {
@@ -381,6 +447,7 @@ void MainWindow::applyAppearance() {
                                         maskColor_[2], maskOpacity_);
     viewport_->renderer()->setComponentShine(fxComponentShine_ / 100.0f);
     viewport_->renderer()->setPadShine(fxPadShine_ / 100.0f);
+    viewport_->renderer()->setShadowSoftness(fxShadowSoftness_ / 100.0f);
     viewport_->requestUpdate();
 }
 
@@ -580,7 +647,7 @@ void MainWindow::dropEvent(QDropEvent* e) {
 }
 
 void MainWindow::rememberRecent(const QString& path) {
-    QSettings s;
+    QSettings s = appSettings();
     QStringList recent = s.value("recentFiles").toStringList();
     recent.removeAll(path);
     recent.prepend(path);
@@ -593,7 +660,7 @@ void MainWindow::rebuildRecentMenu() {
     if (!recentMenu_) return;
     recentMenu_->clear();
 
-    QSettings s;
+    QSettings s = appSettings();
     QStringList recent = s.value("recentFiles").toStringList();
     // Drop entries whose file has since been moved or deleted.
     recent.erase(std::remove_if(recent.begin(), recent.end(),
@@ -612,7 +679,7 @@ void MainWindow::rebuildRecentMenu() {
     }
     recentMenu_->addSeparator();
     recentMenu_->addAction("Clear", this, [this] {
-        QSettings().setValue("recentFiles", QStringList());
+        appSettings().setValue("recentFiles", QStringList());
         rebuildRecentMenu();
     });
 }
@@ -735,37 +802,59 @@ void MainWindow::buildMenus() {
     connect(oidn, &QAction::toggled, this,
             [this](bool on) { viewport_->setDenoising(on); });
 
+    render->addSeparator();
+    QAction* fastMove =
+        render->addAction("&Fast movement (raster while moving)");
+    fastMove->setCheckable(true);
+    fastMove->setToolTip(
+        "While orbiting, panning, zooming or exploding, drop to plain raster and "
+        "restore ray tracing / path tracing when motion stops. Keeps low-power "
+        "GPUs and the CPU device responsive.");
+    connect(fastMove, &QAction::toggled, this,
+            [this](bool on) { viewport_->setFastMovement(on); });
+
     QMenu* gpuMenu = render->addMenu("&Graphics device");
 
     // The GPU list and RT capability are known only after the renderer exists
     // (first expose), so fill these in each time the menu opens.
-    connect(render, &QMenu::aboutToShow, this, [this, rt, pt, oidn, gpuMenu] {
-        const bool avail = viewport_->renderer() && viewport_->rtAvailable();
+    connect(render, &QMenu::aboutToShow, this,
+            [this, rt, pt, oidn, fastMove, gpuMenu] {
+        const bool haveRenderer = viewport_->renderer() != nullptr;
+        const bool rtAvail = haveRenderer && viewport_->rtAvailable();
+        const bool ptAvail = haveRenderer && viewport_->ptAvailable();
         const bool ptOn = viewport_->pathTracing();
-        // RT shadows are a RASTER enhancement. While path tracing owns the
-        // frame the toggle has no effect at all, so grey it out -- otherwise
-        // both read "on" at once and imply they compose. The checked state is
-        // kept, so it comes back when path tracing is switched off.
-        rt->setEnabled(avail && !ptOn);
-        pt->setEnabled(avail);
-        oidn->setEnabled(avail && ptOn);
-        rt->setToolTip(!avail
-                           ? "This GPU does not expose ray_query"
+        // RT shadows are a RASTER enhancement, GPU-only (Vulkan ray query). While
+        // path tracing owns the frame the toggle has no effect at all, so grey it
+        // out -- otherwise both read "on" at once and imply they compose. The
+        // checked state is kept, so it comes back when path tracing is off.
+        rt->setEnabled(rtAvail && !ptOn);
+        pt->setEnabled(ptAvail);
+        oidn->setEnabled(ptAvail && ptOn);
+        rt->setToolTip(!rtAvail
+                           ? "This device cannot ray trace"
                        : ptOn
                            ? "Not applicable while path tracing is on -- the "
                              "path tracer computes full-scene lighting itself"
+                       : viewport_->cpuRender()
+                           ? "Contact shadows + ambient occlusion via Intel "
+                             "Embree on the CPU (assembled board only)"
                            : "Contact shadows + ambient occlusion, ray-traced "
                              "(shown on the assembled board, not while exploded)");
-        pt->setToolTip(avail ? "Full progressive path tracing — accurate global "
-                               "illumination; converges while the view is still"
-                             : "This GPU does not expose ray_query");
+        pt->setToolTip(ptAvail
+                           ? (viewport_->cpuRender()
+                                  ? "Full path tracing on the CPU via Intel Embree; "
+                                    "converges while the view is still"
+                                  : "Full progressive path tracing — accurate global "
+                                    "illumination; converges while the view is still")
+                           : "This device cannot path trace");
         oidn->setToolTip("Intel Open Image Denoise — clean the path-traced image "
                          "in a fraction of the samples");
         {
-            const QSignalBlocker b1(rt), b2(pt), b3(oidn);
+            const QSignalBlocker b1(rt), b2(pt), b3(oidn), b4(fastMove);
             rt->setChecked(viewport_->rayTracing());
             pt->setChecked(viewport_->pathTracing());
             oidn->setChecked(viewport_->denoising());
+            fastMove->setChecked(viewport_->fastMovement());
         }
 
         gpuMenu->clear();
@@ -773,7 +862,7 @@ void MainWindow::buildMenus() {
             gpuMenu->addAction("(initialising…)")->setEnabled(false);
             return;
         }
-        const bool autoPick = QSettings().value("gpuName").toString().isEmpty();
+        const bool autoPick = appSettings().value("gpuName").toString().isEmpty();
         const QString active = viewport_->activeGpuName();
         auto* group = new QActionGroup(gpuMenu);
         group->setExclusive(true);
@@ -787,7 +876,14 @@ void MainWindow::buildMenus() {
         gpuMenu->addSeparator();
 
         for (const QString& name : viewport_->availableGpuNames()) {
-            QAction* a = gpuMenu->addAction(name);
+            // The software CPU driver enumerates as "llvmpipe (LLVM …)"; show it
+            // as a plain "CPU Rendering (llvm)". Selection still keys off the real
+            // device name.
+            const QString label =
+                name.contains("llvmpipe", Qt::CaseInsensitive)
+                    ? QStringLiteral("CPU Rendering (llvm)")
+                    : name;
+            QAction* a = gpuMenu->addAction(label);
             a->setCheckable(true);
             a->setChecked(!autoPick && name == active);
             group->addAction(a);
@@ -799,21 +895,28 @@ void MainWindow::buildMenus() {
     // --- Effects: stylised looks, deliberately NOT physically accurate ---
     // Component reflections turn IC/cap bodies chrome-like so they mirror the
     // board around them in the path tracer -- showing off what PT can do.
-    fxComponentShine_ = QSettings().value("fxComponentShine", 0).toInt();
-    fxPadShine_ = QSettings().value("fxPadShine", 94).toInt();
+    fxComponentShine_ = appSettings().value("fxComponentShine", 0).toInt();
+    fxPadShine_ = appSettings().value("fxPadShine", 94).toInt();
+    fxShadowSoftness_ = appSettings().value("fxShadowSoftness", 15).toInt();
     if (qEnvironmentVariableIsSet("PCBVIEW_FX_COMPONENT"))
         fxComponentShine_ = qEnvironmentVariable("PCBVIEW_FX_COMPONENT").toInt();
     if (qEnvironmentVariableIsSet("PCBVIEW_FX_PADS"))
         fxPadShine_ = qEnvironmentVariable("PCBVIEW_FX_PADS").toInt();
+    if (qEnvironmentVariableIsSet("PCBVIEW_FX_SHADOW"))
+        fxShadowSoftness_ = qEnvironmentVariable("PCBVIEW_FX_SHADOW").toInt();
 
     QMenu* effects = menuBar()->addMenu("&Effects");
+    // Each slider shows its CURRENT VALUE in the label ("Pad shine — 94"), so a
+    // setting can be read, reported, and reproduced exactly rather than
+    // eyeballed from the handle position.
     const auto addFxSlider = [&](const QString& label, int initial,
                                  const std::function<void(int)>& apply) {
         auto* box = new QWidget(effects);
         auto* lay = new QVBoxLayout(box);
         lay->setContentsMargins(12, 6, 12, 6);
         lay->setSpacing(2);
-        auto* text = new QLabel(label, box);
+        auto* text =
+            new QLabel(QString("%1 — %2").arg(label).arg(initial), box);
         auto* slider = new QSlider(Qt::Horizontal, box);
         slider->setRange(0, 100);
         slider->setValue(initial);
@@ -823,23 +926,35 @@ void MainWindow::buildMenus() {
         auto* action = new QWidgetAction(effects);
         action->setDefaultWidget(box);
         effects->addAction(action);
-        connect(slider, &QSlider::valueChanged, this, apply);
+        connect(slider, &QSlider::valueChanged, this,
+                [text, label, apply](int v) {
+                    text->setText(QString("%1 — %2").arg(label).arg(v));
+                    apply(v);
+                });
     };
     addFxSlider("Component reflections (mirror finish)", fxComponentShine_,
                 [this](int v) {
                     fxComponentShine_ = v;
-                    QSettings().setValue("fxComponentShine", v);
+                    appSettings().setValue("fxComponentShine", v);
                     if (viewport_->renderer())
                         viewport_->renderer()->setComponentShine(v / 100.0f);
                     viewport_->requestUpdate();
                 });
     addFxSlider("Pad shine", fxPadShine_, [this](int v) {
         fxPadShine_ = v;
-        QSettings().setValue("fxPadShine", v);
+        appSettings().setValue("fxPadShine", v);
         if (viewport_->renderer())
             viewport_->renderer()->setPadShine(v / 100.0f);
         viewport_->requestUpdate();
     });
+    addFxSlider("Shadow softness (sun size, path tracing)", fxShadowSoftness_,
+                [this](int v) {
+                    fxShadowSoftness_ = v;
+                    appSettings().setValue("fxShadowSoftness", v);
+                    if (viewport_->renderer())
+                        viewport_->renderer()->setShadowSoftness(v / 100.0f);
+                    viewport_->requestUpdate();
+                });
 
     QMenu* help = menuBar()->addMenu("&Help");
     help->addAction("&About pcbview…", this, &MainWindow::showAbout);
@@ -1327,7 +1442,7 @@ void MainWindow::showAbout() {
     // copyright must appear here and the user must be directed to the licences.
     QMessageBox::about(
         this, "About pcbview",
-        "<h3>pcbview 1.11</h3>"
+        "<h3>pcbview 1.12</h3>"
         "<p>Standalone 3D PCB viewer. Renders what the fab will build.</p>"
         "<p>Copyright © 2026 pcbview contributors.<br>"
         "pcbview is free software under the <b>GNU General Public License "

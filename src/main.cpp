@@ -26,6 +26,7 @@
 
 #include "app/viewer.h"
 #include "geom/tessellate.h"
+#include "render/cpu/cpu_tracer.h"
 #include "io/gerber/gerber_parser.h"
 #include "io/gerber/gerber_project.h"
 #include "io/kicad/kicad_importer.h"
@@ -51,6 +52,35 @@ namespace {
 // redirection away and send everything to the console instead, so a caller doing
 // `pcbview board.kicad_pcb > out.txt` (or any shell capturing the output) would
 // silently receive nothing. Only claim the console when nothing else owns stdout.
+// Register the software (CPU) Vulkan driver we ship beside the exe, so a
+// "llvmpipe" CPU device appears in the picker without a system-wide Mesa install.
+//
+// VK_ADD_DRIVER_FILES *adds* to the drivers the loader finds on its own, unlike
+// VK_ICD_FILENAMES which REPLACES them -- using the latter would hide the real
+// GPUs. The loader reads this at vkCreateInstance, which every path here reaches
+// only after main() starts, so setting it now is early enough. If the driver was
+// not staged (a bare dev build), the file is absent and we do nothing.
+void registerBundledVulkanDriver() {
+#ifdef _WIN32
+    wchar_t exePath[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    std::wstring dir(exePath, exePath + n);
+    const size_t slash = dir.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) return;
+    const std::wstring icd = dir.substr(0, slash + 1) + L"lvp_icd.x86_64.json";
+    if (GetFileAttributesW(icd.c_str()) == INVALID_FILE_ATTRIBUTES) return;
+
+    // Preserve anything the user already set; the loader accepts ';'-separated.
+    std::wstring value = icd;
+    wchar_t existing[4096];
+    const DWORD got =
+        GetEnvironmentVariableW(L"VK_ADD_DRIVER_FILES", existing, 4096);
+    if (got > 0 && got < 4096) value = std::wstring(existing) + L";" + icd;
+    SetEnvironmentVariableW(L"VK_ADD_DRIVER_FILES", value.c_str());
+#endif
+}
+
 void attachParentConsole() {
 #ifdef _WIN32
     const HANDLE existing = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -361,8 +391,101 @@ int gerberProbe(const std::string& path) {
     return 0;
 }
 
+// --cpu-trace <board> <out.bmp>: import a board, build the Embree scene, trace a
+// primary-ray image from an iso view, and write a BMP. De-risks the Embree CPU
+// tracer (does its BVH hold the whole ~1M-triangle board? -- lavapipe's did not)
+// without any Vulkan/display plumbing.
+int cpuTrace(const std::string& boardPath, const std::string& outBmp) {
+    pcbview::geom::BoardMesh mesh;
+    const bool isKicad = boardPath.size() > 10 &&
+                         boardPath.substr(boardPath.size() - 10) == ".kicad_pcb";
+    if (isKicad) {
+        const pcbview::BoardModel board = pcbview::kicad::importPcb(boardPath);
+        mesh = pcbview::geom::tessellate(board);
+    } else {
+        const pcbview::geom::LayerArt art =
+            pcbview::gerber::importPackage(boardPath);
+        mesh = pcbview::geom::assemble(art);
+    }
+
+    pcbview::cpu::CpuTracer tracer;
+    tracer.setScene(mesh);
+    if (!tracer.ready()) {
+        std::fprintf(stderr, "cpu-trace: empty scene\n");
+        return 1;
+    }
+
+    const int W = 1024, H = 800;
+    const auto& b = mesh.bounds;
+    const double cx = 0.5 * (b.min[0] + b.max[0]);
+    const double cy = 0.5 * (b.min[1] + b.max[1]);
+    const double cz = 0.5 * (b.min[2] + b.max[2]);
+    const double dx = b.max[0] - b.min[0], dy = b.max[1] - b.min[1];
+    const double span = std::max(dx, dy);
+
+    // iso basis, matching vulkan_window's cameraBasis(yaw=0.6, pitch=0.62).
+    const float yaw = 0.6f, pitch = 0.62f;
+    const float cosP = std::cos(pitch), sinP = std::sin(pitch);
+    const float offx = cosP * std::sin(yaw), offy = -cosP * std::cos(yaw),
+                offz = sinP;
+    const float dist = static_cast<float>(span) * 1.6f + 20.0f;
+    const float fovY = 45.0f * 3.14159265f / 180.0f;
+    const float tanY = std::tan(fovY * 0.5f);
+    const float tanX = tanY * (static_cast<float>(W) / H);
+
+    const float rightx = std::cos(yaw), righty = std::sin(yaw), rightz = 0.0f;
+    // up = cross(right, forward), forward = -offset
+    const float fwdx = -offx, fwdy = -offy, fwdz = -offz;
+    const float upx = righty * fwdz - rightz * fwdy;
+    const float upy = rightz * fwdx - rightx * fwdz;
+    const float upz = rightx * fwdy - righty * fwdx;
+
+    pcbview::cpu::TraceCamera cam;
+    cam.eye = {static_cast<float>(cx) + dist * offx,
+               static_cast<float>(cy) + dist * offy,
+               static_cast<float>(cz) + dist * offz};
+    cam.fwd = {fwdx, fwdy, fwdz};
+    cam.right = {rightx * tanX, righty * tanX, rightz * tanX};
+    cam.up = {upx * tanY, upy * tanY, upz * tanY};
+
+    const std::vector<uint8_t> rgba = tracer.renderImage(cam, W, H, 64, true);
+
+    // Minimal 24-bit BMP (bottom-up, 4-byte-padded rows) from the RGBA8 buffer,
+    // which is already gamma-encoded.
+    const int rowBytes = W * 3;
+    const int padding = (4 - (rowBytes % 4)) % 4;
+    const int imageBytes = (rowBytes + padding) * H;
+    const int fileBytes = 54 + imageBytes;
+    std::ofstream out(outBmp, std::ios::binary);
+    if (!out) { std::fprintf(stderr, "cannot write %s\n", outBmp.c_str()); return 1; }
+    uint8_t hdr[54] = {};
+    hdr[0] = 'B'; hdr[1] = 'M';
+    std::memcpy(&hdr[2], &fileBytes, 4);
+    const int off = 54, dib = 40; std::memcpy(&hdr[10], &off, 4);
+    std::memcpy(&hdr[14], &dib, 4);
+    std::memcpy(&hdr[18], &W, 4);
+    std::memcpy(&hdr[22], &H, 4);
+    const uint16_t planes = 1, bpp = 24;
+    std::memcpy(&hdr[26], &planes, 2); std::memcpy(&hdr[28], &bpp, 2);
+    std::memcpy(&hdr[34], &imageBytes, 4);
+    out.write(reinterpret_cast<char*>(hdr), 54);
+    const uint8_t pad[3] = {0, 0, 0};
+    for (int y = H - 1; y >= 0; --y) {
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const uint8_t bgr[3] = {rgba[i + 2], rgba[i + 1], rgba[i]};
+            out.write(reinterpret_cast<const char*>(bgr), 3);
+        }
+        if (padding) out.write(reinterpret_cast<const char*>(pad), padding);
+    }
+    std::printf("cpu-trace: %zu triangles -> %s\n", mesh.totalTriangles(),
+                outBmp.c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     attachParentConsole();
+    registerBundledVulkanDriver();
     try {
         // No arguments: open the viewer with an empty board rather than printing
         // a report and exiting. Double-clicking the exe should give you the app.
@@ -372,6 +495,8 @@ int main(int argc, char** argv) {
         if (std::string(argv[1]) == "--view" && argc == 2)
             return pcbview::app::runViewer("");
         if (std::string(argv[1]) == "--gpu-info") return gpuReport();
+        if (std::string(argv[1]) == "--cpu-trace" && argc >= 4)
+            return cpuTrace(argv[2], argv[3]);
         if (std::string(argv[1]) == "--gerber-probe" && argc >= 3)
             return gerberProbe(argv[2]);
         if (std::string(argv[1]) == "--gerber" && argc >= 4) {

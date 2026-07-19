@@ -103,14 +103,27 @@ private:
     // renderer does not exist until first expose. Pushed to it on boardUploaded.
     std::array<float, 3> subColor_ = {0.72f, 0.61f, 0.38f};
     float subOpacity_ = 1.0f;
-    std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};
+    std::array<float, 3> maskColor_ = {0.010f, 0.246f, 0.025f};
     float maskOpacity_ = 0.72f;
     // Effects menu (stylised, persisted; 0-100 slider values).
     int fxComponentShine_ = 0;
     int fxPadShine_ = 94;
+    int fxShadowSoftness_ = 15;  // sun radius = v% of 8 deg; 15 = 1.2 deg
     void applyAppearance();  // push colours/opacity if the renderer exists
 
+    // Create viewport_ + its container and wire every viewport signal. Called at
+    // construction and again by rebuildViewport().
+    void buildViewport();
+    // Tear down and recreate the viewport window + container. Required when the
+    // graphics device switches between a hardware GPU and the software CPU
+    // driver: Windows cannot re-associate an existing native window with a new
+    // presenting driver (the screen freezes on the last pre-switch frame), so
+    // the native window itself must be replaced. Camera and peel carry over;
+    // everything else re-loads from the persisted settings.
+    void rebuildViewport();
+
     VulkanWindow* viewport_ = nullptr;
+    QWidget* viewportContainer_ = nullptr;
     QStackedWidget* stack_ = nullptr;
     QLabel* placeholder_ = nullptr;
     QTreeWidget* stackup_ = nullptr;

@@ -58,7 +58,9 @@ public:
     // and surface are kept), then persists the choice.
     QStringList availableGpuNames() const { return gpuNames_; }
     QString activeGpuName() const;
-    bool rtAvailable() const;   // the active device can do ray queries
+    bool rtAvailable() const;   // active device can do Vulkan ray queries (RT shadows)
+    bool cpuRender() const;     // active device is a software (CPU) device
+    bool ptAvailable() const;   // path tracing available (Vulkan RT on a GPU, Embree on CPU)
     void setPreferredGpu(const QString& nameSubstring);
 
     // Ray-traced shadows/AO on top of the raster shading. No-op if the device
@@ -77,6 +79,14 @@ public:
     // Intel OIDN neural denoising of the path-traced result. Persisted.
     void setDenoising(bool on);
     bool denoising() const { return oidnEnabled_; }
+
+    // "Fast movement": while the board is being orbited / panned / zoomed /
+    // exploded, drop to plain raster (no path tracing, no RT shadows) so a
+    // low-power GPU or the CPU device stays interactive, then restore the
+    // requested mode the instant motion settles. RT/PT at CPU speeds is a
+    // slideshow otherwise. Persisted; default on.
+    void setFastMovement(bool on);
+    bool fastMovement() const { return fastMove_; }
 
     // Frame the whole board. Animates unless snap=true (board load/reload should
     // not swoop the camera).
@@ -123,6 +133,16 @@ signals:
     // progress in stages, and the total number of stages a full peel takes.
     void explodeChanged(float progress, float maxProgress);
 
+    // The device switch needs a WHOLE NEW viewport window. Switching the
+    // presenting driver (hardware GPU <-> the software CPU driver) on the same
+    // native HWND leaves the Windows compositor stuck on the old swapchain --
+    // frames present "successfully" but never reach the screen. Recreating just
+    // the platform window in place breaks the QWidget::createWindowContainer
+    // embedding (the container keeps the dead native handle), so the OWNER must
+    // rebuild the container + VulkanWindow pair. MainWindow connects QUEUED and
+    // does exactly that; the persisted settings carry every preference across.
+    void viewportRebuildRequired();
+
 protected:
     void exposeEvent(QExposeEvent*) override;
     void resizeEvent(QResizeEvent*) override;
@@ -167,6 +187,14 @@ private:
     bool rtEnabled_ = false;       // ray-traced shadows/AO requested
     bool ptEnabled_ = false;       // path-tracing mode requested
     bool oidnEnabled_ = false;     // neural denoising requested
+    bool fastMove_ = true;         // drop to raster while the view is moving
+
+    // Apply the fast-movement rule for this frame. Switches the renderer between
+    // the requested mode and plain raster ONLY on a transition, so PT
+    // accumulation is not reset every frame while the view is still. `moving` is
+    // any orbit/pan/zoom/explode/glide in progress.
+    void applyMotionQuality(bool moving);
+    bool motionDowngraded_ = false;  // currently forced to raster by motion
 
     Camera camera_;
     Camera viewTarget_;             // where a view preset / Fit is gliding to
@@ -186,6 +214,7 @@ private:
     bool stepZoomAnimation();
     bool initialised_ = false;
     bool dragging_ = false;
+    bool draggingInv_ = false;  // right-drag: mirrored orbit
     bool panning_ = false;
     QPointF lastPos_;
     double frameMs_ = 0.0;

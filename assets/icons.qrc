@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="pcbview.png">pcbview_256.png</file>
+    </qresource>
+</RCC>

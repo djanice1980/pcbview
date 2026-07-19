@@ -22,8 +22,11 @@
 #include <thread>
 #include <vector>
 
+#include <memory>
+
 #include "geom/tessellate.h"
 #include "render/common/device.h"
+#include "render/cpu/cpu_tracer.h"
 
 namespace pcbview::vk {
 
@@ -102,6 +105,9 @@ public:
     // can do. Pad shine: how polished the exposed copper/pads are.
     void setComponentShine(float s01);
     void setPadShine(float s01);
+    // Sun angular size for the path tracers: 0 = point sun (razor shadows),
+    // 1 = 8-degree radius (very soft penumbras). Restarts accumulation.
+    void setShadowSoftness(float s01);
 
     // Exploded view, peeled outside-in.
     //
@@ -146,10 +152,21 @@ public:
     void setRenderMode(RenderMode m);
     RenderMode renderMode() const { return mode_; }
     bool pathTracingSupported() const { return rtSupported_; }
+    // `ortho`: rays are PARALLEL along fwd, with eye offset across the
+    // right/up plane (right/up carry the half-extents in mm instead of
+    // tan(halfFov)). Matches the raster orthographic projection, so the Ortho
+    // toggle works in the traced modes too.
     void setRayCamera(const float eye[3], const float fwd[3],
-                      const float right[3], const float up[3]);
-    int accumulatedSamples() const { return ptSampleCount_; }
-    int maxSamples() const { return ptMaxSamples_; }
+                      const float right[3], const float up[3], bool ortho);
+    int accumulatedSamples() const {
+        return cpuMode_ && cpuTracer_ ? cpuTracer_->samples() : ptSampleCount_;
+    }
+    int maxSamples() const {
+        // The CPU (Embree) tracer converges to a good OIDN-cleaned image in far
+        // fewer samples, and every sample is expensive, so cap it lower.
+        return cpuMode_ ? (ptMaxSamples_ < 128 ? ptMaxSamples_ : 128)
+                        : ptMaxSamples_;
+    }
     void setMaxSamples(int n) { ptMaxSamples_ = n < 1 ? 1 : n; }
 
     // Intel Open Image Denoise on the accumulated result. Denoising is a
@@ -310,12 +327,53 @@ private:
     std::vector<DrawItem> draws_;
     std::vector<PartInfo> parts_;
     std::vector<MaterialGpu> materials_;  // CPU copy, for live appearance edits
+
+    // --- CPU path tracing (Embree) -----------------------------------------
+    // On a CPU device the Vulkan ray-query path is unusable (lavapipe's software
+    // BVH silently drops most triangles), so path tracing routes to Embree. The
+    // result is copied into sceneColor_ and presented through the SHARED blit +
+    // UI + present path, exactly like the raster and GPU-PT scenes.
+    bool cpuMode_ = false;
+    std::unique_ptr<cpu::CpuTracer> cpuTracer_;
+    // One staging buffer PER FRAME IN FLIGHT: the CPU writes the next image
+    // while the previous frame's copy may still be executing, so sharing one
+    // buffer was a write-during-read race (torn frames).
+    std::vector<Buffer> cpuStaging_;
+    VkDeviceSize cpuStagingBytes_ = 0;
+    uint32_t cpuTracerGen_ = 0xFFFFFFFFu;  // ptGeneration_ the tracer last saw
+    uint32_t cpuPass_ = 0;                 // accumulate() pass since last reset
+    bool cpuPreviewActive_ = false;        // last pass was the RT preview
+    // Last DENOISED display image, shown between denoise milestones so the
+    // render thread is not blocked on OIDN every frame (the GPU path does the
+    // same asynchronously).
+    std::vector<uint8_t> cpuDisplayCache_;
+    // The RT-preview integrator converges fast; cap it low so the loop idles.
+    int cpuTargetSamples() const {
+        return mode_ == RenderMode::PathTraced ? maxSamples() : 32;
+    }
+    void recordCpuPathTrace(VkCommandBuffer cmd, bool preview);
+
+public:
+    // True while a progressive tracer (GPU PT, CPU PT, or the CPU RT preview)
+    // still has samples to add -- the caller keeps frames coming while so.
+    bool accumulating() const {
+        if (cpuMode_) {
+            if (!cpuTracer_) return false;
+            const bool tracing = mode_ == RenderMode::PathTraced ||
+                                 (rtRequested_ && explodeProgress_ < 0.01f);
+            return tracing && cpuTracer_->samples() < cpuTargetSamples();
+        }
+        return mode_ == RenderMode::PathTraced && ptSampleCount_ < ptMaxSamples_;
+    }
+
+private:
     std::array<float, 3> substrateColor_ = {0.72f, 0.61f, 0.38f};  // FR4 tan
     float substrateOpacity_ = 1.0f;
     std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};  // green
     float maskOpacity_ = 0.72f;  // mask albedo.a; drives raster blend + PT show-through
     float componentShine_ = 0.0f;  // 0 matte .. 1 chrome (stylised effect)
     float padShine_ = 0.94f;       // maps to copper roughness 0.5 .. 0.02
+    float shadowSoftness_ = 0.15f; // sun radius = s * 8 deg (default 1.2 deg)
     std::string capturePath_;
 
     // Ray-query RT. Built only when the device advertised ray_query. `blas_` is a
@@ -340,6 +398,7 @@ private:
     RenderMode mode_ = RenderMode::Raster;
     int ptSampleCount_ = 0;     // samples accumulated at the current camera
     int ptMaxSamples_ = 512;    // stop accumulating past this
+    bool rayOrtho_ = false;
     float rayEye_[3] = {0, 0, 0};
     float rayFwd_[3] = {0, 0, 1};
     float rayRight_[3] = {1, 0, 0};

@@ -8,9 +8,16 @@ install required.
 > **Amended 2026-07-16 — "single executable" no longer holds.** The GUI is Qt,
 > used under LGPL-3.0, which requires dynamic linking (see
 > [NOTICE.md](NOTICE.md)). pcbview now ships as a **portable folder**: the
-> executable plus Qt's DLLs, no installer, no registry, xcopy-deployable.
+> executable plus Qt's DLLs, no registry, xcopy-deployable.
 > Everything else stands — no KiCad install, no package manager, native parsers.
 > This was decided knowingly, with the cost on the table.
+>
+> **Amended 2026-07-19 — an installer now exists *alongside* the portable
+> folder, not instead of it.** `installer/pcbview.iss` (Inno Setup) wraps the
+> deployed `build/Release` into `pcbview-<version>-setup.exe` (Start Menu +
+> optional desktop shortcut + uninstaller; per-machine or per-user). The
+> portable zip remains a first-class release artifact, and the app itself still
+> touches no registry — settings stay in `~/.pcbview/settings.xml`.
 
 ## The governing principle
 
@@ -183,6 +190,17 @@ Intel Open Image Denoise.
     filter on opaque-flagged geometry is silently dead code (bit us once).
   - GI bounce rays start `0.03` off the surface, which skips the thin films
     entirely — alpha only matters on camera/shadow rays, which is fine.
+  - **The alpha dice is IDEMPOTENT per (ray, primitive), never a sequential
+    draw.** The spec allows traversal to report the same triangle multiple
+    times as a candidate (NVIDIA spatially splits large triangles across BVH
+    cells and reports each crossing). A sequential `rnd()` rolled per report
+    inflated the film's commit probability per BVH cell — the mask rendered in
+    visibly different greens with seams along the world-axis split planes,
+    NVIDIA-only, worst on large boards. The dice hashes (per-bounce seed ^
+    primitive id), so every report of a primitive gets the same verdict; the
+    film geometry additionally carries
+    `VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR`. Any future
+    candidate-loop logic must stay duplicate-report-safe.
 - **Denoiser guides are ACCUMULATED, not sampled once.** With stochastic alpha, a
   single sample's first-hit albedo is a coin flip (film colour vs what's
   beneath); writing the guide from sample 0 alone hands OIDN a per-pixel noise
@@ -202,6 +220,75 @@ Intel Open Image Denoise.
 - Env hooks: `PCBVIEW_PT=1`, `PCBVIEW_OIDN=1`, `PCBVIEW_PT_SPP=<n>`. Explode
   works: the BLAS is rebuilt from peel-baked vertices when the peel changes
   (`rebuildTracedGeometry`). Menu: Render → Path tracing / Neural denoise.
+
+## CPU rendering (built) — lavapipe raster + Embree tracing
+
+A full CPU device: **CPU Rendering (llvm)** in Render → Graphics device. Two
+separate engines behind one menu entry, because neither can do the other's job:
+
+- **Raster + present: Mesa lavapipe.** A prebuilt `vulkan_lvp.dll` (from
+  mesa-dist-win, staged beside the exe with its ICD json) is registered
+  *additively* at startup via `VK_ADD_DRIVER_FILES`, so it appears as one more
+  Vulkan device next to the hardware GPUs and is never chosen automatically.
+  The whole raster path — pipelines, reversed-Z, the material SSBO — runs on it
+  unchanged.
+- **All ray tracing: Intel Embree 4** (`src/render/cpu/cpu_tracer.cpp`).
+  Lavapipe advertises no ray-query, and worse, **its BVH silently drops
+  triangles on ~1M-triangle scenes** (measured; boards vanish piecemeal), so it
+  cannot be trusted to trace even in software. SwiftShader has no RT extensions
+  at all (verified via `VK_ICD_FILENAMES` isolation). Embree is the only
+  reliable CPU traversal, so `CpuTracer` owns *both* traced modes when the CPU
+  device is active: the RT preview and the path tracer. The renderer writes the
+  traced image into per-frame-in-flight staging buffers (one per frame in
+  flight — a single buffer raced the previous frame's copy) and copies it into
+  the swapchain image.
+
+Design rules that keep it correct:
+
+- **The CPU path tracer is a line-for-line twin of `pathtrace.comp`.** Same
+  RNG (`hashu`/LCG), same lighting rig, same sun-cone sampling, same laminate
+  transmission, same material fetch. Any shader change MUST be mirrored — the
+  user compares GPU and CPU renders side by side and has caught divergence.
+- **The RT preview is a verbatim mirror of `board_rt.frag`**, not a cheap PT:
+  camera-relative key/fill lighting (0.15/0.65/0.20), one traced key shadow,
+  the fixed 6-ray AO kernel, no tonemap/exposure. Translucent films are
+  composited analytically (raster alpha blend) rather than traced through —
+  tracing them reused the stochastic film dice and let AO probes from film
+  surfaces hit copper 35 µm below, which read as ambient blotches.
+- **Stochastic alpha runs in Embree filter callbacks**
+  (`rtcSetGeometryIntersectFilterFunction`), the CPU analogue of the GPU's
+  candidate loop. The dice is idempotent per primitive
+  (`hashu(diceSeed ^ prim)`) so duplicate filter invocations agree — same
+  lesson as the NVIDIA BVH-split squares. **Do not replace the filters with a
+  `tnear = t + eps` restart loop**: coincident surfaces (mask bottom on copper
+  top) fall inside the epsilon per-triangle and produce blocky mottling.
+- **Explode + visibility are baked** (`CpuTracer::bake`): displaced vertices
+  for the peel, NaN vertices for hidden parts — the same inactive-triangle
+  rule the GPU BLAS uses, driven off the same `PartSpan` ranks as
+  `uploadBoard`.
+- **Denoising is milestone-based** (power-of-two sample counts ≤ 32, then
+  every 32), with the last denoised frame cached for display between
+  milestones — OIDN on every progressive frame would starve the tracer.
+
+**Switching device to/from CPU rebuilds the whole viewport widget.** On
+Windows, swapping the presenting ICD (hardware GPU ↔ lavapipe) on the same
+native HWND leaves the compositor stuck on the last pre-switch frame — the new
+device renders (perf counters advance) but nothing presents. In-place
+`QWindow::destroy()`/`create()` does NOT fix it and additionally breaks the
+`createWindowContainer` embedding (blank client area). The only working fix is
+what a manual app-restart-into-CPU-mode proved out: `MainWindow` tears down and
+recreates the container + `VulkanWindow` (`rebuildViewport`, triggered by the
+`viewportRebuildRequired` signal), restoring camera and explode state across
+the swap and clearing the perf label (its 15-frame refresh throttle otherwise
+shows the old device's numbers).
+
+Fast movement (reduced-resolution render while the camera moves) defaults
+**on** for the CPU device and **off** for GPUs, persisted independently
+(`fastMovementCpu` / `fastMovementGpu`).
+
+Settings live in **`~/.pcbview/settings.xml`** — a custom XML `QSettings`
+format (`appSettings()`, `src/app/settings.cpp`) registered so the file is
+human-readable and portable; nothing goes to the registry.
 
 ## The three RT-readiness rules
 
@@ -973,6 +1060,8 @@ interactive run. All are opt-in. Grouped by purpose:
   synthesis (see the SendKeys warning above).
 - `PCBVIEW_START_EXPLODE=<progress>` — open with the stack peeled to `progress`
   (0 = collapsed; up to `maxRank`, ~mid+1 with components), snapped not animated.
+- `PCBVIEW_START_ORTHO=1` — open in orthographic projection.
+- `PCBVIEW_START_DISTANCE=<mm>` — opening camera distance (overrides fit).
 
 **Appearance (mirror the Appearance dialog, which input synthesis can't drive)**
 - `PCBVIEW_THICKNESS=<mm>` — finished-board thickness override.
@@ -986,7 +1075,14 @@ interactive run. All are opt-in. Grouped by purpose:
 - `PCBVIEW_OIDN=1|0` — force neural denoise on/off (else persisted, default on).
 - `PCBVIEW_PT_SPP=<n>` — path-tracer sample cap (convergence target).
 - `PCBVIEW_GPU=<name-substring>` — pick the GPU by name substring (else the
-  persisted `gpuName`, else discrete+RT-ready).
+  persisted `gpuName`, else discrete+RT-ready). Matching the lavapipe device
+  name selects CPU rendering.
+- `PCBVIEW_RENDER_SCALE=<0.25-1>` — headless hook for the internal-resolution
+  slider (some artifacts, e.g. OIDN tiling seams, only appear above a
+  pixel-count threshold the default headless window never reaches).
+- `PCBVIEW_FAST_MOVE=1|0` — force fast movement (reduced-res while the camera
+  moves) on/off; else persisted **per device class** (`fastMovementCpu` /
+  `fastMovementGpu`, default on for the CPU renderer, off for a GPU).
 
 **Capture / verification**
 - `PCBVIEW_CAPTURE=<out.bmp>` — grab the presented Vulkan frame after a settle
@@ -1008,6 +1104,8 @@ interactive run. All are opt-in. Grouped by purpose:
 **Effects (stylised)**
 - `PCBVIEW_FX_COMPONENT=<0-100>` — component reflections (mirror finish).
 - `PCBVIEW_FX_PADS=<0-100>` — pad/copper shine.
+- `PCBVIEW_FX_SHADOW=<0-100>` — path-tracing shadow softness (sun angular
+  size; slider value 15 = default = 1.2° radius, 100 = 8°).
 
 ### Verifying the GUI on a scaled display
 
@@ -1104,6 +1202,10 @@ colour/side group at once.
   "Component rendering" above).
 - **Phase 4** — **Done.** Ray-query RT: contact shadows + ambient occlusion from
   the fragment shader, GPU selectable. See "Ray tracing (built)" above.
+- **Phase 5** — **Done.** CPU rendering device (lavapipe raster + Embree
+  tracing, see "CPU rendering (built)" above), soft sun + laminate
+  transmission in both tracers, Effects sliders with readouts, app icon, and
+  the Inno Setup installer.
 
 ## Test corpus
 
@@ -1114,6 +1216,11 @@ output from it — a far stronger correctness check than eyeballing renders.
 ## Toolchain (verified on this box 2026-07-16)
 
 - Vulkan SDK `1.4.335.0` (`VULKAN_SDK` set) — provides `glslc`, `dxc`, `slangc`
+- Inno Setup 6 (installer compiler) — installed 2026-07-19 via
+  `winget install -e --id JRSoftware.InnoSetup`; `ISCC.exe` at
+  `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe`. Build the installer with
+  `ISCC.exe installer\pcbview.iss` after the `deploy` target has staged
+  `build\Release`; output lands in `installer\Output\`.
 - Visual Studio 18 Community — bundles CMake and Ninja at
   `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\`
 - KiCad 10.0.4 **is** installed, per-user, at

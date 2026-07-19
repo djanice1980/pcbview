@@ -248,8 +248,19 @@ Device createDevice(const GpuInfo& gpu,
     // RT path is ray queries from the fragment shader (rayQueryReady), not the
     // full RT pipeline -- but enable the pipeline too when the GPU offers it, at
     // no cost, so a future RT-pipeline mode is a shader away.
-    const bool wantRt = gpu.rayTracingReady();
-    const bool wantRq = gpu.rayQueryReady();
+    //
+    // CPU devices (Mesa lavapipe) are the exception: they expose ray_query, but
+    // their software BVH builder silently drops most triangles when the
+    // acceleration structure is large (pcbview's boards run ~1M triangles with
+    // via barrels + component models), so ray tracing / path tracing render an
+    // incomplete image -- only the earliest geometry survives. Raster is
+    // complete and fast on the CPU, and that is the whole point of the CPU
+    // device (moving the board on low power), so run it raster-only rather than
+    // ship a broken RT/PT image. Verified by elimination: our BLAS spec is
+    // correct and NVIDIA/AMD build the identical spec perfectly.
+    const bool isCpu = gpu.type == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    const bool wantRt = gpu.rayTracingReady() && !isCpu;
+    const bool wantRq = gpu.rayQueryReady() && !isCpu;
     const bool wantAccel = wantRt || wantRq;
 
     std::vector<const char*> extensions = requested;

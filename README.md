@@ -60,7 +60,18 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   running GPU-accelerated (CUDA/HIP) on a background thread: the image snaps
   clean within a couple of frames of the camera stopping and keeps refining,
   with no UI stalls. Colours match the raster view (hue-preserving tonemap),
-  and layer/component visibility toggles apply in both modes.
+  and layer/component visibility toggles apply in both modes. The sun has a
+  real angular size (adjustable via **Effects → Shadow softness**) and the
+  translucent laminate transmits light diffusely, so shadows soften with
+  distance and read correctly through a flex substrate.
+- **CPU rendering — no GPU required.** Pick **CPU Rendering (llvm)** under
+  Render → Graphics device and pcbview runs entirely on the CPU: rasterization
+  through the bundled Mesa **lavapipe** driver, and both traced modes (RT
+  shadows/AO *and* full path tracing) through **Intel Embree**, matching the
+  GPU output. Everything ships in the box — no drivers to install.
+- **Effects sliders.** Component reflections, pad shine, and path-tracing
+  shadow softness are live sliders in the Effects menu, each with a numeric
+  readout. Settings persist across runs in `~/.pcbview/settings.xml`.
 - **Smooth navigation.** Orbit / pan / glide-zoom, animated view presets (top /
   bottom / iso / fit), orthographic toggle, drag-and-drop, and recent-file
   history.
@@ -103,7 +114,8 @@ between the slabs:
 
 | Action | Control |
 |---|---|
-| Orbit / pan / zoom | Left-drag / right-drag / scroll |
+| Orbit / pan / zoom | Left-drag / middle-drag / scroll |
+| Inverse orbit (mirrored) | Right-drag |
 | Exploded view | `Ctrl` + scroll |
 | Top / Bottom / Isometric | `T` / `B` / `I` |
 | Fit to board | `F` |
@@ -117,6 +129,21 @@ between the slabs:
 Layer visibility, appearance (thickness / substrate / mask), and the print modes
 live in the menus. Each side panel has a **pin** and a **hide** button — hide tucks
 it to a spine on the edge that pops open on hover; pin keeps it open.
+
+## Installing
+
+Grab the latest release from the
+[Releases page](https://github.com/djanice1980/pcbview/releases):
+
+- **`pcbview-<version>-setup.exe`** — Windows installer: Start Menu entry,
+  optional desktop shortcut, uninstaller. Installs per-machine (admin) or
+  per-user — the installer asks.
+- **`pcbview-<version>-win64.zip`** — portable: unzip anywhere and run
+  `pcbview.exe`. No installation, nothing written outside its folder (settings
+  go to `~/.pcbview/settings.xml`).
+
+Both are self-contained — Qt, the CPU Vulkan driver, Embree, and the denoiser
+are all bundled. No prerequisites.
 
 ## Building from source
 
@@ -180,7 +207,9 @@ are incompatible with GPL-2.0. Full third-party attributions are in
   ray-query ray tracing (contact shadows + AO) with GPU selection, full
   path tracing (translucent mask, exploded view, visibility toggles) with
   GPU-accelerated Intel OIDN denoising on a background thread, via barrels with
-  per-tool Excellon plating, and mounting-hole / slot cutouts from Edge_Cuts.
+  per-tool Excellon plating, mounting-hole / slot cutouts from Edge_Cuts, a
+  full CPU rendering device (Mesa lavapipe raster + Embree ray tracing), soft
+  sun shadows + diffuse laminate transmission, and a Windows installer.
 - **Next:** a Linux build, blind/buried via spans, and Excellon
   routed-slot (`G00`/`G01`) support.
 

@@ -87,6 +87,10 @@ Renderer::Renderer(Device& device, VkSurfaceKHR surface, uint32_t width,
     rtSupported_ = device_.rayQueryEnabled;
     if (rtSupported_) loadRtFunctions();
 
+    // On a CPU device, path tracing runs on Embree instead of Vulkan ray query.
+    cpuMode_ = device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    if (cpuMode_) cpuTracer_ = std::make_unique<cpu::CpuTracer>();
+
     createSwapchain(width, height);
     createSceneTargets();
     createDescriptors();
@@ -417,6 +421,8 @@ void Renderer::setPartVisible(const std::string& name, bool visible) {
     // rebuild on the next traced frame, and restart the path-trace accumulation
     // so the change shows immediately rather than after the next camera move.
     tracedVisDirty_ = true;
+    // Mirror to the Embree tracer (CPU device) -- its next bake drops the part.
+    if (cpuMode_ && cpuTracer_) cpuTracer_->setPartVisible(name, visible);
     resetAccumulation();
     ptDenoisedValid_ = false;
 }
@@ -461,13 +467,14 @@ void Renderer::setRenderMode(RenderMode m) {
 }
 
 void Renderer::setRayCamera(const float eye[3], const float fwd[3],
-                            const float right[3], const float up[3]) {
+                            const float right[3], const float up[3],
+                            bool ortho) {
     // Any camera change restarts accumulation.
     auto diff = [](const float a[3], const float b[3]) {
         return std::abs(a[0]-b[0]) + std::abs(a[1]-b[1]) + std::abs(a[2]-b[2]) > 1e-5f;
     };
     if (diff(eye, rayEye_) || diff(fwd, rayFwd_) || diff(right, rayRight_) ||
-        diff(up, rayUp_)) {
+        diff(up, rayUp_) || ortho != rayOrtho_) {
         resetAccumulation();
         // Crucial: also drop the denoised frame. Otherwise the tonemap keeps
         // showing the last (now stale) denoised image while the camera moves --
@@ -480,6 +487,7 @@ void Renderer::setRayCamera(const float eye[3], const float fwd[3],
         rayEye_[i] = eye[i]; rayFwd_[i] = fwd[i];
         rayRight_[i] = right[i]; rayUp_[i] = up[i];
     }
+    rayOrtho_ = ortho;
 }
 
 namespace {
@@ -761,6 +769,107 @@ void Renderer::updatePathTraceDescriptors() {
     ptDenoisedValid_ = false;
 }
 
+void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
+    // Restart accumulation when the view changed (resetAccumulation bumps
+    // ptGeneration_ on any camera move, exactly like the GPU path), or when the
+    // integrator switched between full path tracing and the RT preview.
+    if (cpuTracerGen_ != ptGeneration_ || cpuPreviewActive_ != preview) {
+        cpuTracerGen_ = ptGeneration_;
+        cpuPreviewActive_ = preview;
+        cpuPass_ = 0;
+        cpuDisplayCache_.clear();  // the old view is stale
+    }
+    cpuTracer_->setPreview(preview);
+
+    // Re-bake the exploded geometry (rebuilds the Embree BVH) when the peel
+    // moved; that restarts accumulation just like a camera change.
+    if (cpuTracer_->setExplode(explodeProgress_, explodeStep_)) {
+        cpuPass_ = 0;
+        cpuDisplayCache_.clear();
+    }
+
+    cpu::TraceCamera cam;
+    for (int i = 0; i < 3; ++i) {
+        cam.eye[i] = rayEye_[i];
+        cam.fwd[i] = rayFwd_[i];
+        cam.right[i] = rayRight_[i];
+        cam.up[i] = rayUp_[i];
+    }
+    cam.ortho = rayOrtho_;
+
+    // A few samples per frame keeps the UI responsive while the image converges
+    // over successive frames. Stop adding samples once converged -- redraws
+    // (focus changes, overlays) must not burn CPU re-tracing a finished image.
+    const int target = cpuTargetSamples();
+    if (cpuTracer_->samples() < target || cpuPass_ == 0) {
+        const int batch = 4;
+        cpuTracer_->accumulate(cam, sceneExtent_.width, sceneExtent_.height,
+                               batch, cpuPass_);
+        ++cpuPass_;
+    }
+
+    // Denoising (OIDN, on this thread) is expensive, so run it at sample
+    // milestones -- powers of two early for fast cleanup, then every 32 so the
+    // late convergence still shows progress -- and at convergence. Between
+    // milestones keep showing the last denoised image and accumulate silently
+    // underneath. The RT preview skips OIDN entirely: its integrator is
+    // near-noise-free by 8 samples, so it just refreshes every frame.
+    const int s = cpuTracer_->samples();
+    const bool milestone = s <= 32 ? (s & (s - 1)) == 0 : (s % 32) == 0;
+    const bool converged = s >= target;
+    const bool wantDenoise = !preview && denoisingEnabled_ && s >= 4 &&
+                             (milestone || converged);
+    const bool refresh =
+        wantDenoise || preview || !denoisingEnabled_ || cpuDisplayCache_.empty();
+    if (refresh) cpuDisplayCache_ = cpuTracer_->resolveDisplay(wantDenoise);
+
+    // This frame slot's fence was waited at the top of drawFrame, so ITS staging
+    // buffer is idle; other slots may still be copying theirs.
+    Buffer& staging = cpuStaging_[frame_];
+    void* mapped = nullptr;
+    vkMapMemory(device_.handle, staging.memory, 0, cpuStagingBytes_, 0, &mapped);
+    std::memcpy(mapped, cpuDisplayCache_.data(),
+                std::min<size_t>(cpuDisplayCache_.size(),
+                                 static_cast<size_t>(cpuStagingBytes_)));
+    vkUnmapMemory(device_.handle, staging.memory);
+
+    // sceneColor_: UNDEFINED -> TRANSFER_DST, copy the traced image in, then
+    // -> COLOR_ATTACHMENT_OPTIMAL so the shared blit path finds it exactly where
+    // it expects the raster/GPU-PT scene.
+    VkImageMemoryBarrier2 toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toDst.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    toDst.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toDst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toDst.image = sceneColor_.handle;
+    toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo d1{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d1.imageMemoryBarrierCount = 1;
+    d1.pImageMemoryBarriers = &toDst;
+    vkCmdPipelineBarrier2(cmd, &d1);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {sceneExtent_.width, sceneExtent_.height, 1};
+    vkCmdCopyBufferToImage(cmd, staging.handle, sceneColor_.handle,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    VkImageMemoryBarrier2 toColor{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    toColor.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    toColor.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toColor.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toColor.image = sceneColor_.handle;
+    toColor.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo d2{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d2.imageMemoryBarrierCount = 1;
+    d2.pImageMemoryBarriers = &toColor;
+    vkCmdPipelineBarrier2(cmd, &d2);
+}
+
 void Renderer::recordPathTrace(VkCommandBuffer cmd) {
     const auto barrier = [&](VkImageMemoryBarrier2* b, uint32_t count) {
         VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -838,6 +947,9 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             p.misc[0] = (maxRank_ > 0.0f)
                             ? std::clamp(explodeProgress_ / maxRank_, 0.0f, 1.0f)
                             : 0.0f;
+            // cos(sun angular radius); slider maps 0..1 -> 0..8 degrees.
+            p.misc[1] = std::cos(shadowSoftness_ * 8.0f * 3.14159265f / 180.0f);
+            p.misc[2] = rayOrtho_ ? 1.0f : 0.0f;
             p.counts[0] = opaqueTriCount_;
             vkCmdPushConstants(cmd, ptLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(p), &p);
@@ -1513,11 +1625,30 @@ void Renderer::createSceneTargets() {
 
     sceneColor_ = createImage(sceneExtent_, colorFormat_,
                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                               VK_IMAGE_ASPECT_COLOR_BIT);
     sceneDepth_ = createImage(sceneExtent_, depthFormat_,
                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                               VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    // Host-visible staging for the Embree tracer's BGRA output, copied into
+    // sceneColor_ each CPU-traced frame. One buffer per frame in flight -- the
+    // slot's fence guarantees its previous copy retired before the CPU rewrites.
+    if (cpuMode_) {
+        for (Buffer& b : cpuStaging_) destroyBuffer(b);
+        cpuStaging_.clear();
+        cpuStagingBytes_ =
+            static_cast<VkDeviceSize>(sceneExtent_.width) * sceneExtent_.height * 4;
+        for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+            cpuStaging_.push_back(
+                createBuffer(cpuStagingBytes_, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+        }
+        cpuTracerGen_ = 0xFFFFFFFFu;  // force a fresh accumulation
+        cpuDisplayCache_.clear();
+    }
 
     // Path-tracer targets, at the same resolution. HDR accumulation + the two
     // denoiser guides, all storage images kept in GENERAL layout.
@@ -1552,6 +1683,8 @@ void Renderer::createSceneTargets() {
 void Renderer::destroySceneTargets() {
     destroyImage(sceneColor_);
     destroyImage(sceneDepth_);
+    for (Buffer& b : cpuStaging_) destroyBuffer(b);
+    cpuStaging_.clear();
 }
 
 void Renderer::setRenderScale(float scale) {
@@ -1823,6 +1956,13 @@ void Renderer::createSyncAndCommands() {
 }
 
 void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
+    // Feed the Embree tracer the same mesh (CPU device only). Its own BVH is
+    // separate from the Vulkan buffers built below for raster.
+    if (cpuMode_ && cpuTracer_) {
+        cpuTracer_->setScene(mesh);
+        cpuTracerGen_ = 0xFFFFFFFFu;  // restart accumulation on the new board
+    }
+
     std::vector<geom::Vertex> vertices;
     std::vector<uint32_t> indices;
     std::vector<MaterialGpu> materials;
@@ -1900,7 +2040,9 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
                 m = {{0.72f, 0.61f, 0.38f, 1.0f}, {0.85f, 0.0f, 0.0f, 1.0f}};
                 break;
             case geom::Material::Soldermask:
-                m = {{0.05f, 0.29f, 0.12f, 0.72f}, {0.35f, 0.0f, 0.0f, 0.0f}};
+                // Industry-standard green (#19882C, linearised), semi-gloss finish
+                // (roughness 0.15-0.25 per fab data; matte boards run 0.4-0.6).
+                m = {{0.010f, 0.246f, 0.025f, 0.72f}, {0.20f, 0.0f, 0.0f, 0.0f}};
                 break;
             case geom::Material::Silkscreen:
                 // Opaque ink. Not pure white: real silkscreen is slightly warm
@@ -2158,6 +2300,7 @@ void Renderer::setComponentShine(float s01) {
         materials_[i].params[0] = 0.55f - 0.51f * componentShine_;
         materials_[i].params[1] = 0.10f + 0.90f * componentShine_;
     }
+    if (cpuMode_ && cpuTracer_) cpuTracer_->setComponentShine(componentShine_);
     vkDeviceWaitIdle(device_.handle);
     uploadViaStaging(materialBuffer_, materials_.data(),
                      materials_.size() * sizeof(MaterialGpu));
@@ -2173,10 +2316,21 @@ void Renderer::setPadShine(float s01) {
         // brushed) down to 0.02 (mirror plate).
         materials_[i].params[0] = 0.5f - 0.48f * padShine_;
     }
+    if (cpuMode_ && cpuTracer_) cpuTracer_->setPadShine(padShine_);
     vkDeviceWaitIdle(device_.handle);
     uploadViaStaging(materialBuffer_, materials_.data(),
                      materials_.size() * sizeof(MaterialGpu));
     resetAccumulation();
+}
+
+void Renderer::setShadowSoftness(float s01) {
+    shadowSoftness_ = std::clamp(s01, 0.0f, 1.0f);
+    if (cpuMode_ && cpuTracer_) {
+        const float rad = shadowSoftness_ * 8.0f * 3.14159265f / 180.0f;
+        cpuTracer_->setSunCosMax(std::cos(rad));
+    }
+    resetAccumulation();
+    ptDenoisedValid_ = false;
 }
 
 void Renderer::setMaskColor(float r, float g, float b, float opacity) {
@@ -2197,6 +2351,7 @@ void Renderer::setMaskColor(float r, float g, float b, float opacity) {
         // (passProb = 1 - alpha): lower it to let more copper read through.
         materials_[i].albedo[3] = a;
     }
+    if (cpuMode_ && cpuTracer_) cpuTracer_->setMaskAppearance(r, g, b, a);
     vkDeviceWaitIdle(device_.handle);
     uploadViaStaging(materialBuffer_, materials_.data(),
                      materials_.size() * sizeof(MaterialGpu));
@@ -2232,6 +2387,8 @@ void Renderer::setSubstrateAppearance(float r, float g, float b, float opacity) 
         // No break: the substrate is now several dielectric slabs (one between
         // each pair of copper foils), all named "substrate" -- recolour them all.
     }
+    if (cpuMode_ && cpuTracer_)
+        cpuTracer_->setSubstrateAppearance(r, g, b, substrateOpacity_);
     vkDeviceWaitIdle(device_.handle);
     uploadViaStaging(materialBuffer_, materials_.data(),
                      materials_.size() * sizeof(MaterialGpu));
@@ -2281,7 +2438,17 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // Shared by the scene pass and the later blit/UI barriers.
     VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
 
-  if (mode_ == RenderMode::PathTraced && rtSupported_ &&
+  // CPU device: Embree traces on the host -- full path tracing in PT mode, and
+  // the RT preview (sun shadows + AO, no GI) when the RT toggle is on in raster
+  // mode at rest (same at-rest gate as the GPU's RT shadows). The result is
+  // copied into sceneColor_ (left COLOR_ATTACHMENT_OPTIMAL) and presented by
+  // the shared blit.
+  const bool cpuPt = cpuMode_ && mode_ == RenderMode::PathTraced;
+  const bool cpuRt = cpuMode_ && mode_ == RenderMode::Raster && rtRequested_ &&
+                     explodeProgress_ < 0.01f;
+  if ((cpuPt || cpuRt) && cpuTracer_ && cpuTracer_->ready()) {
+    recordCpuPathTrace(cmd, /*preview=*/cpuRt);
+  } else if (mode_ == RenderMode::PathTraced && rtSupported_ &&
       tlas_ != VK_NULL_HANDLE) {
     // Path-trace + tonemap into sceneColor_ (left COLOR_ATTACHMENT_OPTIMAL), so
     // the shared blit + UI below present it exactly like the raster scene.

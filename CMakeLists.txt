@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(pcbview VERSION 1.11 LANGUAGES CXX)
+project(pcbview VERSION 1.12 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -82,6 +82,38 @@ FetchContent_Declare(oidn
 FetchContent_MakeAvailable(oidn)
 set(OIDN_DIR "${oidn_SOURCE_DIR}")
 
+# Mesa lavapipe: a software (CPU) Vulkan driver, so the board can be rendered
+# entirely on the CPU when no capable GPU is present or wanted. Crucially it
+# exposes VK_KHR_ray_query, so not just raster but RT shadows AND the full path
+# tracer run on it (slowly -- hence the "fast movement" option that drops to
+# raster while the view is moving). Prebuilt Windows package from the
+# mesa-dist-win project; Mesa is MIT-licensed (GPL-3 compatible -- see NOTICE.md).
+# Only the two Vulkan files (the driver DLL + its ICD manifest) are staged beside
+# the exe; main() registers the manifest ADDITIVELY at startup so the CPU device
+# appears in the picker alongside the hardware GPUs. The 7z is extracted by
+# CMake's libarchive; nothing but these two files ships.
+FetchContent_Declare(mesa_lavapipe
+    URL https://github.com/pal1000/mesa-dist-win/releases/download/26.1.3/mesa3d-26.1.3-release-msvc.7z
+    URL_HASH SHA256=6dd431f4620cea73970b13e3ffa94f721f2a3924306b8a4283c97648cdb6eb9c
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(mesa_lavapipe)
+set(LAVAPIPE_DIR "${mesa_lavapipe_SOURCE_DIR}/x64")
+
+# Intel Embree: a production CPU ray-tracing library (Apache-2.0, GPL-3-clean).
+# The CPU device's path tracer runs here, NOT through Vulkan: Mesa lavapipe's
+# software BVH builder silently drops most triangles on our ~1M-triangle boards
+# (see device.cpp), and SwiftShader has no ray tracing at all. Embree builds and
+# traverses the BVH on the CPU with hand-tuned AVX2/AVX-512, so the CPU path
+# tracer is complete and fast. Prebuilt binary package -- header + import lib +
+# runtime DLLs, same pattern as OIDN.
+FetchContent_Declare(embree
+    URL https://github.com/RenderKit/embree/releases/download/v4.4.1/embree-4.4.1.x64.windows.zip
+    URL_HASH SHA256=5aa1fa3161a720f9c610b06c652b80f421cb2b1fe8221fdf92b74157336fdf8f
+)
+FetchContent_MakeAvailable(embree)
+set(EMBREE_DIR "${embree_SOURCE_DIR}")
+
 # ---------------------------------------------------------------------------
 # Qt -- the GUI. Used under LGPL-3.0 via option 4(d)(1): DYNAMIC LINKING ONLY.
 #
@@ -110,8 +142,10 @@ if(NOT Qt6_FOUND)
         "Then re-run cmake, or pass -DQT_ROOT=<path-to-kit>.")
 endif()
 
-# AUTOMOC runs Qt's meta-object compiler over anything with Q_OBJECT.
+# AUTOMOC runs Qt's meta-object compiler over anything with Q_OBJECT; AUTORCC
+# compiles .qrc resources (the window icon) into the executable.
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 message(STATUS "Qt ${Qt6_VERSION} from ${QT_ROOT} (dynamically linked, LGPL-3.0)")
 
 # Shaders are compiled to SPIR-V at build time and embedded as C arrays, so the
@@ -156,11 +190,15 @@ add_executable(pcbview WIN32
     src/render/common/device.cpp
     src/render/soft/preview.cpp
     src/render/vk/renderer.cpp
+    src/render/cpu/cpu_tracer.cpp
     src/app/vulkan_window.cpp
     src/app/main_window.cpp
+    src/app/settings.cpp
     src/app/component_import.cpp
     src/app/theme.cpp
     src/app/viewer.cpp
+    assets/icons.qrc
+    assets/pcbview.rc
     ${SHADER_OUTPUTS}
 )
 
@@ -171,6 +209,7 @@ target_include_directories(pcbview PRIVATE
     ${miniz_SOURCE_DIR}
     ${cgltf_SOURCE_DIR}
     ${OIDN_DIR}/include
+    ${EMBREE_DIR}/include
     ${SHADER_INCLUDE_DIR}
 )
 
@@ -193,6 +232,7 @@ target_link_libraries(pcbview PRIVATE
     Clipper2
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::PrintSupport
     ${OIDN_DIR}/lib/OpenImageDenoise.lib
+    ${EMBREE_DIR}/lib/embree4.lib
 )
 
 # Stage the OIDN runtime beside the exe: the CPU device plus the CUDA (NVIDIA) and
@@ -207,11 +247,37 @@ add_custom_command(TARGET pcbview POST_BUILD
             ${OIDN_DIR}/bin/OpenImageDenoise_device_cpu.dll
             ${OIDN_DIR}/bin/OpenImageDenoise_device_cuda.dll
             ${OIDN_DIR}/bin/OpenImageDenoise_device_hip.dll
-            ${OIDN_DIR}/bin/tbb12.dll
             $<TARGET_FILE_DIR:pcbview>
     COMMENT "Staging Open Image Denoise runtime (CPU + CUDA + HIP) beside the executable"
     VERBATIM
 )
+
+# Stage the Embree CPU ray-tracing runtime + its TBB (which OIDN also uses, so
+# this single tbb12.dll serves both -- oneTBB is ABI-stable across their minor
+# versions). tbbmalloc is Embree's scalable allocator.
+add_custom_command(TARGET pcbview POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${EMBREE_DIR}/bin/embree4.dll
+            ${EMBREE_DIR}/bin/tbb12.dll
+            ${EMBREE_DIR}/bin/tbbmalloc.dll
+            $<TARGET_FILE_DIR:pcbview>
+    COMMENT "Staging Intel Embree (CPU ray tracing) beside the executable"
+    VERBATIM
+)
+
+# Stage the Mesa lavapipe CPU Vulkan driver + its ICD manifest beside the exe.
+# main() registers the manifest via VK_ADD_DRIVER_FILES at startup, so "llvmpipe"
+# shows up as a selectable CPU device under Render -> Graphics device.
+if(EXISTS "${LAVAPIPE_DIR}/vulkan_lvp.dll")
+    add_custom_command(TARGET pcbview POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${LAVAPIPE_DIR}/vulkan_lvp.dll
+                ${LAVAPIPE_DIR}/lvp_icd.x86_64.json
+                $<TARGET_FILE_DIR:pcbview>
+        COMMENT "Staging Mesa lavapipe (CPU Vulkan driver) beside the executable"
+        VERBATIM
+    )
+endif()
 
 if(MSVC)
     target_compile_options(pcbview PRIVATE /W4 /permissive-)

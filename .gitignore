@@ -3,6 +3,9 @@
 /out/
 /cmake-build-*/
 
+# Inno Setup compiler output
+/installer/Output/
+
 # CMake bits if configured in-tree
 CMakeCache.txt
 CMakeFiles/

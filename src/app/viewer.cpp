@@ -1,6 +1,7 @@
 #include "app/viewer.h"
 
 #include <QApplication>
+#include <QIcon>
 
 #include "app/main_window.h"
 #include "app/theme.h"
@@ -16,6 +17,7 @@ int runViewer(const std::string& path, const ViewerOptions& opts) {
     QApplication app(argc, argv);
     QApplication::setApplicationName("pcbview");
     QApplication::setOrganizationName("pcbview");
+    QApplication::setWindowIcon(QIcon(":/pcbview.png"));
 
     theme::apply(app);
 
