@@ -1136,6 +1136,8 @@ interactive run. All are opt-in. Grouped by purpose:
   clip was finally reproduced.
 - `PCBVIEW_MEASURE=x1,y1,z1,x2,y2,z2` — pin a measurement between two world
   points in mm (mouse picks can't be synthesised).
+- `PCBVIEW_NET=<name>` — highlight a net by name (the picker dock and board
+  clicks can't be synthesised). KiCad boards only.
 
 **Appearance (mirror the Appearance dialog, which input synthesis can't drive)**
 - `PCBVIEW_THICKNESS=<mm>` — finished-board thickness override.
@@ -1298,6 +1300,41 @@ together, and why:
   call the rect comes back virtualised on this 200% display and only the
   top-left quadrant lands. That is how the toolbar icons were checked.
 
+## Net highlighting (built 2026-07-19, KiCad only)
+
+Pick a net and it lights up across every layer while the rest of the board
+mutes, so a signal can be followed through the stack and the exploded view.
+Sources: the NETS dock (filterable list), a click on the board, or
+`PCBVIEW_NET=<name>` headlessly. All three funnel through
+`MainWindow::highlightNet`, so the list selection, the renderer and the status
+readout can never disagree.
+
+- **Net identity survives the copper union.** A copper layer is ONE merged
+  polygon set, which destroys the per-track net. `buildLayerArt` now
+  accumulates each layer's copper **per net** as well as in bulk
+  (`ArtLayer::netArt`), and `assemble` runs the layer's clip once per net
+  rather than once per layer. That is lossless — design rules keep nets
+  apart, so unioning each separately covers the same area — and was verified
+  by triangle count: cx4 tessellates to **810,092 triangles, identical to the
+  pre-change binary, every per-layer count matching**.
+- **Per TRIANGLE, not per part.** Splitting copper into a part per net would
+  multiply draw calls by the net count. Instead `Part::triNet` rides along to
+  a global `triNetBuffer_` in the same order as the index buffer, exactly like
+  the existing per-triangle material buffer.
+- **The raster fragment shader only gets `gl_PrimitiveID`**, which restarts at
+  zero every draw. `MaterialGpu::extra[0]` carries the draw's first global
+  triangle so the shader can rebase it. That field is why the `Material`
+  struct had to change in **all four** shaders that read the material SSBO --
+  board.vert, board.frag, board_rt.frag AND pathtrace.comp -- or they read at
+  the wrong stride.
+- **Raster and RT-raster only.** The path tracers shade from their own
+  material fetch and ignore the highlight; highlighting while path tracing
+  says so in the status bar rather than appearing broken. Adding it there
+  means binding the net buffer into the PT descriptor set and resetting
+  accumulation on change.
+- Gerber packages carry no nets, so the dock says so instead of showing an
+  empty list. Verified the Gerber path is untouched (F.Cu still 293.224 mm²).
+
 ## Blind/buried via spans (built 2026-07-19, KiCad only)
 
 A blind via (outer→inner) or buried via (inner→inner) is drilled only through
@@ -1434,17 +1471,12 @@ colour/side group at once.
   in the renderer's UI pass, which also works identically on the CPU device
   and inside PT mode. That pipeline is the one net-trace labels should
   reuse.
-- **Net trace / highlighting.** Pick a net and light it up across the whole
-  board — pads, traces, and via barrels — so a signal can be tracked visually,
-  especially in the exploded view where an inner-layer run becomes followable
-  end to end. Feasibility: the KiCad importer already parses `(net N "name")`
-  on pads/tracks/vias into `BoardModel`, so for KiCad boards this is a
-  plumbing job — carry the net id through `LayerArt` into per-part (or
-  per-region) mesh metadata and drive a highlight tint through the material
-  SSBO. Gerbers carry no net information, so the feature is KiCad-only unless
-  a netlist/schematic file is loaded alongside; "if there is a related
-  schematic" is the operative condition. UI sketch: a searchable net list
-  dock, click-to-select on the board, dim-everything-else mode.
+- **Net trace / highlighting — BUILT 2026-07-19**, see "Net highlighting"
+  below. The sketch held up: searchable net dock, click-to-select on the
+  board, dim-everything-else. The one thing the note got wrong was where the
+  net id lives — "per-part mesh metadata" would have meant a part per net and
+  a draw call per net, so it is per TRIANGLE instead. Still open: the path
+  tracers ignore the highlight.
 - **Party mode.** Fun mode: multi-coloured spinning lights sweeping and
   highlighting the board, possibly with a disco ball. The path tracer already
   supports arbitrary emissive directions (sun NEE + sky), so animated coloured

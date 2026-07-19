@@ -61,6 +61,13 @@ struct Part {
     // renderers rank it by its centre Z rather than parking it at the barrel
     // plane.
     bool partialBarrel = false;
+
+    // Per-TRIANGLE net index (into BoardMesh::nets), -1 for none. Empty on a
+    // part with no net information at all. Per triangle rather than per part
+    // because a copper layer is one part carrying many nets -- splitting the
+    // layer into a part per net would multiply the draw calls by the net
+    // count for no visual gain.
+    std::vector<int32_t> triNet;
 };
 
 struct Bounds {

@@ -12,6 +12,7 @@
 
 class QDockWidget;
 class QImage;
+class QLineEdit;
 class QSlider;
 
 #include "app/vulkan_window.h"
@@ -63,6 +64,13 @@ private:
     // window as presented.
     void grabFrame(std::function<void(const QImage&)> then,
                    float exportScale = 0.0f);
+
+    // Net highlighting. `net` indexes mesh_.nets; -1 clears. Drives the
+    // renderer, the net list selection and the status readout together, so
+    // every entry point (list click, board click, headless hook) agrees.
+    void highlightNet(int net);
+    void buildNetDock();
+    void populateNets();
     void onSaveScreenshot();
     // mode: 0 = as shown on screen, 1 = flat overhead (top orthographic),
     // 2 = flat overhead printed at the board's true physical size (1:1).
@@ -138,6 +146,10 @@ private:
     QTreeWidget* properties_ = nullptr;
     QDockWidget* stackupDock_ = nullptr;
     QDockWidget* propertiesDock_ = nullptr;
+    QDockWidget* netDock_ = nullptr;
+    QTreeWidget* netList_ = nullptr;
+    QLineEdit* netFilter_ = nullptr;
+    int highlightedNet_ = -1;
     QMenu* recentMenu_ = nullptr;
     QAction* measureAction_ = nullptr;
     QAction* dimsAction_ = nullptr;

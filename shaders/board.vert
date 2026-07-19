@@ -11,9 +11,10 @@ layout(push_constant) uniform Push {
     // x = mm per stage, y = eased progress, z = max |rank|,
     // w = peel amount 0..1 (normalised progress)
     vec4 params;
-    // Fragment-stage only (camera forward + ortho orbit distance), declared
-    // here because one push block spans both stages.
+    // Fragment-stage only (camera forward + ortho orbit distance, net
+    // highlight), declared here because one push block spans both stages.
     vec4 camAxis;
+    ivec4 highlight;
 } push;
 
 struct Material {
@@ -21,6 +22,8 @@ struct Material {
     // x = roughness, y = metallic, z = explode rank,
     // w = 1 if this material turns translucent as the board peels
     vec4 params;
+    // Fragment-stage only, declared here to keep the SSBO stride identical.
+    uvec4 extra;
 };
 
 // Same bindless table the fragment stage uses. Read here only for the explode

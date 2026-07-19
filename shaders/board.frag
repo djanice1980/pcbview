@@ -14,11 +14,19 @@ struct Material {
     // x = roughness, y = metallic, z = explode rank,
     // w = 1 if this material turns translucent as the board peels
     vec4 params;
+    // x = this draw's first global triangle; see MaterialGpu::extra.
+    uvec4 extra;
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer Materials {
     Material materials[];
 } materialTable;
+
+// Per-triangle net index, -1 for none. Indexed globally, hence the material's
+// triangle base added to gl_PrimitiveID (which restarts every draw).
+layout(std430, set = 0, binding = 2) readonly buffer TriNets {
+    int nets[];
+} triNetTable;
 
 // Must match board.vert byte for byte -- one push block spans both stages.
 layout(push_constant) uniform Push {
@@ -29,7 +37,29 @@ layout(push_constant) uniform Push {
     vec4 params;
     // xyz = camera forward; w = orbit distance in ORTHO, 0 in perspective.
     vec4 camAxis;
+    // x = highlighted net index, -1 for none.
+    ivec4 highlight;
 } push;
+
+// Net highlighting. The chosen net keeps its colour and gains a warm lift;
+// everything else desaturates toward the laminate so the signal reads at a
+// glance across layers. Returns the albedo unchanged when nothing is picked,
+// so a board with no highlight is bit-identical to before.
+vec3 applyNetHighlight(vec3 albedo) {
+    if (push.highlight.x < 0) return albedo;
+    const uint tri = materialTable.materials[inMaterial].extra.x +
+                     uint(gl_PrimitiveID);
+    if (triNetTable.nets[tri] == push.highlight.x) {
+        // Copper is already gold, so a hue shift alone would not separate the
+        // net from its neighbours -- go bright and warm, and let the raised
+        // value do most of the work.
+        return mix(albedo, vec3(1.0, 0.80, 0.30), 0.85) * 2.1;
+    }
+    // Everything else desaturates and drops well below the highlight, so the
+    // eye lands on the net rather than having to hunt for it.
+    return mix(albedo, vec3(dot(albedo, vec3(0.299, 0.587, 0.114))), 0.85) *
+           0.42;
+}
 
 // The view vector, and the distance used to scale the light rig.
 //
@@ -131,7 +161,8 @@ void main() {
     float envUp = clamp(refl.z * 0.5 + 0.5, 0.0, 1.0);
     vec3 env = mix(vec3(0.22), vec3(1.05), envUp);
 
-    vec3 lit = m.albedo.rgb * diffuse
+    vec3 baseAlbedo = applyNetHighlight(m.albedo.rgb);
+    vec3 lit = baseAlbedo * diffuse
              + specTint * spec * mix(0.12, 1.3, m.params.y)
              + specTint * env * (m.params.y * 0.35)
              + vec3(fresnel) * 0.08;

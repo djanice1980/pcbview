@@ -719,13 +719,12 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
     lastPos_ = e->position();
     if (e->button() == Qt::LeftButton) {
         dragging_ = true;
-        // In measure mode a left CLICK (press+release without a drag) places
-        // a measurement point; a drag still orbits. Track the candidacy here
+        // A left CLICK (press+release without a drag) is a pick: a
+        // measurement point in measure mode, otherwise the net under the
+        // cursor. A drag still orbits either way. Track the candidacy here
         // and cancel it once the cursor moves.
-        if (measureMode_) {
-            clickCandidate_ = true;
-            pressPos_ = e->position();
-        }
+        clickCandidate_ = true;
+        pressPos_ = e->position();
     }
     // Left-drag is yaw+pitch; right-drag is yaw+ROLL (horizontal spins the
     // board on its axis, vertical twists it cw/ccw); middle pans. User
@@ -739,8 +738,19 @@ void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
         dragging_ = false;
         if (clickCandidate_) {
             clickCandidate_ = false;
-            handleMeasureClick(e->position());
-            updateReadout();
+            if (measureMode_) {
+                handleMeasureClick(e->position());
+                updateReadout();
+            } else {
+                // Net pick: the snap points already carry net identity, so a
+                // click near a pad or via names the signal under the cursor.
+                // A click on bare laminate clears the highlight.
+                glm::vec3 p;
+                bool snapped = false;
+                int net = -1;
+                screenToBoard(e->position(), p, snapped, net);
+                emit netPicked(snapped ? net : -1);
+            }
         }
     }
     if (e->button() == Qt::RightButton) draggingInv_ = false;

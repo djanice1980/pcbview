@@ -54,6 +54,11 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   at 0.1–0.8 mm), make the substrate translucent, and recolor the substrate and the
   soldermask — including the **mask opacity**, which drives how strongly traces
   read through the film in both render modes.
+- **Net highlighting (KiCad).** Pick a net from the searchable **Nets** panel
+  or just click a pad or via on the board: that signal lights up across every
+  layer while the rest of the board mutes, so a run can be followed through
+  the stack and into the exploded view. The status bar reports the net's
+  routed length and via count. Raster and ray-traced modes.
 - **Layer control.** Per-layer visibility, a one-click components toggle, and
   auto-hiding side panels (pin, or peek-on-hover).
 - **Print & export.** Print as-shown, flat (overhead orthographic), or **flat at
@@ -247,8 +252,7 @@ are incompatible with GPL-2.0. Full third-party attributions are in
   blind/buried via spans, Excellon rout-mode slots, measurement tools with
   snapping + net path lengths + board-dimension callouts, and
   high-resolution (up to 4×) screenshot export.
-- **Next:** net highlighting (track a signal across layers and through the
-  exploded view — KiCad boards carry net data), a Linux build, a showcase mode
+- **Next:** a Linux build, a showcase mode
   that choreographs the camera and records short video clips, party mode
   (spinning coloured lights; disco ball under consideration), and user
   shader plugins — assign a custom shader to part of the stack, for hairy

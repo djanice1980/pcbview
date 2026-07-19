@@ -19,6 +19,7 @@ layout(location = 0) out vec4 outColor;
 struct Material {
     vec4 albedo;
     vec4 params;  // x roughness, y metallic, z explode rank, w fades-on-peel
+    uvec4 extra;  // x = this draw's first global triangle
 };
 
 layout(std430, set = 0, binding = 0) readonly buffer Materials {
@@ -33,7 +34,25 @@ layout(push_constant) uniform Push {
     vec4 params;
     // xyz = camera forward; w = orbit distance in ORTHO, 0 in perspective.
     vec4 camAxis;
+    // x = highlighted net index, -1 for none.
+    ivec4 highlight;
 } push;
+
+// Per-triangle net index, -1 for none. Keep in step with board.frag.
+layout(std430, set = 0, binding = 2) readonly buffer TriNets {
+    int nets[];
+} triNetTable;
+
+vec3 applyNetHighlight(vec3 albedo) {
+    if (push.highlight.x < 0) return albedo;
+    const uint tri = materialTable.materials[inMaterial].extra.x +
+                     uint(gl_PrimitiveID);
+    if (triNetTable.nets[tri] == push.highlight.x) {
+        return mix(albedo, vec3(1.0, 0.80, 0.30), 0.85) * 2.1;
+    }
+    return mix(albedo, vec3(dot(albedo, vec3(0.299, 0.587, 0.114))), 0.85) *
+           0.42;
+}
 
 // See board.frag: orthographic has ONE view direction for every fragment, and
 // the eye-point shortcut reverses at/behind the eye plane, blackening the near
@@ -147,7 +166,7 @@ void main() {
     vec3 refl = reflect(-viewDir, n);
     float envUp = clamp(refl.z * 0.5 + 0.5, 0.0, 1.0);
     vec3 env = mix(vec3(0.22), vec3(1.05), envUp);
-    vec3 lit = m.albedo.rgb * diffuse
+    vec3 lit = applyNetHighlight(m.albedo.rgb) * diffuse
              + specTint * spec * mix(0.12, 1.3, m.params.y)
              + specTint * env * (m.params.y * 0.35)
              + vec3(fresnel) * 0.08;

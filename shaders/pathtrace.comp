@@ -15,7 +15,9 @@ layout(std430, set = 0, binding = 1) readonly buffer Verts { float vtx[]; };
 layout(std430, set = 0, binding = 2) readonly buffer Idx { uint idx[]; };
 layout(std430, set = 0, binding = 3) readonly buffer TriMat { uint triMat[]; };
 // params: x roughness, y metallic, z explode rank, w = 1 if it fades on peel.
-struct Mat { vec4 albedo; vec4 params; };
+// `extra` is fragment-stage data (the raster net-highlight triangle base);
+// declared so this SSBO's stride matches MaterialGpu exactly.
+struct Mat { vec4 albedo; vec4 params; uvec4 extra; };
 layout(std430, set = 0, binding = 4) readonly buffer Mats { Mat mats[]; };
 layout(rgba32f, set = 0, binding = 5) uniform image2D accumImg;
 layout(rgba32f, set = 0, binding = 6) uniform image2D albedoImg;

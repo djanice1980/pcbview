@@ -30,10 +30,18 @@
 
 namespace pcbview::vk {
 
-// Mirrors the `Material` struct in board.frag. std430 layout.
+// Mirrors the `Material` struct in board.vert, board.frag, board_rt.frag AND
+// pathtrace.comp -- one SSBO read by all four, so a field added here must be
+// added to every one of them or they read at the wrong stride.
 struct MaterialGpu {
     float albedo[4];  // rgb + opacity
     float params[4];  // roughness, metallic, reserved, reserved
+    // x = this draw's FIRST GLOBAL TRIANGLE. The raster fragment shader only
+    // gets gl_PrimitiveID, which restarts at 0 every draw; adding this base
+    // turns it into an index into the per-triangle net buffer. One draw is
+    // one part is one material, so the material table is the natural place
+    // to hang it.
+    uint32_t extra[4];
 };
 
 struct FrameStats {
@@ -127,6 +135,14 @@ public:
     // stroked text all arrive as triangles). Drawn in the UI pass at native
     // resolution, over every render mode. An empty vector clears it.
     void setOverlay(std::vector<float> tris) { overlayTris_ = std::move(tris); }
+
+    // Net highlighting: tint every triangle on `net` (an index into the
+    // BoardMesh net table) and mute the rest, so one signal can be followed
+    // across layers and through the exploded view. -1 clears. Raster and
+    // ray-traced raster only -- the path tracers shade from their own
+    // material fetch and ignore it.
+    void setHighlightNet(int net) { highlightNet_ = net; }
+    int highlightNet() const { return highlightNet_; }
 
     // Exploded view, peeled outside-in.
     //
@@ -309,6 +325,7 @@ private:
     // shaders; see setCameraAxis.
     float camFwd_[3] = {0.0f, 0.0f, -1.0f};
     float camOrthoDistance_ = 0.0f;
+    int highlightNet_ = -1;
     float explodeStep_ = 0.0f;
     float explodeProgress_ = 0.0f;
     float maxRank_ = 0.0f;
@@ -345,6 +362,10 @@ private:
     Buffer indexBuffer_;
     Buffer materialBuffer_;
     Buffer triMaterialBuffer_;  // per-triangle material index, for the path tracer
+    // Per-triangle NET index (-1 = none), for net highlighting. Same global
+    // triangle order as the index buffer; the raster fragment shader reaches
+    // it via MaterialGpu::extra[0] + gl_PrimitiveID.
+    Buffer triNetBuffer_;
     // The BLAS is built from these EXPLODED positions rather than vertexBuffer_
     // (the rest geometry the raster path holds). At rest it is a copy of the rest
     // vertices; in path-traced mode it is re-baked whenever the peel changes so the

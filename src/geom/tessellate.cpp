@@ -468,17 +468,20 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
     // toClipper). Routed length = the sum of a net's track segments; vias are
     // counted, not measured (their barrel height is stackup-dependent and
     // tiny against trace lengths).
+    //
+    // netOf lives at function scope because the copper loop below needs the
+    // same name -> index mapping to split each layer by net.
+    std::map<std::string, int> netIdx;
+    const auto netOf = [&](const std::string& n) -> int {
+        if (n.empty()) return -1;
+        const auto it = netIdx.find(n);
+        if (it != netIdx.end()) return it->second;
+        const int i = static_cast<int>(art.nets.size());
+        netIdx.emplace(n, i);
+        art.nets.push_back({n, 0.0, 0});
+        return i;
+    };
     {
-        std::map<std::string, int> netIdx;
-        const auto netOf = [&](const std::string& n) -> int {
-            if (n.empty()) return -1;
-            const auto it = netIdx.find(n);
-            if (it != netIdx.end()) return it->second;
-            const int i = static_cast<int>(art.nets.size());
-            netIdx.emplace(n, i);
-            art.nets.push_back({n, 0.0, 0});
-            return i;
-        };
         for (const Track& t : board.tracks) {
             const int i = netOf(t.net);
             if (i < 0) continue;
@@ -523,19 +526,28 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
         const bool isOuter = (layer.name == "F.Cu" || layer.name == "B.Cu");
         if (!isOuter && !opts.innerLayers) continue;
 
+        // Copper is accumulated PER NET as well as in bulk: `copper` is what
+        // everything downstream already consumed, `byNet` is what net
+        // highlighting needs. Both describe the same area.
         Paths64 copper;
+        std::map<int, Paths64> byNet;
+        const auto addCopper = [&](Paths64 p, const std::string& net) {
+            Paths64& bucket = byNet[netOf(net)];
+            bucket.insert(bucket.end(), p.begin(), p.end());
+            copper.insert(copper.end(), std::make_move_iterator(p.begin()),
+                          std::make_move_iterator(p.end()));
+        };
+
         for (const Track& track : board.tracks) {
             if (track.layer != layerIndex) continue;
-            const Paths64 p = trackPaths(track);
-            copper.insert(copper.end(), p.begin(), p.end());
+            addCopper(trackPaths(track), track.net);
         }
         for (const Pad& pad : board.pads) {
             if (std::find(pad.layers.begin(), pad.layers.end(), layerIndex) ==
                 pad.layers.end()) {
                 continue;
             }
-            const Paths64 p = padPaths(pad, opts.circleSegments);
-            copper.insert(copper.end(), p.begin(), p.end());
+            addCopper(padPaths(pad, opts.circleSegments), pad.net);
         }
         for (const Via& via : board.vias) {
             // Blind/buried vias only span their own range; -1 means the layer
@@ -546,15 +558,18 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
                      board.layers[via.fromLayer].stackIndex &&
                  layer.stackIndex <= board.layers[via.toLayer].stackIndex);
             if (!spans) continue;
-            copper.push_back(circlePath(via.at, via.size * 0.5, opts.circleSegments));
+            addCopper({circlePath(via.at, via.size * 0.5, opts.circleSegments)},
+                      via.net);
         }
         for (const ZoneFill& zone : board.zones) {
             if (zone.layer != layerIndex) continue;
+            Paths64 fill;
             for (const Polygon& poly : zone.polygons) {
                 Path64 path;
                 for (const Vec2& p : poly.outer) path.push_back(toClipper(p));
-                if (path.size() >= 3) copper.push_back(std::move(path));
+                if (path.size() >= 3) fill.push_back(std::move(path));
             }
+            addCopper(std::move(fill), zone.net);
         }
         if (copper.empty()) continue;
 
@@ -570,6 +585,11 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
         al.z = layer.z;
         al.thickness = layer.thickness;
         al.art = std::move(copper);
+        for (auto& [net, paths] : byNet) {
+            if (paths.empty()) continue;
+            normalizeWinding(paths);
+            al.netArt.push_back({net, std::move(paths)});
+        }
         art.layers.push_back(std::move(al));
     }
 
@@ -853,9 +873,13 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
 
     // --- One part per art layer ---
     for (const ArtLayer& al : art.layers) {
-        Clipper64 clipper;
         ClipType op = ClipType::Union;
         Material material = Material::Copper;
+        // The subject and clip for this layer's one boolean. Held as pointers
+        // so copper can swap the subject per net while everything else about
+        // the operation stays identical.
+        const Paths64* subject = &al.art;
+        const Paths64* clip = nullptr;
         // Blind/buried bores crossing this layer, subtracted after the main
         // boolean (they are not in art.drills, so boardArea leaves them be).
         Paths64 layerBores;
@@ -866,12 +890,11 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // fingers are drawn overhanging and routed off during fab) and
                 // punches the drills in one pass.
                 material = Material::Copper;
-                clipper.AddSubject(al.art);
                 if (!boardArea.empty()) {
-                    clipper.AddClip(boardArea);
+                    clip = &boardArea;
                     op = ClipType::Intersection;
                 } else if (!art.drills.empty()) {
-                    clipper.AddClip(art.drills);
+                    clip = &art.drills;
                     op = ClipType::Difference;
                 }
                 // A bore spans this foil if the foil's centre lies inside it
@@ -893,9 +916,9 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // tenting impossible and render every via as a punched dot.
                 material = Material::Soldermask;
                 if (art.outline.empty()) continue;
-                clipper.AddSubject(art.outline);
+                subject = &art.outline;
                 if (!al.art.empty()) {
-                    clipper.AddClip(al.art);
+                    clip = &al.art;
                     op = ClipType::Difference;
                 }
                 break;
@@ -905,8 +928,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // KiCad's (subtractmaskfromsilk no), which is what the fab does.
                 material = Material::Silkscreen;
                 if (art.outline.empty()) continue;
-                clipper.AddSubject(al.art);
-                clipper.AddClip(art.outline);
+                clip = &art.outline;
                 op = ClipType::Intersection;
                 break;
 
@@ -914,27 +936,51 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 continue;
         }
 
-        PolyTree64 tree;
-        if (layerBores.empty()) {
-            clipper.Execute(op, FillRule::NonZero, tree);
-        } else {
-            Paths64 clipped;
-            clipper.Execute(op, FillRule::NonZero, clipped);
-            Clipper64 boring;
-            boring.AddSubject(clipped);
-            boring.AddClip(layerBores);
-            boring.Execute(ClipType::Difference, FillRule::NonZero, tree);
-        }
-
-        std::vector<Shape> shapes;
-        collectShapes(tree, shapes);
-
+        // Runs one subject through the layer's clip (and the blind/buried
+        // bores) and extrudes the result, tagging every triangle produced
+        // with `net`. Copper calls this once per net; everything else once
+        // with net -1.
         Part part;
         part.material = material;
         part.name = al.name;
         part.maskOpenings = al.openings;
-        for (const Shape& shape : shapes) {
-            extrude(shape, al.z, al.z + al.thickness, part.mesh);
+
+        const auto clipAndExtrude = [&](const Paths64& subj, int net) {
+            if (subj.empty()) return;
+            Clipper64 c;
+            c.AddSubject(subj);
+            if (clip) c.AddClip(*clip);
+
+            PolyTree64 tree;
+            if (layerBores.empty()) {
+                c.Execute(op, FillRule::NonZero, tree);
+            } else {
+                Paths64 clipped;
+                c.Execute(op, FillRule::NonZero, clipped);
+                Clipper64 boring;
+                boring.AddSubject(clipped);
+                boring.AddClip(layerBores);
+                boring.Execute(ClipType::Difference, FillRule::NonZero, tree);
+            }
+
+            std::vector<Shape> shapes;
+            collectShapes(tree, shapes);
+            const size_t before = part.mesh.indices.size();
+            for (const Shape& shape : shapes)
+                extrude(shape, al.z, al.z + al.thickness, part.mesh);
+            const size_t added = (part.mesh.indices.size() - before) / 3;
+            part.triNet.insert(part.triNet.end(), added, net);
+        };
+
+        if (al.kind == LayerKind::Copper && !al.netArt.empty()) {
+            // Per net, so the triangles carry net identity. The union of the
+            // parts equals the union of the whole -- different nets do not
+            // overlap -- so the geometry is unchanged.
+            for (const ArtLayer::NetRegion& r : al.netArt)
+                clipAndExtrude(r.paths, r.net);
+        } else {
+            // Mask, silkscreen, and any copper with no net breakdown.
+            clipAndExtrude(*subject, -1);
         }
         if (!part.mesh.indices.empty()) out.parts.push_back(std::move(part));
     }

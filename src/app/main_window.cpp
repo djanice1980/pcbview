@@ -21,6 +21,7 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
@@ -196,6 +197,7 @@ MainWindow::MainWindow(const QString& path) {
     buildToolbar();
     buildStackupDock();
     buildPropertiesDock();
+    buildNetDock();
     buildStatusBar();
 
     rebuildRecentMenu();
@@ -240,6 +242,21 @@ MainWindow::MainWindow(const QString& path) {
     if (qEnvironmentVariableIsSet("PCBVIEW_START_PITCH"))
         viewport_->camera().pitch =
             qEnvironmentVariable("PCBVIEW_START_PITCH").toFloat();
+
+    // Headless net-highlight hook: highlight a net BY NAME (the UI picker
+    // cannot be driven by synthetic input).
+    if (qEnvironmentVariableIsSet("PCBVIEW_NET")) {
+        const QString want = qEnvironmentVariable("PCBVIEW_NET");
+        QTimer::singleShot(400, this, [this, want] {
+            for (size_t i = 0; i < mesh_.nets.size(); ++i) {
+                if (QString::fromStdString(mesh_.nets[i].name) == want) {
+                    highlightNet(static_cast<int>(i));
+                    return;
+                }
+            }
+            statusBar()->showMessage("No net named " + want, 4000);
+        });
+    }
 
     // Headless measurement hook: pin a measurement between two world points
     // (x1,y1,z1,x2,y2,z2 in mm) -- mouse picks can't be synthesised.
@@ -419,6 +436,12 @@ void MainWindow::buildViewport() {
                     measureAction_->setChecked(on);
                 }
             });
+    // Clicking the board picks the net under the cursor.
+    connect(viewport_, &VulkanWindow::netPicked, this,
+            [this](int net) { highlightNet(net); });
+    // A rebuilt viewport (device switch) starts with no highlight.
+    if (highlightedNet_ >= 0 && viewport_->renderer())
+        viewport_->renderer()->setHighlightNet(highlightedNet_);
     // The O key flips the camera directly, so mirror it onto the action
     // (blocked, or the action would drive the camera straight back).
     connect(viewport_, &VulkanWindow::orthoChanged, this, [this](bool on) {
@@ -597,6 +620,7 @@ bool MainWindow::loadBoard(const QString& path) {
 
     populateStackup();
     populateProperties();
+    populateNets();
     updateStatus();
     rememberRecent(path);
     QApplication::restoreOverrideCursor();
@@ -1488,6 +1512,112 @@ void MainWindow::buildPropertiesDock() {
     dock->setMinimumWidth(230);
     addDockWidget(Qt::RightDockWidgetArea, dock);
     propertiesDock_ = dock;
+}
+
+void MainWindow::buildNetDock() {
+    auto* dock = new CollapsibleDock("NETS", Qt::RightDockWidgetArea, this);
+
+    auto* panel = new QWidget;
+    auto* layout = new QVBoxLayout(panel);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(4);
+
+    netFilter_ = new QLineEdit;
+    netFilter_->setPlaceholderText("Filter nets…");
+    netFilter_->setClearButtonEnabled(true);
+    layout->addWidget(netFilter_);
+
+    netList_ = new QTreeWidget;
+    netList_->setColumnCount(2);
+    netList_->setHeaderLabels({"Net", "Routed"});
+    netList_->header()->setStretchLastSection(false);
+    netList_->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    netList_->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    netList_->setRootIsDecorated(false);
+    netList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    layout->addWidget(netList_);
+
+    // Selecting a row highlights that net; the same call drives the renderer
+    // and the status line, so board clicks and the headless hook land here too.
+    connect(netList_, &QTreeWidget::itemSelectionChanged, this, [this] {
+        const auto sel = netList_->selectedItems();
+        if (sel.isEmpty()) return;
+        highlightNet(sel.first()->data(0, Qt::UserRole).toInt());
+    });
+    connect(netFilter_, &QLineEdit::textChanged, this, [this](const QString& t) {
+        for (int i = 0; i < netList_->topLevelItemCount(); ++i) {
+            QTreeWidgetItem* it = netList_->topLevelItem(i);
+            it->setHidden(!t.isEmpty() &&
+                          !it->text(0).contains(t, Qt::CaseInsensitive));
+        }
+    });
+
+    dock->setContent(panel);
+    dock->setMinimumWidth(230);
+    addDockWidget(Qt::RightDockWidgetArea, dock);
+    netDock_ = dock;
+}
+
+void MainWindow::populateNets() {
+    if (!netList_) return;
+    netList_->clear();
+    highlightedNet_ = -1;
+    if (viewport_->renderer()) viewport_->renderer()->setHighlightNet(-1);
+
+    // Gerber packages carry no nets at all; say so rather than showing an
+    // empty list that looks like a failure.
+    if (mesh_.nets.empty()) {
+        auto* none = new QTreeWidgetItem(
+            netList_, {fromGerber_ ? "(gerbers carry no nets)" : "(no nets)", ""});
+        none->setForeground(0, QColor(theme::kTextDim));
+        none->setFlags(Qt::NoItemFlags);
+        return;
+    }
+    for (size_t i = 0; i < mesh_.nets.size(); ++i) {
+        const auto& n = mesh_.nets[i];
+        auto* it = new QTreeWidgetItem(
+            netList_, {QString::fromStdString(n.name),
+                       QString::number(n.routedMm, 'f', 1) + " mm"});
+        it->setData(0, Qt::UserRole, static_cast<int>(i));
+        it->setForeground(1, QColor(theme::kTextDim));
+    }
+    netList_->sortItems(0, Qt::AscendingOrder);
+}
+
+void MainWindow::highlightNet(int net) {
+    highlightedNet_ = net;
+    if (viewport_->renderer()) {
+        viewport_->renderer()->setHighlightNet(net);
+        viewport_->requestUpdate();
+    }
+    if (net < 0 || net >= static_cast<int>(mesh_.nets.size())) {
+        statusBar()->clearMessage();
+        return;
+    }
+    const auto& n = mesh_.nets[net];
+    QString msg = QString("Net %1  ·  %2 mm routed  ·  %3 via%4")
+                      .arg(QString::fromStdString(n.name))
+                      .arg(n.routedMm, 0, 'f', 3)
+                      .arg(n.viaCount)
+                      .arg(n.viaCount == 1 ? "" : "s");
+    // The tracers shade from their own material fetch, so the tint never
+    // reaches them. Say so rather than letting the board look unchanged.
+    if (viewport_->pathTracing())
+        msg += "   (highlight shows in raster / RT, not path tracing)";
+    statusBar()->showMessage(msg);
+
+    // Keep the list in step when the highlight came from somewhere else.
+    if (netList_) {
+        const QSignalBlocker block(netList_);
+        for (int i = 0; i < netList_->topLevelItemCount(); ++i) {
+            QTreeWidgetItem* it = netList_->topLevelItem(i);
+            if (it->data(0, Qt::UserRole).toInt() == net) {
+                netList_->setCurrentItem(it);
+                netList_->scrollToItem(it);
+                break;
+            }
+        }
+    }
 }
 
 void MainWindow::populateProperties() {

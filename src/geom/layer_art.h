@@ -84,6 +84,21 @@ struct ArtLayer {
     // makes via tenting fall out for free.
     Clipper2Lib::Paths64 art;
 
+    // Copper only: the same geometry as `art`, but SPLIT BY NET so net
+    // identity survives into the mesh (net highlighting needs to know which
+    // triangles belong to which net, and `art` is a single merged union in
+    // which that is gone).
+    //
+    // Splitting is lossless: design rules keep different nets apart, so
+    // unioning each net separately covers exactly the same area as unioning
+    // them together. `net` indexes LayerArt::nets; -1 means unknown (every
+    // Gerber layer, and KiCad copper with no net).
+    struct NetRegion {
+        int net = -1;
+        Clipper2Lib::Paths64 paths;
+    };
+    std::vector<NetRegion> netArt;
+
     // Soldermask only: how many openings were punched. Cross-checks against the
     // flash count in a *_Mask gerber.
     int openings = -1;

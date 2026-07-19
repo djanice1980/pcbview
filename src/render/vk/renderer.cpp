@@ -44,6 +44,11 @@ const uint32_t kOverlayFrag[] =
 
 constexpr uint32_t kFramesInFlight = 2;
 
+// set 0 binding for the per-triangle net buffer. Binding 1 is the TLAS on an
+// RT device and unused otherwise, so 2 is free either way and the fragment
+// shaders can hard-code it.
+constexpr uint32_t kNetBinding = 2;
+
 struct PtPush {
     float eye[4];    // xyz, w = sampleIndex
     float fwd[4];
@@ -88,6 +93,10 @@ struct PushConstants {
     // vector then flips the normal and swings the whole camera-relative light
     // rig, rendering the board's near edge black.
     float camAxis[4];
+    // x = highlighted net index, -1 for none. Total push size is 128 bytes,
+    // exactly the Vulkan minimum guarantee -- do not add another vec4 without
+    // checking maxPushConstantsSize.
+    int32_t highlight[4];
 };
 
 }  // namespace
@@ -1748,6 +1757,17 @@ void Renderer::createDescriptors() {
         bindings.push_back(as);
     }
 
+    // Per-triangle net, for highlighting. A FIXED binding number regardless
+    // of RT support, so the two fragment shaders can declare it once.
+    {
+        VkDescriptorSetLayoutBinding net{};
+        net.binding = kNetBinding;
+        net.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        net.descriptorCount = 1;
+        net.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings.push_back(net);
+    }
+
     VkDescriptorSetLayoutCreateInfo info{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     info.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -1756,7 +1776,7 @@ void Renderer::createDescriptors() {
           "vkCreateDescriptorSetLayout");
 
     std::vector<VkDescriptorPoolSize> sizes{
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};  // materials + per-triangle net
     if (rtSupported_)
         sizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1});
     VkDescriptorPoolCreateInfo pool{
@@ -2130,6 +2150,7 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     std::vector<uint32_t> indices;
     std::vector<MaterialGpu> materials;
     std::vector<uint32_t> triMaterial;  // per global triangle: material index (path tracer)
+    std::vector<int32_t> triNet;        // per global triangle: net index, -1 none
     std::vector<uint32_t> vertexMat;    // per global vertex: material index (explode bake)
     std::vector<float> centreZ;  // per material, for explode ranking
     std::vector<int> mount;      // per material: 0 board layer, +/-1 component side
@@ -2256,8 +2277,16 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
 
         // Per-triangle material index, in the same global triangle order as the
         // index buffer -- the path tracer looks material up by primitive index.
-        for (uint32_t t = 0; t < item.indexCount / 3; ++t)
+        // The net index rides along in the same order for highlighting; the
+        // material records where this draw's triangles start so the raster
+        // shader can turn gl_PrimitiveID into a global index.
+        materials[item.material].extra[0] =
+            static_cast<uint32_t>(triMaterial.size());
+        const uint32_t triCount = item.indexCount / 3;
+        for (uint32_t t = 0; t < triCount; ++t) {
             triMaterial.push_back(item.material);
+            triNet.push_back(t < part.triNet.size() ? part.triNet[t] : -1);
+        }
 
         stats_.trianglesTotal += static_cast<uint32_t>(part.mesh.triangleCount());
         draws_.push_back(item);
@@ -2428,6 +2457,20 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         uploadViaStaging(triMaterialBuffer_, triMaterial.data(), tsize);
     }
 
+    // Per-triangle net, for highlighting. Always allocated (a one-entry dummy
+    // when the board has no nets) so the descriptor is never left dangling --
+    // the raster shaders read it unconditionally.
+    {
+        destroyBuffer(triNetBuffer_);
+        if (triNet.empty()) triNet.push_back(-1);
+        const VkDeviceSize nsize = triNet.size() * sizeof(int32_t);
+        triNetBuffer_ = createBuffer(
+            nsize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        uploadViaStaging(triNetBuffer_, triNet.data(), nsize);
+    }
+
     const VkDeviceSize msize = materials.size() * sizeof(MaterialGpu);
     materialBuffer_ = createBuffer(msize,
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -2437,13 +2480,21 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     uploadViaStaging(materialBuffer_, materials.data(), msize);
 
     VkDescriptorBufferInfo bufferInfo{materialBuffer_.handle, 0, msize};
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = materialSet_;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    write.pBufferInfo = &bufferInfo;
-    vkUpdateDescriptorSets(device_.handle, 1, &write, 0, nullptr);
+    VkDescriptorBufferInfo netInfo{triNetBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet writes[2]{};
+    writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[0].dstSet = materialSet_;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[0].pBufferInfo = &bufferInfo;
+    writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[1].dstSet = materialSet_;
+    writes[1].dstBinding = kNetBinding;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[1].pBufferInfo = &netInfo;
+    vkUpdateDescriptorSets(device_.handle, 2, writes, 0, nullptr);
 
     // Build the RT acceleration structure over this geometry and point binding 1
     // at it. Rebuilt every upload -- a new board / thickness changes the buffers.
@@ -2734,6 +2785,7 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     push.camAxis[1] = camFwd_[1];
     push.camAxis[2] = camFwd_[2];
     push.camAxis[3] = camOrthoDistance_;  // > 0 only in orthographic
+    push.highlight[0] = highlightNet_;
     vkCmdPushConstants(cmd, layout_,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(push), &push);

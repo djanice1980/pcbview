@@ -156,6 +156,10 @@ signals:
     void measureModeChanged(bool on);
     // Likewise for the O key and the Orthographic action.
     void orthoChanged(bool on);
+    // A click on the board picked this net (index into BoardMesh::nets), or
+    // -1 for a click that hit no net-carrying feature. Only outside measure
+    // mode, where a click places measurement points instead.
+    void netPicked(int net);
 
     void frameRendered();
     void statusMessage(const QString& text);
