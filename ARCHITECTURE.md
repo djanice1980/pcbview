@@ -1013,9 +1013,18 @@ Headless verification hooks (dialog can't take synthetic input):
   saves it; print (`Qt6::PrintSupport`) shows a **`QPrintPreviewDialog`** whose
   `paintRequested` paints the image to the page. Three modes: as-shown; flat (snap
   to top-orthographic, capture, restore camera); and flat at **1:1** —
-  orthographic mm-per-pixel is `2*halfW/width` (halfW from `distance`, mirroring
-  `render()`), scaled to the printer's DPI so the board prints at true physical
-  size.
+  orthographic mm-per-pixel is `2*halfW/width`, scaled to the printer's DPI so
+  the board prints at true physical size.
+  - **`halfW` comes from `VulkanWindow::orthoHalfHeight()`, and MUST.** That
+    one function defines the orthographic extent for the raster projection,
+    the tracers' ray spans and this print scale. It returns
+    `distance * tan(fov/2)` — the perspective frustum's half-height at the
+    orbit distance — so toggling Ortho does not change the board's on-screen
+    size. It was `distance / 2` until 2026-07-19, an arbitrary constant that
+    made the O key jump the zoom by 21% (measured 1337 px vs 1097 px across
+    an identical camera). The print path had its OWN copy of that constant,
+    so fixing only the projection would have silently mis-scaled every 1:1
+    print by the same 21% — do not re-inline this value.
   - **The grabFrame callback MUST be deferred** (`invokeMethod(..., QueuedConnection)`).
     `frameRendered` is emitted from inside `render()`; opening a modal dialog
     there re-enters the render/event machinery and left the print preview blank.
