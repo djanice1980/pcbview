@@ -10,7 +10,13 @@
 #include "app/settings.h"
 #include <QWheelEvent>
 
-#define GLM_FORCE_DEPTH_ZERO_TO_ONE  // Vulkan clip space, not OpenGL's
+// GLM_FORCE_DEPTH_ZERO_TO_ONE (Vulkan clip space, not OpenGL's) is a COMPILE
+// DEFINITION in CMakeLists, not a #define here. It configures glm's projection
+// matrices, so it must be set before glm is included ANYWHERE in the
+// translation unit -- and vulkan_window.h includes glm itself, ahead of this
+// file's body. A local #define silently lost that race and glm::ortho started
+// emitting OpenGL's [-1,1] depth, half of which Vulkan clips: the board was
+// sliced along a plane in orthographic view. Never move it back into a .cpp.
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 

@@ -224,6 +224,15 @@ set_source_files_properties(${MINIZ_SOURCES} PROPERTIES COMPILE_FLAGS
 # are guarded by #ifndef, so even defining it to 0 disables them.
 target_compile_definitions(pcbview PRIVATE MINIZ_EXPORT=)
 
+# Vulkan clip space: depth runs 0..1, not OpenGL's -1..1. This configures glm's
+# projection matrices and MUST be set before glm is included anywhere in a
+# translation unit, so it lives here rather than as a #define in one .cpp --
+# a header that includes glm first silently beats a local define. That exact
+# race shipped in v1.13: glm::ortho emitted OpenGL depth, Vulkan clipped
+# everything that mapped below 0, and the board was sliced along a plane in
+# orthographic view.
+target_compile_definitions(pcbview PRIVATE GLM_FORCE_DEPTH_ZERO_TO_ONE)
+
 # The generated miniz_export.h would normally sit beside the sources; provide a
 # stub on the include path so #include "miniz_export.h" is satisfied.
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/miniz_export.h
