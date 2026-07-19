@@ -52,7 +52,23 @@ Basis cameraBasis(const Camera& c) {
     b.forward = -offset;
     b.right = glm::vec3(std::cos(c.yaw), std::sin(c.yaw), 0.0f);
     b.up = glm::cross(b.right, b.forward);
+
+    // Roll spins right/up about the view axis after the pole-safe basis is
+    // built, so it composes with the yaw/pitch turntable instead of breaking
+    // its no-degenerate-poles guarantee.
+    if (c.roll != 0.0f) {
+        const float cr = std::cos(c.roll), sr = std::sin(c.roll);
+        const glm::vec3 r = b.right * cr + b.up * sr;
+        b.up = b.up * cr - b.right * sr;
+        b.right = r;
+    }
     return b;
+}
+
+// Rodrigues rotation of v about the unit axis k by angle a.
+glm::vec3 rotateAbout(const glm::vec3& v, const glm::vec3& k, float a) {
+    const float c = std::cos(a), s = std::sin(a);
+    return v * c + glm::cross(k, v) * s + k * glm::dot(k, v) * (1.0f - c);
 }
 
 // Right-handed view matrix from an explicit basis. Same construction as
@@ -464,6 +480,8 @@ void VulkanWindow::setViewTarget(const Camera& dest, bool snap) {
     constexpr float kPi = 3.14159265f, kTwoPi = 6.28318531f;
     while (viewTarget_.yaw - camera_.yaw > kPi) viewTarget_.yaw -= kTwoPi;
     while (viewTarget_.yaw - camera_.yaw < -kPi) viewTarget_.yaw += kTwoPi;
+    while (viewTarget_.roll - camera_.roll > kPi) viewTarget_.roll -= kTwoPi;
+    while (viewTarget_.roll - camera_.roll < -kPi) viewTarget_.roll += kTwoPi;
 
     // Snap when asked, OR before the first frame exists. A view configured
     // pre-expose (env hooks, a CLI path) must persist -- if it started an
@@ -505,6 +523,7 @@ void VulkanWindow::setViewTop() {
     // Exactly vertical is fine now: the basis comes from yaw, so there is no
     // pole to avoid. This used to need a fudge factor.
     dest.pitch = 1.57079633f;  // +pi/2
+    dest.roll = 0.0f;          // presets are canonical: untwist
     setViewTarget(dest, false);
 }
 
@@ -512,6 +531,7 @@ void VulkanWindow::setViewBottom() {
     Camera dest = camera_;
     dest.yaw = 0.0f;
     dest.pitch = -1.57079633f;  // -pi/2
+    dest.roll = 0.0f;
     setViewTarget(dest, false);
 }
 
@@ -519,6 +539,7 @@ void VulkanWindow::setViewIso() {
     Camera dest = camera_;
     dest.yaw = 0.6f;
     dest.pitch = 0.62f;
+    dest.roll = 0.0f;
     setViewTarget(dest, false);
 }
 
@@ -656,9 +677,9 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
     cameraAnimating_ = false;
     lastPos_ = e->position();
     if (e->button() == Qt::LeftButton) dragging_ = true;
-    // Right-drag rotates INVERSELY to left-drag (mirror directions); middle
-    // pans. User request: with pan on the middle button, the right button is
-    // free to be the "other way round" orbit.
+    // Left-drag is yaw+pitch; right-drag is yaw+ROLL (horizontal spins the
+    // board on its axis, vertical twists it cw/ccw); middle pans. User
+    // request: the right button covers the rotation left-drag can't do.
     if (e->button() == Qt::RightButton) draggingInv_ = true;
     if (e->button() == Qt::MiddleButton) panning_ = true;
 }
@@ -677,13 +698,44 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
     const QPointF delta = e->position() - lastPos_;
     lastPos_ = e->position();
 
-    if (dragging_ || draggingInv_) {
-        const float s = dragging_ ? 0.008f : -0.008f;  // right button mirrors
+    if (dragging_) {
+        const float s = 0.008f;
         camera_.yaw = wrapPi(camera_.yaw + static_cast<float>(delta.x()) * s);
         // No clamp: the basis is pole-safe, so pitch rotates through and keeps
         // going. Past vertical the view inverts, which is correct.
         camera_.pitch =
             wrapPi(camera_.pitch + static_cast<float>(delta.y()) * s);
+        requestUpdate();
+    } else if (draggingInv_) {
+        // Right-drag covers the two SCREEN-relative rotations left-drag
+        // doesn't: horizontal tumbles the board about the screen-VERTICAL
+        // axis (globe spin -- left edge toward you, right edge away),
+        // vertical twists it cw/ccw about the view axis (roll). The globe
+        // spin is a rotation about the current camera up, which the
+        // yaw/pitch/roll parameterisation can't express as one increment --
+        // so rotate the basis and decompose back into yaw/pitch/roll.
+        const float s = 0.008f;
+        const float ax = static_cast<float>(delta.x()) * s;
+        if (ax != 0.0f) {
+            const Basis b = cameraBasis(camera_);
+            // Up is the rotation axis, so it is invariant; only the eye
+            // offset moves. Same sign convention as yaw (matches left-drag
+            // feel at a level view, where up == world Z).
+            const glm::vec3 offset = rotateAbout(-b.forward, b.up, ax);
+            camera_.pitch = std::asin(glm::clamp(offset.z, -1.0f, 1.0f));
+            if (std::abs(offset.x) + std::abs(offset.y) > 1e-6f)
+                camera_.yaw = std::atan2(offset.x, -offset.y);
+            // Whatever part of the new orientation yaw/pitch can't express
+            // lands in roll: compare the carried-over up against the
+            // unrolled reference basis at the new yaw/pitch.
+            const glm::vec3 right0(std::cos(camera_.yaw),
+                                   std::sin(camera_.yaw), 0.0f);
+            const glm::vec3 up0 = glm::cross(right0, -offset);
+            camera_.roll = std::atan2(-glm::dot(b.up, right0),
+                                      glm::dot(b.up, up0));
+        }
+        camera_.roll =
+            wrapPi(camera_.roll + static_cast<float>(delta.y()) * s);
         requestUpdate();
     } else if (panning_) {
         // Pan across the SCREEN plane, using the camera's own right/up. Using
@@ -817,6 +869,7 @@ bool VulkanWindow::stepCameraAnimation() {
     const auto ease = [&](float& cur, float tgt) { cur += (tgt - cur) * k; };
     ease(camera_.yaw, viewTarget_.yaw);
     ease(camera_.pitch, viewTarget_.pitch);
+    ease(camera_.roll, viewTarget_.roll);
     ease(camera_.distance, viewTarget_.distance);
     ease(camera_.targetX, viewTarget_.targetX);
     ease(camera_.targetY, viewTarget_.targetY);
@@ -827,6 +880,7 @@ bool VulkanWindow::stepCameraAnimation() {
     const float residual =
         std::abs(camera_.yaw - viewTarget_.yaw) +
         std::abs(camera_.pitch - viewTarget_.pitch) +
+        std::abs(camera_.roll - viewTarget_.roll) +
         0.01f * (std::abs(camera_.distance - viewTarget_.distance) +
                  std::abs(camera_.targetX - viewTarget_.targetX) +
                  std::abs(camera_.targetY - viewTarget_.targetY) +

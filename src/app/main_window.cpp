@@ -133,6 +133,11 @@ MainWindow::MainWindow(const QString& path) {
     if (qEnvironmentVariable("PCBVIEW_START_ORTHO").toInt() != 0)
         viewport_->camera().orthographic = true;
 
+    // Headless roll hook (right-drag vertical can't be synthesised); radians.
+    if (qEnvironmentVariableIsSet("PCBVIEW_START_ROLL"))
+        viewport_->camera().roll =
+            qEnvironmentVariable("PCBVIEW_START_ROLL").toFloat();
+
     // Headless close-up: set the orbit distance AFTER first expose --
     // initialise()'s frameBoard() would clobber a pre-expose value (the usual
     // before-first-frame trap). Needed to reproduce artifacts that only show

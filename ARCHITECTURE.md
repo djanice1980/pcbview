@@ -1062,6 +1062,8 @@ interactive run. All are opt-in. Grouped by purpose:
   (0 = collapsed; up to `maxRank`, ~mid+1 with components), snapped not animated.
 - `PCBVIEW_START_ORTHO=1` — open in orthographic projection.
 - `PCBVIEW_START_DISTANCE=<mm>` — opening camera distance (overrides fit).
+- `PCBVIEW_START_ROLL=<radians>` — opening camera roll (right-drag vertical
+  can't be synthesised).
 
 **Appearance (mirror the Appearance dialog, which input synthesis can't drive)**
 - `PCBVIEW_THICKNESS=<mm>` — finished-board thickness override.
@@ -1209,19 +1211,27 @@ colour/side group at once.
 
 ### Future release ideas (noted 2026-07-19)
 
-- **FIX FIRST — right-drag rotation shipped wrong in v1.12.** What shipped is
-  a *mirrored* left-drag (same motions, opposite direction): up/down pitches
-  the board toward/away, left/right reads as a clockwise/counterclockwise
-  twist. That is exactly what left-drag already does and NOT what was asked
-  for. Wanted (user's words, 2026-07-19): right-drag **up/down** should
-  *twist the model clockwise and counterclockwise*; right-drag **left/right**
-  should *rotate the model left and right (spin on axis)*. I.e. the axes swap
-  roles relative to left-drag rather than merely negating — the vertical
-  mouse axis picks up the twist/roll motion, the horizontal axis the
-  spin-on-axis motion. Note the current camera has no roll degree of freedom
-  (orbit is yaw+pitch only), so the twist component likely means adding roll
-  about the view axis — confirm the exact mapping with the user before
-  implementing.
+- **FIXED post-v1.12 — right-drag is globe-spin + twist (took two tries).**
+  v1.12 shipped right-drag as a *mirrored* left-drag. The first fix mapped
+  it to yaw + roll — wrong again, because from a top-down view roll and yaw
+  are visually the same in-plane spin, so both right-drag axes looked
+  identical ("all yaw"). The user's screenshot walkthrough pinned the
+  vocabulary: "twist cw/ccw" = the in-plane spin, "rotate left and right
+  (spin on axis)" = a **globe spin** — tumbling about the SCREEN-VERTICAL
+  axis, the one rotation no drag produced. Final mapping: left-drag =
+  yaw + pitch (turntable spin + toward/away tumble); **right-drag
+  horizontal = globe spin** (rotate the eye offset about the camera's up
+  axis via a Rodrigues helper, then decompose the result back into
+  yaw/pitch/roll — a camera-up rotation is not expressible as one turntable
+  increment; up itself is invariant, and the residual orientation lands in
+  roll), **right-drag vertical = roll** (cw/ccw twist about the view axis).
+  User-confirmed 2026-07-19. Supporting infrastructure: `Camera::roll`
+  applied in `cameraBasis` AFTER the pole-safe yaw/pitch basis; roll eases
+  in view-preset glides, wraps shortest-way, and is cleared by Top/Bottom/
+  Iso (canonical views untwist; Fit keeps it). Everything downstream —
+  raster view, PT/RT ray camera on both devices, pan — derives from
+  `cameraBasis`, so no other plumbing changed. `PCBVIEW_START_ROLL`
+  (radians) is the headless hook; raster + PT captures verified at 45°.
 
 - **Measurement tools (noted 2026-07-19).** Two complementary pieces:
   1. **Point-to-point measure** — click first point, click second (rubber-band

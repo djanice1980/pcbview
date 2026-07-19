@@ -115,7 +115,7 @@ between the slabs:
 | Action | Control |
 |---|---|
 | Orbit / pan / zoom | Left-drag / middle-drag / scroll |
-| Inverse orbit (mirrored) | Right-drag |
+| Globe-spin + twist | Right-drag (horizontal tumbles about the screen-vertical axis; vertical twists cw/ccw) |
 | Exploded view | `Ctrl` + scroll |
 | Top / Bottom / Isometric | `T` / `B` / `I` |
 | Fit to board | `F` |

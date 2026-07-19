@@ -33,6 +33,7 @@ struct Camera {
     float distance = 100.0f;
     float yaw = 0.0f;
     float pitch = 1.2f;
+    float roll = 0.0f;  // about the view axis; right-drag vertical drives it
     float fovDegrees = 45.0f;
     bool orthographic = false;
 };
@@ -214,7 +215,7 @@ private:
     bool stepZoomAnimation();
     bool initialised_ = false;
     bool dragging_ = false;
-    bool draggingInv_ = false;  // right-drag: mirrored orbit
+    bool draggingInv_ = false;  // right-drag: yaw (horizontal) + roll (vertical)
     bool panning_ = false;
     QPointF lastPos_;
     double frameMs_ = 0.0;
