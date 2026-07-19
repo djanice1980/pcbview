@@ -7,6 +7,7 @@
 #include <QApplication>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDockWidget>
@@ -34,6 +35,7 @@
 #include <QStatusBar>
 #include <QTimer>
 #include <QToolBar>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWidgetAction>
@@ -204,6 +206,35 @@ MainWindow::MainWindow(const QString& path) {
                 viewport_->renderer()->requestCapture(cap.toStdString());
             viewport_->requestUpdate();
             QTimer::singleShot(1000, qApp, &QApplication::quit);
+        });
+    }
+
+    // One-time support notice. Shown once ever (persisted flag), never during
+    // a headless run -- a modal dialog would deadlock every capture script.
+    if (!appSettings().value("kofiNoticeShown", false).toBool() &&
+        !qEnvironmentVariableIsSet("PCBVIEW_CAPTURE") &&
+        !qEnvironmentVariableIsSet("PCBVIEW_GPU_REPORT") &&
+        !qEnvironmentVariableIsSet("PCBVIEW_ART_DUMP")) {
+        appSettings().setValue("kofiNoticeShown", true);
+        QTimer::singleShot(1200, this, [this] {
+            QMessageBox box(this);
+            box.setWindowTitle("Support pcbview");
+            box.setTextFormat(Qt::RichText);
+            box.setText(
+                "<p><b>pcbview is free, open-source software.</b></p>"
+                "<p>If it's useful to you, you can support its development "
+                "on Ko-fi.</p>"
+                "<p style='color:#8f8f8f'>You can always find this later "
+                "under <b>Help &rarr; Support on Ko-fi</b>, or in the About "
+                "dialog. This notice won't appear again.</p>");
+            QPushButton* support =
+                box.addButton("Support on Ko-fi", QMessageBox::AcceptRole);
+            box.addButton("Close", QMessageBox::RejectRole);
+            box.exec();
+            if (box.clickedButton() == support) {
+                QDesktopServices::openUrl(
+                    QUrl("https://ko-fi.com/P5P81EV1M0"));
+            }
         });
     }
 }
@@ -1016,6 +1047,10 @@ void MainWindow::buildMenus() {
                 });
 
     QMenu* help = menuBar()->addMenu("&Help");
+    help->addAction("&Support on Ko-fi…", this, [] {
+        QDesktopServices::openUrl(QUrl("https://ko-fi.com/P5P81EV1M0"));
+    });
+    help->addSeparator();
     help->addAction("&About pcbview…", this, &MainWindow::showAbout);
 
     applyContext();
@@ -1503,6 +1538,9 @@ void MainWindow::showAbout() {
         this, "About pcbview",
         "<h3>pcbview 1.12</h3>"
         "<p>Standalone 3D PCB viewer. Renders what the fab will build.</p>"
+        "<p>If pcbview is useful to you, you can "
+        "<a href=\"https://ko-fi.com/P5P81EV1M0\">support its development on "
+        "Ko-fi</a>.</p>"
         "<p>Copyright © 2026 pcbview contributors.<br>"
         "pcbview is free software under the <b>GNU General Public License "
         "version 3</b> or later. See <code>LICENSE</code> beside the "

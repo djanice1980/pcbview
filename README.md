@@ -241,4 +241,10 @@ Built by **David Janice** — [github.com/djanice1980](https://github.com/djanic
 For questions, bug reports, or feature requests, please
 [open an issue](https://github.com/djanice1980/pcbview/issues) on this repository.
 
+If pcbview is useful to you, you can support its development:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/P5P81EV1M0)
+
+(In the app: **Help → Support on Ko-fi**.)
+
 *Developed with the assistance of [Claude Code](https://claude.com/claude-code).*
