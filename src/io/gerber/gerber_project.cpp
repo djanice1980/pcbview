@@ -3,6 +3,7 @@
 #include <miniz.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <filesystem>
@@ -208,6 +209,86 @@ Paths64 parseDrills(const std::string& text, int segments,
         if (plated && platedOut) platedOut->push_back(p);
     };
 
+    // ---- Excellon ROUT mode ----------------------------------------------
+    // Some CAM tools emit slots as MILLED PATHS instead of G85 obrounds:
+    //   G00X..Y..  rapid move, tool up (enters rout mode)
+    //   M15        plunge -- cutting starts at the current position
+    //   G01X..Y..  linear cut; G02/G03 arc cuts (I/J centre or A radius)
+    //   M16        retract -- the chain so far becomes one swept slot
+    //   G05        back to drill mode
+    // While the tool is down, a bare X..Y.. line CONTINUES the cut (G01 is
+    // modal) -- it must not fall through to the plain drill-hit case.
+    bool routMode = false;
+    bool toolDown = false;
+    bool havePos = false;
+    double curX = 0.0, curY = 0.0;
+    std::vector<std::array<double, 2>> routPts;  // mm, while tool is down
+
+    // The swept slot is the tool disc dragged along the chain: offset the open
+    // polyline outward by the tool radius (round joins, round end caps). A
+    // single-point chain (plunge + retract, no move) is just a drilled hole.
+    const auto sweepRout = [&]() {
+        auto it = tools.find(currentTool);
+        const double r = (it != tools.end() ? it->second : 0.0) * 0.5;
+        if (routPts.empty()) return;
+        if (r <= 0.0) {
+            if (warnings)
+                warnings->push_back(
+                    "routed slot with no tool diameter SKIPPED -- this slot "
+                    "is missing");
+            routPts.clear();
+            return;
+        }
+        Paths64 swept;
+        if (routPts.size() == 1) {
+            Path64 c;
+            for (int i = 0; i < segments; ++i) {
+                const double t = 2.0 * std::numbers::pi * i / segments;
+                c.push_back(
+                    Point64{geom::toInt(routPts[0][0] + r * std::cos(t)),
+                            geom::toInt(routPts[0][1] + r * std::sin(t))});
+            }
+            swept.push_back(std::move(c));
+        } else {
+            Path64 chain;
+            chain.reserve(routPts.size());
+            for (const auto& p : routPts)
+                chain.push_back(Point64{geom::toInt(p[0]), geom::toInt(p[1])});
+            ClipperOffset co;
+            co.ArcTolerance(geom::kScale * 0.005);
+            co.AddPath(chain, JoinType::Round, EndType::Round);
+            co.Execute(r * geom::kScale, swept);
+        }
+        bool droppedIsland = false;
+        for (Path64& p : swept) {
+            // A CLOSED rout loop sweeps to an annulus: outer boundary plus an
+            // inner hole around the surviving island. The drill set is
+            // winding-normalised downstream, which would flip the hole into a
+            // cut -- keep only the outers and say so, rather than silently
+            // cutting away an island.
+            if (Area(p) < 0) {
+                droppedIsland = true;
+                continue;
+            }
+            emitPlated(p);
+            holes.push_back(std::move(p));
+        }
+        if (droppedIsland && warnings)
+            warnings->push_back(
+                "closed routed path: the island inside it was CUT instead of "
+                "kept (annulus holes are not preserved)");
+        routPts.clear();
+    };
+
+    // A rout move/cut to (x, y): while the tool is down the point extends the
+    // chain; tool up it just moves the head.
+    const auto routTo = [&](double x, double y) {
+        if (toolDown) routPts.push_back({x, y});
+        curX = x;
+        curY = y;
+        havePos = true;
+    };
+
     std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
@@ -244,6 +325,130 @@ Paths64 parseDrills(const std::string& text, int segments,
             currentTool = std::stoi(m[1]);
             continue;
         }
+
+        // ---- Rout-mode commands (see the state block above) ----
+        if (std::regex_search(line, m,
+                              std::regex("^G0?0X([-\\d.]+)Y([-\\d.]+)"))) {
+            if (toolDown) {
+                // A rapid move with the tool down is malformed; close the cut
+                // rather than dragging it across the board.
+                sweepRout();
+                toolDown = false;
+                if (warnings)
+                    warnings->push_back(
+                        "rout: G00 rapid move with the tool down -- cut ended "
+                        "at the previous point");
+            }
+            routMode = true;
+            curX = std::atof(m[1].str().c_str()) * unitScale;
+            curY = std::atof(m[2].str().c_str()) * unitScale;
+            havePos = true;
+            continue;
+        }
+        if (line == "M15") {
+            if (havePos) {
+                toolDown = true;
+                routPts.assign(1, {curX, curY});
+            } else if (warnings) {
+                warnings->push_back(
+                    "rout: M15 plunge with no known position SKIPPED");
+            }
+            continue;
+        }
+        if (line == "M16") {
+            if (toolDown) sweepRout();
+            toolDown = false;
+            continue;
+        }
+        if (line == "G05") {
+            if (toolDown) {
+                sweepRout();
+                toolDown = false;
+            }
+            routMode = false;
+            continue;
+        }
+        if (std::regex_search(line, m,
+                              std::regex("^G0?1X([-\\d.]+)Y([-\\d.]+)"))) {
+            routTo(std::atof(m[1].str().c_str()) * unitScale,
+                   std::atof(m[2].str().c_str()) * unitScale);
+            continue;
+        }
+        if (std::regex_search(
+                line, m, std::regex("^G0?([23])X([-\\d.]+)Y([-\\d.]+)"))) {
+            // Arc cut. The centre comes as I/J (offset from the START point,
+            // the standard form) or as A (radius; two candidate centres, the
+            // one giving the <=180-degree arc in the commanded direction).
+            const bool cw = (m[1].str() == "2");
+            const double x2 = std::atof(m[2].str().c_str()) * unitScale;
+            const double y2 = std::atof(m[3].str().c_str()) * unitScale;
+            double cx = 0.0, cy = 0.0;
+            bool haveCentre = false;
+            std::smatch cm;
+            if (std::regex_search(line, cm,
+                                  std::regex("I([-\\d.]+)J([-\\d.]+)"))) {
+                cx = curX + std::atof(cm[1].str().c_str()) * unitScale;
+                cy = curY + std::atof(cm[2].str().c_str()) * unitScale;
+                haveCentre = true;
+            } else if (std::regex_search(line, cm,
+                                         std::regex("A([\\d.]+)"))) {
+                const double radius =
+                    std::atof(cm[1].str().c_str()) * unitScale;
+                const double dx = x2 - curX, dy = y2 - curY;
+                const double chord = std::hypot(dx, dy);
+                if (chord > 1e-9 && radius >= chord * 0.5) {
+                    const double h = std::sqrt(
+                        std::max(0.0, radius * radius - chord * chord * 0.25));
+                    // Left normal of the chord; a CW minor arc keeps its
+                    // centre on the RIGHT of the travel direction, CCW left.
+                    const double nx = -dy / chord, ny = dx / chord;
+                    const double sign = cw ? -1.0 : 1.0;
+                    cx = (curX + x2) * 0.5 + sign * h * nx;
+                    cy = (curY + y2) * 0.5 + sign * h * ny;
+                    haveCentre = true;
+                }
+            }
+            if (haveCentre && toolDown) {
+                const double radius = std::hypot(curX - cx, curY - cy);
+                double a1 = std::atan2(curY - cy, curX - cx);
+                double a2 = std::atan2(y2 - cy, x2 - cx);
+                if (cw) {
+                    while (a2 >= a1 - 1e-12) a2 -= 2.0 * std::numbers::pi;
+                } else {
+                    while (a2 <= a1 + 1e-12) a2 += 2.0 * std::numbers::pi;
+                }
+                const int steps = std::max(
+                    2, static_cast<int>(std::ceil(std::abs(a2 - a1) /
+                                                  (2.0 * std::numbers::pi /
+                                                   segments))));
+                for (int i = 1; i <= steps; ++i) {
+                    const double t = a1 + (a2 - a1) * i / steps;
+                    routPts.push_back({cx + radius * std::cos(t),
+                                       cy + radius * std::sin(t)});
+                }
+                curX = x2;
+                curY = y2;
+                havePos = true;
+            } else {
+                if (toolDown && warnings)
+                    warnings->push_back(
+                        "rout: arc without a resolvable centre approximated "
+                        "as a straight line");
+                routTo(x2, y2);
+            }
+            continue;
+        }
+        // In rout mode a bare X..Y.. continues the current motion (G01 is
+        // modal) -- it is NOT a drill hit, so intercept it before that case.
+        if (routMode &&
+            std::regex_search(line, m,
+                              std::regex("^X([-\\d.]+)Y([-\\d.]+)")) &&
+            line.find("G85") == std::string::npos) {
+            routTo(std::atof(m[1].str().c_str()) * unitScale,
+                   std::atof(m[2].str().c_str()) * unitScale);
+            continue;
+        }
+
         // An Excellon routed slot: X<x1>Y<y1>G85X<x2>Y<y2>. The tool is swept
         // from A to B, so the hole is an obround (the Minkowski sum of the
         // segment with a disc of the tool radius), not a point. This MUST be
@@ -323,6 +528,13 @@ Paths64 parseDrills(const std::string& text, int segments,
             // user learns holes are missing instead of never noticing.
             ++modalSkipped;
         }
+    }
+
+    // A file that ends mid-cut still owes its slot.
+    if (toolDown) {
+        sweepRout();
+        if (warnings)
+            warnings->push_back("rout: file ended with the tool down");
     }
 
     if (warnings) {

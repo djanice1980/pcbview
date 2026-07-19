@@ -423,6 +423,22 @@ KiCad path. Both of the founding input formats now work.
   The G85 form is tested BEFORE the plain-hole regex, which would otherwise match
   its leading coordinate and cut a single dot at one end (the original "slots not
   cut" bug). METRIC/INCH + decimal coords; tool table from `T<n>C<dia>`.
+- **Excellon ROUT mode (built 2026-07-19):** some CAM tools emit slots as
+  milled paths instead of G85 — `G00X..Y..` (rapid, tool up, enters rout
+  mode), `M15` (plunge), `G01`/bare `X..Y..` (linear cut; G01 is modal),
+  `G02`/`G03` (arc cut, centre from `I../J..` offset or `A<radius>` with the
+  ≤180° arc chosen per direction), `M16` (retract → the chain becomes one
+  slot), `G05` (back to drill mode). The swept slot = the open polyline
+  offset by the tool radius (ClipperOffset, round joins/ends); a plunge with
+  no move is a plain hole. The bare-coordinate continuation MUST be
+  intercepted before the drill-hit regex or every rout waypoint becomes a
+  phantom round hole. Closed rout loops sweep to an annulus whose inner
+  island cannot survive downstream winding-normalisation — the outer is kept
+  and a warning says the island was cut. Malformed input (G00 with tool
+  down, EOF mid-cut, unknown tool, unresolvable arc centre) closes the cut
+  and warns rather than failing silently. Verified on a synthetic package
+  (round hit + G85 + L-shaped rout + I/J arc rout: swept areas analytic-
+  exact); cx4 (217/215) and neptune (1622) gerber regressions unchanged.
 
 ### Cross-validation: two independent paths, same board
 
