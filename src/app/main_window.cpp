@@ -23,6 +23,8 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QMouseEvent>
+#include <QMovie>
 #include <QPushButton>
 #include <QSettings>
 #include <QDir>
@@ -39,6 +41,8 @@
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QWidgetAction>
+
+#include <functional>
 
 #include <algorithm>
 #include <cmath>
@@ -60,6 +64,20 @@ namespace {
 constexpr int kMaxRecent = 8;
 // Fixed rows in the properties tree; layer-specific rows are appended after.
 constexpr int kFixedPropertyRows = 12;
+
+// A QLabel that runs a callback on click -- carries the Ko-fi badge in the
+// Help menu and the animated one in the About dialog (QPushButton cannot host
+// a QMovie, and these are the only clickable images in the app).
+class ClickLabel : public QLabel {
+public:
+    std::function<void()> onClick;
+
+protected:
+    void mousePressEvent(QMouseEvent* e) override {
+        if (e->button() == Qt::LeftButton && onClick) onClick();
+        QLabel::mousePressEvent(e);
+    }
+};
 
 // Layer swatches. Not decoration -- in a stackup tree the colour is how you find
 // the layer, so it has to match what the viewport draws.
@@ -1047,9 +1065,24 @@ void MainWindow::buildMenus() {
                 });
 
     QMenu* help = menuBar()->addMenu("&Help");
-    help->addAction("&Support on Ko-fi…", this, [] {
-        QDesktopServices::openUrl(QUrl("https://ko-fi.com/P5P81EV1M0"));
-    });
+    // The Ko-fi badge as an actual graphic in the menu -- a plain text entry
+    // was too easy to overlook. Clicking opens the page and closes the menu.
+    {
+        auto* badge = new ClickLabel;
+        badge->setPixmap(QPixmap(":/kofi_badge.png")
+                             .scaledToWidth(170, Qt::SmoothTransformation));
+        badge->setAlignment(Qt::AlignCenter);
+        badge->setCursor(Qt::PointingHandCursor);
+        badge->setContentsMargins(8, 6, 8, 6);
+        badge->setToolTip("Support pcbview on Ko-fi");
+        badge->onClick = [help] {
+            QDesktopServices::openUrl(QUrl("https://ko-fi.com/P5P81EV1M0"));
+            help->close();
+        };
+        auto* badgeAction = new QWidgetAction(help);
+        badgeAction->setDefaultWidget(badge);
+        help->addAction(badgeAction);
+    }
     help->addSeparator();
     help->addAction("&About pcbview…", this, &MainWindow::showAbout);
 
@@ -1532,15 +1565,17 @@ void MainWindow::showAppearanceDialog() {
 }
 
 void MainWindow::showAbout() {
-    // LGPL-3.0 4(c): this displays copyright notices during execution, so Qt's
-    // copyright must appear here and the user must be directed to the licences.
-    QMessageBox::about(
-        this, "About pcbview",
+    // Custom dialog rather than QMessageBox::about: it hosts the ANIMATED
+    // Ko-fi button (QMovie needs a real QLabel). The licence text is
+    // unchanged -- LGPL-3.0 4(c): this displays copyright notices during
+    // execution, so Qt's copyright must appear here and the user must be
+    // directed to the licences.
+    QDialog dlg(this);
+    dlg.setWindowTitle("About pcbview");
+
+    auto* text = new QLabel(
         "<h3>pcbview 1.12</h3>"
         "<p>Standalone 3D PCB viewer. Renders what the fab will build.</p>"
-        "<p>If pcbview is useful to you, you can "
-        "<a href=\"https://ko-fi.com/P5P81EV1M0\">support its development on "
-        "Ko-fi</a>.</p>"
         "<p>Copyright © 2026 pcbview contributors.<br>"
         "pcbview is free software under the <b>GNU General Public License "
         "version 3</b> or later. See <code>LICENSE</code> beside the "
@@ -1560,6 +1595,32 @@ void MainWindow::showAbout() {
         "program in the <code>LICENSES</code> folder beside the executable, "
         "alongside <code>NOTICE.md</code>.</p>"
         "<p>Also uses Clipper2 (BSL-1.0), earcut.hpp (ISC) and glm (MIT).</p>");
+    text->setWordWrap(true);
+    text->setOpenExternalLinks(true);
+    text->setTextInteractionFlags(Qt::TextBrowserInteraction);
+
+    // The animated Ko-fi button. QMovie loops the GIF for as long as the
+    // dialog is open; clicking opens the page.
+    auto* kofi = new ClickLabel;
+    auto* movie = new QMovie(":/kofi_support.gif", QByteArray(), kofi);
+    movie->setScaledSize(QSize(276, 63));  // 690x158 at 40%
+    kofi->setMovie(movie);
+    kofi->setCursor(Qt::PointingHandCursor);
+    kofi->setToolTip("Support pcbview on Ko-fi");
+    kofi->setAlignment(Qt::AlignCenter);
+    kofi->onClick = [] {
+        QDesktopServices::openUrl(QUrl("https://ko-fi.com/P5P81EV1M0"));
+    };
+    movie->start();
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+
+    auto* layout = new QVBoxLayout(&dlg);
+    layout->addWidget(text);
+    layout->addWidget(kofi, 0, Qt::AlignHCenter);
+    layout->addWidget(buttons);
+    dlg.exec();
 }
 
 }  // namespace pcbview::app

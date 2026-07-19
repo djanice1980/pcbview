@@ -1,5 +1,7 @@
 <RCC>
     <qresource prefix="/">
         <file alias="pcbview.png">pcbview_256.png</file>
+        <file alias="kofi_badge.png">kofi_badge.png</file>
+        <file alias="kofi_support.gif">kofi_support.gif</file>
     </qresource>
 </RCC>
