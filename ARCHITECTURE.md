@@ -788,6 +788,19 @@ It stays useful as a headless smoke test once Vulkan lands.
 
 Depth runs **1.0 at the near plane → 0.0 at infinity**, cleared to **0**, compared
 with **GREATER**, in a **D32_SFLOAT** buffer. The perspective projection is
+**`GLM_FORCE_DEPTH_ZERO_TO_ONE` is a CMake compile definition, never a
+`#define` in a .cpp** (fixed 2026-07-19). It configures glm's projection
+matrices for Vulkan's 0..1 clip depth instead of OpenGL's -1..1, so it must be
+set before glm is included ANYWHERE in a translation unit. It lived as a
+`#define` in `vulkan_window.cpp` — until `vulkan_window.h` gained a glm include
+(v1.13, for the measurement tools) and, being included on line 1, configured
+glm first. `glm::ortho` then emitted OpenGL depth, Vulkan clipped everything
+that mapped below 0, and **the board was sliced along a plane in orthographic
+view** — the near side, the far side, or through a component, depending on
+where the geometry fell. Only ortho showed it because
+`infiniteReverseZPerspective` is hand-written; `glm::ortho` is the only glm
+projection in the codebase. Do not move it back into a source file.
+
 **Orthographic depth brackets the SCENE, never the eye** (fixed 2026-07-19).
 A parallel projection has no viewpoint: geometry BEHIND the camera plane still
 projects into the image and must still be drawn. Carrying the perspective habit
