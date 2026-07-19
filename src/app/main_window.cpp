@@ -219,8 +219,13 @@ MainWindow::MainWindow(const QString& path) {
 
     // Headless orthographic-projection hook (the O toggle can't be driven by
     // synthetic input; exists to verify ortho in the traced modes).
-    if (qEnvironmentVariable("PCBVIEW_START_ORTHO").toInt() != 0)
+    if (qEnvironmentVariable("PCBVIEW_START_ORTHO").toInt() != 0) {
         viewport_->camera().orthographic = true;
+        if (orthoAction_) {
+            const QSignalBlocker block(orthoAction_);
+            orthoAction_->setChecked(true);
+        }
+    }
 
     // Headless roll hook (right-drag vertical can't be synthesised); radians.
     if (qEnvironmentVariableIsSet("PCBVIEW_START_ROLL"))
@@ -392,6 +397,14 @@ void MainWindow::buildViewport() {
                     measureAction_->setChecked(on);
                 }
             });
+    // The O key flips the camera directly, so mirror it onto the action
+    // (blocked, or the action would drive the camera straight back).
+    connect(viewport_, &VulkanWindow::orthoChanged, this, [this](bool on) {
+        if (orthoAction_) {
+            const QSignalBlocker block(orthoAction_);
+            orthoAction_->setChecked(on);
+        }
+    });
     // The menus are built once, before the first viewport exists; a REBUILT
     // viewport reloads the persisted dims toggle, so reflect it back.
     if (dimsAction_) {
@@ -721,11 +734,11 @@ void MainWindow::printView(int mode) {
     grabFrame([this, mode, flat, saved](const QImage& img) {
         double mmPerPixel = 0.0;
         if (mode == 2) {
-            // Orthographic: the view spans 2*halfH mm vertically (halfH =
-            // distance/2, mirroring render()), so each pixel is a fixed number of
-            // mm -- exactly what a 1:1 print needs.
-            const Camera& c = viewport_->camera();
-            const double halfH = c.distance * 0.5;
+            // Orthographic: the view spans 2*halfH mm vertically, so each
+            // pixel is a fixed number of mm -- exactly what a 1:1 print
+            // needs. halfH comes from VulkanWindow so the print scale can
+            // never drift from the projection actually rendered.
+            const double halfH = viewport_->orthoHalfHeight();
             const double halfW = halfH * (static_cast<double>(img.width()) /
                                           std::max(1, img.height()));
             mmPerPixel = 2.0 * halfW / std::max(1, img.width());
@@ -885,10 +898,10 @@ void MainWindow::buildMenus() {
     view->addSeparator();
     view->addAction("&Fit to board", QKeySequence(Qt::Key_F), this,
                     [this] { viewport_->frameBoard(); });
-    QAction* ortho = view->addAction("&Orthographic");
-    ortho->setCheckable(true);
-    ortho->setShortcut(QKeySequence(Qt::Key_O));
-    connect(ortho, &QAction::toggled, this, [this](bool on) {
+    orthoAction_ = view->addAction("&Orthographic");
+    orthoAction_->setCheckable(true);
+    orthoAction_->setShortcut(QKeySequence(Qt::Key_O));
+    connect(orthoAction_, &QAction::toggled, this, [this](bool on) {
         viewport_->camera().orthographic = on;
         viewport_->requestUpdate();
     });
@@ -1181,13 +1194,12 @@ void MainWindow::buildToolbar() {
     tb->addSeparator();
     addBtn("Fit", "Fit board to window (F)", [this] { viewport_->frameBoard(); });
 
-    QAction* ortho = tb->addAction("Ortho");
-    ortho->setCheckable(true);
-    ortho->setToolTip("Orthographic projection (O)");
-    connect(ortho, &QAction::toggled, this, [this](bool on) {
-        viewport_->camera().orthographic = on;
-        viewport_->requestUpdate();
-    });
+    // Same action the View menu owns -- see orthoAction_.
+    if (orthoAction_) {
+        orthoAction_->setIconText("Ortho");
+        orthoAction_->setToolTip("Orthographic projection (O)");
+        tb->addAction(orthoAction_);
+    }
 
     // Measurement tools. These are the SAME QActions the View menu owns, so
     // the toolbar buttons, the menu checkboxes and the M key all stay in sync

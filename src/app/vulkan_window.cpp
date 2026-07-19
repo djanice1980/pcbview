@@ -582,7 +582,7 @@ void VulkanWindow::render() {
 
     glm::mat4 proj;
     if (camera_.orthographic) {
-        const float halfH = camera_.distance * 0.5f;
+        const float halfH = orthoHalfHeight();
         const float halfW = halfH * (w / h);
         proj = reverseZOrtho(-halfW, halfW, -halfH, halfH, zNear,
                              camera_.distance * 4.0f + 1000.0f);
@@ -602,8 +602,9 @@ void VulkanWindow::render() {
         const glm::vec3 fwd = glm::normalize(basis.forward);
         glm::vec3 right, up;
         if (camera_.orthographic) {
-            // Half-extents in mm, mirroring the raster ortho projection.
-            const float halfH = camera_.distance * 0.5f;
+            // Half-extents in mm, from the same definition as the raster
+            // ortho projection above.
+            const float halfH = orthoHalfHeight();
             const float halfW = halfH * (w / h);
             right = basis.right * halfW;
             up = basis.up * halfH;
@@ -1283,6 +1284,11 @@ void VulkanWindow::updateReadout() {
     emit measureReadout(text);
 }
 
+float VulkanWindow::orthoHalfHeight() const {
+    return camera_.distance *
+           std::tan(glm::radians(camera_.fovDegrees) * 0.5f);
+}
+
 float VulkanWindow::explodeStepMm() const {
     // "A few mm off the stack" reads right on a 50mm board but would be
     // invisible on a 300mm backplane, so scale gently with board size and hold a
@@ -1306,6 +1312,7 @@ void VulkanWindow::keyPressEvent(QKeyEvent* e) {
             case Qt::Key_F: frameBoard(); return;
             case Qt::Key_O:
                 camera_.orthographic = !camera_.orthographic;
+                emit orthoChanged(camera_.orthographic);
                 requestUpdate();
                 return;
             case Qt::Key_M:

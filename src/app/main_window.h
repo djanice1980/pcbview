@@ -133,6 +133,10 @@ private:
     QMenu* recentMenu_ = nullptr;
     QAction* measureAction_ = nullptr;
     QAction* dimsAction_ = nullptr;
+    // One action shared by the View menu and the toolbar; the O key syncs it
+    // through VulkanWindow::orthoChanged. Two separate checkable actions for
+    // one piece of camera state drift apart the moment either is used.
+    QAction* orthoAction_ = nullptr;
 
     QLabel* statusFile_ = nullptr;
     QLabel* statusBoard_ = nullptr;

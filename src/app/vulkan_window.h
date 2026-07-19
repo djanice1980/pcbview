@@ -113,6 +113,18 @@ public:
     // How far a ring travels per stage, scaled to the board's size.
     float explodeStepMm() const;
 
+    // Orthographic half-height in mm at the orbit distance.
+    //
+    // It MATCHES the perspective frustum's half-height at that same distance,
+    // so toggling projection keeps the board exactly the same size on screen.
+    // It used to be distance/2 -- a constant unrelated to the FOV, which made
+    // the O key jump the zoom by ~21%.
+    //
+    // THE ONE definition: the raster projection, the tracers' ray spans and
+    // the 1:1 print scale all derive from this. A private copy in any of them
+    // silently mis-scales a printed board.
+    float orthoHalfHeight() const;
+
     // Milliseconds for the last frame, smoothed. Zero until the first frame.
     double frameMs() const { return frameMs_; }
 
@@ -136,6 +148,8 @@ signals:
     void measureReadout(const QString& text);
     // Fired when the M key toggles the mode, so the menu checkbox follows.
     void measureModeChanged(bool on);
+    // Likewise for the O key and the Orthographic action.
+    void orthoChanged(bool on);
 
     void frameRendered();
     void statusMessage(const QString& text);
