@@ -1202,9 +1202,9 @@ void VulkanWindow::buildOverlay() {
             char l1[96], l2[64], l3[64];
             std::snprintf(l1, sizeof(l1), "Net %s", net.name.c_str());
             if (path >= 0.0)
-                std::snprintf(l2, sizeof(l2), "Path %.3f mm", path);
+                std::snprintf(l2, sizeof(l2), "Shortest route %.3f mm", path);
             else
-                std::snprintf(l2, sizeof(l2), "Path: no track route");
+                std::snprintf(l2, sizeof(l2), "No track route between points");
             std::snprintf(l3, sizeof(l3), "Net total %.3f mm, %d via%s",
                           net.routedMm, net.viaCount,
                           net.viaCount == 1 ? "" : "s");
@@ -1271,7 +1271,8 @@ void VulkanWindow::updateReadout() {
                 text += QString("   |   net %1: ")
                             .arg(QString::fromStdString(net.name));
                 if (path >= 0.0)
-                    text += QString("path %1 mm, ").arg(path, 0, 'f', 3);
+                    text += QString("shortest route %1 mm, ")
+                                .arg(path, 0, 'f', 3);
                 text += QString("total %1 mm routed")
                             .arg(net.routedMm, 0, 'f', 3);
             }
