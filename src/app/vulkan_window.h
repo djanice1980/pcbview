@@ -202,7 +202,10 @@ private:
     // with; cursor -> board point by unprojecting through its inverse and
     // intersecting the board-top plane, with snap targets checked first.
     bool worldToScreen(const glm::vec3& w, float& px, float& py) const;
-    bool screenToBoard(const QPointF& posDip, glm::vec3& out, bool& snapped);
+    // `net` returns the snapped point's index into mesh_->nets, -1 if the
+    // pick was free or the point carries no net.
+    bool screenToBoard(const QPointF& posDip, glm::vec3& out, bool& snapped,
+                       int& net);
     void handleMeasureClick(const QPointF& posDip);
     // Rebuild the renderer overlay (measure line + dimension callouts) for
     // this frame. Cheap; called from render() after the matrices are known.
@@ -261,9 +264,12 @@ private:
     int measureStage_ = 0;  // 0 idle, 1 first point placed, 2 pinned
     glm::vec3 measureA_{0.0f};
     glm::vec3 measureB_{0.0f};
+    int measureANet_ = -1;  // net of each snapped endpoint (-1 = none)
+    int measureBNet_ = -1;
     bool haveHover_ = false;
     bool hoverSnapped_ = false;
     glm::vec3 hover_{0.0f};
+    int hoverNet_ = -1;
     QPointF cursorPos_;          // device-independent px, for hover re-picks
     QPointF pressPos_;
     bool clickCandidate_ = false;  // press seen; becomes a pick if no drag

@@ -462,17 +462,46 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
         }
     }
 
-    // Pad centres, as measurement snap targets. Same Y flip as toClipper.
-    for (const Pad& pad : board.pads) {
-        bool front = false;
-        for (int li : pad.layers) {
-            if (li >= 0 && board.layers[li].name == "F.Cu") {
-                front = true;
-                break;
-            }
+    // Net table + net-aware snap targets (pads and vias, same Y flip as
+    // toClipper). Routed length = the sum of a net's track segments; vias are
+    // counted, not measured (their barrel height is stackup-dependent and
+    // tiny against trace lengths).
+    {
+        std::map<std::string, int> netIdx;
+        const auto netOf = [&](const std::string& n) -> int {
+            if (n.empty()) return -1;
+            const auto it = netIdx.find(n);
+            if (it != netIdx.end()) return it->second;
+            const int i = static_cast<int>(art.nets.size());
+            netIdx.emplace(n, i);
+            art.nets.push_back({n, 0.0, 0});
+            return i;
+        };
+        for (const Track& t : board.tracks) {
+            const int i = netOf(t.net);
+            if (i >= 0)
+                art.nets[i].routedMm +=
+                    std::hypot(t.end.x - t.start.x, t.end.y - t.start.y);
         }
-        art.padCentres.push_back(
-            {pad.at.x, -pad.at.y, front ? board.thickness : 0.0});
+        for (const Via& via : board.vias) {
+            const int i = netOf(via.net);
+            if (i >= 0) ++art.nets[i].viaCount;
+            art.netPoints.push_back(
+                {{via.at.x, -via.at.y, board.thickness}, i});
+            art.netPoints.push_back({{via.at.x, -via.at.y, 0.0}, i});
+        }
+        for (const Pad& pad : board.pads) {
+            bool front = false;
+            for (int li : pad.layers) {
+                if (li >= 0 && board.layers[li].name == "F.Cu") {
+                    front = true;
+                    break;
+                }
+            }
+            art.netPoints.push_back(
+                {{pad.at.x, -pad.at.y, front ? board.thickness : 0.0},
+                 netOf(pad.net)});
+        }
     }
 
     // The bare profile, drills still intact. assemble() subtracts them, because
@@ -1015,6 +1044,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
     // centre, every outline vertex. Free clicks fall back to the board-top
     // plane, recorded here too.
     out.boardTopZ = art.thickness;
+    out.nets = art.nets;
     {
         const auto centre = [](const Path64& p) {
             double sx = 0.0, sy = 0.0;
@@ -1025,13 +1055,20 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             const double n = static_cast<double>(std::max<size_t>(p.size(), 1));
             return std::array<double, 2>{sx / n / kScale, sy / n / kScale};
         };
-        const auto add = [&](double x, double y, double z) {
+        const auto add = [&](double x, double y, double z, int net = -1) {
             SnapPoint sp;
             sp.pos[0] = static_cast<float>(x);
             sp.pos[1] = static_cast<float>(y);
             sp.pos[2] = static_cast<float>(z);
+            sp.net = net;
             out.snapPoints.push_back(sp);
         };
+        // Net-carrying points go FIRST: the snap search keeps the first of
+        // equally-near candidates, so a via centre with a net beats the
+        // identical netless point its drill also emits below.
+        for (const LayerArt::NetPoint& np : art.netPoints) {
+            add(np.pos[0], np.pos[1], np.pos[2], np.net);
+        }
         for (const Path64& d : art.drills) {
             const auto c = centre(d);
             add(c[0], c[1], art.thickness);
@@ -1042,7 +1079,6 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             add(c[0], c[1], rb.z1);
             add(c[0], c[1], rb.z0);
         }
-        for (const auto& pc : art.padCentres) add(pc[0], pc[1], pc[2]);
         for (const Path64& loop : art.outline) {
             for (const Point64& q : loop) {
                 add(static_cast<double>(q.x) / kScale,

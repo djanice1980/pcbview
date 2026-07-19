@@ -730,7 +730,7 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
     // Hover pick for the rubber band / snap highlight, only while no button
     // is steering the camera.
     if (measureMode_ && !dragging_ && !draggingInv_ && !panning_) {
-        haveHover_ = screenToBoard(cursorPos_, hover_, hoverSnapped_);
+        haveHover_ = screenToBoard(cursorPos_, hover_, hoverSnapped_, hoverNet_);
         updateReadout();
         requestUpdate();
     }
@@ -946,6 +946,18 @@ void VulkanWindow::setMeasurement(float ax, float ay, float az, float bx,
     measureMode_ = true;
     measureA_ = {ax, ay, az};
     measureB_ = {bx, by, bz};
+    // Resolve nets like a snapped click would: the nearest snap point within
+    // a hair of the given position (net-carrying points are listed first).
+    const auto netAt = [&](const glm::vec3& p) -> int {
+        if (!mesh_) return -1;
+        for (const geom::SnapPoint& sp : mesh_->snapPoints) {
+            const glm::vec3 w(sp.pos[0], sp.pos[1], sp.pos[2]);
+            if (glm::length(w - p) < 0.05f) return sp.net;
+        }
+        return -1;
+    };
+    measureANet_ = netAt(measureA_);
+    measureBNet_ = netAt(measureB_);
     measureStage_ = 2;
     emit measureModeChanged(true);
     updateReadout();
@@ -971,19 +983,23 @@ bool VulkanWindow::worldToScreen(const glm::vec3& w, float& px,
 }
 
 bool VulkanWindow::screenToBoard(const QPointF& posDip, glm::vec3& out,
-                                 bool& snapped) {
+                                 bool& snapped, int& net) {
     snapped = false;
+    net = -1;
     if (!haveViewProj_ || !mesh_) return false;
     const qreal dpr = devicePixelRatio();
     const float px = static_cast<float>(posDip.x() * dpr);
     const float py = static_cast<float>(posDip.y() * dpr);
 
     // Snap targets first: nearest pad/drill centre or outline vertex within a
-    // small screen radius wins, making the measurement fab-exact.
+    // small screen radius wins, making the measurement fab-exact. Strict `<`
+    // keeps the FIRST of equally-near points -- net-carrying points are
+    // emitted first, so they beat their netless drill twins.
     const float thresh = 14.0f * static_cast<float>(dpr);
     float best = thresh * thresh;
     bool found = false;
     glm::vec3 bestP{0.0f};
+    int bestNet = -1;
     for (const geom::SnapPoint& sp : mesh_->snapPoints) {
         const glm::vec3 wpt(sp.pos[0], sp.pos[1], sp.pos[2]);
         float sx, sy;
@@ -992,12 +1008,14 @@ bool VulkanWindow::screenToBoard(const QPointF& posDip, glm::vec3& out,
         if (d2 < best) {
             best = d2;
             bestP = wpt;
+            bestNet = sp.net;
             found = true;
         }
     }
     if (found) {
         out = bestP;
         snapped = true;
+        net = bestNet;
         return true;
     }
 
@@ -1024,13 +1042,16 @@ bool VulkanWindow::screenToBoard(const QPointF& posDip, glm::vec3& out,
 void VulkanWindow::handleMeasureClick(const QPointF& posDip) {
     glm::vec3 p;
     bool snapped = false;
-    if (!screenToBoard(posDip, p, snapped)) return;
+    int net = -1;
+    if (!screenToBoard(posDip, p, snapped, net)) return;
     if (measureStage_ == 1) {
         measureB_ = p;
+        measureBNet_ = net;
         measureStage_ = 2;
     } else {
         // Idle or already pinned: this click starts a fresh measurement.
         measureA_ = p;
+        measureANet_ = net;
         measureStage_ = 1;
     }
     requestUpdate();
@@ -1166,6 +1187,56 @@ void VulkanWindow::buildOverlay() {
         }
     }
 
+    // Net panel: when both measurement endpoints sit on the SAME net, show
+    // that net's routed length in the corner -- the measured straight line is
+    // the crow-flies distance, this is the copper the signal actually takes.
+    if (measureMode_ && measureStage_ >= 1 && mesh_ && measureANet_ >= 0) {
+        const int endNet =
+            (measureStage_ >= 2) ? measureBNet_ : (haveHover_ ? hoverNet_ : -1);
+        if (endNet == measureANet_ &&
+            measureANet_ < static_cast<int>(mesh_->nets.size())) {
+            const auto& net = mesh_->nets[measureANet_];
+            char l1[96], l2[64], l3[32];
+            std::snprintf(l1, sizeof(l1), "Net %s", net.name.c_str());
+            std::snprintf(l2, sizeof(l2), "Routed %.3f mm", net.routedMm);
+            std::snprintf(l3, sizeof(l3), "%d via%s", net.viaCount,
+                          net.viaCount == 1 ? "" : "s");
+            const char* rows[3] = {l1, l2, l3};
+
+            const float ts = 13.0f * dpr;   // text size
+            const float lh = ts * 1.5f;     // line height
+            const float pad = 10.0f * dpr;  // panel padding
+            text::TextStyle st;
+            st.size = {static_cast<double>(ts) * 0.9,
+                       static_cast<double>(ts)};
+            st.thickness = ts * 0.14;
+            float wMax = 0.0f;
+            for (const char* r : rows)
+                wMax = std::max(wMax,
+                                static_cast<float>(text::measure(r, st)));
+
+            const float panelW = wMax + 2.0f * pad;
+            const float panelH = 3.0f * lh + 2.0f * pad;
+            const float x1 =
+                static_cast<float>(width() * dpr) - 14.0f * dpr;
+            const float x0 = x1 - panelW;
+            const float y0 = 14.0f * dpr;
+
+            static const float kPanelBg[4] = {0.07f, 0.07f, 0.09f, 0.85f};
+            // Background as one thick "line", plus an amber accent bar.
+            quad(x0, y0 + panelH * 0.5f, x1, y0 + panelH * 0.5f, panelH,
+                 kPanelBg);
+            quad(x0, y0 + panelH * 0.5f, x0 + 3.0f * dpr, y0 + panelH * 0.5f,
+                 panelH, kAmber);
+            for (int i = 0; i < 3; ++i) {
+                // layout() centres on the origin; centre each row in the panel.
+                drawText(rows[i], (x0 + x1) * 0.5f,
+                         y0 + pad + lh * (static_cast<float>(i) + 0.5f), ts,
+                         i == 0 ? kAmber : kWhite);
+            }
+        }
+    }
+
     renderer_->setOverlay(std::move(tris));
 }
 
@@ -1182,6 +1253,16 @@ void VulkanWindow::updateReadout() {
                        .arg(std::abs(d.x), 0, 'f', 3)
                        .arg(std::abs(d.y), 0, 'f', 3)
                        .arg(std::abs(d.z), 0, 'f', 3);
+            const int endNet =
+                (measureStage_ >= 2) ? measureBNet_ : hoverNet_;
+            if (mesh_ && measureANet_ >= 0 && endNet == measureANet_ &&
+                measureANet_ < static_cast<int>(mesh_->nets.size())) {
+                const auto& net = mesh_->nets[measureANet_];
+                text += QString("   |   net %1: %2 mm routed, %3 vias")
+                            .arg(QString::fromStdString(net.name))
+                            .arg(net.routedMm, 0, 'f', 3)
+                            .arg(net.viaCount);
+            }
         }
     } else if (measureMode_) {
         text = "Measure: click the first point";

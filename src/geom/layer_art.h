@@ -127,12 +127,27 @@ struct LayerArt {
     std::vector<ArtLayer> layers;
     std::vector<std::string> warnings;
 
-    // Measurement snap targets the importers know exactly: pad centres (KiCad
-    // only -- Gerber flashes are not distinguishable from any other exposure),
-    // in mm with the Y flip applied, z = 3D height to display the marker at.
-    // Drill/bore centres and outline vertices are derived in assemble() from
-    // the geometry above and do not need to be listed here.
-    std::vector<std::array<double, 3>> padCentres;
+    // Net table (KiCad only -- Gerber has no nets): name plus the routed
+    // copper length (sum of that net's track segments) and via count, for the
+    // measure tool's net panel.
+    struct NetInfo {
+        std::string name;
+        double routedMm = 0.0;
+        int viaCount = 0;
+    };
+    std::vector<NetInfo> nets;
+
+    // Measurement snap targets the importers know exactly: pad and via
+    // centres (KiCad only -- Gerber flashes are not distinguishable from any
+    // other exposure), in mm with the Y flip applied, z = 3D height for the
+    // marker, net = index into `nets` (-1 for none). Drill/bore centres and
+    // outline vertices are derived in assemble() from the geometry above and
+    // do not need to be listed here.
+    struct NetPoint {
+        double pos[3] = {0, 0, 0};
+        int net = -1;
+    };
+    std::vector<NetPoint> netPoints;
 };
 
 }  // namespace pcbview::geom

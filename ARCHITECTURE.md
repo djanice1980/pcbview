@@ -1197,9 +1197,20 @@ together, and why:
   dimension callouts stay glued to the board through orbit/zoom/explode.
   Dimension callouts use `BoardMesh::outlineMin/Max` (outline bbox —
   component overhang must not inflate the board size).
+- **Net panel (KiCad only):** pad/via snap points carry a net index
+  (`LayerArt::netPoints`, emitted FIRST so they win snap ties against their
+  netless drill twins -- the search keeps the first of equally-near points).
+  When both measurement endpoints resolve to the same net, a corner panel
+  shows `BoardMesh::nets[i]`: the net's **routed length** (sum of its track
+  segments, computed in buildLayerArt) and via count, beside the crow-flies
+  measurement. **Zone-poured copper is NOT included in the routed length** --
+  a pour-fed power net legitimately reads short. Vias are counted, not
+  measured (barrel height is stackup noise against trace lengths).
 - Headless: `PCBVIEW_MEASURE=x1,y1,z1,x2,y2,z2` pins a measurement (mouse
-  picks cannot be synthesised); the `dimensionsOverlay` setting persists the
-  callout toggle.
+  picks cannot be synthesised) and resolves endpoint nets exactly like a
+  snapped click; the `dimensionsOverlay` setting persists the callout
+  toggle. Verified: two V3V3 vias on cx4 read 30.955 mm crow-flies (exact)
+  with "Net V3V3, Routed 28.112 mm, 26 vias" in the panel.
 
 ## Blind/buried via spans (built 2026-07-19, KiCad only)
 

@@ -71,9 +71,11 @@ struct Bounds {
 // A point the measurement tool can snap to exactly: pad centres, drill/bore
 // centres, board-outline vertices. Fab-exact coordinates from the importers,
 // so a measurement between two snapped points is the true design dimension,
-// not click precision.
+// not click precision. `net` indexes BoardMesh::nets (-1 when the point has
+// no net -- Gerber, bare drills, outline vertices).
 struct SnapPoint {
     float pos[3] = {0, 0, 0};
+    int net = -1;
 };
 
 struct BoardMesh {
@@ -85,6 +87,8 @@ struct BoardMesh {
     // the plane free measurement points are projected onto.
     std::vector<SnapPoint> snapPoints;
     double boardTopZ = 0.0;
+    // Net table for the measure tool (KiCad only; empty for Gerber).
+    std::vector<LayerArt::NetInfo> nets;
     // Board-outline bounding box (mm, components excluded) for the
     // width/height dimension callouts. Valid once an outline was assembled.
     bool outlineValid = false;
