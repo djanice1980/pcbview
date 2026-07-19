@@ -2031,6 +2031,7 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         info.blended = item.blended;
         info.visible = true;
         info.material = part.material;
+        info.partialBarrel = part.partialBarrel;
         parts_.push_back(std::move(info));
 
         // params: roughness, metallic, explode rank (filled below), fade flag.
@@ -2161,8 +2162,34 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
                 return false;
             };
             const float barrelRank = rankTaken(0.0f) ? 0.5f : 0.0f;
-            for (size_t m = 0; m < parts_.size() && m < materials.size(); ++m)
-                if (parts_[m].name == "vias") materials[m].params[2] = barrelRank;
+
+            // A blind/buried barrel is NOT one intact tube through the stack:
+            // it spans a few layers and should travel WITH them, not stay
+            // pinned. Rank it by its centre Z, interpolated between the board
+            // layers' consecutive ranks -- fractional, so it claims no stage
+            // of its own and rides between its end layers.
+            const auto rankAtZ = [&](float z) {
+                if (byHeight.empty()) return 0.0f;
+                if (z <= byHeight.front().first)
+                    return materials[byHeight.front().second].params[2];
+                if (z >= byHeight.back().first)
+                    return materials[byHeight.back().second].params[2];
+                for (size_t i = 0; i + 1 < byHeight.size(); ++i) {
+                    const float z0 = byHeight[i].first;
+                    const float z1 = byHeight[i + 1].first;
+                    if (z <= z1) {
+                        const float t = (z1 > z0) ? (z - z0) / (z1 - z0) : 0.0f;
+                        return materials[byHeight[i].second].params[2] + t;
+                    }
+                }
+                return 0.0f;
+            };
+            for (size_t m = 0; m < parts_.size() && m < materials.size(); ++m) {
+                if (parts_[m].name != "vias") continue;
+                materials[m].params[2] = parts_[m].partialBarrel
+                                             ? rankAtZ(centreZ[m])
+                                             : barrelRank;
+            }
         }
 
         // Mid-plane of the stack in Z, for the translucent sort's view-side test.

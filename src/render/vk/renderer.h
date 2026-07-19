@@ -55,6 +55,10 @@ struct PartInfo {
     // What the part is made of -- lets appearance/effects setters find e.g. all
     // Component or all Copper parts without name games.
     geom::Material material = geom::Material::Copper;
+    // "vias" parts only: a blind/buried barrel spanning part of the stack. It
+    // travels with its layers during the peel instead of pinning to the
+    // barrel plane -- see the explode-rank block in uploadBoard.
+    bool partialBarrel = false;
 };
 
 class Renderer {

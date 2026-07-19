@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <map>
 #include <numbers>
 
 #include "clipper2/clipper.h"
@@ -432,6 +433,35 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
     }
     normalizeWinding(art.barrels);
 
+    // Blind/buried vias: the importer keeps them OUT of board.drills (their
+    // bore does not reach the outer faces -- see the via-span note there), so
+    // they surface here as partial-depth bores instead. Same span judgement as
+    // the importer: layer span, never the `(via buried)` type token.
+    {
+        int lastCopperStack = 0;
+        for (int idx : board.copperLayers()) {
+            lastCopperStack =
+                std::max(lastCopperStack, board.layers[idx].stackIndex);
+        }
+        for (const Via& via : board.vias) {
+            if (via.drill <= 0.0 || via.fromLayer < 0 || via.toLayer < 0)
+                continue;
+            const int lo = std::min(board.layers[via.fromLayer].stackIndex,
+                                    board.layers[via.toLayer].stackIndex);
+            const int hi = std::max(board.layers[via.fromLayer].stackIndex,
+                                    board.layers[via.toLayer].stackIndex);
+            if (lo == 0 && hi == lastCopperStack) continue;  // full-stack via
+            LayerArt::PartialBore bore;
+            bore.path =
+                circlePath(via.at, via.drill * 0.5, opts.circleSegments);
+            if (Area(bore.path) < 0)
+                std::reverse(bore.path.begin(), bore.path.end());
+            bore.fromLayer = board.layers[via.fromLayer].name;
+            bore.toLayer = board.layers[via.toLayer].name;
+            art.partialBores.push_back(std::move(bore));
+        }
+    }
+
     // The bare profile, drills still intact. assemble() subtracts them, because
     // soldermask must tent ACROSS a drill and so needs the un-drilled outline.
     for (const Polygon& poly : board.outline) {
@@ -635,6 +665,39 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                         FillRule::NonZero, boardArea);
     }
 
+    // --- Blind/buried bores, resolved from end-layer names to Z ranges ---
+    //
+    // A partial bore spans from the BOTTOM face of its lower end foil to the
+    // TOP face of its upper end foil (the drill goes through both end foils'
+    // copper). Resolved here, after the stackup is final, so a thickness
+    // override has already moved the layers. A bore whose end layer is absent
+    // (inner layers disabled, or a name mismatch) is dropped -- boring blindly
+    // to a guessed depth would be worse than not boring at all.
+    struct ResolvedBore {
+        const Clipper2Lib::Path64* path;
+        double z0, z1;
+        std::string spanKey;  // groups barrels: one part per distinct span
+    };
+    std::vector<ResolvedBore> bores;
+    for (const LayerArt::PartialBore& pb : art.partialBores) {
+        const ArtLayer* a = nullptr;
+        const ArtLayer* b = nullptr;
+        for (const ArtLayer& al : art.layers) {
+            if (al.kind != LayerKind::Copper) continue;
+            if (al.name == pb.fromLayer) a = &al;
+            if (al.name == pb.toLayer) b = &al;
+        }
+        if (!a || !b || a == b) continue;
+        ResolvedBore rb;
+        rb.path = &pb.path;
+        rb.z0 = std::min(a->z, b->z);
+        rb.z1 = std::max(a->z + a->thickness, b->z + b->thickness);
+        // Key ordered by Z, so (F.Cu,In1.Cu) and (In1.Cu,F.Cu) share a part.
+        const ArtLayer* lo = (a->z <= b->z) ? a : b;
+        rb.spanKey = lo->name + "/" + ((lo == a) ? b : a)->name;
+        bores.push_back(rb);
+    }
+
     // The dielectric core. Its TOP is the underside of the topmost copper; its
     // BOTTOM is the top of the bottommost copper -- the foils and masks sit
     // outside it. Derived from the copper actually present, not by name.
@@ -712,10 +775,30 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
         // Every slab is named "substrate": one stackup toggle drives them all,
         // and the appearance picker recolours by material, not by name.
         for (const auto& span : spans) {
+            // Blind/buried bores punch only the slabs inside their span; the
+            // full-stack drills are already out of boardArea. Slabs a bore
+            // crosses get their own boolean; untouched slabs reuse `shapes`.
+            Paths64 slabBores;
+            for (const ResolvedBore& rb : bores) {
+                if (rb.z0 < span.second - 1e-6 && rb.z1 > span.first + 1e-6)
+                    slabBores.push_back(*rb.path);
+            }
+            const std::vector<Shape>* slabShapes = &shapes;
+            std::vector<Shape> bored;
+            if (!slabBores.empty()) {
+                Clipper64 c;
+                c.AddSubject(boardArea);
+                c.AddClip(slabBores);
+                PolyTree64 t;
+                c.Execute(ClipType::Difference, FillRule::NonZero, t);
+                collectShapes(t, bored);
+                slabShapes = &bored;
+            }
+
             Part part;
             part.material = Material::Substrate;
             part.name = "substrate";
-            for (const Shape& shape : shapes) {
+            for (const Shape& shape : *slabShapes) {
                 extrude(shape, span.first, span.second, part.mesh);
             }
             if (!part.mesh.indices.empty()) out.parts.push_back(std::move(part));
@@ -727,6 +810,9 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
         Clipper64 clipper;
         ClipType op = ClipType::Union;
         Material material = Material::Copper;
+        // Blind/buried bores crossing this layer, subtracted after the main
+        // boolean (they are not in art.drills, so boardArea leaves them be).
+        Paths64 layerBores;
 
         switch (al.kind) {
             case LayerKind::Copper:
@@ -741,6 +827,16 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 } else if (!art.drills.empty()) {
                     clipper.AddClip(art.drills);
                     op = ClipType::Difference;
+                }
+                // A bore spans this foil if the foil's centre lies inside it
+                // (its end foils' centres always do -- the bore reaches their
+                // outer faces).
+                {
+                    const double c = al.z + al.thickness * 0.5;
+                    for (const ResolvedBore& rb : bores) {
+                        if (c > rb.z0 - 1e-6 && c < rb.z1 + 1e-6)
+                            layerBores.push_back(*rb.path);
+                    }
                 }
                 break;
 
@@ -773,7 +869,16 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
         }
 
         PolyTree64 tree;
-        clipper.Execute(op, FillRule::NonZero, tree);
+        if (layerBores.empty()) {
+            clipper.Execute(op, FillRule::NonZero, tree);
+        } else {
+            Paths64 clipped;
+            clipper.Execute(op, FillRule::NonZero, clipped);
+            Clipper64 boring;
+            boring.AddSubject(clipped);
+            boring.AddClip(layerBores);
+            boring.Execute(ClipType::Difference, FillRule::NonZero, tree);
+        }
 
         std::vector<Shape> shapes;
         collectShapes(tree, shapes);
@@ -788,36 +893,34 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
         if (!part.mesh.indices.empty()) out.parts.push_back(std::move(part));
     }
 
-    // --- Via barrels: each plated hole lined with a copper tube spanning the
-    // whole copper stack, collected into ONE part ("vias"). A via is a single
-    // plated barrel through the board; the renderer pins this part to explode
-    // rank 0 so it stays intact and centred while the layers peel around it,
-    // instead of being sliced like the substrate. ---
-    if (!art.barrels.empty()) {
-        double botZ = 1e18, topZ = -1e18;
-        for (const ArtLayer& al : art.layers) {
-            if (al.kind != LayerKind::Copper) continue;
-            botZ = std::min(botZ, al.z);
-            topZ = std::max(topZ, al.z + al.thickness);
-        }
-        if (botZ < topZ) {
-            // The barrel sits JUST INSIDE the drilled wall (radial `gap`), not on
-            // it: the copper and substrate hole edges are exactly at the drill
-            // radius, so a barrel of that radius shares a wall with every layer at
-            // every via and z-fights into heavy speckle (bad on via-dense boards).
-            // Insetting puts both the outer and inner barrel walls inside the bore,
-            // where nothing else lives. A tube = inset(gap) minus inset(gap+wall);
-            // holes too small for the void just render as a solid plug.
-            const double gap = 0.03;   // clearance from the drilled wall (mm)
-            const double wall = 0.15;  // plating thickness shown (mm)
+    // --- Via barrels: each plated hole lined with a copper tube. Full-stack
+    // drills collect into ONE part ("vias") spanning the whole copper stack,
+    // pinned during the exploded peel. Blind/buried bores get one part per
+    // span (also named "vias" -- one stackup toggle drives them all), each a
+    // tube over just its own Z range, ranked by the renderers to travel with
+    // the layers it spans. ---
+    {
+        // The barrel sits JUST INSIDE the drilled wall (radial `gap`), not on
+        // it: the copper and substrate hole edges are exactly at the drill
+        // radius, so a barrel of that radius shares a wall with every layer at
+        // every via and z-fights into heavy speckle (bad on via-dense boards).
+        // Insetting puts both the outer and inner barrel walls inside the bore,
+        // where nothing else lives. A tube = inset(gap) minus inset(gap+wall);
+        // holes too small for the void just render as a solid plug.
+        const double gap = 0.03;   // clearance from the drilled wall (mm)
+        const double wall = 0.15;  // plating thickness shown (mm)
+
+        const auto makeBarrelPart = [&](const Paths64& holes, double z0,
+                                        double z1, bool partial) {
+            if (holes.empty() || z0 >= z1) return;
 
             // Castellated holes -- drills the routed board edge cuts through --
             // get NO barrel at all: only drills FULLY inside the outline keep
             // their plating tube. (Half-barrels looked wrong; the user wants
             // the milled half-holes bare.)
-            Paths64 fullBarrels;
-            fullBarrels.reserve(art.barrels.size());
-            for (const Path64& b : art.barrels) {
+            Paths64 interior;
+            interior.reserve(holes.size());
+            for (const Path64& b : holes) {
                 Clipper64 t;
                 t.AddSubject(Paths64{b});
                 t.AddClip(art.outline);
@@ -826,13 +929,14 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 double insideArea = 0.0;
                 for (const Path64& p : inside) insideArea += Area(p);
                 if (insideArea >= std::abs(Area(b)) * 0.999)
-                    fullBarrels.push_back(b);
+                    interior.push_back(b);
             }
+            if (interior.empty()) return;
 
             const auto inset = [&](double d) {
                 ClipperOffset co;
                 co.ArcTolerance(kScale * 0.001);
-                co.AddPaths(fullBarrels, JoinType::Round, EndType::Polygon);
+                co.AddPaths(interior, JoinType::Round, EndType::Polygon);
                 Paths64 r;
                 co.Execute(-d * kScale, r);
                 return r;
@@ -864,9 +968,30 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             Part part;
             part.material = Material::Copper;
             part.name = "vias";
-            for (const Shape& shape : shapes)
-                extrude(shape, botZ, topZ, part.mesh);
+            part.partialBarrel = partial;
+            for (const Shape& shape : shapes) extrude(shape, z0, z1, part.mesh);
             if (!part.mesh.indices.empty()) out.parts.push_back(std::move(part));
+        };
+
+        double botZ = 1e18, topZ = -1e18;
+        for (const ArtLayer& al : art.layers) {
+            if (al.kind != LayerKind::Copper) continue;
+            botZ = std::min(botZ, al.z);
+            topZ = std::max(topZ, al.z + al.thickness);
+        }
+        if (!art.barrels.empty()) makeBarrelPart(art.barrels, botZ, topZ, false);
+
+        // Blind/buried barrels, one part per distinct span.
+        std::map<std::string, std::pair<Paths64, std::pair<double, double>>>
+            bySpan;
+        for (const ResolvedBore& rb : bores) {
+            auto& entry = bySpan[rb.spanKey];
+            entry.first.push_back(*rb.path);
+            entry.second = {rb.z0, rb.z1};
+        }
+        for (const auto& [key, entry] : bySpan) {
+            makeBarrelPart(entry.first, entry.second.first, entry.second.second,
+                           /*partial=*/true);
         }
     }
 

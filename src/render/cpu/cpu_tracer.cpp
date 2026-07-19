@@ -190,6 +190,7 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
     std::vector<float> centreZ;
     std::vector<int> mount;   // 0 board layer, +/-1 component side
     std::vector<bool> isVia;
+    std::vector<bool> isPartialBarrel;  // blind/buried span barrels
 
     for (const geom::Part& part : mesh.parts) {
         if (part.mesh.indices.empty()) continue;
@@ -225,6 +226,7 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
         mount.push_back(part.material == geom::Material::Component ? part.mountSide
                                                                    : 0);
         isVia.push_back(part.name == "vias");
+        isPartialBarrel.push_back(part.partialBarrel);
     }
     if (indices_.empty()) return;
 
@@ -251,8 +253,27 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
         return false;
     };
     const float barrelRank = rankTaken(0.0f) ? 0.5f : 0.0f;
+    // Blind/buried barrels travel with their layers: rank by centre Z, lerped
+    // between the consecutive board-layer ranks (mirrors renderer rankAtZ).
+    const auto rankAtZ = [&](float z) {
+        if (byHeight.empty()) return 0.0f;
+        if (z <= byHeight.front().first)
+            return partSpans_[byHeight.front().second].rank;
+        if (z >= byHeight.back().first)
+            return partSpans_[byHeight.back().second].rank;
+        for (size_t i = 0; i + 1 < byHeight.size(); ++i) {
+            const float z0 = byHeight[i].first, z1 = byHeight[i + 1].first;
+            if (z <= z1) {
+                const float t = (z1 > z0) ? (z - z0) / (z1 - z0) : 0.0f;
+                return partSpans_[byHeight[i].second].rank + t;
+            }
+        }
+        return 0.0f;
+    };
     for (size_t i = 0; i < partSpans_.size(); ++i)
-        if (isVia[i]) partSpans_[i].rank = barrelRank;
+        if (isVia[i])
+            partSpans_[i].rank =
+                isPartialBarrel[i] ? rankAtZ(centreZ[i]) : barrelRank;
 
     restVerts_ = vertsPadded_;
     rebuildScene(/*fastBuild=*/false);

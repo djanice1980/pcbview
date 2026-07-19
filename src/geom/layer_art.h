@@ -110,6 +110,19 @@ struct LayerArt {
     // into per-layer pieces. Non-plated (NPTH) holes get no barrel.
     Clipper2Lib::Paths64 barrels;
 
+    // Partial-depth plated bores: blind/buried vias. Each is drilled only
+    // between its two end copper layers, so it appears in neither `drills`
+    // (which punches the whole stack) nor `barrels` (full-stack tubes).
+    // assemble() bores it through just the copper and dielectric inside its
+    // span and lines it with a span-length barrel. End layers are identified
+    // by ArtLayer NAME, not by Z, so applyThickness's re-stacking moves the
+    // bore with its layers for free.
+    struct PartialBore {
+        Clipper2Lib::Path64 path;  // the hole, at drill radius
+        std::string fromLayer, toLayer;  // copper ArtLayer names, either order
+    };
+    std::vector<PartialBore> partialBores;
+
     std::vector<ArtLayer> layers;
     std::vector<std::string> warnings;
 };

@@ -40,6 +40,10 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
 - **Via barrels.** Every plated hole is lined with a copper barrel. Excellon
   plating is read **per tool**, so merged (MixedPlating) drill programs split
   plated from non-plated correctly; mounting holes stay bare.
+- **Blind & buried vias (KiCad).** A via spanning only part of the stack is
+  bored only through its own layers — partial-depth hole, span-length barrel,
+  outer faces intact — and in the exploded view it travels with the layers it
+  connects instead of hanging in space.
 - **Adjustable appearance.** Override the finished thickness (preview a flex build
   at 0.1–0.8 mm), make the substrate translucent, and recolor the substrate and the
   soldermask — including the **mask opacity**, which drives how strongly traces
@@ -210,7 +214,7 @@ are incompatible with GPL-2.0. Full third-party attributions are in
   per-tool Excellon plating, mounting-hole / slot cutouts from Edge_Cuts, a
   full CPU rendering device (Mesa lavapipe raster + Embree ray tracing), soft
   sun shadows + diffuse laminate transmission, and a Windows installer.
-- **Next:** a Linux build, blind/buried via spans, Excellon routed-slot
+- **Next:** a Linux build, Excellon routed-slot
   (`G00`/`G01`) support, measurement tools (point-to-point with snapping to
   pads/drills/outline, plus a board-dimensions overlay), net highlighting
   (track a signal across layers and through the exploded view — KiCad boards

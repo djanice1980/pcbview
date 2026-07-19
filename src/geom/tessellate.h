@@ -54,6 +54,13 @@ struct Part {
     //              sit on the new surface.
     float color[4] = {0.8f, 0.8f, 0.8f, 1.0f};
     int mountSide = 1;
+
+    // "vias" parts only: true for a blind/buried barrel that spans part of the
+    // stack. Full-stack barrels stay pinned during the exploded peel; a
+    // partial barrel instead travels with the layers it spans, so the
+    // renderers rank it by its centre Z rather than parking it at the barrel
+    // plane.
+    bool partialBarrel = false;
 };
 
 struct Bounds {

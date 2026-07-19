@@ -1138,12 +1138,45 @@ Things we currently render differently from what the plant would produce:
 ### Not yet verified
 
 - **Rotations other than 0 / ±90.** No test board has one.
-- **Genuine blind/buried vias** (spanning inner layers only). `spansOuterFaces`
-  should already leave the outer faces intact, but no board on hand has one.
 - **Custom / trapezoid pad shapes.** Not implemented; fall back to the bounding
   rect and emit a warning. No test board uses them.
 - `validatePadConnectivity` is meaningless on an unrouted board — CPS3brd1 has
   zero tracks, so it reports top 0/79. Read the top-vs-bottom *gap*, not the rate.
+
+## Blind/buried via spans (built 2026-07-19, KiCad only)
+
+A blind via (outer→inner) or buried via (inner→inner) is drilled only through
+part of the stack. The importer already excluded them from `board.drills`
+(their bore never reaches the outer faces — span judged by LAYERS, never the
+`(via buried)` type token, which real boards contradict); now they surface as
+**partial-depth bores** instead of vanishing:
+
+- `LayerArt::partialBores` — each bore carries its hole path plus its two end
+  copper layers **by name**, so `applyThickness`'s re-stacking moves the bore
+  with its layers for free. Resolved to a Z range in `assemble()`: bottom face
+  of the lower end foil to top face of the upper one (the drill goes through
+  both end foils' copper).
+- **Copper**: foils whose centre lies inside the bore get it subtracted — the
+  end foils' annular rings become real rings, not solid discs.
+- **Substrate**: only the slabs the span crosses are bored; untouched slabs
+  reuse the shared shape set (the no-bore fast path — 8-layer cx4 still
+  produces 7 identical slabs).
+- **Barrels**: one part per distinct span (all named "vias", so one stackup
+  toggle), tube over just its Z range, built by the same castellation-filtered
+  inset pipeline as full barrels (`makeBarrelPart`).
+- **Explode**: a partial barrel is NOT pinned like a full-stack tube — it
+  travels WITH the layers it spans. `Part::partialBarrel` flags it; both
+  renderers rank it by centre Z **interpolated between the consecutive
+  board-layer ranks** (`rankAtZ`, mirrored in renderer.cpp and
+  cpu_tracer.cpp — keep in step), fractional so it claims no peel stage.
+- Verified on a synthetic 4-layer board (through + blind F–In1 + buried
+  In1–In2): OBJ Z-extents exact (0.010–1.590 / 1.040–1.590 / 0.525–1.075),
+  per-slab hole counts correct, GPU and CPU exploded renders in identical
+  positions, buried barrel visible through a translucent substrate at rest.
+- **Gerber packages are excluded**: a Gerber job expresses blind/buried spans
+  as separate per-span drill FILES (KiCad exports e.g. `-F_Cu-In1_Cu.drl`),
+  which the Gerber importer does not yet map to spans — those drills are
+  currently treated as full-stack. Follow-up work.
 
 ## Component rendering (KiCad only) — via kicad-cli GLB
 
