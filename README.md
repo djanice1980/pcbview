@@ -2,6 +2,10 @@
 
 **A standalone, GPU-accelerated 3D viewer for KiCad projects and Gerber packages.**
 
+[![Latest release](https://img.shields.io/github/v/release/djanice1980/pcbview)](https://github.com/djanice1980/pcbview/releases/latest)
+[![License: GPL-3.0](https://img.shields.io/badge/licence-GPL--3.0-blue)](LICENSE)
+[![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-support%20this%20project-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/P5P81EV1M0)
+
 pcbview renders a printed circuit board the way the *fab* will build it — not the
 way any one CAD tool happens to draw it. Point it at a `.kicad_pcb` or a folder /
 zip / `.gbrjob` of Gerbers and it reconstructs the physical stackup — copper,

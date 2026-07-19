@@ -1,0 +1,3 @@
+# Drives the "Sponsor" button GitHub shows on the repository page and on
+# every release. The value is the Ko-fi page slug, not a full URL.
+ko_fi: P5P81EV1M0
