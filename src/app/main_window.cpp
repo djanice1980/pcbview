@@ -694,14 +694,18 @@ void MainWindow::grabFrame(std::function<void(const QImage&)> then,
     }
     vk::Renderer* r = viewport_->renderer();
 
-    // A high-resolution export renders the scene at `exportScale` and grabs the
-    // OFFSCREEN target rather than the window. Raising the scale restarts any
+    // An export renders the scene at exactly `exportScale` and grabs the
+    // OFFSCREEN target rather than the window, so the result is that
+    // resolution regardless of where the internal-res slider happens to sit --
+    // asking for 1x while the slider is at 4x gives a crisp window-size
+    // render, not a downsample of the 4x one. Changing the scale restarts any
     // accumulation, so a traced mode must be allowed to converge before the
-    // grab -- otherwise the export is a one-sample noise field.
-    const bool hiRes = exportScale > 1.0f;
+    // grab or the export is a one-sample noise field. exportScale <= 0 means
+    // "leave everything alone and grab the window" -- what print uses.
+    const bool explicitScale = exportScale > 0.0f;
     const float savedScale = r->renderScale();
-    if (hiRes) {
-        r->setRenderScale(exportScale);
+    if (explicitScale) {
+        r->setRenderScale(exportScale);  // no-op when already at that scale
         statusBar()->showMessage("Rendering export…");
     }
 
@@ -716,7 +720,7 @@ void MainWindow::grabFrame(std::function<void(const QImage&)> then,
     auto conn = std::make_shared<QMetaObject::Connection>();
     *conn = connect(
         viewport_, &VulkanWindow::frameRendered, this,
-        [this, tmp, then, conn, requested, frames, hiRes, savedScale]() {
+        [this, tmp, then, conn, requested, frames, explicitScale, savedScale]() {
             vk::Renderer* r = viewport_->renderer();
             if (!r) return;
             if (!*requested) {
@@ -727,7 +731,7 @@ void MainWindow::grabFrame(std::function<void(const QImage&)> then,
                     return;
                 }
                 *requested = true;
-                r->requestCapture(tmp.toStdString(), hiRes);
+                r->requestCapture(tmp.toStdString(), explicitScale);
                 viewport_->requestUpdate();
                 return;
             }
@@ -735,7 +739,7 @@ void MainWindow::grabFrame(std::function<void(const QImage&)> then,
             QObject::disconnect(*conn);
             QImage img(tmp);
             QFile::remove(tmp);
-            if (hiRes) r->setRenderScale(savedScale);
+            if (explicitScale) r->setRenderScale(savedScale);
             if (img.isNull()) {
                 statusBar()->showMessage("Frame capture failed", 4000);
                 return;
@@ -775,34 +779,59 @@ void MainWindow::onSaveScreenshot() {
                                       static_cast<int>(
                                           viewport_->renderer()->windowExtent().height))
                               : size();
-        const float choices[] = {1.0f, 2.0f, 3.0f, 4.0f};
+        // "As on screen" is whatever the INTERNAL RESOLUTION slider is set to,
+        // not 1x -- with the slider at 4x the window already shows a 4x render
+        // downsampled, so labelling 1x "as on screen" was simply wrong.
+        const float current =
+            viewport_->renderer() ? viewport_->renderer()->renderScale() : 1.0f;
+
+        std::vector<float> choices = {1.0f, 2.0f, 3.0f, 4.0f};
+        // The slider is continuous, so the current scale is often not one of
+        // the presets; offer it explicitly rather than silently changing it.
+        const bool haveCurrent =
+            std::any_of(choices.begin(), choices.end(), [current](float m) {
+                return std::abs(m - current) < 0.01f;
+            });
+        if (!haveCurrent) {
+            choices.push_back(current);
+            std::sort(choices.begin(), choices.end());
+        }
+
         QStringList labels;
-        for (float m : choices) {
+        int currentIndex = 0;
+        for (size_t i = 0; i < choices.size(); ++i) {
+            const float m = choices[i];
+            const bool isCurrent = std::abs(m - current) < 0.01f;
+            if (isCurrent) currentIndex = static_cast<int>(i);
             labels << QString("%1×  —  %2 × %3 px%4")
-                          .arg(QString::number(m, 'g', 2))
+                          .arg(QString::number(m, 'g', 3))
                           .arg(static_cast<int>(win.width() * m))
                           .arg(static_cast<int>(win.height() * m))
-                          .arg(m == 1.0f ? "  (as on screen)" : "");
+                          .arg(isCurrent ? "  (current — as on screen)" : "");
         }
+
         bool ok = false;
-        // A traced mode has to re-converge at the new resolution, and on the
-        // CPU device that is minutes, not seconds -- say so before they wait.
+        // A traced mode has to re-converge whenever the export size DIFFERS
+        // from what is already rendered; picking the current scale costs
+        // nothing. On the CPU device that re-converge is minutes, not seconds.
         const bool traced = viewport_->pathTracing() ||
                             (viewport_->cpuRender() && viewport_->rayTracing());
         const QString note =
             traced ? (viewport_->cpuRender()
-                          ? "\n\nNote: the CPU renderer must re-converge at the "
-                            "export size. 4× is 16× the pixels and can take "
-                            "several minutes."
-                          : "\n\nNote: the path tracer re-converges at the "
-                            "export size, so this takes a few seconds.")
+                          ? "\n\nNote: any size other than the current one makes "
+                            "the CPU renderer re-converge, which can take "
+                            "several minutes at the larger scales."
+                          : "\n\nNote: any size other than the current one makes "
+                            "the path tracer re-converge, which takes a few "
+                            "seconds.")
                    : QString();
         const QString choice = QInputDialog::getItem(
-            this, "Export resolution",
-            "Render the board at:" + note, labels, 0, false, &ok);
+            this, "Export resolution", "Render the board at:" + note, labels,
+            currentIndex, false, &ok);
         if (!ok) return;
         const int idx = labels.indexOf(choice);
-        exportScale = choices[idx < 0 ? 0 : idx];
+        exportScale = choices[idx < 0 ? static_cast<size_t>(currentIndex)
+                                      : static_cast<size_t>(idx)];
     }
 
     grabFrame(
