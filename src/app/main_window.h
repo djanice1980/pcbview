@@ -12,6 +12,7 @@
 
 class QDockWidget;
 class QImage;
+class QSlider;
 
 #include "app/vulkan_window.h"
 #include "geom/tessellate.h"
@@ -144,6 +145,12 @@ private:
     QLabel* statusPerf_ = nullptr;
     QLabel* toolbarInfo_ = nullptr;
     QLabel* scaleLabel_ = nullptr;
+    QSlider* scaleSlider_ = nullptr;
+    // Set by rebuildViewport (device switch) to the scale the dying renderer
+    // had; the new renderer picks it up once it exists. Negative = nothing
+    // pending, which is what keeps a normal board load from clobbering the
+    // PCBVIEW_RENDER_SCALE override.
+    float pendingRenderScale_ = -1.0f;
     QLabel* explodeLabel_ = nullptr;
 
     int frameCounter_ = 0;

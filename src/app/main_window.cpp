@@ -356,6 +356,14 @@ void MainWindow::buildViewport() {
     connect(viewport_, &VulkanWindow::boardUploaded, this, [this] {
         populateStackup();
         applyAppearance();
+        // A rebuilt viewport (device switch) brings a fresh renderer at 1.00x,
+        // so carry the scale across. Only on a REBUILD: doing it on every load
+        // would overwrite the PCBVIEW_RENDER_SCALE headless override, which is
+        // applied before the first frame.
+        if (pendingRenderScale_ > 0.0f && viewport_->renderer()) {
+            viewport_->renderer()->setRenderScale(pendingRenderScale_);
+            pendingRenderScale_ = -1.0f;
+        }
     });
     connect(viewport_, &VulkanWindow::explodeChanged, this,
             [this](float progress, float maxProgress) {
@@ -429,6 +437,10 @@ void MainWindow::rebuildViewport() {
     // settings inside the new window's initialise().
     const Camera cam = viewport_->camera();
     const float explode = viewport_->explodeProgress();
+    // The internal-resolution scale lives on the renderer, which is about to
+    // die with this viewport; hand it to the replacement.
+    if (viewport_->renderer())
+        pendingRenderScale_ = viewport_->renderer()->renderScale();
 
     VulkanWindow* oldViewport = viewport_;
     QWidget* oldContainer = viewportContainer_;
@@ -1227,6 +1239,7 @@ void MainWindow::buildToolbar() {
     tb->addSeparator();
     tb->addWidget(new QLabel("  Internal res  "));
     QSlider* scale = new QSlider(Qt::Horizontal);
+    scaleSlider_ = scale;
     scale->setRange(25, 400);  // 0.25x .. 4.00x, default 1.00x (native)
     scale->setValue(100);
     scale->setFixedWidth(130);

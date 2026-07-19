@@ -1714,6 +1714,16 @@ void Renderer::setRenderScale(float scale) {
     renderScale_ = scale;
     destroySceneTargets();
     createSceneTargets();
+    // Every accumulated image is sized to the OLD scene extent, so the new
+    // resolution has to start over. Without this the raster path followed the
+    // slider but the traced paths did not: a converged CPU trace skips
+    // accumulate() entirely and keeps blitting its cached display buffer, so
+    // the internal-resolution slider did nothing at all on the CPU device.
+    // resetAccumulation bumps ptGeneration_, which is also what makes
+    // recordCpuPathTrace drop its pass counter and cache on the next frame.
+    resetAccumulation();
+    cpuDisplayCache_.clear();
+    cpuPass_ = 0;
 }
 
 void Renderer::createDescriptors() {
