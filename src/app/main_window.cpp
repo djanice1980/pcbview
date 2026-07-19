@@ -25,6 +25,7 @@
 #include <QMimeData>
 #include <QMouseEvent>
 #include <QMovie>
+#include <QPainterPath>
 #include <QPushButton>
 #include <QSettings>
 #include <QDir>
@@ -78,6 +79,74 @@ protected:
         QLabel::mousePressEvent(e);
     }
 };
+
+// Toolbar icons are DRAWN, not shipped as bitmaps: they stay crisp at any DPI
+// or icon size, follow the theme colour, and keep the asset list to the app
+// icon alone. Painted at 64px and scaled down by Qt.
+QPixmap paintIcon(const std::function<void(QPainter&)>& draw) {
+    constexpr int kS = 64;
+    QPixmap pm(kS, kS);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    draw(p);
+    p.end();
+    return pm;
+}
+
+// A ruler laid diagonally, with alternating long/short graduations -- the
+// measure-distance tool.
+QIcon rulerIcon() {
+    return QIcon(paintIcon([](QPainter& p) {
+        const QColor ink(theme::kText);
+        p.translate(32, 32);
+        p.rotate(-45);
+        p.translate(-32, -32);
+
+        QRectF body(6, 25, 52, 14);
+        p.setPen(QPen(ink, 3.2));
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(body, 2.5, 2.5);
+        // Graduations hang from the top edge; every other one is full length.
+        p.setPen(QPen(ink, 2.6));
+        for (int i = 1; i <= 5; ++i) {
+            const qreal x = body.left() + body.width() * i / 6.0;
+            const qreal len = (i % 2 == 1) ? 8.0 : 4.5;
+            p.drawLine(QPointF(x, body.top()), QPointF(x, body.top() + len));
+        }
+    }));
+}
+
+// A speed (rafter) square: right triangle with the pivot fence along one leg
+// -- the board-dimensions overlay.
+QIcon speedSquareIcon() {
+    return QIcon(paintIcon([](QPainter& p) {
+        const QColor ink(theme::kText);
+        QPainterPath path;
+        path.setFillRule(Qt::OddEvenFill);
+        // Outer triangle: right angle bottom-left.
+        path.moveTo(10, 55);
+        path.lineTo(10, 11);
+        path.lineTo(54, 55);
+        path.closeSubpath();
+        // The window cut through the middle, as on a real speed square.
+        path.moveTo(21, 45);
+        path.lineTo(21, 27);
+        path.lineTo(39, 45);
+        path.closeSubpath();
+
+        p.setPen(QPen(ink, 3.2, Qt::SolidLine, Qt::FlatCap, Qt::MiterJoin));
+        p.setBrush(Qt::NoBrush);
+        p.drawPath(path);
+
+        // Graduations along the vertical leg (the fence edge).
+        p.setPen(QPen(ink, 2.4));
+        for (int i = 1; i <= 3; ++i) {
+            const qreal y = 55 - 44.0 * i / 4.0;
+            p.drawLine(QPointF(10, y), QPointF(10 + 6.5, y));
+        }
+    }));
+}
 
 // Layer swatches. Not decoration -- in a stackup tree the colour is how you find
 // the layer, so it has to match what the viewport draws.
@@ -1092,7 +1161,10 @@ void MainWindow::buildMenus() {
 void MainWindow::buildToolbar() {
     QToolBar* tb = addToolBar("Main");
     tb->setMovable(false);
-    tb->setIconSize(QSize(16, 16));
+    tb->setIconSize(QSize(18, 18));
+    // Text beside icon: the view/preset buttons carry no icon and still show
+    // their label, while the measurement tools read as icon + word.
+    tb->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 
     auto addBtn = [&](const QString& text, const QString& tip, auto fn) {
         QAction* a = tb->addAction(text);
@@ -1116,6 +1188,21 @@ void MainWindow::buildToolbar() {
         viewport_->camera().orthographic = on;
         viewport_->requestUpdate();
     });
+
+    // Measurement tools. These are the SAME QActions the View menu owns, so
+    // the toolbar buttons, the menu checkboxes and the M key all stay in sync
+    // for free -- no duplicate state to keep aligned.
+    tb->addSeparator();
+    if (measureAction_) {
+        measureAction_->setIcon(rulerIcon());
+        measureAction_->setIconText("Measure");
+        tb->addAction(measureAction_);
+    }
+    if (dimsAction_) {
+        dimsAction_->setIcon(speedSquareIcon());
+        dimsAction_->setIconText("Dimensions");
+        tb->addAction(dimsAction_);
+    }
 
     tb->addSeparator();
     tb->addWidget(new QLabel("  Internal res  "));
@@ -1574,7 +1661,7 @@ void MainWindow::showAbout() {
     dlg.setWindowTitle("About pcbview");
 
     auto* text = new QLabel(
-        "<h3>pcbview 1.12</h3>"
+        "<h3>pcbview 1.13</h3>"
         "<p>Standalone 3D PCB viewer. Renders what the fab will build.</p>"
         "<p>Copyright © 2026 pcbview contributors.<br>"
         "pcbview is free software under the <b>GNU General Public License "

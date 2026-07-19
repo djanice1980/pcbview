@@ -54,7 +54,8 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   auto-hiding side panels (pin, or peek-on-hover).
 - **Print & export.** Print as-shown, flat (overhead orthographic), or **flat at
   true 1:1 physical size**, with a print preview. Save a PNG/JPG screenshot.
-- **Measurement tools.** Press `M` and click two points: the distance readout
+- **Measurement tools.** Hit the **ruler** button in the toolbar (or press `M`)
+  and click two points: the distance readout
   **snaps to pad centres, drill/via centres and board-edge vertices**, so
   hole-to-hole and pad-to-pad measurements are fab-exact rather than
   click-precision. A rubber-band line with a live mm label follows the cursor;
@@ -63,8 +64,8 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   path between those two points** -- the copper the signal actually travels,
   walked along the net's tracks -- plus the net's total length and via count,
   next to the crow-flies distance.
-  **View → Board dimensions** adds fab-drawing width/height callouts around
-  the board.
+  The **speed-square** button (View → Board dimensions) adds fab-drawing
+  width/height callouts around the board.
 - **Ray-traced lighting.** On a GPU with `ray_query` (most modern discrete cards
   and many iGPUs), an optional mode traces contact shadows and ambient occlusion
   from the fragment shader, so components read as *seated* on the board. Pick which

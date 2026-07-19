@@ -1212,11 +1212,24 @@ together, and why:
   counted, not measured (barrel height is stackup noise against trace
   lengths). Verified: synthetic board reads path 13.090 / total 24.495 mm,
   both analytic-exact, against a 10.000 mm crow-flies line.
+- **Toolbar buttons share the View menu's QActions** (ruler = measure,
+  speed square = dimensions), so button, menu checkbox and the `M` key stay
+  in sync with no duplicated state. Both icons are **drawn with QPainter**
+  (`rulerIcon()` / `speedSquareIcon()`) rather than shipped as bitmaps:
+  crisp at any DPI or icon size, themed via `theme::kText`, and the asset
+  list stays down to the app icon. The toolbar uses
+  `Qt::ToolButtonTextBesideIcon`, so the older icon-less buttons still show
+  their labels.
 - Headless: `PCBVIEW_MEASURE=x1,y1,z1,x2,y2,z2` pins a measurement (mouse
   picks cannot be synthesised) and resolves endpoint nets exactly like a
   snapped click; the `dimensionsOverlay` setting persists the callout
   toggle. Verified: two V3V3 vias on cx4 read 30.955 mm crow-flies (exact)
   with "Net V3V3, Routed 28.112 mm, 26 vias" in the panel.
+- **Verifying menus/toolbars** (they never appear in `PCBVIEW_CAPTURE`, which
+  grabs the Vulkan frame): grab the window with `PrintWindow(hwnd, dc, 2)`
+  (`PW_RENDERFULLCONTENT`) after `SetProcessDPIAware()` — without the DPI
+  call the rect comes back virtualised on this 200% display and only the
+  top-left quadrant lands. That is how the toolbar icons were checked.
 
 ## Blind/buried via spans (built 2026-07-19, KiCad only)
 
@@ -1316,6 +1329,10 @@ colour/side group at once.
   tracing, see "CPU rendering (built)" above), soft sun + laminate
   transmission in both tracers, Effects sliders with readouts, app icon, and
   the Inno Setup installer.
+- **Phase 6** — **Done.** Blind/buried via spans, Excellon rout-mode slots,
+  measurement tools (snapping, dimension callouts, same-net shortest-route
+  panel), globe-spin/roll right-drag, and the screen-space overlay pipeline
+  those all draw through.
 
 ### Future release ideas (noted 2026-07-19)
 
