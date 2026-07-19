@@ -132,6 +132,13 @@ between the slabs:
 
 ![Path-traced exploded view](docs/images/pathtraced_exploded.png)
 
+Measure between any two points — snapped to pad and via centres, so the number
+is the design dimension — with board width/height callouts and, when both ends
+sit on one net, that net's **shortest routed path**. Here the two RST5 vias are
+30.195 mm apart in a straight line but 38.260 mm along the copper:
+
+![Measurement, dimension callouts and the net panel](docs/images/measure.png)
+
 ## Controls
 
 | Action | Control |
@@ -233,8 +240,9 @@ are incompatible with GPL-2.0. Full third-party attributions are in
   per-tool Excellon plating, mounting-hole / slot cutouts from Edge_Cuts, a
   full CPU rendering device (Mesa lavapipe raster + Embree ray tracing), soft
   sun shadows + diffuse laminate transmission, a Windows installer,
-  blind/buried via spans, Excellon rout-mode slots, and measurement tools
-  with snapping + board-dimension callouts.
+  blind/buried via spans, Excellon rout-mode slots, measurement tools with
+  snapping + net path lengths + board-dimension callouts, and
+  high-resolution (up to 4×) screenshot export.
 - **Next:** a Linux build, net highlighting
   (track a signal across layers and through the exploded view — KiCad boards
   carry net data), a showcase mode that choreographs the camera and records
