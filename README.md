@@ -211,10 +211,12 @@ are incompatible with GPL-2.0. Full third-party attributions are in
   full CPU rendering device (Mesa lavapipe raster + Embree ray tracing), soft
   sun shadows + diffuse laminate transmission, and a Windows installer.
 - **Next:** a Linux build, blind/buried via spans, Excellon routed-slot
-  (`G00`/`G01`) support, net highlighting (track a signal across layers and
-  through the exploded view — KiCad boards carry net data), a showcase mode
-  that choreographs the camera and records short video clips, and party mode
-  (spinning coloured lights; disco ball under consideration).
+  (`G00`/`G01`) support, measurement tools (point-to-point with snapping to
+  pads/drills/outline, plus a board-dimensions overlay), net highlighting
+  (track a signal across layers and through the exploded view — KiCad boards
+  carry net data), a showcase mode that choreographs the camera and records
+  short video clips, and party mode (spinning coloured lights; disco ball
+  under consideration).
 
 ## Author & support
 

@@ -1223,6 +1223,29 @@ colour/side group at once.
   about the view axis — confirm the exact mapping with the user before
   implementing.
 
+- **Measurement tools (noted 2026-07-19).** Two complementary pieces:
+  1. **Point-to-point measure** — click first point, click second (rubber-band
+     line + live readout between clicks), distance in mm plus dx/dy
+     components. The picking problem is already solved in-tree: `CpuTracer`
+     (Embree) can cast one camera ray through the cursor and return the exact
+     3D hit on board or component geometry, on ANY device — the GPU path
+     never needs to implement picking. Accuracy comes from **snapping**: pad
+     centres, drill/via centres, board-outline vertices, and component
+     origins are all known exactly (`BoardModel` for KiCad; LayerArt-derived
+     for Gerber), so snap the raw ray hit to the nearest feature within a
+     pixel radius and measurements become fab-exact instead of
+     click-precision. Component-to-component: clicking a component measures
+     from its origin/courtyard centre. In the exploded view, measuring
+     across layers should use REST positions (report the true in-board
+     distance, not the peeled one) — display both if ambiguous.
+  2. **Outside dimensions / floating ruler** — an auto-dimension overlay
+     like a fab drawing: board width × height callouts from the outline
+     bbox (the numbers already exist — they drive 1:1 print), plus optional
+     edge-to-edge dimension lines. A menu toggle, no clicking required.
+  Overlay rendering: lines/text drawn over the 3D view — either a
+  transparent QWidget on top of the window container (QPainter, easiest) or
+  in-scene Vulkan lines (depth-aware, harder). Start with the QPainter
+  overlay; it also serves the net-trace label needs below.
 - **Net trace / highlighting.** Pick a net and light it up across the whole
   board — pads, traces, and via barrels — so a signal can be tracked visually,
   especially in the exploded view where an inner-layer run becomes followable
