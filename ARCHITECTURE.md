@@ -788,6 +788,19 @@ It stays useful as a headless smoke test once Vulkan lands.
 
 Depth runs **1.0 at the near plane → 0.0 at infinity**, cleared to **0**, compared
 with **GREATER**, in a **D32_SFLOAT** buffer. The perspective projection is
+**Orthographic depth brackets the SCENE, never the eye** (fixed 2026-07-19).
+A parallel projection has no viewpoint: geometry BEHIND the camera plane still
+projects into the image and must still be drawn. Carrying the perspective habit
+of a small positive near plane (`0.005 * distance`) clipped whatever crossed
+that plane, and at a grazing angle that is the corner NEAREST the viewer — the
+board was visibly sliced along a straight line as you tilted or zoomed in, and
+the substrate wall at the cut went black. The ortho range is now
+`distance ± sceneRadius()` (board corner + a full peel + margin), which removes
+the clip and tightens depth precision at the same time (~100 mm linear range
+instead of 0.09 mm → 1072 mm). The TRACERS need the mirror of this: parallel
+rays start on the camera plane, so their origin is pushed back by the same
+radius — moving a parallel ray's origin cannot change what it hits.
+
 *infinite* reversed-Z (no far plane at all). Orthographic swaps near/far to match,
 so both paths share one convention.
 
@@ -1089,6 +1102,10 @@ interactive run. All are opt-in. Grouped by purpose:
 - `PCBVIEW_START_DISTANCE=<mm>` — opening camera distance (overrides fit).
 - `PCBVIEW_START_ROLL=<radians>` — opening camera roll (right-drag vertical
   can't be synthesised).
+- `PCBVIEW_START_YAW` / `PCBVIEW_START_PITCH=<radians>` — explicit orbit
+  angles for views the three presets cannot express. A grazing pitch is how
+  the board EDGE gets inspected, which is where the orthographic near-plane
+  clip was finally reproduced.
 - `PCBVIEW_MEASURE=x1,y1,z1,x2,y2,z2` — pin a measurement between two world
   points in mm (mouse picks can't be synthesised).
 

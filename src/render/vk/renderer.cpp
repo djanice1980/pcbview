@@ -78,6 +78,16 @@ struct PushConstants {
     float viewProj[16];
     float cameraPos[4];
     float params[4];  // x = explode distance (mm per rank)
+    // xyz = camera forward (unit, eye -> target).
+    // w   = 0 in perspective; the ORBIT DISTANCE in orthographic.
+    //
+    // The fragment shaders need to know the projection kind. A parallel
+    // projection has ONE view direction for every fragment; deriving it from
+    // the eye POINT (the perspective shortcut) reverses for fragments at or
+    // behind the eye plane -- which ortho happily shows -- and that flipped
+    // vector then flips the normal and swings the whole camera-relative light
+    // rig, rendering the board's near edge black.
+    float camAxis[4];
 };
 
 }  // namespace
@@ -2501,6 +2511,13 @@ void Renderer::setShadowSoftness(float s01) {
     ptDenoisedValid_ = false;
 }
 
+void Renderer::setCameraAxis(const float fwd[3], float orthoDistance) {
+    camFwd_[0] = fwd[0];
+    camFwd_[1] = fwd[1];
+    camFwd_[2] = fwd[2];
+    camOrthoDistance_ = orthoDistance;
+}
+
 void Renderer::setMaskColor(float r, float g, float b, float opacity) {
     maskColor_ = {r, g, b};
     const float a = std::clamp(opacity, 0.05f, 1.0f);
@@ -2701,6 +2718,10 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     push.params[3] =
         (maxRank_ > 0.0f) ? std::clamp(explodeProgress_ / maxRank_, 0.0f, 1.0f)
                           : 0.0f;
+    push.camAxis[0] = camFwd_[0];
+    push.camAxis[1] = camFwd_[1];
+    push.camAxis[2] = camFwd_[2];
+    push.camAxis[3] = camOrthoDistance_;  // > 0 only in orthographic
     vkCmdPushConstants(cmd, layout_,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(push), &push);

@@ -125,6 +125,12 @@ public:
     // silently mis-scales a printed board.
     float orthoHalfHeight() const;
 
+    // Distance from the orbit target to the farthest thing worth drawing
+    // (board corner + a full peel + margin). Brackets the orthographic depth
+    // range and pushes the ortho ray origin back, so a parallel projection
+    // never clips geometry for sitting near or behind the camera plane.
+    float sceneRadius() const;
+
     // Milliseconds for the last frame, smoothed. Zero until the first frame.
     double frameMs() const { return frameMs_; }
 

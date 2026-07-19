@@ -113,6 +113,14 @@ public:
     // 1 = 8-degree radius (very soft penumbras). Restarts accumulation.
     void setShadowSoftness(float s01);
 
+    // The camera's forward axis and projection kind, for the RASTER shaders.
+    // `orthoDistance` is the orbit distance in orthographic mode and 0 in
+    // perspective. Orthographic has one view direction for every fragment;
+    // without this the shaders fall back to the eye-point view vector, which
+    // reverses for fragments at or behind the eye plane and blackens the
+    // board's near edge. Costs nothing when unchanged.
+    void setCameraAxis(const float fwd[3], float orthoDistance);
+
     // Screen-space overlay (measurements, dimension callouts): a triangle list
     // in PIXELS with the origin at the top-left, interleaved x,y,r,g,b,a --
     // 6 floats per vertex, pre-built by the caller (thick lines, arrowheads,
@@ -284,6 +292,10 @@ private:
     Image sceneDepth_;
     VkExtent2D sceneExtent_{};
     float renderScale_ = 1.0f;
+    // Camera forward + ortho orbit distance (0 = perspective) for the raster
+    // shaders; see setCameraAxis.
+    float camFwd_[3] = {0.0f, 0.0f, -1.0f};
+    float camOrthoDistance_ = 0.0f;
     float explodeStep_ = 0.0f;
     float explodeProgress_ = 0.0f;
     float maxRank_ = 0.0f;

@@ -584,8 +584,19 @@ void VulkanWindow::render() {
     if (camera_.orthographic) {
         const float halfH = orthoHalfHeight();
         const float halfW = halfH * (w / h);
-        proj = reverseZOrtho(-halfW, halfW, -halfH, halfH, zNear,
-                             camera_.distance * 4.0f + 1000.0f);
+        // Depth range brackets the SCENE, not the eye.
+        //
+        // A parallel projection has no viewpoint: geometry BEHIND the camera
+        // plane still projects into the image and must still be drawn. Keeping
+        // a positive near plane (the perspective habit) clips whatever crosses
+        // the eye plane, which at a grazing angle is the corner nearest the
+        // viewer -- the board visibly got sliced along a straight line as you
+        // zoomed or tilted. Bracketing the target +-radius removes the clip
+        // and TIGHTENS depth precision at the same time (a ~100mm range beats
+        // the old 4*distance + 1000).
+        const float r = sceneRadius();
+        proj = reverseZOrtho(-halfW, halfW, -halfH, halfH,
+                             camera_.distance - r, camera_.distance + r);
     } else {
         proj = infiniteReverseZPerspective(glm::radians(camera_.fovDegrees),
                                            w / h, zNear);
@@ -600,6 +611,7 @@ void VulkanWindow::render() {
     if (renderer_->renderMode() == vk::RenderMode::PathTraced ||
         (cpuRender() && rtEnabled_)) {
         const glm::vec3 fwd = glm::normalize(basis.forward);
+        glm::vec3 rayEye = eye;
         glm::vec3 right, up;
         if (camera_.orthographic) {
             // Half-extents in mm, from the same definition as the raster
@@ -608,14 +620,29 @@ void VulkanWindow::render() {
             const float halfW = halfH * (w / h);
             right = basis.right * halfW;
             up = basis.up * halfH;
+            // Parallel rays start ON the camera plane, so anything behind it
+            // would simply never be hit -- the tracers' version of the near
+            // clip that sliced the raster board. Pushing the origin back by
+            // the scene radius cannot change WHAT a parallel ray hits, only
+            // how much of the scene is in front of it.
+            rayEye -= fwd * sceneRadius();
         } else {
             const float tanY = std::tan(glm::radians(camera_.fovDegrees) * 0.5f);
             const float tanX = tanY * (w / h);
             right = basis.right * tanX;
             up = basis.up * tanY;
         }
-        renderer_->setRayCamera(&eye[0], &fwd[0], &right[0], &up[0],
+        renderer_->setRayCamera(&rayEye[0], &fwd[0], &right[0], &up[0],
                                 camera_.orthographic);
+    }
+
+    // The raster shaders need the projection kind: a parallel projection has
+    // one view direction for every fragment, and the eye-point fallback
+    // reverses at/behind the eye plane (black near edge).
+    {
+        const glm::vec3 fwd = glm::normalize(basis.forward);
+        renderer_->setCameraAxis(
+            &fwd[0], camera_.orthographic ? camera_.distance : 0.0f);
     }
 
     lastViewProj_ = viewProj;
@@ -1287,6 +1314,29 @@ void VulkanWindow::updateReadout() {
 float VulkanWindow::orthoHalfHeight() const {
     return camera_.distance *
            std::tan(glm::radians(camera_.fovDegrees) * 0.5f);
+}
+
+float VulkanWindow::sceneRadius() const {
+    // Farthest board corner from the orbit target, plus however far a full
+    // peel throws the outermost ring, plus a margin. Used to bracket the
+    // orthographic depth range (and to push the ortho ray origin back) so
+    // nothing is ever clipped for being near or behind the camera plane.
+    float radius = 1.0f;
+    if (mesh_) {
+        const auto& b = mesh_->bounds;
+        const glm::vec3 target(camera_.targetX, camera_.targetY,
+                               camera_.targetZ);
+        for (int i = 0; i < 8; ++i) {
+            const glm::vec3 corner(
+                static_cast<float>((i & 1) ? b.max[0] : b.min[0]),
+                static_cast<float>((i & 2) ? b.max[1] : b.min[1]),
+                static_cast<float>((i & 4) ? b.max[2] : b.min[2]));
+            radius = std::max(radius, glm::length(corner - target));
+        }
+    }
+    // A peeled stack reaches well outside the rest bounds.
+    if (renderer_) radius += renderer_->maxRank() * explodeStepMm();
+    return radius * 1.10f + 5.0f;  // margin for components and slack
 }
 
 float VulkanWindow::explodeStepMm() const {

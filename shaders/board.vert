@@ -11,6 +11,9 @@ layout(push_constant) uniform Push {
     // x = mm per stage, y = eased progress, z = max |rank|,
     // w = peel amount 0..1 (normalised progress)
     vec4 params;
+    // Fragment-stage only (camera forward + ortho orbit distance), declared
+    // here because one push block spans both stages.
+    vec4 camAxis;
 } push;
 
 struct Material {

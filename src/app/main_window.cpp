@@ -231,6 +231,14 @@ MainWindow::MainWindow(const QString& path) {
     if (qEnvironmentVariableIsSet("PCBVIEW_START_ROLL"))
         viewport_->camera().roll =
             qEnvironmentVariable("PCBVIEW_START_ROLL").toFloat();
+    // Explicit orbit angles in radians, for views the three presets cannot
+    // express -- a grazing pitch is how the board EDGE gets inspected.
+    if (qEnvironmentVariableIsSet("PCBVIEW_START_YAW"))
+        viewport_->camera().yaw =
+            qEnvironmentVariable("PCBVIEW_START_YAW").toFloat();
+    if (qEnvironmentVariableIsSet("PCBVIEW_START_PITCH"))
+        viewport_->camera().pitch =
+            qEnvironmentVariable("PCBVIEW_START_PITCH").toFloat();
 
     // Headless measurement hook: pin a measurement between two world points
     // (x1,y1,z1,x2,y2,z2 in mm) -- mouse picks can't be synthesised.

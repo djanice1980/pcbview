@@ -27,7 +27,26 @@ layout(push_constant) uniform Push {
     // x = mm per stage, y = eased progress, z = max |rank|,
     // w = peel amount 0..1 (normalised progress)
     vec4 params;
+    // xyz = camera forward; w = orbit distance in ORTHO, 0 in perspective.
+    vec4 camAxis;
 } push;
+
+// The view vector, and the distance used to scale the light rig.
+//
+// Perspective: both come from the eye POINT. Orthographic: every ray is
+// PARALLEL, so the direction is constant and the eye point is meaningless --
+// worse, a fragment at or behind the eye plane (which a parallel projection
+// still shows) yields a reversed vector, which flips the normal and swings the
+// camera-relative key/fill lights away, collapsing the surface to ambient. That
+// was the black near edge on a zoomed-in orthographic board.
+vec3 viewVector(vec3 worldPos) {
+    if (push.camAxis.w > 0.0) return -push.camAxis.xyz;
+    return normalize(push.cameraPos.xyz - worldPos);
+}
+float viewScale(vec3 worldPos) {
+    if (push.camAxis.w > 0.0) return push.camAxis.w;
+    return length(push.cameraPos.xyz - worldPos);
+}
 
 // How transparent the substrate goes at a full peel. The laminate is what hides
 // the copper, so fading it is what makes an exploded view legible -- but it must
@@ -38,7 +57,7 @@ void main() {
     Material m = materialTable.materials[inMaterial];
 
     vec3 n = normalize(inNormal);
-    vec3 viewDir = normalize(push.cameraPos.xyz - inWorldPos);
+    vec3 viewDir = viewVector(inWorldPos);
 
     // Two-sided: we inspect geometry from underneath as often as above, and a
     // back-facing normal should read as shading rather than a black hole.
@@ -62,9 +81,25 @@ void main() {
     // angle, so the top of an IC reads as one dead tone. A positioned lamp's
     // incidence sweeps across the face, giving a soft diffuse gradient. The
     // offset scales with view distance so the falloff looks the same at any zoom.
-    float viewDist = length(push.cameraPos.xyz - inWorldPos);
-    vec3 keyPos = push.cameraPos.xyz + (camRight * 0.55 + camUp * 0.55) * viewDist;
-    vec3 keyDir = normalize(keyPos - inWorldPos);
+    float viewDist = viewScale(inWorldPos);
+    // Perspective gets the positional lamp. ORTHOGRAPHIC gets a DIRECTIONAL
+    // key -- the parallel-projection analogue. A positional lamp is placed at
+    // eye + offset*viewDist, and in ortho "zoomed in" means a SMALL orbit
+    // distance while still framing a wide area, so that lamp sinks down over
+    // the board and every outward-facing edge wall falls into its shadow --
+    // the board's near edge went black. A directional key cannot land inside
+    // the scene, so edges stay lit at any zoom.
+    vec3 keyDir;
+    float keyDist;
+    if (push.camAxis.w > 0.0) {
+        keyDir = normalize(-push.camAxis.xyz + camRight * 0.55 + camUp * 0.55);
+        keyDist = 1.0e4;  // effectively infinite, for the shadow ray
+    } else {
+        vec3 keyPos =
+            push.cameraPos.xyz + (camRight * 0.55 + camUp * 0.55) * viewDist;
+        keyDir = normalize(keyPos - inWorldPos);
+        keyDist = length(keyPos - inWorldPos);
+    }
     vec3 fillDir = normalize(viewDir - camRight * 0.5 - camUp * 0.25);
 
     float key = max(dot(n, keyDir), 0.0);
