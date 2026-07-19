@@ -1207,6 +1207,35 @@ colour/side group at once.
   transmission in both tracers, Effects sliders with readouts, app icon, and
   the Inno Setup installer.
 
+### Future release ideas (noted 2026-07-19)
+
+- **Net trace / highlighting.** Pick a net and light it up across the whole
+  board — pads, traces, and via barrels — so a signal can be tracked visually,
+  especially in the exploded view where an inner-layer run becomes followable
+  end to end. Feasibility: the KiCad importer already parses `(net N "name")`
+  on pads/tracks/vias into `BoardModel`, so for KiCad boards this is a
+  plumbing job — carry the net id through `LayerArt` into per-part (or
+  per-region) mesh metadata and drive a highlight tint through the material
+  SSBO. Gerbers carry no net information, so the feature is KiCad-only unless
+  a netlist/schematic file is loaded alongside; "if there is a related
+  schematic" is the operative condition. UI sketch: a searchable net list
+  dock, click-to-select on the board, dim-everything-else mode.
+- **Party mode.** Fun mode: multi-coloured spinning lights sweeping and
+  highlighting the board, possibly with a disco ball. The path tracer already
+  supports arbitrary emissive directions (sun NEE + sky), so animated coloured
+  key lights are mostly parameter animation; a disco ball is a mirrored sphere
+  mesh + the existing metallic lobe. Needs continuous re-accumulation (or
+  raster-mode lights) since PT converges on a *still* scene — raster-mode
+  animated lights first, traced version later.
+- **Showcase mode (turntable video).** Automated camera choreography — orbit,
+  glide, explode/collapse sweeps — driven by the existing animation plumbing
+  (view presets + `PCBVIEW_START_*` show the camera is already scriptable),
+  recorded and encoded to short video clips. Capture side exists in embryo
+  (`PCBVIEW_CAPTURE` grabs the presented frame); a clip recorder is
+  frame-sequence capture at a fixed timestep + an encoder. Prefer a
+  no-new-DLL route (Windows Media Foundation H.264) over bundling ffmpeg;
+  fallback is emitting a PNG sequence the user encodes themselves.
+
 ## Test corpus
 
 `C:\Users\drayj\cx4-multicart` has `cx4multicart_v3.kicad_pcb` **and** a Gerber
