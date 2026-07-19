@@ -1209,6 +1209,20 @@ colour/side group at once.
 
 ### Future release ideas (noted 2026-07-19)
 
+- **FIX FIRST — right-drag rotation shipped wrong in v1.12.** What shipped is
+  a *mirrored* left-drag (same motions, opposite direction): up/down pitches
+  the board toward/away, left/right reads as a clockwise/counterclockwise
+  twist. That is exactly what left-drag already does and NOT what was asked
+  for. Wanted (user's words, 2026-07-19): right-drag **up/down** should
+  *twist the model clockwise and counterclockwise*; right-drag **left/right**
+  should *rotate the model left and right (spin on axis)*. I.e. the axes swap
+  roles relative to left-drag rather than merely negating — the vertical
+  mouse axis picks up the twist/roll motion, the horizontal axis the
+  spin-on-axis motion. Note the current camera has no roll degree of freedom
+  (orbit is yaw+pitch only), so the twist component likely means adding roll
+  about the view axis — confirm the exact mapping with the user before
+  implementing.
+
 - **Net trace / highlighting.** Pick a net and light it up across the whole
   board — pads, traces, and via barrels — so a signal can be tracked visually,
   especially in the exploded view where an inner-layer run becomes followable
