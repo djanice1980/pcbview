@@ -2044,7 +2044,7 @@ void Renderer::createOverlayPipeline() {
 
 // Upload this frame's overlay triangles and draw them. Called inside the UI
 // pass (swapchain bound at native resolution).
-void Renderer::recordOverlay(VkCommandBuffer cmd) {
+void Renderer::recordOverlay(VkCommandBuffer cmd, VkExtent2D drawArea) {
     if (overlayTris_.empty()) return;
     const VkDeviceSize bytes = overlayTris_.size() * sizeof(float);
 
@@ -2062,12 +2062,14 @@ void Renderer::recordOverlay(VkCommandBuffer cmd) {
     std::memcpy(mapped, overlayTris_.data(), bytes);
     vkUnmapMemory(device_.handle, vb.memory);
 
-    VkViewport viewport{0.0f, 0.0f, static_cast<float>(extent_.width),
-                        static_cast<float>(extent_.height), 0.0f, 1.0f};
-    VkRect2D scissor{{0, 0}, extent_};
+    VkViewport viewport{0.0f, 0.0f, static_cast<float>(drawArea.width),
+                        static_cast<float>(drawArea.height), 0.0f, 1.0f};
+    VkRect2D scissor{{0, 0}, drawArea};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlayPipeline_);
+    // Always the WINDOW size: vertices are in window pixels, and the viewport
+    // above does the stretching when drawArea is a bigger export target.
     const float vpPush[4] = {static_cast<float>(extent_.width),
                              static_cast<float>(extent_.height), 0.0f, 0.0f};
     vkCmdPushConstants(cmd, overlayLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
@@ -2827,6 +2829,27 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     vkCmdEndRendering(cmd);
   }  // end raster-vs-pathtrace branch
 
+    // On an export frame the overlay goes into the SCENE image as well, at the
+    // export resolution -- otherwise a high-res screenshot would silently drop
+    // the measurements and dimension callouts the user is looking at. The
+    // on-screen copy is still drawn later, onto the swapchain.
+    if (!capturePath_.empty() && captureScene_ && !overlayTris_.empty()) {
+        VkRenderingAttachmentInfo oColor{
+            VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        oColor.imageView = sceneColor_.view;
+        oColor.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        oColor.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;  // keep the rendered board
+        oColor.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo oPass{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        oPass.renderArea = {{0, 0}, sceneExtent_};
+        oPass.layerCount = 1;
+        oPass.colorAttachmentCount = 1;
+        oPass.pColorAttachments = &oColor;
+        vkCmdBeginRendering(cmd, &oPass);
+        recordOverlay(cmd, sceneExtent_);
+        vkCmdEndRendering(cmd);
+    }
+
     // --- Blit the scene up (or down) onto the swapchain ---
     VkImageMemoryBarrier2 toBlit[2]{};
     toBlit[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -2894,7 +2917,7 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
         uiPass.pColorAttachments = &uiColor;
         vkCmdBeginRendering(cmd, &uiPass);
         if (drawUi) drawUi(cmd);
-        recordOverlay(cmd);
+        recordOverlay(cmd, extent_);
         vkCmdEndRendering(cmd);
     }
 
@@ -2971,8 +2994,18 @@ void Renderer::resize(uint32_t width, uint32_t height) {
 void Renderer::waitIdle() { vkDeviceWaitIdle(device_.handle); }
 
 void Renderer::captureImage(uint32_t imageIndex) {
+    // Either the presented swapchain image (window size) or the offscreen
+    // scene image (internal render scale -- the high-resolution export).
+    const VkImage srcImage =
+        captureScene_ ? sceneColor_.handle : images_[imageIndex];
+    const VkExtent2D srcExtent = captureScene_ ? sceneExtent_ : extent_;
+    // The scene image was left in TRANSFER_SRC by the blit; the swapchain in
+    // PRESENT_SRC by the present barrier.
+    const VkImageLayout srcLayout = captureScene_
+                                        ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                        : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     const VkDeviceSize size =
-        static_cast<VkDeviceSize>(extent_.width) * extent_.height * 4;
+        static_cast<VkDeviceSize>(srcExtent.width) * srcExtent.height * 4;
 
     Buffer host = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -2995,9 +3028,9 @@ void Renderer::captureImage(uint32_t imageIndex) {
     toSrc.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     toSrc.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
     toSrc.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    toSrc.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    toSrc.oldLayout = srcLayout;
     toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toSrc.image = images_[imageIndex];
+    toSrc.image = srcImage;
     toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
     VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -3007,17 +3040,16 @@ void Renderer::captureImage(uint32_t imageIndex) {
 
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {extent_.width, extent_.height, 1};
-    vkCmdCopyImageToBuffer(cmd, images_[imageIndex],
-                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, host.handle, 1,
-                           &copy);
+    copy.imageExtent = {srcExtent.width, srcExtent.height, 1};
+    vkCmdCopyImageToBuffer(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           host.handle, 1, &copy);
 
     VkImageMemoryBarrier2 back = toSrc;
     back.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
     back.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
     back.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    back.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    back.newLayout = srcLayout;
     dep.pImageMemoryBarriers = &back;
     vkCmdPipelineBarrier2(cmd, &dep);
 
@@ -3038,9 +3070,10 @@ void Renderer::captureImage(uint32_t imageIndex) {
     // The swapchain is B8G8R8A8_SRGB, which is already the byte order a 24-bit
     // BMP wants -- so no channel swap, just drop alpha and flip rows.
     const uint8_t* src = static_cast<const uint8_t*>(mapped);
-    const int rowBytes = static_cast<int>(extent_.width) * 3;
+    const int rowBytes = static_cast<int>(srcExtent.width) * 3;
     const int padding = (4 - (rowBytes % 4)) % 4;
-    const int imageBytes = (rowBytes + padding) * static_cast<int>(extent_.height);
+    const int imageBytes =
+        (rowBytes + padding) * static_cast<int>(srcExtent.height);
     const int fileBytes = 54 + imageBytes;
 
     std::vector<uint8_t> bmp;
@@ -3052,8 +3085,8 @@ void Renderer::captureImage(uint32_t imageIndex) {
     std::memcpy(&header[10], &offset, 4);
     const int dibSize = 40;
     std::memcpy(&header[14], &dibSize, 4);
-    const int w = static_cast<int>(extent_.width);
-    const int h = static_cast<int>(extent_.height);
+    const int w = static_cast<int>(srcExtent.width);
+    const int h = static_cast<int>(srcExtent.height);
     std::memcpy(&header[18], &w, 4);
     std::memcpy(&header[22], &h, 4);
     const uint16_t planes = 1, bpp = 24;

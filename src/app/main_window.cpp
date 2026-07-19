@@ -19,6 +19,7 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QLabel>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -301,9 +302,14 @@ MainWindow::MainWindow(const QString& path) {
         const int delay = qEnvironmentVariableIsSet("PCBVIEW_CAPTURE_DELAY_MS")
                               ? qEnvironmentVariable("PCBVIEW_CAPTURE_DELAY_MS").toInt()
                               : 1500;
-        QTimer::singleShot(delay, this, [this, cap] {
+        // PCBVIEW_CAPTURE_SCENE=1 grabs the OFFSCREEN scene image instead of
+        // the swapchain -- the high-resolution export path, which the Save
+        // Screenshot dialog cannot be driven into headlessly.
+        const bool scene =
+            qEnvironmentVariable("PCBVIEW_CAPTURE_SCENE").toInt() != 0;
+        QTimer::singleShot(delay, this, [this, cap, scene] {
             if (viewport_->renderer())
-                viewport_->renderer()->requestCapture(cap.toStdString());
+                viewport_->renderer()->requestCapture(cap.toStdString(), scene);
             viewport_->requestUpdate();
             QTimer::singleShot(1000, qApp, &QApplication::quit);
         });
@@ -680,37 +686,67 @@ void MainWindow::appendComponents() {
     }
 }
 
-void MainWindow::grabFrame(std::function<void(const QImage&)> then) {
+void MainWindow::grabFrame(std::function<void(const QImage&)> then,
+                           float exportScale) {
     if (!viewport_->renderer()) {
         statusBar()->showMessage("Renderer not ready yet", 3000);
         return;
     }
-    // The renderer captures the presented frame to a file on the NEXT frame. Ask
-    // for it, then pick the file up once frameRendered confirms that frame ran.
-    // A one-shot connection: it disconnects itself the moment it fires.
+    vk::Renderer* r = viewport_->renderer();
+
+    // A high-resolution export renders the scene at `exportScale` and grabs the
+    // OFFSCREEN target rather than the window. Raising the scale restarts any
+    // accumulation, so a traced mode must be allowed to converge before the
+    // grab -- otherwise the export is a one-sample noise field.
+    const bool hiRes = exportScale > 1.0f;
+    const float savedScale = r->renderScale();
+    if (hiRes) {
+        r->setRenderScale(exportScale);
+        statusBar()->showMessage("Rendering export…");
+    }
+
     const QString tmp = QDir::temp().filePath("pcbview_grab.bmp");
     QFile::remove(tmp);
-    viewport_->renderer()->requestCapture(tmp.toStdString());
 
+    // State shared with the frame handler: whether the capture has been asked
+    // for yet, and a frame budget so a mode that never settles cannot hang the
+    // export forever.
+    auto requested = std::make_shared<bool>(false);
+    auto frames = std::make_shared<int>(0);
     auto conn = std::make_shared<QMetaObject::Connection>();
-    *conn = connect(viewport_, &VulkanWindow::frameRendered, this,
-                    [this, tmp, then, conn]() {
-                        if (!QFileInfo::exists(tmp)) return;  // not written yet
-                        QObject::disconnect(*conn);
-                        QImage img(tmp);
-                        QFile::remove(tmp);
-                        if (img.isNull()) {
-                            statusBar()->showMessage("Frame capture failed", 4000);
-                            return;
-                        }
-                        // Run `then` on the NEXT event-loop turn, not inside this
-                        // frameRendered emission -- it fires from within render(),
-                        // and opening a modal dialog (print preview) re-entrantly
-                        // there is what left the preview blank/broken.
-                        QMetaObject::invokeMethod(
-                            this, [then, img]() { then(img); },
-                            Qt::QueuedConnection);
-                    });
+    *conn = connect(
+        viewport_, &VulkanWindow::frameRendered, this,
+        [this, tmp, then, conn, requested, frames, hiRes, savedScale]() {
+            vk::Renderer* r = viewport_->renderer();
+            if (!r) return;
+            if (!*requested) {
+                // Let a progressive mode converge first. The cap is generous
+                // (a CPU path trace at 4x is genuinely slow) but finite.
+                if (r->accumulating() && ++*frames < 3000) {
+                    viewport_->requestUpdate();
+                    return;
+                }
+                *requested = true;
+                r->requestCapture(tmp.toStdString(), hiRes);
+                viewport_->requestUpdate();
+                return;
+            }
+            if (!QFileInfo::exists(tmp)) return;  // capture frame not run yet
+            QObject::disconnect(*conn);
+            QImage img(tmp);
+            QFile::remove(tmp);
+            if (hiRes) r->setRenderScale(savedScale);
+            if (img.isNull()) {
+                statusBar()->showMessage("Frame capture failed", 4000);
+                return;
+            }
+            // Run `then` on the NEXT event-loop turn, not inside this
+            // frameRendered emission -- it fires from within render(), and
+            // opening a modal dialog (print preview) re-entrantly there is
+            // what left the preview blank/broken.
+            QMetaObject::invokeMethod(
+                this, [then, img]() { then(img); }, Qt::QueuedConnection);
+        });
     viewport_->requestUpdate();
 }
 
@@ -725,12 +761,62 @@ void MainWindow::onSaveScreenshot() {
         this, "Save screenshot", suggested,
         "PNG image (*.png);;JPEG image (*.jpg)");
     if (path.isEmpty()) return;
-    grabFrame([this, path](const QImage& img) {
-        if (img.save(path))
-            statusBar()->showMessage("Saved " + path, 5000);
-        else
-            statusBar()->showMessage("Could not save " + path, 5000);
-    });
+
+    // Resolution picker. The internal-resolution machinery already renders the
+    // scene off-screen at a multiple of the window, so an export is just that
+    // scale plus grabbing the offscreen target -- which is also why the
+    // choices are expressed as multiples and the real pixel size is spelled
+    // out rather than left to the user to multiply.
+    float exportScale = 1.0f;
+    {
+        const QSize win = viewport_->renderer()
+                              ? QSize(static_cast<int>(
+                                          viewport_->renderer()->windowExtent().width),
+                                      static_cast<int>(
+                                          viewport_->renderer()->windowExtent().height))
+                              : size();
+        const float choices[] = {1.0f, 2.0f, 3.0f, 4.0f};
+        QStringList labels;
+        for (float m : choices) {
+            labels << QString("%1×  —  %2 × %3 px%4")
+                          .arg(QString::number(m, 'g', 2))
+                          .arg(static_cast<int>(win.width() * m))
+                          .arg(static_cast<int>(win.height() * m))
+                          .arg(m == 1.0f ? "  (as on screen)" : "");
+        }
+        bool ok = false;
+        // A traced mode has to re-converge at the new resolution, and on the
+        // CPU device that is minutes, not seconds -- say so before they wait.
+        const bool traced = viewport_->pathTracing() ||
+                            (viewport_->cpuRender() && viewport_->rayTracing());
+        const QString note =
+            traced ? (viewport_->cpuRender()
+                          ? "\n\nNote: the CPU renderer must re-converge at the "
+                            "export size. 4× is 16× the pixels and can take "
+                            "several minutes."
+                          : "\n\nNote: the path tracer re-converges at the "
+                            "export size, so this takes a few seconds.")
+                   : QString();
+        const QString choice = QInputDialog::getItem(
+            this, "Export resolution",
+            "Render the board at:" + note, labels, 0, false, &ok);
+        if (!ok) return;
+        const int idx = labels.indexOf(choice);
+        exportScale = choices[idx < 0 ? 0 : idx];
+    }
+
+    grabFrame(
+        [this, path](const QImage& img) {
+            if (img.save(path)) {
+                statusBar()->showMessage(
+                    QString("Saved %1  (%2 × %3)")
+                        .arg(path).arg(img.width()).arg(img.height()),
+                    6000);
+            } else {
+                statusBar()->showMessage("Could not save " + path, 5000);
+            }
+        },
+        exportScale);
 }
 
 void MainWindow::printView(int mode) {

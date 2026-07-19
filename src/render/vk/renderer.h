@@ -205,7 +205,16 @@ public:
     // Write the next presented frame to a BMP. Exists so the Vulkan path can be
     // verified without a human watching a window -- the same reason the software
     // rasteriser exists. Requires TRANSFER_SRC on the swapchain images.
-    void requestCapture(const std::string& path) { capturePath_ = path; }
+    //
+    // `sceneTarget` grabs the OFFSCREEN scene image instead of the swapchain,
+    // i.e. the board at the internal render scale rather than at window size.
+    // That is what makes a high-resolution export possible: raise the scale,
+    // capture this, restore. The overlay is drawn into that image too, so
+    // measurements and dimension callouts survive the export.
+    void requestCapture(const std::string& path, bool sceneTarget = false) {
+        capturePath_ = path;
+        captureScene_ = sceneTarget;
+    }
 
     const FrameStats& stats() const { return stats_; }
 
@@ -257,7 +266,11 @@ private:
     void destroySceneTargets();
     void createPipeline();
     void createOverlayPipeline();
-    void recordOverlay(VkCommandBuffer cmd);
+    // `drawArea` is the target being rendered into. Overlay vertices are in
+    // WINDOW pixels, so the push constant always describes the window and the
+    // viewport transform stretches that onto a larger export target -- line
+    // widths and glyph strokes scale with it for free.
+    void recordOverlay(VkCommandBuffer cmd, VkExtent2D drawArea);
     void createSyncAndCommands();
     void createDescriptors();
 
@@ -326,6 +339,7 @@ private:
     uint32_t frame_ = 0;
 
     void captureImage(uint32_t imageIndex);
+    bool captureScene_ = false;  // capture sceneColor_ instead of the swapchain
 
     Buffer vertexBuffer_;
     Buffer indexBuffer_;

@@ -1051,6 +1051,21 @@ Headless verification hooks (dialog can't take synthetic input):
     an identical camera). The print path had its OWN copy of that constant,
     so fixing only the projection would have silently mis-scaled every 1:1
     print by the same 21% — do not re-inline this value.
+  - **High-resolution export** (`grabFrame(then, exportScale)`): raise the
+    internal render scale, capture the OFFSCREEN scene image instead of the
+    swapchain (`requestCapture(path, sceneTarget=true)`), restore the scale.
+    The whole feature is those three steps because the internal-resolution
+    slider already renders the scene off-screen at a multiple of the window —
+    a 4× export is 16× the pixels of a window grab, genuinely re-rendered.
+    Two things it must do: **wait for convergence** before grabbing (raising
+    the scale restarts accumulation, so a traced mode would otherwise export
+    one noisy sample — grabFrame polls `accumulating()` with a frame budget),
+    and **draw the overlay into the scene image** at export size, or the
+    measurements and dimension callouts silently vanish from the export. The
+    overlay vertices are in WINDOW pixels and its push constant stays the
+    window size; only the VkViewport becomes the export extent, so the
+    viewport transform does the scaling and stroke widths grow with it.
+    Headless hook: `PCBVIEW_CAPTURE_SCENE=1` alongside `PCBVIEW_CAPTURE`.
   - **The grabFrame callback MUST be deferred** (`invokeMethod(..., QueuedConnection)`).
     `frameRendered` is emitted from inside `render()`; opening a modal dialog
     there re-enters the render/event machinery and left the print preview blank.
@@ -1148,6 +1163,10 @@ interactive run. All are opt-in. Grouped by purpose:
   delay, then quit.
 - `PCBVIEW_CAPTURE_DELAY_MS=<ms>` — override the pre-grab settle delay (default
   1500); raise it so the path tracer can converge + denoise before the grab.
+- `PCBVIEW_CAPTURE_SCENE=1` — grab the offscreen scene image (the internal
+  render scale) rather than the swapchain: the high-resolution export path,
+  which the Save Screenshot dialog cannot be driven into headlessly. Combine
+  with `PCBVIEW_RENDER_SCALE`.
 - `PCBVIEW_GPU_REPORT=<file>` — write the chosen device + ray-query/OIDN state to
   a file (console output is uncapturable on the Windows subsystem).
 - `PCBVIEW_ART_DUMP=<file>` — write LayerArt geometry stats (outline/drills/layer

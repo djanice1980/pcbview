@@ -55,7 +55,12 @@ private:
 
     // Grab the next rendered frame as a QImage (async: the capture lands one
     // frame later), then invoke `then`. Used by screenshot and print.
-    void grabFrame(std::function<void(const QImage&)> then);
+    // `exportScale` > 1 renders the scene at that multiple of the window and
+    // grabs the offscreen target instead of the swapchain -- the high-res
+    // export. Progressive modes are allowed to converge first, and the scale
+    // is restored afterwards.
+    void grabFrame(std::function<void(const QImage&)> then,
+                   float exportScale = 1.0f);
     void onSaveScreenshot();
     // mode: 0 = as shown on screen, 1 = flat overhead (top orthographic),
     // 2 = flat overhead printed at the board's true physical size (1:1).
