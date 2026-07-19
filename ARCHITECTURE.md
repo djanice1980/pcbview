@@ -1249,6 +1249,21 @@ colour/side group at once.
   frame-sequence capture at a fixed timestep + an encoder. Prefer a
   no-new-DLL route (Windows Media Foundation H.264) over bundling ffmpeg;
   fallback is emitting a PNG sequence the user encodes themselves.
+  **Not a live screen grab — this is a record-then-render pipeline (user
+  requirement, 2026-07-19).** In PT (and CPU RT) a moving camera never
+  converges, so grabbing presented frames would record noise (or the
+  fast-movement raster downgrade). Instead: **pass 1** records the
+  choreography as a list of per-frame camera + explode states at the output
+  timestep; **pass 2** replays it offline, treating every frame as a still —
+  park the camera, accumulate to the sample target, denoise (OIDN), *then*
+  capture — and encodes the post-processed frames. Frame time is whatever
+  convergence takes, decoupled from playback time. The accumulate→denoise→
+  resolve machinery is exactly what `PCBVIEW_CAPTURE` + `resolveDisplay`
+  already do per still image, so pass 2 is that loop iterated over the
+  recorded path. Per-frame cost can drop a lot by warm-starting: consecutive
+  frames differ by a tiny camera delta, so fewer samples per frame may
+  suffice (or reproject), but correctness first — naive full re-converge per
+  frame is acceptable for short clips.
 
 ## Test corpus
 
