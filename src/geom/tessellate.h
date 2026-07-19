@@ -68,9 +68,28 @@ struct Bounds {
     double max[3] = {0, 0, 0};
 };
 
+// A point the measurement tool can snap to exactly: pad centres, drill/bore
+// centres, board-outline vertices. Fab-exact coordinates from the importers,
+// so a measurement between two snapped points is the true design dimension,
+// not click precision.
+struct SnapPoint {
+    float pos[3] = {0, 0, 0};
+};
+
 struct BoardMesh {
     std::vector<Part> parts;
     Bounds bounds;
+
+    // Measurement snap targets (pad/drill centres, outline vertices) and the
+    // Z of the board's top surface (masks included, components excluded) --
+    // the plane free measurement points are projected onto.
+    std::vector<SnapPoint> snapPoints;
+    double boardTopZ = 0.0;
+    // Board-outline bounding box (mm, components excluded) for the
+    // width/height dimension callouts. Valid once an outline was assembled.
+    bool outlineValid = false;
+    double outlineMin[2] = {0, 0};
+    double outlineMax[2] = {0, 0};
 
     size_t totalTriangles() const;
     size_t totalVertices() const;

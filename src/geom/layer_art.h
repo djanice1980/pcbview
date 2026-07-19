@@ -26,6 +26,7 @@
 #include <clipper2/clipper.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -125,6 +126,13 @@ struct LayerArt {
 
     std::vector<ArtLayer> layers;
     std::vector<std::string> warnings;
+
+    // Measurement snap targets the importers know exactly: pad centres (KiCad
+    // only -- Gerber flashes are not distinguishable from any other exposure),
+    // in mm with the Y flip applied, z = 3D height to display the marker at.
+    // Drill/bore centres and outline vertices are derived in assemble() from
+    // the geometry above and do not need to be listed here.
+    std::vector<std::array<double, 3>> padCentres;
 };
 
 }  // namespace pcbview::geom

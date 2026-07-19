@@ -35,6 +35,12 @@ const uint32_t kFullscreenVert[] =
 const uint32_t kTonemapFrag[] =
 #include "shaders/tonemap.frag.inc"
     ;
+const uint32_t kOverlayVert[] =
+#include "shaders/overlay.vert.inc"
+    ;
+const uint32_t kOverlayFrag[] =
+#include "shaders/overlay.frag.inc"
+    ;
 
 constexpr uint32_t kFramesInFlight = 2;
 
@@ -95,6 +101,7 @@ Renderer::Renderer(Device& device, VkSurfaceKHR surface, uint32_t width,
     createSceneTargets();
     createDescriptors();
     createPipeline();
+    createOverlayPipeline();
     if (rtSupported_) createPathTracer();
     createSyncAndCommands();
 }
@@ -119,6 +126,9 @@ Renderer::~Renderer() {
 
     if (pipelineOpaque_) vkDestroyPipeline(device_.handle, pipelineOpaque_, nullptr);
     if (pipelineBlend_) vkDestroyPipeline(device_.handle, pipelineBlend_, nullptr);
+    if (overlayPipeline_) vkDestroyPipeline(device_.handle, overlayPipeline_, nullptr);
+    if (overlayLayout_) vkDestroyPipelineLayout(device_.handle, overlayLayout_, nullptr);
+    for (Buffer& b : overlayVb_) destroyBuffer(b);
     if (layout_) vkDestroyPipelineLayout(device_.handle, layout_, nullptr);
     if (descriptorPool_) vkDestroyDescriptorPool(device_.handle, descriptorPool_, nullptr);
     if (setLayout_) vkDestroyDescriptorSetLayout(device_.handle, setLayout_, nullptr);
@@ -1916,6 +1926,137 @@ void Renderer::createPipeline() {
     vkDestroyShaderModule(device_.handle, fs, nullptr);
 }
 
+// Screen-space overlay pipeline: pixel-space triangles with per-vertex colour,
+// alpha-blended straight onto the swapchain in the UI pass. No depth, no
+// descriptors -- just a viewport-size push constant.
+void Renderer::createOverlayPipeline() {
+    VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT, 0, 4 * sizeof(float)};
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
+    check(vkCreatePipelineLayout(device_.handle, &pl, nullptr, &overlayLayout_),
+          "overlay pipeline layout");
+
+    VkShaderModule vs =
+        makeModule(device_.handle, kOverlayVert, sizeof(kOverlayVert));
+    VkShaderModule fs =
+        makeModule(device_.handle, kOverlayFrag, sizeof(kOverlayFrag));
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription bind{0, 6 * sizeof(float),
+                                         VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attrs[2]{};
+    attrs[0] = {0, 0, VK_FORMAT_R32G32_SFLOAT, 0};
+    attrs[1] = {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 2 * sizeof(float)};
+    VkPipelineVertexInputStateCreateInfo vin{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vin.vertexBindingDescriptionCount = 1;
+    vin.pVertexBindingDescriptions = &bind;
+    vin.vertexAttributeDescriptionCount = 2;
+    vin.pVertexAttributeDescriptions = attrs;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds{
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = 2;
+    ds.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo rend{
+        VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rend.colorAttachmentCount = 1;
+    rend.pColorAttachmentFormats = &colorFormat_;
+
+    VkGraphicsPipelineCreateInfo gpi{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpi.pNext = &rend;
+    gpi.stageCount = 2;
+    gpi.pStages = stages;
+    gpi.pVertexInputState = &vin;
+    gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vp;
+    gpi.pRasterizationState = &rs;
+    gpi.pMultisampleState = &ms;
+    gpi.pColorBlendState = &cb;
+    gpi.pDynamicState = &ds;
+    gpi.layout = overlayLayout_;
+    check(vkCreateGraphicsPipelines(device_.handle, VK_NULL_HANDLE, 1, &gpi,
+                                    nullptr, &overlayPipeline_),
+          "overlay pipeline");
+    vkDestroyShaderModule(device_.handle, vs, nullptr);
+    vkDestroyShaderModule(device_.handle, fs, nullptr);
+}
+
+// Upload this frame's overlay triangles and draw them. Called inside the UI
+// pass (swapchain bound at native resolution).
+void Renderer::recordOverlay(VkCommandBuffer cmd) {
+    if (overlayTris_.empty()) return;
+    const VkDeviceSize bytes = overlayTris_.size() * sizeof(float);
+
+    if (overlayVb_.empty()) overlayVb_.resize(kFramesInFlight);
+    Buffer& vb = overlayVb_[frame_];
+    if (vb.size < bytes) {
+        destroyBuffer(vb);
+        vb = createBuffer(std::max<VkDeviceSize>(bytes, 64 * 1024),
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+    void* mapped = nullptr;
+    vkMapMemory(device_.handle, vb.memory, 0, bytes, 0, &mapped);
+    std::memcpy(mapped, overlayTris_.data(), bytes);
+    vkUnmapMemory(device_.handle, vb.memory);
+
+    VkViewport viewport{0.0f, 0.0f, static_cast<float>(extent_.width),
+                        static_cast<float>(extent_.height), 0.0f, 1.0f};
+    VkRect2D scissor{{0, 0}, extent_};
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, overlayPipeline_);
+    const float vpPush[4] = {static_cast<float>(extent_.width),
+                             static_cast<float>(extent_.height), 0.0f, 0.0f};
+    vkCmdPushConstants(cmd, overlayLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                       sizeof(vpPush), vpPush);
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vb.handle, &zero);
+    vkCmdDraw(cmd, static_cast<uint32_t>(overlayTris_.size() / 6), 1, 0, 0);
+}
+
 void Renderer::createSyncAndCommands() {
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -2707,7 +2848,7 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     dep.pImageMemoryBarriers = &toUi;
     vkCmdPipelineBarrier2(cmd, &dep);
 
-    if (drawUi) {
+    if (drawUi || !overlayTris_.empty()) {
         VkRenderingAttachmentInfo uiColor{
             VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         uiColor.imageView = views_[imageIndex];
@@ -2721,7 +2862,8 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
         uiPass.colorAttachmentCount = 1;
         uiPass.pColorAttachments = &uiColor;
         vkCmdBeginRendering(cmd, &uiPass);
-        drawUi(cmd);
+        if (drawUi) drawUi(cmd);
+        recordOverlay(cmd);
         vkCmdEndRendering(cmd);
     }
 

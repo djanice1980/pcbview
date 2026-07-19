@@ -174,6 +174,8 @@ pcbview_add_shader(board_rt.frag)
 pcbview_add_shader(pathtrace.comp)
 pcbview_add_shader(fullscreen.vert)
 pcbview_add_shader(tonemap.frag)
+pcbview_add_shader(overlay.vert)
+pcbview_add_shader(overlay.frag)
 
 add_executable(pcbview WIN32
     src/main.cpp

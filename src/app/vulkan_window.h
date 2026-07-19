@@ -20,6 +20,8 @@
 #include <QVulkanInstance>
 #include <QWindow>
 
+#include <glm/glm.hpp>
+
 #include <memory>
 
 #include "geom/tessellate.h"
@@ -114,7 +116,27 @@ public:
     // Milliseconds for the last frame, smoothed. Zero until the first frame.
     double frameMs() const { return frameMs_; }
 
+    // Measure mode: left-CLICK (press+release without a drag) sets the two
+    // endpoints; the readout follows the cursor between them, snapping to
+    // pad/drill centres and outline vertices. Orbit/pan/zoom stay live.
+    void setMeasureMode(bool on);
+    bool measureMode() const { return measureMode_; }
+    // Fab-drawing style board width/height callouts.
+    void setDimensionsOverlay(bool on);
+    bool dimensionsOverlay() const { return dimsOverlay_; }
+    // Headless hook (PCBVIEW_MEASURE): pin a measurement between two world
+    // points as if the user had clicked them -- mouse picks cannot be
+    // synthesised, but the rendering/readout path can still be verified.
+    void setMeasurement(float ax, float ay, float az, float bx, float by,
+                        float bz);
+
 signals:
+    // Live measurement readout for the status bar ("12.345 mm ..."), empty
+    // when measuring is idle.
+    void measureReadout(const QString& text);
+    // Fired when the M key toggles the mode, so the menu checkbox follows.
+    void measureModeChanged(bool on);
+
     void frameRendered();
     void statusMessage(const QString& text);
     // Emitted once the renderer exists and a board is on the GPU. The stackup
@@ -175,6 +197,19 @@ private:
     // validation (rightly) objects. Driven by QEvent::PlatformSurface.
     void releaseResources();
 
+    // --- Measurement overlay ---
+    // World -> framebuffer pixels via the same viewProj the frame rendered
+    // with; cursor -> board point by unprojecting through its inverse and
+    // intersecting the board-top plane, with snap targets checked first.
+    bool worldToScreen(const glm::vec3& w, float& px, float& py) const;
+    bool screenToBoard(const QPointF& posDip, glm::vec3& out, bool& snapped);
+    void handleMeasureClick(const QPointF& posDip);
+    // Rebuild the renderer overlay (measure line + dimension callouts) for
+    // this frame. Cheap; called from render() after the matrices are known.
+    void buildOverlay();
+    // Push the live measurement text out via measureReadout.
+    void updateReadout();
+
     const geom::BoardMesh* mesh_ = nullptr;
 
     QVulkanInstance qtInstance_;
@@ -219,6 +254,21 @@ private:
     bool panning_ = false;
     QPointF lastPos_;
     double frameMs_ = 0.0;
+
+    // --- Measurement state ---
+    bool measureMode_ = false;
+    bool dimsOverlay_ = false;
+    int measureStage_ = 0;  // 0 idle, 1 first point placed, 2 pinned
+    glm::vec3 measureA_{0.0f};
+    glm::vec3 measureB_{0.0f};
+    bool haveHover_ = false;
+    bool hoverSnapped_ = false;
+    glm::vec3 hover_{0.0f};
+    QPointF cursorPos_;          // device-independent px, for hover re-picks
+    QPointF pressPos_;
+    bool clickCandidate_ = false;  // press seen; becomes a pick if no drag
+    glm::mat4 lastViewProj_{1.0f};
+    bool haveViewProj_ = false;
 };
 
 }  // namespace pcbview::app

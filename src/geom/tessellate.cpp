@@ -462,6 +462,19 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
         }
     }
 
+    // Pad centres, as measurement snap targets. Same Y flip as toClipper.
+    for (const Pad& pad : board.pads) {
+        bool front = false;
+        for (int li : pad.layers) {
+            if (li >= 0 && board.layers[li].name == "F.Cu") {
+                front = true;
+                break;
+            }
+        }
+        art.padCentres.push_back(
+            {pad.at.x, -pad.at.y, front ? board.thickness : 0.0});
+    }
+
     // The bare profile, drills still intact. assemble() subtracts them, because
     // soldermask must tent ACROSS a drill and so needs the un-drilled outline.
     for (const Polygon& poly : board.outline) {
@@ -992,6 +1005,69 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
         for (const auto& [key, entry] : bySpan) {
             makeBarrelPart(entry.first, entry.second.first, entry.second.second,
                            /*partial=*/true);
+        }
+    }
+
+    // --- Measurement snap targets ---
+    //
+    // Fab-exact points the measure tool can lock onto: every drill/bore
+    // centre (top and bottom face, so either viewing side snaps), every pad
+    // centre, every outline vertex. Free clicks fall back to the board-top
+    // plane, recorded here too.
+    out.boardTopZ = art.thickness;
+    {
+        const auto centre = [](const Path64& p) {
+            double sx = 0.0, sy = 0.0;
+            for (const Point64& q : p) {
+                sx += static_cast<double>(q.x);
+                sy += static_cast<double>(q.y);
+            }
+            const double n = static_cast<double>(std::max<size_t>(p.size(), 1));
+            return std::array<double, 2>{sx / n / kScale, sy / n / kScale};
+        };
+        const auto add = [&](double x, double y, double z) {
+            SnapPoint sp;
+            sp.pos[0] = static_cast<float>(x);
+            sp.pos[1] = static_cast<float>(y);
+            sp.pos[2] = static_cast<float>(z);
+            out.snapPoints.push_back(sp);
+        };
+        for (const Path64& d : art.drills) {
+            const auto c = centre(d);
+            add(c[0], c[1], art.thickness);
+            add(c[0], c[1], 0.0);
+        }
+        for (const ResolvedBore& rb : bores) {
+            const auto c = centre(*rb.path);
+            add(c[0], c[1], rb.z1);
+            add(c[0], c[1], rb.z0);
+        }
+        for (const auto& pc : art.padCentres) add(pc[0], pc[1], pc[2]);
+        for (const Path64& loop : art.outline) {
+            for (const Point64& q : loop) {
+                add(static_cast<double>(q.x) / kScale,
+                    static_cast<double>(q.y) / kScale, art.thickness);
+                add(static_cast<double>(q.x) / kScale,
+                    static_cast<double>(q.y) / kScale, 0.0);
+            }
+        }
+
+        // Outline bounding box, for the dimension callouts.
+        for (const Path64& loop : art.outline) {
+            for (const Point64& q : loop) {
+                const double x = static_cast<double>(q.x) / kScale;
+                const double y = static_cast<double>(q.y) / kScale;
+                if (!out.outlineValid) {
+                    out.outlineMin[0] = out.outlineMax[0] = x;
+                    out.outlineMin[1] = out.outlineMax[1] = y;
+                    out.outlineValid = true;
+                } else {
+                    out.outlineMin[0] = std::min(out.outlineMin[0], x);
+                    out.outlineMin[1] = std::min(out.outlineMin[1], y);
+                    out.outlineMax[0] = std::max(out.outlineMax[0], x);
+                    out.outlineMax[1] = std::max(out.outlineMax[1], y);
+                }
+            }
         }
     }
 

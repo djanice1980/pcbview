@@ -113,6 +113,13 @@ public:
     // 1 = 8-degree radius (very soft penumbras). Restarts accumulation.
     void setShadowSoftness(float s01);
 
+    // Screen-space overlay (measurements, dimension callouts): a triangle list
+    // in PIXELS with the origin at the top-left, interleaved x,y,r,g,b,a --
+    // 6 floats per vertex, pre-built by the caller (thick lines, arrowheads,
+    // stroked text all arrive as triangles). Drawn in the UI pass at native
+    // resolution, over every render mode. An empty vector clears it.
+    void setOverlay(std::vector<float> tris) { overlayTris_ = std::move(tris); }
+
     // Exploded view, peeled outside-in.
     //
     // `mmPerStage` is how far a ring travels per stage of progress.
@@ -241,6 +248,8 @@ private:
     void createSceneTargets();
     void destroySceneTargets();
     void createPipeline();
+    void createOverlayPipeline();
+    void recordOverlay(VkCommandBuffer cmd);
     void createSyncAndCommands();
     void createDescriptors();
 
@@ -284,6 +293,14 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipelineOpaque_ = VK_NULL_HANDLE;
     VkPipeline pipelineBlend_ = VK_NULL_HANDLE;
+
+    // Screen-space overlay: one host-visible vertex buffer per frame in flight
+    // (the CPU rewrites it while the previous frame may still be reading its
+    // own -- same reasoning as cpuStaging_).
+    VkPipelineLayout overlayLayout_ = VK_NULL_HANDLE;
+    VkPipeline overlayPipeline_ = VK_NULL_HANDLE;
+    std::vector<Buffer> overlayVb_;
+    std::vector<float> overlayTris_;
 
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;

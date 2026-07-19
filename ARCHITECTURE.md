@@ -1080,6 +1080,8 @@ interactive run. All are opt-in. Grouped by purpose:
 - `PCBVIEW_START_DISTANCE=<mm>` — opening camera distance (overrides fit).
 - `PCBVIEW_START_ROLL=<radians>` — opening camera roll (right-drag vertical
   can't be synthesised).
+- `PCBVIEW_MEASURE=x1,y1,z1,x2,y2,z2` — pin a measurement between two world
+  points in mm (mouse picks can't be synthesised).
 
 **Appearance (mirror the Appearance dialog, which input synthesis can't drive)**
 - `PCBVIEW_THICKNESS=<mm>` — finished-board thickness override.
@@ -1158,6 +1160,46 @@ Things we currently render differently from what the plant would produce:
   rect and emit a warning. No test board uses them.
 - `validatePadConnectivity` is meaningless on an unrouted board — CPS3brd1 has
   zero tracks, so it reports top 0/79. Read the top-vs-bottom *gap*, not the rate.
+
+## Measurement tools (built 2026-07-19)
+
+Press `M` (or View → Measure distance): click two points, get a fab-exact
+distance. View → Board dimensions draws width/height callouts. How it hangs
+together, and why:
+
+- **Snap-first picking, no ray tracing.** `BoardMesh::snapPoints` carries
+  every drill/bore centre (top AND bottom face, so either viewing side
+  snaps), every pad centre (`LayerArt::padCentres`, KiCad only — a Gerber
+  flash is indistinguishable from any other exposure), and every outline
+  vertex. The cursor snaps to the nearest snap point within 14 px
+  (screen-projected); only a miss falls back to unprojecting the cursor
+  through the inverse of the frame's own viewProj and intersecting the
+  board-top plane (`BoardMesh::boardTopZ`). Snapped measurements are the
+  true design dimension — hole-to-hole on the synthetic test board reads
+  exactly 10.000 mm.
+- **Click vs drag:** a left press in measure mode becomes a pick only if the
+  cursor moves under 4 px before release, so orbit/pan/zoom stay fully live
+  while measuring. Esc clears the measurement; M leaves the mode.
+- **Overlay rendering is in-renderer, not Qt.** A transparent QWidget cannot
+  reliably paint over a native `createWindowContainer` window (airspace), so
+  `Renderer::setOverlay` takes a screen-space triangle list (pixels,
+  top-left origin; 6 floats/vertex xy+rgba) drawn by a tiny pipeline in the
+  existing UI pass — native resolution, alpha-blended, after the scene blit,
+  so it works over raster, RT, PT, and on the CPU device, and appears in
+  `PCBVIEW_CAPTURE` output. Host-visible vertex buffer per frame in flight
+  (same race reasoning as cpuStaging_). Thick lines, arrowheads/ticks,
+  markers, and TEXT all arrive as triangles: text is Newstroke
+  (`text::layout`) — its KiCad-sense Y-down output IS screen-pixel space, so
+  glyph polylines just get thickened into quads. Labels draw twice (1 px
+  black offset, then white) for contrast on any board.
+- **World anchoring:** `VulkanWindow::buildOverlay()` rebuilds the triangle
+  list every frame from the stored `lastViewProj_`, so measurements and
+  dimension callouts stay glued to the board through orbit/zoom/explode.
+  Dimension callouts use `BoardMesh::outlineMin/Max` (outline bbox —
+  component overhang must not inflate the board size).
+- Headless: `PCBVIEW_MEASURE=x1,y1,z1,x2,y2,z2` pins a measurement (mouse
+  picks cannot be synthesised); the `dimensionsOverlay` setting persists the
+  callout toggle.
 
 ## Blind/buried via spans (built 2026-07-19, KiCad only)
 
@@ -1282,29 +1324,15 @@ colour/side group at once.
   `cameraBasis`, so no other plumbing changed. `PCBVIEW_START_ROLL`
   (radians) is the headless hook; raster + PT captures verified at 45°.
 
-- **Measurement tools (noted 2026-07-19).** Two complementary pieces:
-  1. **Point-to-point measure** — click first point, click second (rubber-band
-     line + live readout between clicks), distance in mm plus dx/dy
-     components. The picking problem is already solved in-tree: `CpuTracer`
-     (Embree) can cast one camera ray through the cursor and return the exact
-     3D hit on board or component geometry, on ANY device — the GPU path
-     never needs to implement picking. Accuracy comes from **snapping**: pad
-     centres, drill/via centres, board-outline vertices, and component
-     origins are all known exactly (`BoardModel` for KiCad; LayerArt-derived
-     for Gerber), so snap the raw ray hit to the nearest feature within a
-     pixel radius and measurements become fab-exact instead of
-     click-precision. Component-to-component: clicking a component measures
-     from its origin/courtyard centre. In the exploded view, measuring
-     across layers should use REST positions (report the true in-board
-     distance, not the peeled one) — display both if ambiguous.
-  2. **Outside dimensions / floating ruler** — an auto-dimension overlay
-     like a fab drawing: board width × height callouts from the outline
-     bbox (the numbers already exist — they drive 1:1 print), plus optional
-     edge-to-edge dimension lines. A menu toggle, no clicking required.
-  Overlay rendering: lines/text drawn over the 3D view — either a
-  transparent QWidget on top of the window container (QPainter, easiest) or
-  in-scene Vulkan lines (depth-aware, harder). Start with the QPainter
-  overlay; it also serves the net-trace label needs below.
+- **Measurement tools — BUILT 2026-07-19**, see "Measurement tools (built)"
+  below. Both pieces landed: snap-first point-to-point measure and the
+  board-dimensions overlay. Notable departures from this note: no Embree
+  picking (snapping + a board-plane unproject covered every use case without
+  per-frame ray casts), and no QPainter overlay — a native QWindow suffers
+  the airspace problem, so the overlay is a small Vulkan triangle pipeline
+  in the renderer's UI pass, which also works identically on the CPU device
+  and inside PT mode. That pipeline is the one net-trace labels should
+  reuse.
 - **Net trace / highlighting.** Pick a net and light it up across the whole
   board — pads, traces, and via barrels — so a signal can be tracked visually,
   especially in the exploded view where an inner-layer run becomes followable

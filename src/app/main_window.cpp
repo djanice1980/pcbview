@@ -138,6 +138,17 @@ MainWindow::MainWindow(const QString& path) {
         viewport_->camera().roll =
             qEnvironmentVariable("PCBVIEW_START_ROLL").toFloat();
 
+    // Headless measurement hook: pin a measurement between two world points
+    // (x1,y1,z1,x2,y2,z2 in mm) -- mouse picks can't be synthesised.
+    if (qEnvironmentVariableIsSet("PCBVIEW_MEASURE")) {
+        const QStringList p = qEnvironmentVariable("PCBVIEW_MEASURE").split(',');
+        if (p.size() == 6) {
+            viewport_->setMeasurement(p[0].toFloat(), p[1].toFloat(),
+                                      p[2].toFloat(), p[3].toFloat(),
+                                      p[4].toFloat(), p[5].toFloat());
+        }
+    }
+
     // Headless close-up: set the orbit distance AFTER first expose --
     // initialise()'s frameBoard() would clobber a pre-expose value (the usual
     // before-first-frame trap). Needed to reproduce artifacts that only show
@@ -249,6 +260,29 @@ void MainWindow::buildViewport() {
     // frame.
     connect(viewport_, &VulkanWindow::viewportRebuildRequired, this,
             &MainWindow::rebuildViewport, Qt::QueuedConnection);
+
+    // Measurement readout in the status bar; menu checkbox follows the M key.
+    connect(viewport_, &VulkanWindow::measureReadout, this,
+            [this](const QString& t) {
+                if (t.isEmpty()) statusBar()->clearMessage();
+                else statusBar()->showMessage(t);
+            });
+    connect(viewport_, &VulkanWindow::measureModeChanged, this,
+            [this](bool on) {
+                if (measureAction_) {
+                    const QSignalBlocker block(measureAction_);
+                    measureAction_->setChecked(on);
+                }
+            });
+    // The menus are built once, before the first viewport exists; a REBUILT
+    // viewport reloads the persisted dims toggle, so reflect it back.
+    if (dimsAction_) {
+        const QSignalBlocker block(dimsAction_);
+        dimsAction_->setChecked(viewport_->dimensionsOverlay());
+    }
+    if (measureAction_ && measureAction_->isChecked()) {
+        viewport_->setMeasureMode(true);
+    }
 }
 
 void MainWindow::rebuildViewport() {
@@ -740,6 +774,26 @@ void MainWindow::buildMenus() {
         viewport_->camera().orthographic = on;
         viewport_->requestUpdate();
     });
+
+    view->addSeparator();
+    // Measurement tools. The M shortcut lives in the viewport's own
+    // keyPressEvent (native QWindow -- QAction shortcuts never fire while it
+    // has focus, see unhandledKey); the actions here are the discoverable
+    // path and stay in sync via measureModeChanged.
+    measureAction_ = view->addAction("&Measure distance");
+    measureAction_->setCheckable(true);
+    measureAction_->setToolTip(
+        "Click two points to measure (M). Snaps to pads, holes and the board "
+        "edge; Esc clears.");
+    connect(measureAction_, &QAction::toggled, this,
+            [this](bool on) { viewport_->setMeasureMode(on); });
+    dimsAction_ = view->addAction("Board &dimensions");
+    dimsAction_->setCheckable(true);
+    dimsAction_->setToolTip("Width and height callouts around the board");
+    connect(dimsAction_, &QAction::toggled, this,
+            [this](bool on) { viewport_->setDimensionsOverlay(on); });
+    dimsAction_->setChecked(
+        appSettings().value("dimensionsOverlay", false).toBool());
 
     view->addSeparator();
     // Hide the stackup / properties docks for a clean, full-width view of the

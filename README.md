@@ -54,6 +54,12 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   auto-hiding side panels (pin, or peek-on-hover).
 - **Print & export.** Print as-shown, flat (overhead orthographic), or **flat at
   true 1:1 physical size**, with a print preview. Save a PNG/JPG screenshot.
+- **Measurement tools.** Press `M` and click two points: the distance readout
+  **snaps to pad centres, drill/via centres and board-edge vertices**, so
+  hole-to-hole and pad-to-pad measurements are fab-exact rather than
+  click-precision. A rubber-band line with a live mm label follows the cursor;
+  `Esc` clears; orbit/pan/zoom stay live while measuring. **View → Board
+  dimensions** adds fab-drawing width/height callouts around the board.
 - **Ray-traced lighting.** On a GPU with `ray_query` (most modern discrete cards
   and many iGPUs), an optional mode traces contact shadows and ambient occlusion
   from the fragment shader, so components read as *seated* on the board. Pick which
@@ -126,6 +132,7 @@ between the slabs:
 | Top / Bottom / Isometric | `T` / `B` / `I` |
 | Fit to board | `F` |
 | Orthographic toggle | `O` |
+| Measure distance | `M` (click two points; `Esc` clears) |
 | Open board / gerbers | `Ctrl`+`O` |
 | Reload | `F5` |
 | Save screenshot | `Ctrl`+`S` |
@@ -215,9 +222,10 @@ are incompatible with GPL-2.0. Full third-party attributions are in
   GPU-accelerated Intel OIDN denoising on a background thread, via barrels with
   per-tool Excellon plating, mounting-hole / slot cutouts from Edge_Cuts, a
   full CPU rendering device (Mesa lavapipe raster + Embree ray tracing), soft
-  sun shadows + diffuse laminate transmission, and a Windows installer.
-- **Next:** a Linux build, measurement tools (point-to-point with snapping to
-  pads/drills/outline, plus a board-dimensions overlay), net highlighting
+  sun shadows + diffuse laminate transmission, a Windows installer,
+  blind/buried via spans, Excellon rout-mode slots, and measurement tools
+  with snapping + board-dimension callouts.
+- **Next:** a Linux build, net highlighting
   (track a signal across layers and through the exploded view — KiCad boards
   carry net data), a showcase mode that choreographs the camera and records
   short video clips, and party mode (spinning coloured lights; disco ball

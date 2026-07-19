@@ -131,6 +131,8 @@ private:
     QDockWidget* stackupDock_ = nullptr;
     QDockWidget* propertiesDock_ = nullptr;
     QMenu* recentMenu_ = nullptr;
+    QAction* measureAction_ = nullptr;
+    QAction* dimsAction_ = nullptr;
 
     QLabel* statusFile_ = nullptr;
     QLabel* statusBoard_ = nullptr;

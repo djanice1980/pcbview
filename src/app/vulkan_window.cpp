@@ -14,6 +14,8 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include "text/stroke_text.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -238,6 +240,7 @@ void VulkanWindow::initialise() {
     oidnEnabled_ = qEnvironmentVariableIsSet("PCBVIEW_OIDN")
                        ? qgetenv("PCBVIEW_OIDN").toInt() != 0
                        : appSettings().value("denoising", true).toBool();
+    dimsOverlay_ = appSettings().value("dimensionsOverlay", false).toBool();
     // fastMove_ is loaded in createDeviceAndRenderer -- its default depends on
     // the device (on for the CPU renderer, off for a GPU).
 
@@ -614,6 +617,10 @@ void VulkanWindow::render() {
                                 camera_.orthographic);
     }
 
+    lastViewProj_ = viewProj;
+    haveViewProj_ = true;
+    buildOverlay();
+
     if (!renderer_->drawFrame(&viewProj[0][0], &eye[0])) {
         renderer_->resize(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
     }
@@ -676,7 +683,16 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
     // driving, so the animation should not fight the drag.
     cameraAnimating_ = false;
     lastPos_ = e->position();
-    if (e->button() == Qt::LeftButton) dragging_ = true;
+    if (e->button() == Qt::LeftButton) {
+        dragging_ = true;
+        // In measure mode a left CLICK (press+release without a drag) places
+        // a measurement point; a drag still orbits. Track the candidacy here
+        // and cancel it once the cursor moves.
+        if (measureMode_) {
+            clickCandidate_ = true;
+            pressPos_ = e->position();
+        }
+    }
     // Left-drag is yaw+pitch; right-drag is yaw+ROLL (horizontal spins the
     // board on its axis, vertical twists it cw/ccw); middle pans. User
     // request: the right button covers the rotation left-drag can't do.
@@ -685,7 +701,14 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
 }
 
 void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
-    if (e->button() == Qt::LeftButton) dragging_ = false;
+    if (e->button() == Qt::LeftButton) {
+        dragging_ = false;
+        if (clickCandidate_) {
+            clickCandidate_ = false;
+            handleMeasureClick(e->position());
+            updateReadout();
+        }
+    }
     if (e->button() == Qt::RightButton) draggingInv_ = false;
     if (e->button() == Qt::MiddleButton) panning_ = false;
     // A drag has no easing animation to keep the loop alive, so without this the
@@ -697,6 +720,20 @@ void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
 void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
     const QPointF delta = e->position() - lastPos_;
     lastPos_ = e->position();
+    cursorPos_ = e->position();
+
+    // A real drag cancels the measure-click candidacy.
+    if (clickCandidate_ &&
+        (e->position() - pressPos_).manhattanLength() > 4.0) {
+        clickCandidate_ = false;
+    }
+    // Hover pick for the rubber band / snap highlight, only while no button
+    // is steering the camera.
+    if (measureMode_ && !dragging_ && !draggingInv_ && !panning_) {
+        haveHover_ = screenToBoard(cursorPos_, hover_, hoverSnapped_);
+        updateReadout();
+        requestUpdate();
+    }
 
     if (dragging_) {
         const float s = 0.008f;
@@ -892,6 +929,266 @@ bool VulkanWindow::stepCameraAnimation() {
     return cameraAnimating_;
 }
 
+// --- Measurement + dimensions overlay ---------------------------------------
+
+void VulkanWindow::setMeasureMode(bool on) {
+    if (measureMode_ == on) return;
+    measureMode_ = on;
+    measureStage_ = 0;
+    haveHover_ = false;
+    clickCandidate_ = false;
+    emit measureReadout(QString());
+    requestUpdate();
+}
+
+void VulkanWindow::setMeasurement(float ax, float ay, float az, float bx,
+                                  float by, float bz) {
+    measureMode_ = true;
+    measureA_ = {ax, ay, az};
+    measureB_ = {bx, by, bz};
+    measureStage_ = 2;
+    emit measureModeChanged(true);
+    updateReadout();
+    requestUpdate();
+}
+
+void VulkanWindow::setDimensionsOverlay(bool on) {
+    if (dimsOverlay_ == on) return;
+    dimsOverlay_ = on;
+    appSettings().setValue("dimensionsOverlay", on);
+    requestUpdate();
+}
+
+bool VulkanWindow::worldToScreen(const glm::vec3& w, float& px,
+                                 float& py) const {
+    if (!haveViewProj_) return false;
+    const glm::vec4 clip = lastViewProj_ * glm::vec4(w, 1.0f);
+    if (clip.w <= 1e-6f) return false;
+    const qreal dpr = devicePixelRatio();
+    px = (clip.x / clip.w * 0.5f + 0.5f) * static_cast<float>(width() * dpr);
+    py = (clip.y / clip.w * 0.5f + 0.5f) * static_cast<float>(height() * dpr);
+    return true;
+}
+
+bool VulkanWindow::screenToBoard(const QPointF& posDip, glm::vec3& out,
+                                 bool& snapped) {
+    snapped = false;
+    if (!haveViewProj_ || !mesh_) return false;
+    const qreal dpr = devicePixelRatio();
+    const float px = static_cast<float>(posDip.x() * dpr);
+    const float py = static_cast<float>(posDip.y() * dpr);
+
+    // Snap targets first: nearest pad/drill centre or outline vertex within a
+    // small screen radius wins, making the measurement fab-exact.
+    const float thresh = 14.0f * static_cast<float>(dpr);
+    float best = thresh * thresh;
+    bool found = false;
+    glm::vec3 bestP{0.0f};
+    for (const geom::SnapPoint& sp : mesh_->snapPoints) {
+        const glm::vec3 wpt(sp.pos[0], sp.pos[1], sp.pos[2]);
+        float sx, sy;
+        if (!worldToScreen(wpt, sx, sy)) continue;
+        const float d2 = (sx - px) * (sx - px) + (sy - py) * (sy - py);
+        if (d2 < best) {
+            best = d2;
+            bestP = wpt;
+            found = true;
+        }
+    }
+    if (found) {
+        out = bestP;
+        snapped = true;
+        return true;
+    }
+
+    // Free point: unproject the cursor through the SAME matrix the frame
+    // rendered with and intersect the board-top plane. Reversed-Z: NDC depth
+    // 1 is the near plane, 0.25 just a second point along the ray.
+    const float u = px / static_cast<float>(width() * dpr) * 2.0f - 1.0f;
+    const float v = py / static_cast<float>(height() * dpr) * 2.0f - 1.0f;
+    const glm::mat4 inv = glm::inverse(lastViewProj_);
+    const glm::vec4 h0 = inv * glm::vec4(u, v, 1.0f, 1.0f);
+    const glm::vec4 h1 = inv * glm::vec4(u, v, 0.25f, 1.0f);
+    if (std::abs(h0.w) < 1e-12f || std::abs(h1.w) < 1e-12f) return false;
+    const glm::vec3 a = glm::vec3(h0) / h0.w;
+    const glm::vec3 b = glm::vec3(h1) / h1.w;
+    const glm::vec3 dir = glm::normalize(b - a);
+    if (std::abs(dir.z) < 1e-6f) return false;
+    const float topZ = static_cast<float>(mesh_->boardTopZ);
+    const float t = (topZ - a.z) / dir.z;
+    if (t < 0.0f) return false;
+    out = a + dir * t;
+    return true;
+}
+
+void VulkanWindow::handleMeasureClick(const QPointF& posDip) {
+    glm::vec3 p;
+    bool snapped = false;
+    if (!screenToBoard(posDip, p, snapped)) return;
+    if (measureStage_ == 1) {
+        measureB_ = p;
+        measureStage_ = 2;
+    } else {
+        // Idle or already pinned: this click starts a fresh measurement.
+        measureA_ = p;
+        measureStage_ = 1;
+    }
+    requestUpdate();
+}
+
+void VulkanWindow::buildOverlay() {
+    if (!renderer_) return;
+    std::vector<float> tris;
+    const float dpr = static_cast<float>(devicePixelRatio());
+
+    const auto push = [&](float x, float y, const float c[4]) {
+        tris.push_back(x);
+        tris.push_back(y);
+        tris.insert(tris.end(), c, c + 4);
+    };
+    const auto quad = [&](float ax, float ay, float bx, float by, float wpx,
+                          const float c[4]) {
+        float dx = bx - ax, dy = by - ay;
+        const float len = std::sqrt(dx * dx + dy * dy);
+        if (len < 1e-3f) return;
+        dx /= len;
+        dy /= len;
+        const float nx = -dy * wpx * 0.5f, ny = dx * wpx * 0.5f;
+        push(ax + nx, ay + ny, c);
+        push(bx + nx, by + ny, c);
+        push(bx - nx, by - ny, c);
+        push(ax + nx, ay + ny, c);
+        push(bx - nx, by - ny, c);
+        push(ax - nx, ay - ny, c);
+    };
+    const auto marker = [&](float x, float y, float r, const float c[4]) {
+        push(x, y - r, c);
+        push(x + r, y, c);
+        push(x, y + r, c);
+        push(x, y - r, c);
+        push(x, y + r, c);
+        push(x - r, y, c);
+    };
+    const auto drawText = [&](const std::string& s, float x, float y,
+                              float sizePx, const float c[4],
+                              double rotation = 0.0) {
+        text::TextStyle st;
+        st.size = {sizePx * 0.9, sizePx};
+        st.thickness = sizePx * 0.14;
+        st.rotation = rotation;
+        // Stroke layout is Y-down (KiCad sense) -- exactly screen pixels.
+        const float shadow[4] = {0.0f, 0.0f, 0.0f, 0.75f};
+        for (int pass = 0; pass < 2; ++pass) {
+            const float off = (pass == 0) ? dpr : 0.0f;
+            const auto lines = text::layout(
+                s, {static_cast<double>(x + off), static_cast<double>(y + off)},
+                st);
+            for (const auto& pl : lines) {
+                for (size_t i = 0; i + 1 < pl.size(); ++i) {
+                    quad(static_cast<float>(pl[i].x),
+                         static_cast<float>(pl[i].y),
+                         static_cast<float>(pl[i + 1].x),
+                         static_cast<float>(pl[i + 1].y),
+                         static_cast<float>(st.thickness),
+                         pass == 0 ? shadow : c);
+                }
+            }
+        }
+    };
+
+    static const float kAmber[4] = {1.0f, 0.82f, 0.25f, 0.95f};
+    static const float kWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    static const float kDim[4] = {0.72f, 0.84f, 1.0f, 0.9f};
+
+    // Board dimension callouts, fab-drawing style: W below the board, H at its
+    // left, world-anchored so they follow the camera.
+    if (dimsOverlay_ && mesh_ && mesh_->outlineValid) {
+        const float x0 = static_cast<float>(mesh_->outlineMin[0]);
+        const float y0 = static_cast<float>(mesh_->outlineMin[1]);
+        const float x1 = static_cast<float>(mesh_->outlineMax[0]);
+        const float y1 = static_cast<float>(mesh_->outlineMax[1]);
+        const float z = static_cast<float>(mesh_->boardTopZ);
+        const float m =
+            0.08f * std::max(x1 - x0, y1 - y0);  // callout offset, mm
+
+        const auto dimLine = [&](glm::vec3 wa, glm::vec3 wb,
+                                 const std::string& label) {
+            float ax, ay, bx, by;
+            if (!worldToScreen(wa, ax, ay) || !worldToScreen(wb, bx, by))
+                return;
+            quad(ax, ay, bx, by, 1.5f * dpr, kDim);
+            // End ticks, perpendicular on screen.
+            float dx = bx - ax, dy = by - ay;
+            const float len = std::sqrt(dx * dx + dy * dy);
+            if (len > 1e-3f) {
+                dx /= len;
+                dy /= len;
+                const float t = 6.0f * dpr;
+                quad(ax - dy * t, ay + dx * t, ax + dy * t, ay - dx * t,
+                     1.5f * dpr, kDim);
+                quad(bx - dy * t, by + dx * t, bx + dy * t, by - dx * t,
+                     1.5f * dpr, kDim);
+            }
+            drawText(label, (ax + bx) * 0.5f, (ay + by) * 0.5f - 11.0f * dpr,
+                     12.0f * dpr, kDim);
+        };
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.3f mm", x1 - x0);
+        dimLine({x0, y0 - m, z}, {x1, y0 - m, z}, buf);
+        std::snprintf(buf, sizeof(buf), "%.3f mm", y1 - y0);
+        dimLine({x0 - m, y0, z}, {x0 - m, y1, z}, buf);
+    }
+
+    // The measurement itself: first point marker, rubber-band (or pinned)
+    // line, live distance label.
+    if (measureMode_ && measureStage_ >= 1) {
+        const bool haveEnd = (measureStage_ >= 2) || haveHover_;
+        const glm::vec3 end = (measureStage_ >= 2) ? measureB_ : hover_;
+        float ax, ay;
+        if (worldToScreen(measureA_, ax, ay)) {
+            marker(ax, ay, 5.0f * dpr, kAmber);
+            float bx, by;
+            if (haveEnd && worldToScreen(end, bx, by)) {
+                quad(ax, ay, bx, by, 2.0f * dpr, kAmber);
+                marker(bx, by, 5.0f * dpr, kAmber);
+                const glm::vec3 d = end - measureA_;
+                char buf[96];
+                std::snprintf(buf, sizeof(buf), "%.3f mm", glm::length(d));
+                drawText(buf, (ax + bx) * 0.5f, (ay + by) * 0.5f - 14.0f * dpr,
+                         14.0f * dpr, kWhite);
+            }
+        }
+    }
+    if (measureMode_ && haveHover_ && hoverSnapped_) {
+        float sx, sy;
+        if (worldToScreen(hover_, sx, sy)) {
+            marker(sx, sy, 6.0f * dpr, kWhite);
+        }
+    }
+
+    renderer_->setOverlay(std::move(tris));
+}
+
+void VulkanWindow::updateReadout() {
+    QString text;
+    if (measureMode_ && measureStage_ >= 1) {
+        const bool haveEnd = (measureStage_ >= 2) || haveHover_;
+        if (haveEnd) {
+            const glm::vec3 end =
+                (measureStage_ >= 2) ? measureB_ : hover_;
+            const glm::vec3 d = end - measureA_;
+            text = QString("Measure: %1 mm   (dx %2  dy %3  dz %4)")
+                       .arg(glm::length(d), 0, 'f', 3)
+                       .arg(std::abs(d.x), 0, 'f', 3)
+                       .arg(std::abs(d.y), 0, 'f', 3)
+                       .arg(std::abs(d.z), 0, 'f', 3);
+        }
+    } else if (measureMode_) {
+        text = "Measure: click the first point";
+    }
+    emit measureReadout(text);
+}
+
 float VulkanWindow::explodeStepMm() const {
     // "A few mm off the stack" reads right on a 50mm board but would be
     // invisible on a 300mm backplane, so scale gently with board size and hold a
@@ -917,6 +1214,19 @@ void VulkanWindow::keyPressEvent(QKeyEvent* e) {
                 camera_.orthographic = !camera_.orthographic;
                 requestUpdate();
                 return;
+            case Qt::Key_M:
+                setMeasureMode(!measureMode_);
+                emit measureModeChanged(measureMode_);
+                return;
+            case Qt::Key_Escape:
+                // Clear the current measurement but stay in measure mode.
+                if (measureMode_) {
+                    measureStage_ = 0;
+                    updateReadout();
+                    requestUpdate();
+                    return;
+                }
+                break;
             default:
                 break;
         }
