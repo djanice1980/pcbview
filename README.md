@@ -247,11 +247,19 @@ are incompatible with GPL-2.0. Full third-party attributions are in
   blind/buried via spans, Excellon rout-mode slots, measurement tools with
   snapping + net path lengths + board-dimension callouts, and
   high-resolution (up to 4×) screenshot export.
-- **Next:** a Linux build, net highlighting
-  (track a signal across layers and through the exploded view — KiCad boards
-  carry net data), a showcase mode that choreographs the camera and records
-  short video clips, and party mode (spinning coloured lights; disco ball
-  under consideration).
+- **Next:** net highlighting (track a signal across layers and through the
+  exploded view — KiCad boards carry net data), a Linux build, a showcase mode
+  that choreographs the camera and records short video clips, party mode
+  (spinning coloured lights; disco ball under consideration), and user
+  shader plugins — assign a custom shader to part of the stack, for hairy
+  soldermask or liquid-metal traces.
+- **Known gaps**, tracked in
+  [ARCHITECTURE.md](ARCHITECTURE.md): the KiCad path derives the stackup
+  rather than reading an explicit `(setup (stackup ...))` block (gerbers read
+  real thicknesses, so they are currently more accurate for an asymmetric
+  stack); oval drills are approximated as round; custom/trapezoid pads fall
+  back to their bounding rect; and exposed copper is rendered bare rather
+  than ENIG/HASL. Each is warned about rather than silently wrong.
 
 ## Author & support
 

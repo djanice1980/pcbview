@@ -1194,7 +1194,13 @@ and it silently captures only the top-left quadrant — which looks exactly like
 a false alarm that cost real time. Measure the layout (`QDockWidget::geometry`)
 before believing a screenshot.
 
-### Fab-truth gaps (ranked by the governing principle)
+### Fab-truth gaps (ranked by the governing principle) — TO FIX
+
+**These are a work list, not accepted behaviour.** The governing principle is
+"render what the fab will build", so every entry here is a place the render is
+knowingly wrong and should eventually be corrected. Ranked by how far each one
+departs from fab output. Items 1-3 also appear under "Not yet verified" below,
+where the gap is a *missing test board* rather than missing code.
 
 Things we currently render differently from what the plant would produce:
 
@@ -1211,9 +1217,12 @@ Things we currently render differently from what the plant would produce:
 5. **No surface finish distinction.** Exposed copper is rendered as bare copper;
    real boards are ENIG/HASL, which is why KiCad's pads read yellower.
 
-### Not yet verified
+### Not yet verified — TO FIX (needs a test board, not just code)
 
-- **Rotations other than 0 / ±90.** No test board has one.
+- **Rotations other than 0 / ±90.** No test board has one. Until one exists
+  the rotation convention (see the pad-rotation note above) is unproven for
+  arbitrary angles, and that convention is exactly the kind of sign error
+  that hides until a 30-degree footprint shows up.
 - **Custom / trapezoid pad shapes.** Not implemented; fall back to the bounding
   rect and emit a warning. No test board uses them.
 - `validatePadConnectivity` is meaningless on an unrouted board — CPS3brd1 has
@@ -1443,6 +1452,20 @@ colour/side group at once.
   mesh + the existing metallic lobe. Needs continuous re-accumulation (or
   raster-mode lights) since PT converges on a *still* scene — raster-mode
   animated lights first, traced version later.
+- **Shader plugins (noted 2026-07-19).** User-authored shaders assignable to
+  a chosen slice of the stack: hairy soldermask, liquid-metal traces, whatever
+  someone dreams up. Feasibility notes: the material table is already bindless
+  and indexed per part (RT-readiness rule 3), so "which shader does this part
+  use" is a field in that table rather than a re-plumb. The hard parts are
+  (a) shipping a compiler — shaders are currently glslc'd at BUILD time into
+  the exe, so runtime plugins need either a bundled compiler or pre-compiled
+  SPIR-V dropped in a folder; (b) **the two tracers**, since a custom raster
+  shader does not exist for the path tracer or Embree, so a plugin either
+  declares itself raster-only or supplies a BSDF the tracers can call; and
+  (c) sandboxing — arbitrary SPIR-V can hang the GPU, so a plugin needs to
+  be opt-in and clearly the user's own risk. Suggested first cut: raster-only
+  plugins, SPIR-V or GLSL from `~/.pcbview/shaders/`, assigned per part in
+  the stackup tree, with the traced modes falling back to the stock material.
 - **Showcase mode (turntable video).** Automated camera choreography — orbit,
   glide, explode/collapse sweeps — driven by the existing animation plumbing
   (view presets + `PCBVIEW_START_*` show the camera is already scriptable),
