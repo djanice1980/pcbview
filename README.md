@@ -59,8 +59,10 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   hole-to-hole and pad-to-pad measurements are fab-exact rather than
   click-precision. A rubber-band line with a live mm label follows the cursor;
   `Esc` clears; orbit/pan/zoom stay live while measuring. When both endpoints
-  land on the **same net** (KiCad boards), a corner panel shows that net's
-  **routed track length and via count** next to the crow-flies distance.
+  land on the **same net** (KiCad boards), a corner panel shows the **routed
+  path between those two points** -- the copper the signal actually travels,
+  walked along the net's tracks -- plus the net's total length and via count,
+  next to the crow-flies distance.
   **View → Board dimensions** adds fab-drawing width/height callouts around
   the board.
 - **Ray-traced lighting.** On a GPU with `ray_query` (most modern discrete cards

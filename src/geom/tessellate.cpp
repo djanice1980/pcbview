@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <numbers>
+#include <queue>
 
 #include "clipper2/clipper.h"
 #include "mapbox/earcut.hpp"
@@ -479,9 +481,11 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
         };
         for (const Track& t : board.tracks) {
             const int i = netOf(t.net);
-            if (i >= 0)
-                art.nets[i].routedMm +=
-                    std::hypot(t.end.x - t.start.x, t.end.y - t.start.y);
+            if (i < 0) continue;
+            art.nets[i].routedMm +=
+                std::hypot(t.end.x - t.start.x, t.end.y - t.start.y);
+            art.netSegments.push_back(
+                {t.start.x, -t.start.y, t.end.x, -t.end.y, i});
         }
         for (const Via& via : board.vias) {
             const int i = netOf(via.net);
@@ -1045,6 +1049,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
     // plane, recorded here too.
     out.boardTopZ = art.thickness;
     out.nets = art.nets;
+    out.netSegments = art.netSegments;
     {
         const auto centre = [](const Path64& p) {
             double sx = 0.0, sy = 0.0;
@@ -1129,6 +1134,87 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
 
 BoardMesh tessellate(const BoardModel& board, const TessellateOptions& opts) {
     return assemble(buildLayerArt(board, opts), opts);
+}
+
+// Dijkstra over one net's segment graph. Nodes are segment endpoints
+// quantised to 1 um (KiCad shares exact coordinates between connected
+// segments, and a via joins layers at one exact position, so 2D endpoint
+// identity IS the connectivity). The two query points attach to every node
+// within 1 mm (weighted by the gap) -- a track normally lands on the pad/via
+// centre the measure tool snapped to, but not always exactly.
+double netPathLength(const BoardMesh& mesh, int net, double ax, double ay,
+                     double bx, double by) {
+    struct Node {
+        double x, y;
+        std::vector<std::pair<int, double>> edges;  // (node, length)
+    };
+    std::vector<Node> nodes;
+    std::map<std::pair<int64_t, int64_t>, int> byPos;
+    const auto nodeAt = [&](double x, double y) {
+        const std::pair<int64_t, int64_t> key{
+            static_cast<int64_t>(std::llround(x * 1000.0)),
+            static_cast<int64_t>(std::llround(y * 1000.0))};
+        const auto it = byPos.find(key);
+        if (it != byPos.end()) return it->second;
+        const int id = static_cast<int>(nodes.size());
+        byPos.emplace(key, id);
+        nodes.push_back({x, y, {}});
+        return id;
+    };
+
+    for (const LayerArt::NetSeg& s : mesh.netSegments) {
+        if (s.net != net) continue;
+        const int na = nodeAt(s.ax, s.ay);
+        const int nb = nodeAt(s.bx, s.by);
+        const double len = std::hypot(s.bx - s.ax, s.by - s.ay);
+        nodes[na].edges.emplace_back(nb, len);
+        nodes[nb].edges.emplace_back(na, len);
+    }
+    if (nodes.empty()) return -1.0;
+
+    // Attach the query points. Source gets a virtual node; the target keeps a
+    // per-node landing cost added at pop time.
+    const int src = static_cast<int>(nodes.size());
+    nodes.push_back({ax, ay, {}});
+    constexpr double kAttach = 1.0;  // mm
+    std::vector<double> landing(nodes.size(),
+                                std::numeric_limits<double>::infinity());
+    bool anyLanding = false;
+    for (int i = 0; i < src; ++i) {
+        const double da = std::hypot(nodes[i].x - ax, nodes[i].y - ay);
+        if (da <= kAttach) nodes[src].edges.emplace_back(i, da);
+        const double db = std::hypot(nodes[i].x - bx, nodes[i].y - by);
+        if (db <= kAttach) {
+            landing[i] = db;
+            anyLanding = true;
+        }
+    }
+    if (nodes[src].edges.empty() || !anyLanding) return -1.0;
+
+    std::vector<double> dist(nodes.size(),
+                             std::numeric_limits<double>::infinity());
+    using QE = std::pair<double, int>;
+    std::priority_queue<QE, std::vector<QE>, std::greater<QE>> q;
+    dist[src] = 0.0;
+    q.push({0.0, src});
+    double best = std::numeric_limits<double>::infinity();
+    while (!q.empty()) {
+        const auto [d, n] = q.top();
+        q.pop();
+        if (d > dist[n]) continue;
+        if (d >= best) break;  // everything further can only be worse
+        if (n < static_cast<int>(landing.size()) &&
+            std::isfinite(landing[n])) {
+            best = std::min(best, d + landing[n]);
+        }
+        for (const auto& [m, w] : nodes[n].edges) {
+            if (d + w < dist[m]) {
+                dist[m] = d + w;
+                q.push({d + w, m});
+            }
+        }
+    }
+    return std::isfinite(best) ? best : -1.0;
 }
 
 void applyThickness(LayerArt& art, double finishedThicknessMm) {

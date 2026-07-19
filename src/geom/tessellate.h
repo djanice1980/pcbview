@@ -87,8 +87,10 @@ struct BoardMesh {
     // the plane free measurement points are projected onto.
     std::vector<SnapPoint> snapPoints;
     double boardTopZ = 0.0;
-    // Net table for the measure tool (KiCad only; empty for Gerber).
+    // Net table for the measure tool (KiCad only; empty for Gerber), plus
+    // every track segment with its net -- the graph netPathLength() walks.
     std::vector<LayerArt::NetInfo> nets;
+    std::vector<LayerArt::NetSeg> netSegments;
     // Board-outline bounding box (mm, components excluded) for the
     // width/height dimension callouts. Valid once an outline was assembled.
     bool outlineValid = false;
@@ -117,6 +119,15 @@ struct TessellateOptions {
 // graphics, text) into filled polygons per layer. This is the only part of the
 // pipeline that knows what a "track" is.
 LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts = {});
+
+// Shortest routed path along `net`'s track segments between two points
+// (XY, mm), or a negative value when no track path connects them (e.g. the
+// net is joined through a zone pour, which carries no segments). Endpoints
+// snap onto the segment graph within a small radius, so pad/via centres --
+// what the measure tool hands in -- resolve even when a track lands slightly
+// off the exact centre.
+double netPathLength(const BoardMesh& mesh, int net, double ax, double ay,
+                     double bx, double by);
 
 // LayerArt -> triangles. Format-agnostic: clips copper to the profile, derives
 // the mask film from its openings (which is what makes via tenting free),

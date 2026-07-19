@@ -1201,11 +1201,17 @@ together, and why:
   (`LayerArt::netPoints`, emitted FIRST so they win snap ties against their
   netless drill twins -- the search keeps the first of equally-near points).
   When both measurement endpoints resolve to the same net, a corner panel
-  shows `BoardMesh::nets[i]`: the net's **routed length** (sum of its track
-  segments, computed in buildLayerArt) and via count, beside the crow-flies
-  measurement. **Zone-poured copper is NOT included in the routed length** --
-  a pour-fed power net legitimately reads short. Vias are counted, not
-  measured (barrel height is stackup noise against trace lengths).
+  shows the **routed PATH between the two points** -- `netPathLength()`, a
+  Dijkstra walk over that net's track segments (`BoardMesh::netSegments`;
+  nodes = endpoints quantised to 1 um, which IS KiCad connectivity; layers
+  deliberately ignored -- same-net layer changes go through a via at the
+  shared endpoint; query points attach to nodes within 1 mm) -- plus the
+  net's total routed length and via count. A net joined only through a zone
+  pour has no track path and says so. **Zone-poured copper is in neither
+  number** -- a pour-fed power net legitimately reads short. Vias are
+  counted, not measured (barrel height is stackup noise against trace
+  lengths). Verified: synthetic board reads path 13.090 / total 24.495 mm,
+  both analytic-exact, against a 10.000 mm crow-flies line.
 - Headless: `PCBVIEW_MEASURE=x1,y1,z1,x2,y2,z2` pins a measurement (mouse
   picks cannot be synthesised) and resolves endpoint nets exactly like a
   snapped click; the `dimensionsOverlay` setting persists the callout

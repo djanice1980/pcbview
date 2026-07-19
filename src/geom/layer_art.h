@@ -137,6 +137,17 @@ struct LayerArt {
     };
     std::vector<NetInfo> nets;
 
+    // Every track segment with its net (mm, Y flip applied) -- the graph the
+    // measure tool walks to report the routed distance BETWEEN two points on
+    // a net, not just the net's total. Layers are deliberately ignored: a
+    // same-net layer change virtually always happens through a via at the
+    // shared endpoint, so a 2D endpoint graph is the right approximation.
+    struct NetSeg {
+        double ax = 0, ay = 0, bx = 0, by = 0;
+        int net = -1;
+    };
+    std::vector<NetSeg> netSegments;
+
     // Measurement snap targets the importers know exactly: pad and via
     // centres (KiCad only -- Gerber flashes are not distinguishable from any
     // other exposure), in mm with the Y flip applied, z = 3D height for the

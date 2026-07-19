@@ -1196,10 +1196,17 @@ void VulkanWindow::buildOverlay() {
         if (endNet == measureANet_ &&
             measureANet_ < static_cast<int>(mesh_->nets.size())) {
             const auto& net = mesh_->nets[measureANet_];
-            char l1[96], l2[64], l3[32];
+            const glm::vec3 end = (measureStage_ >= 2) ? measureB_ : hover_;
+            const double path = geom::netPathLength(
+                *mesh_, measureANet_, measureA_.x, measureA_.y, end.x, end.y);
+            char l1[96], l2[64], l3[64];
             std::snprintf(l1, sizeof(l1), "Net %s", net.name.c_str());
-            std::snprintf(l2, sizeof(l2), "Routed %.3f mm", net.routedMm);
-            std::snprintf(l3, sizeof(l3), "%d via%s", net.viaCount,
+            if (path >= 0.0)
+                std::snprintf(l2, sizeof(l2), "Path %.3f mm", path);
+            else
+                std::snprintf(l2, sizeof(l2), "Path: no track route");
+            std::snprintf(l3, sizeof(l3), "Net total %.3f mm, %d via%s",
+                          net.routedMm, net.viaCount,
                           net.viaCount == 1 ? "" : "s");
             const char* rows[3] = {l1, l2, l3};
 
@@ -1258,10 +1265,15 @@ void VulkanWindow::updateReadout() {
             if (mesh_ && measureANet_ >= 0 && endNet == measureANet_ &&
                 measureANet_ < static_cast<int>(mesh_->nets.size())) {
                 const auto& net = mesh_->nets[measureANet_];
-                text += QString("   |   net %1: %2 mm routed, %3 vias")
-                            .arg(QString::fromStdString(net.name))
-                            .arg(net.routedMm, 0, 'f', 3)
-                            .arg(net.viaCount);
+                const double path = geom::netPathLength(
+                    *mesh_, measureANet_, measureA_.x, measureA_.y, end.x,
+                    end.y);
+                text += QString("   |   net %1: ")
+                            .arg(QString::fromStdString(net.name));
+                if (path >= 0.0)
+                    text += QString("path %1 mm, ").arg(path, 0, 'f', 3);
+                text += QString("total %1 mm routed")
+                            .arg(net.routedMm, 0, 'f', 3);
             }
         }
     } else if (measureMode_) {
