@@ -864,7 +864,53 @@ void VulkanWindow::wheelEvent(QWheelEvent* e) {
     // If a view preset is mid-glide it also eases distance; keep both targets
     // agreed so the two animations pull the same way instead of fighting.
     if (cameraAnimating_) viewTarget_.distance = zoomTarget_;
+
+    // Re-anchor to whatever the cursor is over NOW. Recomputing every wheel
+    // event (even mid-glide) keeps it continuous -- at the instant of capture
+    // distance == anchor distance, so the pivot shift is zero and there is no
+    // jump. A view preset drives the pivot itself, so defer to it there.
+    zoomToCursor_ = !cameraAnimating_ && computeZoomAnchor(e->position());
     requestUpdate();
+}
+
+// Capture the world point under the cursor for zoom-to-cursor. It is taken on
+// the focal plane (through the pivot, perpendicular to the view axis) by
+// unprojecting the cursor through the very matrix the last frame rendered with
+// -- so it is correct for the perspective AND the orthographic projection with
+// no special casing, since both bake `distance` into that matrix. Stores the
+// pivot shift per unit of distance change; stepZoomAnimation applies it.
+bool VulkanWindow::computeZoomAnchor(const QPointF& posDip) {
+    if (!haveViewProj_ || camera_.distance < 1e-4f) return false;
+    const qreal dpr = devicePixelRatio();
+    const float wpx = static_cast<float>(width() * dpr);
+    const float hpx = static_cast<float>(height() * dpr);
+    if (wpx < 1.0f || hpx < 1.0f) return false;
+    const float u = static_cast<float>(posDip.x() * dpr) / wpx * 2.0f - 1.0f;
+    const float v = static_cast<float>(posDip.y() * dpr) / hpx * 2.0f - 1.0f;
+
+    // Two points down the cursor ray. Reversed-Z: NDC depth 1 is the near
+    // plane, 0.25 an arbitrary second point farther along.
+    const glm::mat4 inv = glm::inverse(lastViewProj_);
+    const glm::vec4 h0 = inv * glm::vec4(u, v, 1.0f, 1.0f);
+    const glm::vec4 h1 = inv * glm::vec4(u, v, 0.25f, 1.0f);
+    if (std::abs(h0.w) < 1e-12f || std::abs(h1.w) < 1e-12f) return false;
+    const glm::vec3 a = glm::vec3(h0) / h0.w;
+    const glm::vec3 b = glm::vec3(h1) / h1.w;
+    const glm::vec3 dir = glm::normalize(b - a);
+
+    const Basis basis = cameraBasis(camera_);
+    const glm::vec3 target0{camera_.targetX, camera_.targetY, camera_.targetZ};
+    const float denom = glm::dot(dir, basis.forward);
+    if (std::abs(denom) < 1e-4f) return false;  // ray parallel to focal plane
+    const float t = glm::dot(target0 - a, basis.forward) / denom;
+    const glm::vec3 pFocal = a + dir * t;
+
+    // pivot(distance) = target0 + (dist0 - distance) * K keeps pFocal fixed
+    // under the cursor, where K = (pFocal - target0) / dist0.
+    zoomAnchorK_ = (pFocal - target0) / camera_.distance;
+    zoomAnchorTarget0_ = target0;
+    zoomAnchorDist0_ = camera_.distance;
+    return true;
 }
 
 bool VulkanWindow::stepZoomAnimation() {
@@ -886,6 +932,17 @@ bool VulkanWindow::stepZoomAnimation() {
         const float k = 1.0f - static_cast<float>(std::exp(-dt / kTimeConstant));
         camera_.distance *= std::pow(ratio, k);
     }
+
+    // Slide the pivot so the point captured under the cursor stays put as the
+    // dolly changes distance. A view preset owns the pivot, so stand down then.
+    if (zoomToCursor_ && !cameraAnimating_) {
+        const glm::vec3 tgt =
+            zoomAnchorTarget0_ + (zoomAnchorDist0_ - camera_.distance) * zoomAnchorK_;
+        camera_.targetX = tgt.x;
+        camera_.targetY = tgt.y;
+        camera_.targetZ = tgt.z;
+    }
+    if (!zoomAnimating_) zoomToCursor_ = false;  // spent; next wheel re-anchors
     return zoomAnimating_;
 }
 

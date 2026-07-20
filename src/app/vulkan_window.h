@@ -282,6 +282,16 @@ private:
     bool zoomAnimating_ = false;
     QElapsedTimer zoomClock_;
     bool stepZoomAnimation();
+
+    // Zoom-to-cursor: the wheel zooms INTO the world point under the cursor
+    // rather than the screen centre. computeZoomAnchor captures that point (on
+    // the focal plane through the pivot) when the wheel turns; stepZoomAnimation
+    // slides the pivot to keep it fixed under the cursor as `distance` changes.
+    bool computeZoomAnchor(const QPointF& posDip);
+    bool zoomToCursor_ = false;
+    glm::vec3 zoomAnchorK_{0.0f};        // pivot shift per unit distance change
+    glm::vec3 zoomAnchorTarget0_{0.0f};  // pivot at the moment of anchoring
+    float zoomAnchorDist0_ = 0.0f;       // distance at the moment of anchoring
     bool initialised_ = false;
     bool dragging_ = false;
     bool draggingInv_ = false;  // right-drag: yaw (horizontal) + roll (vertical)
