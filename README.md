@@ -61,8 +61,10 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   Ctrl+click in the list) adds more nets, each in its own colour**, and the
   list rows are tinted to match so the panel doubles as the legend. In
   path-traced mode the nets are genuine emitters — they light the copper
-  around them in their own colours and appear in reflections. The status bar
-  reports routed length and via count.
+  around them in their own colours and appear in reflections. Highlighted nets
+  **animate**: a head sweeps the length of the run, then a band cycles along
+  it, in every render mode including path tracing. The status bar reports
+  routed length and via count.
 - **Layer control.** Per-layer visibility, a one-click components toggle, and
   auto-hiding side panels (pin, or peek-on-hover).
 - **Print & export.** Print as-shown, flat (overhead orthographic), or **flat at
@@ -151,6 +153,32 @@ sit on one net, that net's **shortest routed path**. Here the two RST5 vias are
 30.195 mm apart in a straight line but 38.260 mm along the copper:
 
 ![Measurement, dimension callouts and the net panel](docs/images/measure.png)
+
+## Net highlighting
+
+Click a net in the **Nets** panel to light it up; `Ctrl`-click to add more, each
+in its own colour. The rest of the board desaturates and drops back so the
+signals you care about are the only thing your eye lands on.
+
+The highlight is **emissive, not painted on**. In raster and ray-traced modes
+that means it ignores shading entirely, so a trace stays legible where it runs
+under a component or into shadow. In the path tracer it is a real emitter: the
+net physically throws light onto the copper and laminate around it, and the sun
+and sky dim while it is lit, so the glow reads the way a filament does at night
+rather than a candle at noon. Bloom gives it its aura.
+
+| ![Six nets highlighted, ray traced](docs/images/nets_multi.png) | ![The same six nets, path traced](docs/images/nets_multi_pt.png) |
+|---|---|
+| Six nets, six colours — ray traced | The same, path traced and denoised |
+
+Highlighted nets also **animate**: a bright head sweeps from one end of the run
+to the other, so you can see which way the signal goes and where it terminates,
+then a band cycles along it so it stays easy to follow. This works in the path
+tracer too, which is less obvious than it sounds — pcbview's path tracer
+converges a still scene and resets on any change, so the animation is applied
+when the finished image is resolved rather than while tracing. The image stays
+fully converged while the net moves. Turn it off under **View → Animate net
+highlight**.
 
 ## Controls
 
