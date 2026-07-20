@@ -668,9 +668,19 @@ private:
         }
     }
 
-    std::vector<Point64> arcPoints(double sx, double sy, double ex, double ey,
-                                   double cx, double cy, bool cw) {
-        std::vector<Point64> pts;
+    // Arc chording in mm. The Clipper version below wraps this rather than
+    // repeating the maths, so the net graph is chorded EXACTLY like the copper
+    // it describes -- a separate approximation could disagree with what is
+    // drawn, and a length that does not match the visible trace is worse than
+    // no length at all.
+    //
+    // Returns points k = 1..segs: the start is the caller's current point and
+    // is deliberately excluded, the end point is included.
+    std::vector<std::pair<double, double>> arcPointsMm(double sx, double sy,
+                                                       double ex, double ey,
+                                                       double cx, double cy,
+                                                       bool cw) {
+        std::vector<std::pair<double, double>> pts;
         const double r = std::hypot(sx - cx, sy - cy);
         double a0 = std::atan2(sy - cy, sx - cx);
         double a1 = std::atan2(ey - cy, ex - cx);
@@ -687,9 +697,17 @@ private:
                                                    kArcSegments)));
         for (int k = 1; k <= segs; ++k) {
             const double t = a0 + (a1 - a0) * k / segs;
-            pts.push_back(toClip(cx + r * std::cos(t), cy + r * std::sin(t)));
+            pts.emplace_back(cx + r * std::cos(t), cy + r * std::sin(t));
         }
         return pts;
+    }
+
+    std::vector<Point64> arcPoints(double sx, double sy, double ex, double ey,
+                                   double cx, double cy, bool cw) {
+        std::vector<Point64> out;
+        for (const auto& [px, py] : arcPointsMm(sx, sy, ex, ey, cx, cy, cw))
+            out.push_back(toClip(px, py));
+        return out;
     }
 
     void operationMove(double x, double y) {
@@ -704,18 +722,35 @@ private:
     }
 
     void operationDraw(double x, double y, double i, double j, bool hasIJ) {
-        // Record LINEAR draws on a net as graph segments: this is the same
-        // track-endpoint graph the KiCad path builds, and what lets the
-        // measure tool report distance ALONG a net rather than through the
-        // air. Region fills are excluded -- a zone outline is not a route --
-        // and so are arcs, which contribute copper but would need chording to
-        // become graph edges.
-        if (!regionMode_ && interp_ == 1 && !currentNet_.empty()) {
-            const double dx = x - curX_, dy = y - curY_;
-            const double len = std::sqrt(dx * dx + dy * dy);
-            if (len > 1e-9) {
+        // Record draws on a net as graph segments: the same track-endpoint
+        // graph the KiCad path builds, and what lets the measure tool report
+        // distance ALONG a net rather than through the air. Region fills are
+        // excluded -- a zone outline is not a route.
+        //
+        // Arcs are chorded with the same subdivision as the copper they draw,
+        // so a net routed in arcs reports its real length instead of silently
+        // under-reporting it. Chord length runs a hair under true arc length
+        // (~0.02% at 48 segments per full circle); that is deliberate, because
+        // the alternative -- an analytic arc length that disagrees with the
+        // walked graph -- would make the total and the between-two-points
+        // distance contradict each other.
+        if (!regionMode_ && !currentNet_.empty()) {
+            const auto edge = [&](double ax, double ay, double bx, double by) {
+                const double len = std::hypot(bx - ax, by - ay);
+                if (len <= 1e-9) return;
                 netLen_[currentNet_] += len;
-                netSegs_[currentNet_].push_back({curX_, curY_, x, y});
+                netSegs_[currentNet_].push_back({ax, ay, bx, by});
+            };
+            if (interp_ == 1) {
+                edge(curX_, curY_, x, y);
+            } else if (hasIJ) {
+                double px = curX_, py = curY_;
+                for (const auto& [qx, qy] : arcPointsMm(curX_, curY_, x, y,
+                                                        curX_ + i, curY_ + j,
+                                                        interp_ == 2)) {
+                    edge(px, py, qx, qy);
+                    px = qx; py = qy;
+                }
             }
         }
         if (regionMode_) {

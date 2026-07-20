@@ -597,6 +597,79 @@ BoardModel importPcb(const std::string& path) {
 
     readLayers(root, board);
 
+    // Curved copper. KiCad 6+ stores a curved track as `(arc (start) (mid)
+    // (end) ...)`, a THREE-POINT arc -- not as a segment. Reading only
+    // `segment` dropped that copper from the board entirely: missing from the
+    // render, from the net length, and from the measure graph. Chording it
+    // into ordinary tracks fixes all three at once, because everything
+    // downstream already handles straight segments.
+    for (const Node* arc : root.childList("arc")) {
+        const Node* sN = arc->child("start");
+        const Node* mN = arc->child("mid");
+        const Node* eN = arc->child("end");
+        if (!sN || !mN || !eN) continue;
+        const auto s0 = readXY(*sN), m0 = readXY(*mN), e0 = readXY(*eN);
+        const int layer = board.layerIndex(arc->childStr("layer", ""));
+        if (layer < 0) {
+            board.warnings.push_back(
+                "arc track on unknown layer '" +
+                std::string(arc->childStr("layer", "?")) + "'");
+            continue;
+        }
+        const double width = arc->childNum("width", 0.0);
+        const std::string net(arc->childStr("net", ""));
+
+        // Circumcentre of the three points. Collinear (or duplicate) points
+        // have no circle -- fall back to a straight track rather than
+        // dividing by ~0 and scattering geometry across the board.
+        const double ax = s0.x, ay = s0.y, bx = m0.x, by = m0.y;
+        const double cx2 = e0.x, cy2 = e0.y;
+        const double d = 2.0 * (ax * (by - cy2) + bx * (cy2 - ay) +
+                                cx2 * (ay - by));
+        const auto pushTrack = [&](double x0, double y0, double x1, double y1) {
+            Track t;
+            t.start = {x0, y0};
+            t.end = {x1, y1};
+            t.width = width;
+            t.layer = layer;
+            t.net = net;
+            board.tracks.push_back(std::move(t));
+        };
+        if (std::abs(d) < 1e-12) {
+            pushTrack(s0.x, s0.y, e0.x, e0.y);
+            continue;
+        }
+        const double a2 = ax * ax + ay * ay, b2 = bx * bx + by * by;
+        const double c2 = cx2 * cx2 + cy2 * cy2;
+        const double ox = (a2 * (by - cy2) + b2 * (cy2 - ay) + c2 * (ay - by)) / d;
+        const double oy = (a2 * (cx2 - bx) + b2 * (ax - cx2) + c2 * (bx - ax)) / d;
+        const double r = std::hypot(ax - ox, ay - oy);
+
+        double a0 = std::atan2(ay - oy, ax - ox);
+        double am = std::atan2(by - oy, bx - ox);
+        double a1 = std::atan2(cy2 - oy, cx2 - ox);
+        // Direction is whichever sweep passes THROUGH the mid point -- the
+        // only thing that distinguishes the minor arc from the major one.
+        const double twoPi = 2.0 * std::numbers::pi;
+        const auto norm = [twoPi](double v) {
+            while (v < 0) v += twoPi;
+            while (v >= twoPi) v -= twoPi;
+            return v;
+        };
+        const bool ccw = norm(am - a0) < norm(a1 - a0);
+        double sweep = ccw ? norm(a1 - a0) : -norm(a0 - a1);
+        constexpr int kArcSegments = 48;  // per full circle, as in the Gerber path
+        const int segs = std::max(
+            2, static_cast<int>(std::ceil(std::abs(sweep) / twoPi * kArcSegments)));
+        double px = ax, py = ay;
+        for (int k = 1; k <= segs; ++k) {
+            const double t = a0 + sweep * k / segs;
+            const double qx = ox + r * std::cos(t), qy = oy + r * std::sin(t);
+            pushTrack(px, py, qx, qy);
+            px = qx; py = qy;
+        }
+    }
+
     for (const Node* seg : root.childList("segment")) {
         Track track;
         if (const Node* start = seg->child("start")) track.start = readXY(*start);

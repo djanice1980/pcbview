@@ -3,8 +3,8 @@
 IDI_ICON1 ICON "pcbview.ico"
 
 1 VERSIONINFO
-FILEVERSION     1,15,0,0
-PRODUCTVERSION  1,15,0,0
+FILEVERSION     1,15,1,0
+PRODUCTVERSION  1,15,1,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -12,9 +12,9 @@ BEGIN
     BEGIN
       VALUE "CompanyName",      "David Janice"
       VALUE "FileDescription",  "pcbview - 3D PCB viewer"
-      VALUE "FileVersion",      "1.15.0"
+      VALUE "FileVersion",      "1.15.1"
       VALUE "ProductName",      "pcbview"
-      VALUE "ProductVersion",   "1.15.0"
+      VALUE "ProductVersion",   "1.15.1"
       VALUE "LegalCopyright",   "GPL-3.0-or-later"
       VALUE "OriginalFilename", "pcbview.exe"
     END
