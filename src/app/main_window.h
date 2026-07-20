@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QLabel>
+#include <QPushButton>
 #include <QMainWindow>
 #include <QStackedWidget>
 #include <QStringList>
@@ -96,6 +97,8 @@ private:
     void rebuildRecentMenu();
 
     void reassemble();  // rebuild mesh_ from baseArt_ + current thickness override
+    // Derive nets from copper connectivity for a package with no netlist.
+    void inferNetsFromCopper();
 
     // Append the cached component parts onto mesh_ (fresh copies, so repeated
     // reassembles don't accumulate), shifting top-mounted parts to sit on the
@@ -155,6 +158,8 @@ private:
     QDockWidget* netDock_ = nullptr;
     QTreeWidget* netList_ = nullptr;
     QLineEdit* netFilter_ = nullptr;
+    QPushButton* inferNetsBtn_ = nullptr;
+    QLabel* pseudoNetNote_ = nullptr;
     int highlightedNet_ = -1;
     QMenu* recentMenu_ = nullptr;
     QAction* measureAction_ = nullptr;

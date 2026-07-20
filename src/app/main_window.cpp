@@ -55,6 +55,7 @@
 #include <limits>
 
 #include "app/collapsible_dock.h"
+#include "geom/connectivity.h"
 #include "app/component_import.h"
 #include "app/theme.h"
 #include "io/gerber/gerber_project.h"
@@ -249,13 +250,20 @@ MainWindow::MainWindow(const QString& path) {
         viewport_->camera().pitch =
             qEnvironmentVariable("PCBVIEW_START_PITCH").toFloat();
 
+    // Headless connectivity hook. The Infer button is a click the capture
+    // harness cannot make, so nothing about pseudo-nets is verifiable without
+    // this. Runs before PCBVIEW_NET so a derived net can then be highlighted
+    // by name.
+    if (qEnvironmentVariable("PCBVIEW_INFER_NETS").toInt() != 0)
+        QTimer::singleShot(300, this, [this] { inferNetsFromCopper(); });
+
     // Headless net-highlight hook: highlight a net BY NAME (the UI picker
     // cannot be driven by synthetic input).
     if (qEnvironmentVariableIsSet("PCBVIEW_NET")) {
         // Comma-separated for multi-net highlighting, mirroring Ctrl+click.
         const QStringList want =
             qEnvironmentVariable("PCBVIEW_NET").split(',', Qt::SkipEmptyParts);
-        QTimer::singleShot(400, this, [this, want] {
+        QTimer::singleShot(700, this, [this, want] {
             highlightedNets_.clear();
             for (const QString& w : want) {
                 for (size_t i = 0; i < mesh_.nets.size(); ++i) {
@@ -1575,6 +1583,29 @@ void MainWindow::buildNetDock() {
     netFilter_->setClearButtonEnabled(true);
     layout->addWidget(netFilter_);
 
+    // Derive connectivity from copper when the package has no netlist. On
+    // DEMAND, deliberately: inferred data must never appear on load looking
+    // like ground truth. Hidden unless it would actually do something.
+    inferNetsBtn_ = new QPushButton("Infer nets from copper");
+    inferNetsBtn_->setToolTip(
+        "Work out what is electrically connected by following the copper and "
+        "its plated holes.\n"
+        "These are NOT a netlist: they have no real names, an unrouted net "
+        "appears as several,\nand two shorted nets appear as one.");
+    inferNetsBtn_->setVisible(false);
+    connect(inferNetsBtn_, &QPushButton::clicked, this,
+            &MainWindow::inferNetsFromCopper);
+    layout->addWidget(inferNetsBtn_);
+
+    // Provenance banner, shown only while pseudo-nets are on display.
+    pseudoNetNote_ = new QLabel(
+        "Derived from copper geometry — not a netlist. Names are arbitrary.");
+    pseudoNetNote_->setWordWrap(true);
+    pseudoNetNote_->setStyleSheet(
+        QString("color:%1; padding:2px 4px;").arg(theme::kTextDim));
+    pseudoNetNote_->setVisible(false);
+    layout->addWidget(pseudoNetNote_);
+
     netList_ = new QTreeWidget;
     netList_->setColumnCount(2);
     netList_->setHeaderLabels({"Net", "Routed"});
@@ -1619,6 +1650,36 @@ void MainWindow::buildNetDock() {
     netDock_ = dock;
 }
 
+void MainWindow::inferNetsFromCopper() {
+    if (!loaded_) return;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    // Runs on baseArt_ so it survives a thickness change or any other
+    // reassemble -- recomputing per rebuild would be wasted work, and the
+    // connectivity does not depend on Z.
+    const geom::PseudoNetStats found = geom::extractPseudoNets(baseArt_);
+    QApplication::restoreOverrideCursor();
+
+    if (found.groups <= 0) {
+        statusBar()->showMessage(
+            "No connectivity could be derived — the board has no copper, or "
+            "already has a netlist.",
+            6000);
+        return;
+    }
+    reassemble();      // netArt changed, so the mesh must carry the new net ids
+    populateNets();
+    // Quote both numbers. The total alone reads as an explosion on a dense
+    // board, when most of what it found is copper that really is isolated.
+    statusBar()->showMessage(
+        QString("Derived %1 groups from copper connectivity — %2 join two or "
+                "more pieces of copper, %3 are isolated (a lone pad or a "
+                "fragment). Not a netlist; names are arbitrary.")
+            .arg(found.groups)
+            .arg(found.connecting)
+            .arg(found.groups - found.connecting),
+        12000);
+}
+
 void MainWindow::populateNets() {
     if (!netList_) return;
     netList_->clear();
@@ -1630,6 +1691,13 @@ void MainWindow::populateNets() {
     // nets (X2 %TO.N% object attributes, which pcbview reads); this particular
     // package simply has none, which for a KiCad export means it was written
     // without "Include advanced X2 features".
+    // Offer inference only when there is no netlist to overwrite, and say so
+    // whenever the list is showing derived data.
+    if (inferNetsBtn_)
+        inferNetsBtn_->setVisible(loaded_ && mesh_.nets.empty());
+    if (pseudoNetNote_)
+        pseudoNetNote_->setVisible(baseArt_.netsArePseudo && !mesh_.nets.empty());
+
     if (mesh_.nets.empty()) {
         auto* none = new QTreeWidgetItem(
             netList_,
@@ -1646,15 +1714,27 @@ void MainWindow::populateNets() {
         none->setFlags(Qt::NoItemFlags);
         return;
     }
+    // Derived nets have no track centrelines to sum a routed length from --
+    // Gerber copper is filled regions, not routes -- so the column reports
+    // copper AREA instead of printing a 0.0 mm that was never measured.
+    const bool pseudo = baseArt_.netsArePseudo;
+    netList_->setHeaderLabels({"Net", pseudo ? "Copper" : "Routed"});
     for (size_t i = 0; i < mesh_.nets.size(); ++i) {
         const auto& n = mesh_.nets[i];
+        const QString metric =
+            pseudo ? QString::number(n.copperMm2, 'f', 2) + " mm²"
+                   : QString::number(n.routedMm, 'f', 1) + " mm";
         auto* it = new QTreeWidgetItem(
-            netList_, {QString::fromStdString(n.name),
-                       QString::number(n.routedMm, 'f', 1) + " mm"});
+            netList_, {QString::fromStdString(n.name), metric});
         it->setData(0, Qt::UserRole, static_cast<int>(i));
         it->setForeground(1, QColor(theme::kTextDim));
     }
-    netList_->sortItems(0, Qt::AscendingOrder);
+    // Real nets sort by name, which is what you want when hunting for one you
+    // can already name. Derived nets have no meaningful names, so insertion
+    // order is kept instead -- extractPseudoNets emits them largest-copper
+    // first, putting the pours and power planes at the top. Sorting them by
+    // name would order them "~1, ~10, ~100", which is worse than useless.
+    if (!pseudo) netList_->sortItems(0, Qt::AscendingOrder);
 }
 
 // A distinct, high-contrast palette. Red first because a single highlight

@@ -186,6 +186,7 @@ add_executable(pcbview WIN32
     src/io/kicad/kicad_importer.cpp
     src/io/gerber/gerber_parser.cpp
     src/io/gerber/gerber_project.cpp
+    src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     ${MINIZ_SOURCES}
     src/text/stroke_text.cpp

@@ -1161,6 +1161,8 @@ interactive run. All are opt-in. Grouped by purpose:
   `fastMovementGpu`, default on for the CPU renderer, off for a GPU).
 
 **Capture / verification**
+- `PCBVIEW_INFER_NETS=1` — derive pseudo-nets from copper connectivity on
+  load (the Nets-panel button, which a capture harness cannot click).
 - `PCBVIEW_START_PT=1` — enable path tracing at startup. PT is a menu toggle the
   capture harness cannot reach, so anything PT-specific (net chase, emission,
   denoiser) is unverifiable without this.
@@ -1346,6 +1348,26 @@ readout can never disagree.
     create the module). And the net colour/light buffers are referenced by
     live descriptor sets, so they need a `vkDeviceWaitIdle` before being
     freed on a highlight change.
+- **Pseudo-nets (`geom/connectivity.cpp`) recover connectivity from copper
+  alone**, for packages with no net data. Per layer, the copper is unioned
+  through a `PolyTree64` so nesting is explicit -- each top-level outer contour
+  is an island and its children are that island's holes; a flat `Paths64` could
+  not tell "a second island" from "a hole in the first" and would merge a pour
+  with whatever sits in its cutout. A grandchild contour is copper sitting
+  inside a hole (a pad in a pour cutout), so it becomes its own island.
+  Union-find then joins islands through `barrels` (plated, whole-stack --
+  unplated holes are absent from `barrels` by construction, which is exactly
+  right since they conduct nothing) and through `partialBores` across only the
+  layers in their span.
+  - Report `connecting` alongside `groups`. A dense board yields ~1900 groups
+    of which ~1200 are single isolated islands (lone pads, pour fragments,
+    copper logos); quoting the total alone reads as an explosion when most of
+    what was found is isolated by design.
+  - Derived nets have NO routed length -- there are no track centrelines to sum
+    -- so the panel shows copper area instead. Printing `0.0 mm routed` would
+    be inventing a number rather than measuring one.
+  - They are ordered by area and the panel does NOT sort them by name, because
+    `~1, ~10, ~100` is worse than useless. Real nets still sort by name.
 - **Gerber nets come from X2 `%TO.N%` object attributes**, not from a
   schematic (Gerbers have none). The attribute names the net for every object
   drawn until it is replaced or `%TD*%` deletes it, so the parser tracks it as

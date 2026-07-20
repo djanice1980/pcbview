@@ -150,8 +150,19 @@ struct LayerArt {
         std::string name;
         double routedMm = 0.0;
         int viaCount = 0;
+        // Copper area in mm^2. Meaningful for DERIVED nets, which have no
+        // track centrelines to sum a routed length from -- Gerber copper is
+        // filled regions, not routes, so reporting 0.0 mm routed would be
+        // inventing a number rather than measuring one.
+        double copperMm2 = 0.0;
     };
     std::vector<NetInfo> nets;
+
+    // True when `nets` was DERIVED from copper geometry rather than read from
+    // a netlist (see geom/connectivity.h). Such nets have no real names, an
+    // unrouted net appears as several of them, and two shorted nets appear as
+    // one -- so every surface that shows them must say where they came from.
+    bool netsArePseudo = false;
 
     // Every track segment with its net (mm, Y flip applied) -- the graph the
     // measure tool walks to report the routed distance BETWEEN two points on

@@ -174,6 +174,30 @@ rather than a candle at noon. Bloom gives it its aura.
 |---|---|
 | Six nets, six colours — ray traced | The same, path traced and denoised |
 
+### No netlist? Derive one from the copper
+
+If a package has no net data at all — most Gerbers plotted without X2 — the
+**Nets** panel offers *Infer nets from copper*. A net is physically just
+galvanically-connected copper, so connectivity can be recovered exactly from
+geometry: connected islands per layer, joined through plated barrels and
+blind/buried vias. You get highlighting, colours and the animation on a board
+that shipped with nothing but Gerbers.
+
+They are labelled `~1`, `~2`… and the panel says plainly that they are derived.
+Being clear about what this is **not**:
+
+- **There are no names.** Ground comes back as `~1`, never `GND`.
+- **An unrouted net appears as several** — the copper honestly reporting that
+  it is not connected.
+- **Two shorted nets appear as one.** With no netlist to check against, that is
+  the most useful thing here.
+- **Anything joined only through a component** — 0 Ω links, ferrites, net-ties
+  — stays separate, because a component is not copper.
+
+Since derived nets have no routed length to report (Gerber copper is filled
+regions, not routes), the panel shows copper **area** instead, largest first —
+so the pours and power planes sort to the top.
+
 Highlighted nets also **animate**: a bright head sweeps from one end of the run
 to the other, so you can see which way the signal goes and where it terminates,
 then a band cycles along it so it stays easy to follow. This works in the path
