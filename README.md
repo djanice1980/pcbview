@@ -253,16 +253,16 @@ before they are published.
 
 ```bat
 :: per-machine (needs an elevated context: SYSTEM, an RMM agent, or admin)
-pcbview-1.17.0-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ALLUSERS
+pcbview-1.17.1-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ALLUSERS
 
 :: per-user, no elevation, custom location
-pcbview-1.17.0-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /DIR="%LOCALAPPDATA%\pcbview"
+pcbview-1.17.1-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /DIR="%LOCALAPPDATA%\pcbview"
 
 :: also drop a desktop shortcut (off by default)
-pcbview-1.17.0-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /TASKS="desktopicon"
+pcbview-1.17.1-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /TASKS="desktopicon"
 
 :: write an install log for diagnosis
-pcbview-1.17.0-setup.exe /VERYSILENT /LOG="%TEMP%\pcbview-install.log"
+pcbview-1.17.1-setup.exe /VERYSILENT /LOG="%TEMP%\pcbview-install.log"
 ```
 
 **Upgrading needs neither the old version removed nor pcbview closed.** The
