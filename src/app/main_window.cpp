@@ -626,11 +626,40 @@ bool MainWindow::loadBoard(const QString& path) {
           << bbox(baseArt_.drills) << "\n";
         d << "barrels paths=" << baseArt_.barrels.size()
           << " area=" << Clipper2Lib::Area(baseArt_.barrels) / 1e12 << "mm2\n";
-        for (const auto& al : baseArt_.layers)
+        // Report the UNIONED area alongside the raw sum. `art` is a raw pile of
+        // overlapping tracks/pads/vias on the KiCad path but a single
+        // composited image on the Gerber path, so the raw sum double-counts
+        // overlaps on one side and not the other. Comparing the two importers
+        // on it is apples-to-oranges and reads as a large geometry discrepancy
+        // that does not exist; the union is the only number worth
+        // cross-validating.
+        for (const auto& al : baseArt_.layers) {
+            const auto merged = Clipper2Lib::BooleanOp(
+                Clipper2Lib::ClipType::Union, Clipper2Lib::FillRule::NonZero,
+                al.art, Clipper2Lib::Paths64{});
             d << "layer " << al.name << " kind=" << int(al.kind)
               << " z=" << al.z << " paths=" << al.art.size()
-              << " area=" << Clipper2Lib::Area(al.art) / 1e12 << "mm2 "
+              << " area=" << Clipper2Lib::Area(al.art) / 1e12 << "mm2"
+              << " union=" << Clipper2Lib::Area(merged) / 1e12 << "mm2 "
               << bbox(al.art) << "\n";
+        }
+        // Soldermask openings with NO copper under them: bare laminate left
+        // exposed. A thin ring around every pad is normal -- the mask relief
+        // is deliberately larger than the pad -- so the total is what matters.
+        for (const auto& mask : baseArt_.layers) {
+            if (mask.kind != LayerKind::Soldermask) continue;
+            const std::string side =
+                mask.name.rfind("F.", 0) == 0 ? "F.Cu" : "B.Cu";
+            for (const auto& cu : baseArt_.layers) {
+                if (cu.name != side) continue;
+                const auto bare = Clipper2Lib::BooleanOp(
+                    Clipper2Lib::ClipType::Difference,
+                    Clipper2Lib::FillRule::NonZero, mask.art, cu.art);
+                d << "bare-laminate " << mask.name << " minus " << side
+                  << " area=" << Clipper2Lib::Area(bare) / 1e12
+                  << "mm2 regions=" << bare.size() << " " << bbox(bare) << "\n";
+            }
+        }
         for (const auto& w : baseArt_.warnings) d << "warn: " << w << "\n";
     }
 
