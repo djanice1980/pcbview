@@ -104,6 +104,10 @@ private:
     void showImportWarnings();
     QStringList importWarnings_;
     QStringList importNotes_;
+    // Persistent status-bar indicator for the last import; click opens the
+    // report. Lives in the status bar rather than being a load-time dialog.
+    QLabel* statusReport_ = nullptr;
+    void updateImportReportBadge();
 
     // Append the cached component parts onto mesh_ (fresh copies, so repeated
     // reassembles don't accumulate), shifting top-mounted parts to sit on the

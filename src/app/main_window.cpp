@@ -670,6 +670,8 @@ bool MainWindow::loadBoard(const QString& path) {
         std::fprintf(stderr, "[import note] %s\n", n.toUtf8().constData());
     std::fflush(stderr);
 
+    updateImportReportBadge();
+
     // Lead with warnings. A package where everything was understood must not
     // look like it has problems -- notes get a count, not an alarm.
     if (!warnings.isEmpty()) {
@@ -2010,12 +2012,52 @@ void MainWindow::buildStatusBar() {
     statusChecks_ = new QLabel;
     statusPerf_ = new QLabel;
 
+    // Import report indicator, far left so it reads first. A PERSISTENT
+    // control rather than a dialog on load: a popup you dismiss is gone, and
+    // on the common notes-only import a modal would be exactly the crying-wolf
+    // problem the notes/warnings split exists to avoid. This waits to be
+    // asked, and is still there an hour later.
+    // ClickLabel is file-local, so the callback is set here and the member
+    // holds it as a plain QLabel*.
+    auto* report = new ClickLabel;
+    report->onClick = [this] { showImportWarnings(); };
+    report->setCursor(Qt::PointingHandCursor);
+    report->setVisible(false);
+    statusReport_ = report;
+
+    statusBar()->addWidget(statusReport_);
     statusBar()->addWidget(statusFile_);
     statusBar()->addWidget(new QLabel(" · "));
     statusBar()->addWidget(statusBoard_);
     statusBar()->addWidget(new QLabel(" · "));
     statusBar()->addWidget(statusChecks_);
     statusBar()->addPermanentWidget(statusPerf_);
+}
+
+// Reflect the last import in the status bar. Colour carries the severity so
+// the difference is visible without reading: amber only when something might
+// actually make the render disagree with the board.
+void MainWindow::updateImportReportBadge() {
+    if (!statusReport_) return;
+    const int w = importWarnings_.size();
+    const int n = importNotes_.size();
+    if (w == 0 && n == 0) {
+        statusReport_->setVisible(false);
+        return;
+    }
+    QString text;
+    if (w > 0) {
+        text = QString("⚠ %1 warning%2").arg(w).arg(w == 1 ? "" : "s");
+        if (n > 0) text += QString(", %1 note%2").arg(n).arg(n == 1 ? "" : "s");
+        statusReport_->setStyleSheet("color:#E0A030; padding:0 6px;");
+    } else {
+        text = QString("%1 note%2").arg(n).arg(n == 1 ? "" : "s");
+        statusReport_->setStyleSheet(
+            QString("color:%1; padding:0 6px;").arg(theme::kTextDim));
+    }
+    statusReport_->setText(text + "  ·");
+    statusReport_->setToolTip("Click for the full import report");
+    statusReport_->setVisible(true);
 }
 
 void MainWindow::updateStatus() {
