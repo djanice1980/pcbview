@@ -488,6 +488,11 @@ private:
     VkDeviceSize cpuStagingBytes_ = 0;
     uint32_t cpuTracerGen_ = 0xFFFFFFFFu;  // ptGeneration_ the tracer last saw
     uint32_t cpuPass_ = 0;                 // accumulate() pass since last reset
+    // Sample count at which the next denoise refresh is due: doubling to 32,
+    // then every 32. A THRESHOLD, deliberately not an exact-count test -- the
+    // 1-then-4 batch sizing makes the count run 1, 5, 9, ..., which never
+    // lands on a power of two, and an exact test silently never denoised.
+    int cpuNextDenoise_ = 4;
     bool cpuPreviewActive_ = false;        // last pass was the RT preview
     // Last DENOISED display image, shown between denoise milestones so the
     // render thread is not blocked on OIDN every frame (the GPU path does the

@@ -925,6 +925,7 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
         // after a camera move is what interactivity is judged by, and 1spp of
         // the deterministic preview is already a complete picture. Later
         // batches take 4 so the per-frame overhead is paid less often.
+        if (cpuPass_ == 0) cpuNextDenoise_ = 4;  // fresh view, fresh cadence
         const int batch = cpuPass_ == 0 ? 1 : 4;
         cpuTracer_->accumulate(cam, sceneExtent_.width, sceneExtent_.height,
                                batch, cpuPass_);
@@ -937,7 +938,6 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
     // preview skips OIDN entirely: its integrator is near-noise-free by 8
     // samples, so it just refreshes every frame.
     const int s = cpuTracer_->samples();
-    const bool milestone = s <= 32 ? (s & (s - 1)) == 0 : (s % 32) == 0;
     const bool converged = s >= target;
     const bool chasing = netAnimating();
     const uint32_t chaseMs =
@@ -947,8 +947,14 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
                           .count())
                 : 0u;
     const bool denoised = !preview && denoisingEnabled_;
-    if (denoised && s >= 4 && (milestone || converged))
-        cpuTracer_->kickDenoiseResolve(chasing);
+    // Threshold, not equality: the sample count runs 1, 5, 9, ... under the
+    // 1-then-4 batches, so testing for exact powers of two never fired and the
+    // display froze on the first raw resolve until full convergence.
+    if (denoised && (s >= cpuNextDenoise_ || converged)) {
+        cpuTracer_->kickDenoiseResolve(chasing);  // dedupes per sample count
+        if (s >= cpuNextDenoise_)
+            cpuNextDenoise_ = s < 32 ? std::max(2 * s, 4) : s + 32;
+    }
 
     // Display refresh, cheapest source first: a finished denoise swaps in; a
     // chase on an unchanged base only re-touches the tagged pixels; otherwise
@@ -1189,6 +1195,10 @@ void Renderer::setDenoising(bool on) {
 }
 
 std::string Renderer::oidnDeviceName() const {
+    // In CPU mode denoising runs inside the Embree tracer, which owns its own
+    // OIDN state; oidnDevice_ here is the GPU path's and is never created, so
+    // without this the status bar reported "none" while denoising worked fine.
+    if (cpuMode_ && cpuTracer_) return "CPU";
     if (!oidnDevice_) return "none";
     switch (oidnGetDeviceInt(static_cast<OIDNDevice>(oidnDevice_), "type")) {
         case OIDN_DEVICE_TYPE_CPU:   return "CPU";
