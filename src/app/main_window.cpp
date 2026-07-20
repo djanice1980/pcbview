@@ -252,6 +252,25 @@ MainWindow::MainWindow(const QString& path) {
         viewport_->camera().pitch =
             qEnvironmentVariable("PCBVIEW_START_PITCH").toFloat();
 
+    // Headless layer-hiding hook: comma-separated part names to switch off
+    // after load. Layer visibility is a checkbox a capture harness cannot
+    // click, which makes "is that copper or silkscreen?" unanswerable
+    // headlessly -- and answering it by eye is exactly how a wrong material
+    // gets confirmed rather than caught.
+    if (qEnvironmentVariableIsSet("PCBVIEW_HIDE")) {
+        const QStringList hide =
+            qEnvironmentVariable("PCBVIEW_HIDE").split(',', Qt::SkipEmptyParts);
+        QTimer::singleShot(500, this, [this, hide] {
+            for (const QString& h : hide)
+                viewport_->renderer()->setPartVisible(h.trimmed().toStdString(),
+                                                      false);
+            // Keep the stackup checkboxes honest about what is showing.
+            for (int i = 0; i < stackup_->topLevelItemCount(); ++i)
+                syncStackupChecks(stackup_->topLevelItem(i), hide);
+            viewport_->requestUpdate();
+        });
+    }
+
     // Headless connectivity hook. The Infer button is a click the capture
     // harness cannot make, so nothing about pseudo-nets is verifiable without
     // this. Runs before PCBVIEW_NET so a derived net can then be highlighted
@@ -1687,6 +1706,18 @@ void MainWindow::buildNetDock() {
     dock->setMinimumWidth(230);
     addDockWidget(Qt::RightDockWidgetArea, dock);
     netDock_ = dock;
+}
+
+// Tick off any stackup row whose part was hidden from the environment, so the
+// panel matches the render.
+void MainWindow::syncStackupChecks(QTreeWidgetItem* item, const QStringList& hidden) {
+    if (!item) return;
+    const QString name = item->data(0, Qt::UserRole).toString();
+    for (const QString& h : hidden)
+        if (!name.isEmpty() && name == h.trimmed())
+            item->setCheckState(0, Qt::Unchecked);
+    for (int i = 0; i < item->childCount(); ++i)
+        syncStackupChecks(item->child(i), hidden);
 }
 
 void MainWindow::showImportWarnings() {

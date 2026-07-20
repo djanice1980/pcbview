@@ -102,6 +102,7 @@ private:
     // Every warning from the last import. The status line shows only the
     // first, so this is the only way to see the rest.
     void showImportWarnings();
+    void syncStackupChecks(QTreeWidgetItem* item, const QStringList& hidden);
     QStringList importWarnings_;
     QStringList importNotes_;
     // Persistent status-bar indicator for the last import; click opens the
