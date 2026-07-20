@@ -1407,6 +1407,17 @@ readout can never disagree.
     be inventing a number rather than measuring one.
   - They are ordered by area and the panel does NOT sort them by name, because
     `~1, ~10, ~100` is worse than useless. Real nets still sort by name.
+- **Every dark object must reach a net bucket, including untagged ones.**
+  `assemble()` extrudes the per-net regions INSTEAD OF the bulk `al.art` the
+  moment a copper layer has any `netArt`, so copper that reaches no bucket is
+  not merely unhighlightable -- it is never built. The Gerber reader originally
+  bucketed only objects that HAD a net (and deliberately cleared it for `N/C`),
+  which silently deleted ~37 mm2 of front copper on cx4multicart_v3, whole pads
+  included. The empty key is the no-net bucket, mapped to net -1.
+  - This is why LayerArt cross-validation kept passing while the render was
+    wrong: `art` always held the copper, so every area check agreed. The loss
+    happened later, in the mesh. **An area check on LayerArt cannot see a
+    mesh-building bug** -- compare renders, or count what assemble() emits.
 - **Gerber nets come from X2 `%TO.N%` object attributes**, not from a
   schematic (Gerbers have none). The attribute names the net for every object
   drawn until it is replaced or `%TD*%` deletes it, so the parser tracks it as
