@@ -642,6 +642,57 @@ bool MainWindow::loadBoard(const QString& path) {
               << " area=" << Clipper2Lib::Area(al.art) / 1e12 << "mm2"
               << " union=" << Clipper2Lib::Area(merged) / 1e12 << "mm2 "
               << bbox(al.art) << "\n";
+            // Per-path detail on small layers. Aggregates cannot see a shape
+            // that is mirrored or rotated wrongly -- area and bbox are both
+            // invariant under mirroring -- so a fixture board needs the
+            // individual shapes to compare against another importer.
+            if (merged.size() <= 40) {
+                for (size_t pi = 0; pi < merged.size(); ++pi) {
+                    const auto& path = merged[pi];
+                    long double cx = 0, cy = 0, a2 = 0;
+                    for (size_t i = 0; i < path.size(); ++i) {
+                        const auto& p0 = path[i];
+                        const auto& p1 = path[(i + 1) % path.size()];
+                        const long double cr =
+                            static_cast<long double>(p0.x) * p1.y -
+                            static_cast<long double>(p1.x) * p0.y;
+                        a2 += cr;
+                        cx += (p0.x + p1.x) * cr;
+                        cy += (p0.y + p1.y) * cr;
+                    }
+                    if (a2 == 0) continue;
+                    cx /= (3.0L * a2);
+                    cy /= (3.0L * a2);
+                    // Principal-axis angle. Area, centroid and bounding box are
+                    // ALL invariant under mirroring and under swapping the sign
+                    // of a rotation, so none of them can tell a pad rotated +45
+                    // from one rotated -45. This can, and that distinction is
+                    // exactly what a rotation convention gets wrong.
+                    long double ixx = 0, iyy = 0, ixy = 0;
+                    for (size_t i = 0; i < path.size(); ++i) {
+                        const size_t j = (i + 1) % path.size();
+                        const long double x0 = path[i].x - cx;
+                        const long double y0 = path[i].y - cy;
+                        const long double x1 = path[j].x - cx;
+                        const long double y1 = path[j].y - cy;
+                        const long double cr = x0 * y1 - x1 * y0;
+                        ixx += (y0 * y0 + y0 * y1 + y1 * y1) * cr;
+                        iyy += (x0 * x0 + x0 * x1 + x1 * x1) * cr;
+                        ixy += (x0 * y1 + 2 * (x0 * y0 + x1 * y1) + x1 * y0) * cr;
+                    }
+                    const double angle =
+                        0.5 *
+                        std::atan2(2.0 * static_cast<double>(ixy),
+                                   static_cast<double>(iyy) -
+                                       static_cast<double>(ixx)) *
+                        180.0 / 3.14159265358979;
+                    d << "   path[" << pi << "] pts=" << path.size()
+                      << " area=" << Clipper2Lib::Area(path) / 1e12
+                      << "mm2 centroid=" << static_cast<double>(cx) / 1e6 << ","
+                      << static_cast<double>(cy) / 1e6 << " axis=" << angle
+                      << "deg\n";
+                }
+            }
         }
         // Soldermask openings with NO copper under them: bare laminate left
         // exposed. A thin ring around every pad is normal -- the mask relief

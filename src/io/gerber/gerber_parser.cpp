@@ -193,18 +193,44 @@ Paths64 evalMacro(const Macro& m, const std::vector<double>& params, double ox,
         if (a.empty()) continue;
 
         const int code = static_cast<int>(a[0]);
+
+        // Every primitive takes a trailing ROTATION about the macro origin,
+        // counterclockwise in degrees. Ignoring it silently draws the shape
+        // unrotated -- which is invisible on a circle, invisible on any
+        // symmetric shape at 0/90/180, and invisible to area, centroid and
+        // bounding-box checks at ANY angle. KiCad emits rotated rectangular
+        // pads exactly this way (its RotRect / Outline4P macros), so every
+        // rotated rect pad in a KiCad gerber came in axis-aligned.
+        const auto at = [&](size_t i) { return i < a.size() ? a[i] : 0.0; };
+        const auto place = [&](double x, double y, double deg) {
+            if (deg != 0.0) {
+                const double r = deg * 3.14159265358979 / 180.0;
+                const double c = std::cos(r), s2 = std::sin(r);
+                const double rx = x * c - y * s2;
+                const double ry = x * s2 + y * c;
+                x = rx;
+                y = ry;
+            }
+            return toClip(ox + x, oy + y);
+        };
+
         switch (code) {
             case 1: {  // circle: code, exposure, diameter, x, y[, rot]
                 if (a.size() < 5) break;
                 const bool dark = a[1] != 0.0;
-                add({circle(ox + a[3], oy + a[4], a[2] * 0.5)}, dark);
+                // A circle is rotation-invariant, but its CENTRE is not.
+                const Point64 c = place(a[3], a[4], at(5));
+                add({circle(static_cast<double>(c.x) / geom::kScale,
+                            static_cast<double>(c.y) / geom::kScale,
+                            a[2] * 0.5)},
+                    dark);
                 break;
             }
             case 20: {  // vector line: code, exp, width, x1,y1,x2,y2[, rot]
                 if (a.size() < 7) break;
                 const bool dark = a[1] != 0.0;
-                Path64 spine{toClip(ox + a[3], oy + a[4]),
-                             toClip(ox + a[5], oy + a[6])};
+                const double rot = at(7);
+                Path64 spine{place(a[3], a[4], rot), place(a[5], a[6], rot)};
                 ClipperOffset co;
                 co.ArcTolerance(geom::kScale * 0.001);
                 co.AddPath(spine, JoinType::Round, EndType::Butt);
@@ -216,18 +242,27 @@ Paths64 evalMacro(const Macro& m, const std::vector<double>& params, double ox,
             case 21: {  // center line rect: code, exp, w, h, x, y[, rot]
                 if (a.size() < 6) break;
                 const bool dark = a[1] != 0.0;
-                add({rect(ox + a[4], oy + a[5], a[2], a[3])}, dark);
+                const double rot = at(6);
+                const double hw = a[2] * 0.5, hh = a[3] * 0.5;
+                const double px = a[4], py = a[5];
+                Path64 poly{place(px - hw, py - hh, rot),
+                            place(px + hw, py - hh, rot),
+                            place(px + hw, py + hh, rot),
+                            place(px - hw, py + hh, rot)};
+                add({std::move(poly)}, dark);
                 break;
             }
             case 4: {  // outline: code, exp, N, x0,y0,...,xN,yN[, rot]
                 if (a.size() < 5) break;
                 const bool dark = a[1] != 0.0;
                 const int n = static_cast<int>(a[2]);
+                // Rotation follows the vertex list: 3 + 2*(n+1).
+                const double rot = at(3 + 2 * (static_cast<size_t>(n) + 1));
                 Path64 poly;
                 for (int k = 0; k <= n; ++k) {
                     const size_t xi = 3 + 2 * k, yi = 4 + 2 * k;
                     if (yi >= a.size()) break;
-                    poly.push_back(toClip(ox + a[xi], oy + a[yi]));
+                    poly.push_back(place(a[xi], a[yi], rot));
                 }
                 if (poly.size() >= 3) add({std::move(poly)}, dark);
                 break;

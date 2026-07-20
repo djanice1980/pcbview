@@ -136,10 +136,20 @@ Path64 arcThrough(Vec2 a, Vec2 m, Vec2 b, Place place) {
 Path64 trapezoidPath(const Pad& pad) {
     const double dx = pad.size.x * 0.5, dy = pad.size.y * 0.5;
     const double ddx = pad.rectDelta.x * 0.5, ddy = pad.rectDelta.y * 0.5;
-    const Vec2 local[4] = {{-dx - ddy, -dy - ddx},
-                           {-dx + ddy, dy + ddx},
-                           {dx - ddy, dy - ddx},
-                           {dx + ddy, -dy + ddx}};
+    // Signs verified against KiCad's own plotter, not derived: for
+    // `(rect_delta 0 1)` KiCad emits (-2,-0.5)(2,-0.5)(1,0.5)(-1,0.5) in
+    // APERTURE space, i.e. wide at world y = -dy. This code builds in KiCad's
+    // Y-DOWN space and is flipped on the way out, so the wide edge must sit at
+    // kicad +dy -- the opposite sign to the naive reading. The x terms (ddx)
+    // need no flip because x is not mirrored.
+    //
+    // A rect or oval pad is symmetric in y, so this error was invisible on
+    // every other pad shape, and invisible to area and bounding-box checks on
+    // a trapezoid too: mirroring changes neither.
+    const Vec2 local[4] = {{-dx + ddy, -dy - ddx},
+                           {-dx - ddy, dy + ddx},
+                           {dx + ddy, dy - ddx},
+                           {dx - ddy, -dy + ddx}};
     Path64 out;
     for (const Vec2& v : local) {
         const Vec2 r = rotateKicad(v, pad.rotation);
