@@ -94,7 +94,8 @@ struct BoardMesh {
     // the plane free measurement points are projected onto.
     std::vector<SnapPoint> snapPoints;
     double boardTopZ = 0.0;
-    // Net table for the measure tool (KiCad only; empty for Gerber), plus
+    // Net table for the measure tool (from KiCad, or from Gerber X2 %TO.N%
+    // attributes when the package carries them), plus
     // every track segment with its net -- the graph netPathLength() walks.
     std::vector<LayerArt::NetInfo> nets;
     std::vector<LayerArt::NetSeg> netSegments;

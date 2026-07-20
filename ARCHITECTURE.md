@@ -1269,7 +1269,7 @@ together, and why:
   dimension callouts stay glued to the board through orbit/zoom/explode.
   Dimension callouts use `BoardMesh::outlineMin/Max` (outline bbox —
   component overhang must not inflate the board size).
-- **Net panel (KiCad only):** pad/via snap points carry a net index
+- **Net panel:** pad/via snap points carry a net index
   (`LayerArt::netPoints`, emitted FIRST so they win snap ties against their
   netless drill twins -- the search keeps the first of equally-near points).
   When both measurement endpoints resolve to the same net, a corner panel
@@ -1303,7 +1303,7 @@ together, and why:
   call the rect comes back virtualised on this 200% display and only the
   top-left quadrant lands. That is how the toolbar icons were checked.
 
-## Net highlighting (built 2026-07-19, KiCad only)
+## Net highlighting (built 2026-07-19; Gerber X2 nets added 2026-07-20)
 
 Pick a net and it lights up across every layer while the rest of the board
 mutes, so a signal can be followed through the stack and the exploded view.

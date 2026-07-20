@@ -1625,11 +1625,23 @@ void MainWindow::populateNets() {
     highlightedNet_ = -1;
     if (viewport_->renderer()) viewport_->renderer()->setHighlightNet(-1);
 
-    // Gerber packages carry no nets at all; say so rather than showing an
-    // empty list that looks like a failure.
+    // Say WHY the list is empty rather than showing a blank panel that looks
+    // like a failure -- but say it accurately. Gerbers absolutely can carry
+    // nets (X2 %TO.N% object attributes, which pcbview reads); this particular
+    // package simply has none, which for a KiCad export means it was written
+    // without "Include advanced X2 features".
     if (mesh_.nets.empty()) {
         auto* none = new QTreeWidgetItem(
-            netList_, {fromGerber_ ? "(gerbers carry no nets)" : "(no nets)", ""});
+            netList_,
+            {fromGerber_ ? "(no net attributes in this package)" : "(no nets)",
+             ""});
+        if (fromGerber_)
+            none->setToolTip(
+                0,
+                "This Gerber package has no X2 net attributes (%TO.N%).\n"
+                "Re-export with X2 attributes enabled -- in KiCad, Plot -> "
+                "\"Include advanced X2 features\" -- and nets will appear "
+                "here, with highlighting and routed length.");
         none->setForeground(0, QColor(theme::kTextDim));
         none->setFlags(Qt::NoItemFlags);
         return;
@@ -1839,10 +1851,16 @@ void MainWindow::updateStatus() {
             .arg(mm(thickness, 2)));
 
     if (fromGerber_) {
-        // The net-connectivity and short checks need nets, which a Gerber does
-        // not have. Say so honestly rather than show a green zero that means "no
-        // data", not "verified clean".
-        statusChecks_->setText("gerber — no net data for checks");
+        // The connectivity and short checks need per-PAD nets. Gerber X2 gives
+        // us net names on copper (so highlighting and routed length work), but
+        // a flash is not distinguishable from any other exposure, so there is
+        // no pad table to check against. Say which of the two situations this
+        // is rather than a blanket "no nets", and never show a green zero that
+        // means "no data" rather than "verified clean".
+        statusChecks_->setText(mesh_.nets.empty()
+                                   ? "gerber — no net attributes for checks"
+                                   : "gerber — nets loaded; pad checks need a "
+                                     "board file");
         statusChecks_->setStyleSheet(QString("color:%1").arg(theme::kTextDim));
         return;
     }
