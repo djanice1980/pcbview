@@ -148,6 +148,12 @@ public:
     void setMeasurement(float ax, float ay, float az, float bx, float by,
                         float bz);
 
+    // Camera readout drawn INTO the frame (not the status bar), so a capture
+    // carries the exact view that produced it and can be reproduced from the
+    // headless hooks. Off by default.
+    void setCameraHud(bool on) { cameraHud_ = on; requestUpdate(); }
+    bool cameraHud() const { return cameraHud_; }
+
 signals:
     // Live measurement readout for the status bar ("12.345 mm ..."), empty
     // when measuring is idle.
@@ -234,6 +240,7 @@ private:
     // Rebuild the renderer overlay (measure line + dimension callouts) for
     // this frame. Cheap; called from render() after the matrices are known.
     void buildOverlay();
+
     // Push the live measurement text out via measureReadout.
     void updateReadout();
 
@@ -299,6 +306,7 @@ private:
     bool clickCandidate_ = false;  // press seen; becomes a pick if no drag
     glm::mat4 lastViewProj_{1.0f};
     bool haveViewProj_ = false;
+    bool cameraHud_ = false;
 };
 
 }  // namespace pcbview::app

@@ -1174,6 +1174,61 @@ void VulkanWindow::buildOverlay() {
     static const float kWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     static const float kDim[4] = {0.72f, 0.84f, 1.0f, 0.9f};
 
+    // Camera readout. Deliberately part of the OVERLAY rather than the status
+    // bar: the overlay is drawn into the frame itself, so it survives
+    // PCBVIEW_CAPTURE and a screenshot carries the exact view that produced
+    // it. Reading a capture without this means guessing the projection, and
+    // guessing it is how a pixel gets mapped to the wrong board coordinate.
+    //
+    // The numbers are exactly the ones the headless hooks take, so a view can
+    // be read off a screenshot and reproduced verbatim.
+    if (cameraHud_) {
+        const float wpx = static_cast<float>(width()) * dpr;
+        const float hpx = static_cast<float>(height()) * dpr;
+        const float size = 13.0f * dpr;
+        const float lh = size * 1.45f;
+        float y = size * 1.8f;
+        const float x = 10.0f * dpr;
+
+        // Millimetres per pixel. Exact in orthographic; in perspective it is
+        // only true at the target plane, and is labelled so nobody measures
+        // off-plane geometry with it.
+        const float halfH = camera_.orthographic
+                                ? orthoHalfHeight()
+                                : camera_.distance *
+                                      std::tan(camera_.fovDegrees * 0.5f *
+                                               3.14159265f / 180.0f);
+        const float mmPerPx = (hpx > 0.0f) ? (2.0f * halfH / hpx) : 0.0f;
+
+        // text::layout CENTRES on the origin (KiCad's convention for
+        // reference/value text), so a left-aligned HUD has to offset by half
+        // the advance width or it runs off the left edge of the frame.
+        const auto drawLeft = [&](const std::string& t, float ty) {
+            text::TextStyle st;
+            st.size = {size * 0.9, size};
+            st.thickness = size * 0.14;
+            drawText(t, x + static_cast<float>(text::measure(t, st)) * 0.5f, ty,
+                     size, kAmber);
+        };
+
+        char buf[256];
+        std::snprintf(buf, sizeof buf, "yaw %.2f  pitch %.2f  roll %.2f",
+                      camera_.yaw, camera_.pitch, camera_.roll);
+        drawLeft(buf, y);
+        y += lh;
+        std::snprintf(buf, sizeof buf, "dist %.3f  target %.3f, %.3f, %.3f",
+                      camera_.distance, camera_.targetX, camera_.targetY,
+                      camera_.targetZ);
+        drawLeft(buf, y);
+        y += lh;
+        std::snprintf(buf, sizeof buf, "%s  %.6f mm/px%s  %.0fx%.0f",
+                      camera_.orthographic ? "ortho" : "persp",
+                      mmPerPx,
+                      camera_.orthographic ? "" : " at target",
+                      wpx, hpx);
+        drawLeft(buf, y);
+    }
+
     // Board dimension callouts, fab-drawing style: W below the board, H at its
     // left, world-anchored so they follow the camera.
     if (dimsOverlay_ && mesh_ && mesh_->outlineValid) {

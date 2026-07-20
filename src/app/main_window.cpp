@@ -1422,6 +1422,26 @@ void MainWindow::buildMenus() {
         viewport_->requestUpdate();
     });
 
+    // Camera readout. Persisted, and reachable headlessly, because its whole
+    // point is that a capture carries the view that produced it.
+    {
+        auto* hud = view->addAction("Camera readout");
+        hud->setCheckable(true);
+        hud->setShortcut(QKeySequence("Ctrl+`"));
+        hud->setStatusTip(
+            "Draw yaw/pitch/roll, distance, target and mm-per-pixel into the "
+            "frame — appears in screenshots, so a view can be reproduced");
+        const bool on = appSettings().value("cameraHud", false).toBool() ||
+                        qEnvironmentVariable("PCBVIEW_CAMERA_HUD").toInt() != 0;
+        hud->setChecked(on);
+        connect(hud, &QAction::toggled, this, [this](bool v) {
+            appSettings().setValue("cameraHud", v);
+            viewport_->setCameraHud(v);
+        });
+        viewport_->setCameraHud(on);
+    }
+    view->addSeparator();
+
     {
         auto* warn = view->addAction("Import report…");
         warn->setStatusTip(

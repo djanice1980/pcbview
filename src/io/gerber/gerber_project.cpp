@@ -800,6 +800,7 @@ geom::LayerArt importPackage(const std::string& path) {
     std::map<std::string, int> netIndex;
     for (const ParsedLayer& pl : copper) {
         for (const NetArea& na : pl.nets) {
+            if (na.name.empty()) continue;  // the no-net bucket has no entry
             auto [it, inserted] = netIndex.emplace(na.name,
                                                    static_cast<int>(art.nets.size()));
             if (inserted) art.nets.push_back({na.name, 0.0, 0});
@@ -827,7 +828,11 @@ geom::LayerArt importPackage(const std::string& path) {
         // behaves exactly as Gerber always has.
         for (NetArea& na : copper[i].nets) {
             geom::ArtLayer::NetRegion nr;
-            nr.net = netIndex[na.name];
+            // Untagged copper still has to be EXTRUDED, just not highlightable:
+            // net -1 is the "belongs to no net" bucket, and omitting it would
+            // delete that copper from the board entirely.
+            const auto it = netIndex.find(na.name);
+            nr.net = (it == netIndex.end()) ? -1 : it->second;
             nr.paths = std::move(na.area);
             al.netArt.push_back(std::move(nr));
         }

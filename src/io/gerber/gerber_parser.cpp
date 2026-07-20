@@ -351,7 +351,7 @@ public:
         // wants one region per net, not thousands of stamped shapes.
         for (auto& [name, paths] : netPaths_) {
             NetArea na;
-            na.name = name;
+            na.name = name;   // empty = the no-net bucket
             na.area = BooleanOp(ClipType::Union, FillRule::NonZero, paths,
                                 Paths64{});
             na.routedMm = netLen_[name];
@@ -424,7 +424,13 @@ private:
         // Clear polarity is deliberately not recorded: a clear region belongs
         // to no net, and subtracting it from the net area would misreport a
         // thermal relief as a break in the net.
-        if (polarityDark_ && !currentNet_.empty()) {
+        // EVERY dark object must land in a bucket, including the ones with no
+        // net -- an untagged pad, a fiducial, anything marked N/C. assemble()
+        // extrudes the per-net regions INSTEAD OF the bulk art once any net is
+        // present, so copper that reaches no bucket is not merely unhighlighted,
+        // it is never built at all. The empty key is the no-net bucket and the
+        // project layer maps it to net -1.
+        if (polarityDark_) {
             Paths64& bucket = netPaths_[currentNet_];
             bucket.insert(bucket.end(), shape.begin(), shape.end());
         }
