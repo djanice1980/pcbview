@@ -441,6 +441,9 @@ private:
     // reading back from the GPU.
     std::vector<uint32_t> restIndices_;
     std::vector<int32_t> triNetCpu_;
+    // Per-net chase origin + inverse span, kept CPU-side so the Embree tracer
+    // can be handed the same table the GPU paths read from netSpanBuffer_.
+    std::vector<std::array<float, 4>> netSpanCpu_;
     // The BLAS is built from these EXPLODED positions rather than vertexBuffer_
     // (the rest geometry the raster path holds). At rest it is a copy of the rest
     // vertices; in path-traced mode it is re-baked whenever the peel changes so the

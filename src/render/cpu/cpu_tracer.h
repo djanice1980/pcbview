@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "geom/tessellate.h"
@@ -83,6 +84,32 @@ public:
     // cos(sun angular radius) for the soft-shadow cone; 1 = point sun.
     void setSunCosMax(float c) { sunCosMax_ = c; }
 
+    // Net highlighting, mirroring shaders/pathtrace.comp and board_rt.frag.
+    //
+    // The per-triangle net table is NOT passed in: it is built by setScene, in
+    // this tracer's own triangle order. The renderer's equivalent array is in a
+    // different order (it hoists films to the end of the index buffer), so
+    // accepting one from outside just invites the two to drift apart -- which
+    // is exactly the bug that made an unrelated plane light up.
+    //
+    // `netColour` is rgb + a, where a > 0 marks a net as highlighted.
+    //
+    // KNOWN DIFFERENCE from the GPU tracer: pathtrace.comp also samples the
+    // highlighted net explicitly as an area light (next-event estimation), so
+    // its red spill lands on the copper and laminate AROUND the net. This
+    // tracer only emits from the net itself, so the net reads correctly but
+    // its surroundings stay darker -- measured as ~7k pixels of missing spill
+    // on cx4multicart_v3/GND at 2152x1738. Everything else (emission, the
+    // 0.18 scene dim, the desaturation of other geometry, and the chase) is
+    // matched. `netSpan` is the per-net chase origin (xyz) and inverse span
+    // (w) -- phase is computed from the HIT POSITION against it, so the sweep
+    // follows the copper's shape rather than its triangulation, exactly as the
+    // GPU paths do. Empty vectors turn highlighting off.
+    void setHighlight(std::vector<std::array<float, 4>> netColour,
+                      std::vector<std::array<float, 4>> netSpan);
+    void setNetGlow(float strength) { netGlow_ = strength; }
+    bool highlighting() const { return netOn_; }
+
     // Visibility parity: hidden parts are removed from the traced scene by
     // NaN-ing their vertices in the next bake (Embree ignores non-finite
     // triangles), mirroring the GPU's NaN-bake. Returns true if anything
@@ -108,7 +135,11 @@ public:
 
     // Resolve for on-screen display: 8-bit BGRA, sRGB-encoded, to be copied
     // straight into a B8G8R8A8_SRGB Vulkan image and blit to the swapchain.
-    std::vector<uint8_t> resolveDisplay(bool denoise) const;
+    // `chaseMs` + `animate` drive the highlight chase, applied HERE rather than
+    // during tracing -- like the GPU's tonemap pass, so the animation costs no
+    // convergence and a converged image can keep animating.
+    std::vector<uint8_t> resolveDisplay(bool denoise, uint32_t chaseMs = 0,
+                                        bool animate = false) const;
 
     // Convenience for the headless CLI: clear + accumulate spp + resolve.
     std::vector<uint8_t> renderImage(const TraceCamera& cam, uint32_t width,
@@ -172,6 +203,18 @@ private:
     mutable uint32_t oidnW_ = 0, oidnH_ = 0;
     void denoiseInto(std::vector<float>& colorOut) const;
     void resolveLinear(std::vector<float>& lin, bool denoise) const;
+
+    // Net highlight state. triNet_ is per triangle; the other two per net.
+    std::vector<int32_t> triNet_;
+    std::vector<std::array<float, 4>> netColour_;
+    std::vector<std::array<float, 4>> netSpan_;
+    bool netOn_ = false;
+    float netGlow_ = 1.0f;
+    // First-hit chase AOV, 2 floats per pixel: phase along the net, and 1 when
+    // the pixel shows highlighted copper directly. The GPU keeps this as a
+    // storage image for the same reason -- the chase is a display-time
+    // modulation and must not be baked into the accumulated radiance.
+    mutable std::vector<float> phaseAov_;
 };
 
 }  // namespace pcbview::cpu

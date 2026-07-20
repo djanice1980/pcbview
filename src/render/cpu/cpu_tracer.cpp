@@ -62,7 +62,7 @@ V3 sky(V3 d) {
     const float t = std::clamp(d.z * 0.5f + 0.5f, 0.0f, 1.0f);
     const V3 env = mix({0.11f, 0.12f, 0.15f}, {0.42f, 0.44f, 0.49f}, t);
     const float sun = std::pow(std::max(dot(d, kSunDir), 0.0f), 350.0f);
-    return env + kSunColor * sun;
+    return env + kSunColor * sun;  // scaled by sceneDim() at the call sites
 }
 
 // Laminate transmission scatter cone (~5 deg); KEEP IN STEP with
@@ -167,6 +167,7 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
     vertsPadded_.clear();
     normals_.clear();
     indices_.clear();
+    triNet_.clear();
     materials_.clear();
     triMat_.clear();
     partSpans_.clear();
@@ -183,6 +184,7 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
     normals_.reserve(nv * 3);
     indices_.reserve(nt * 3);
     triMat_.reserve(nt);
+    triNet_.reserve(nt);
 
     // Per-part data for the explode-rank computation, mirroring the GPU path's
     // uploadBoard: board layers get consecutive centred ranks by Z, components
@@ -214,6 +216,15 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
             indices_.push_back(base + part.mesh.indices[i + 1]);
             indices_.push_back(base + part.mesh.indices[i + 2]);
             triMat_.push_back(matId);
+            // Net id in the SAME order, filled by the same loop that emits the
+            // triangle. The renderer builds its own copy in a DIFFERENT order
+            // (it hoists films to the end of the index buffer), so taking that
+            // array would silently highlight unrelated geometry -- it did, and
+            // a ground plane lit up that was not the selected net.
+            const size_t tri = i / 3;
+            triNet_.push_back(tri < part.triNet.size()
+                                  ? static_cast<int32_t>(part.triNet[tri])
+                                  : -1);
         }
         PartSpan span;
         span.firstVertex = base;
@@ -375,7 +386,39 @@ struct Ctx {
     float peel;       // substrate fade amount (0 at rest)
     bool preview;     // RT preview: sun shadow + AO, no GI bounces
     float sunCosMax;  // cos(sun angular radius); 1 = point sun
+    // Net highlighting (mirrors pathtrace.comp's triNet/netCol/netSpan).
+    const int32_t* triNet = nullptr;
+    const float* netCol = nullptr;   // 4 per net, a > 0 = highlighted
+    const float* netSpan = nullptr;  // 4 per net: origin xyz + inverse span
+    uint32_t netCount = 0;
+    bool netOn = false;
+    float netGlow = 1.0f;
 };
+
+// Highlighting a net turns the lights down -- see sceneDim() in
+// pathtrace.comp: the net's emission is physically tiny next to the sun, so
+// without this its red spill onto the surrounding copper never reads.
+inline float sceneDim(const Ctx& c) { return c.netOn ? 0.18f : 1.0f; }
+
+// Net id and colour for a triangle. a > 0 means "this net is highlighted".
+inline std::array<float, 4> netColourOf(const Ctx& c, uint32_t prim, int& net) {
+    net = -1;
+    if (!c.netOn || !c.triNet || !c.netCol) return {0, 0, 0, 0};
+    const int n = c.triNet[prim];
+    if (n < 0 || static_cast<uint32_t>(n) >= c.netCount) return {0, 0, 0, 0};
+    net = n;
+    return {c.netCol[n * 4 + 0], c.netCol[n * 4 + 1], c.netCol[n * 4 + 2],
+            c.netCol[n * 4 + 3]};
+}
+
+// Chase phase at a hit POSITION -- not per triangle, so the sweep follows the
+// copper's shape however finely it happens to be tessellated.
+inline float netPhaseAt(const Ctx& c, int net, V3 p) {
+    if (net < 0 || !c.netSpan) return 0.0f;
+    const float* sp = &c.netSpan[net * 4];
+    const V3 d{p.x - sp[0], p.y - sp[1], p.z - sp[2]};
+    return std::clamp(std::sqrt(dot(d, d)) * sp[3], 0.0f, 1.0f);
+}
 
 inline V3 vpos(const Ctx& c, uint32_t i) {
     return {c.verts[4u * i], c.verts[4u * i + 1u], c.verts[4u * i + 2u]};
@@ -537,7 +580,7 @@ bool occluded(const Ctx& c, V3 o, V3 d, float tmax) {
 
 // One full path. Returns radiance; fills guides on the primary hit.
 V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
-         V3& firstNormal, int maxDepth) {
+         V3& firstNormal, int maxDepth, float* outPhase = nullptr) {
     V3 radiance{0, 0, 0};
     V3 throughput{1, 1, 1};
     firstAlbedo = {1, 1, 1};
@@ -570,7 +613,8 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
 
         if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
             // Preview matches the raster clear colour, not the PT sky dome.
-            const V3 bg = c.preview ? V3{0.118f, 0.118f, 0.118f} : sky(dir);
+            const V3 bg = c.preview ? V3{0.118f, 0.118f, 0.118f}
+                                    : sky(dir) * sceneDim(c);
             radiance = radiance + throughput * bg;
             if (depth == 0) { firstAlbedo = bg; firstNormal = dir * -1.0f; }
             break;
@@ -591,8 +635,34 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
         const V3 gn = dot(ng, dir * -1.0f) < 0.0f ? ng * -1.0f : ng;
 
         const Material& m = c.mats[c.triMat[prim]];
-        const V3 albedo = {m.albedo[0], m.albedo[1], m.albedo[2]};
-        const float metallic = m.metallic;
+        V3 albedo = {m.albedo[0], m.albedo[1], m.albedo[2]};
+        float metallicOverride = m.metallic;
+
+        // Net highlighting, mirroring pathtrace.comp. The chosen net is an
+        // EMITTER, not a tint: it adds radiance so it lights the copper around
+        // it. The chase is NOT applied here -- the phase is tagged into an AOV
+        // and the modulation happens at resolve, so animating never disturbs
+        // accumulation.
+        int hnet = -1;
+        const std::array<float, 4> hcol = netColourOf(c, prim, hnet);
+        if (hcol[3] > 0.0f) {
+            const V3 glow{hcol[0], hcol[1], hcol[2]};
+            // Positive tags only: a film hit or an unhighlighted triangle must
+            // leave an existing tag alone.
+            if (depth == 0 && outPhase) {
+                outPhase[0] = netPhaseAt(c, hnet, p);
+                outPhase[1] = 1.0f;
+            }
+            if (depth == 0) radiance = radiance + throughput * glow * c.netGlow;
+            albedo = mix(albedo, glow, 0.85f);
+            metallicOverride = 0.0f;  // an emitter should not also mirror the sky
+        } else if (c.netOn) {
+            // Everything that is NOT the chosen net desaturates and darkens, so
+            // the glow dominates instead of competing with green laminate and
+            // gold copper. Same weights as pathtrace.comp.
+            const float lum = albedo.x * 0.299f + albedo.y * 0.587f + albedo.z * 0.114f;
+            albedo = mix(albedo, V3{lum, lum, lum}, 0.85f) * 0.42f;
+        }
 
         // TRANSMISSION through the peeling laminate (mirrors pathtrace.comp):
         // scatter into a small cone, tint by the resin, continue -- the cheap
@@ -639,8 +709,15 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
                     ? 0.0f
                     : 1.0f;
             const float ao = ambientOcclusionRt(c, p, n);
-            radiance = rasterShade(albedo, m.roughness, metallic, n, viewDir,
+            radiance = rasterShade(albedo, m.roughness, metallicOverride, n, viewDir,
                                    keyDir, fillDir, shadow, ao);
+            if (hcol[3] > 0.0f) {
+                // board.frag/board_rt.frag return the highlight directly at
+                // 0.8x glow -- raster has no exposure to soak up more before
+                // it clips to flat white and loses the hue.
+                radiance = V3{hcol[0], hcol[1], hcol[2]} * (c.netGlow * 0.8f);
+                break;
+            }
             if (coatAlpha > 0.0f && coatT < tHit) {
                 V3 fn{0, 0, 1};
                 if (dot(fn, viewDir) < 0.0f) fn = fn * -1.0f;  // two-sided
@@ -662,15 +739,16 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
             const V3 h = normalize(sunDir - dir);
             const float spec = std::pow(std::max(dot(n, h), 0.0f),
                                         2.0f / (rough * rough) - 2.0f);
-            const V3 specCol = mix({0.04f, 0.04f, 0.04f}, albedo, metallic);
+            const V3 specCol =
+                mix({0.04f, 0.04f, 0.04f}, albedo, metallicOverride);
             radiance = radiance +
                        throughput * (albedo * (1.0f / PI) + specCol * spec) *
-                           kSunColor * ndl;
+                           kSunColor * (ndl * sceneDim(c));
         }
 
         // Next direction.
         origin = p + gn * 0.03f;
-        if (rng.next() < metallic) {
+        if (rng.next() < metallicOverride) {
             const float rough = std::clamp(m.roughness, 0.04f, 1.0f);
             const V3 refl = reflect(dir, n);
             const V3 glossy = normalize(refl + cosineHemisphere(n, rng) * rough);
@@ -708,8 +786,11 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
         accumColor_.assign(static_cast<size_t>(width) * height * 3, 0.0f);
         accumAlbedo_.assign(static_cast<size_t>(width) * height * 3, 0.0f);
         accumNormal_.assign(static_cast<size_t>(width) * height * 3, 0.0f);
+        phaseAov_.assign(static_cast<size_t>(width) * height * 2, 0.0f);
         accumSamples_ = 0;
     }
+    if (phaseAov_.size() != static_cast<size_t>(width_) * height_ * 2)
+        phaseAov_.assign(static_cast<size_t>(width_) * height_ * 2, 0.0f);
 
     Ctx c;
     c.scene = static_cast<RTCScene>(scene_);
@@ -721,6 +802,12 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
     c.peel = peel_;  // substrate fade while exploded
     c.preview = preview_;
     c.sunCosMax = sunCosMax_;
+    c.triNet = triNet_.empty() ? nullptr : triNet_.data();
+    c.netCol = netColour_.empty() ? nullptr : &netColour_[0][0];
+    c.netSpan = netSpan_.empty() ? nullptr : &netSpan_[0][0];
+    c.netCount = static_cast<uint32_t>(netColour_.size());
+    c.netOn = netOn_;
+    c.netGlow = netGlow_;
 
     const uint32_t baseSample = static_cast<uint32_t>(accumSamples_);
     const int maxDepth = 6;
@@ -728,6 +815,7 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
     float* col = accumColor_.data();
     float* alb = accumAlbedo_.data();
     float* nor = accumNormal_.data();
+    float* aov = phaseAov_.data();
     const uint32_t w = width_, h = height_;
 
     // Parallelise over rows with a plain thread pool -- each pixel writes only
@@ -762,7 +850,14 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
                     }
 
                     V3 ga, gn;
-                    const V3 rad = trace(c, origin, dir, rng, ga, gn, maxDepth);
+                    float ph[2] = {0.0f, 0.0f};
+                    const V3 rad =
+                        trace(c, origin, dir, rng, ga, gn, maxDepth, ph);
+                    if (ph[1] > 0.0f) {
+                        const size_t a = (static_cast<size_t>(y) * w + x) * 2;
+                        aov[a] = ph[0];
+                        aov[a + 1] = 1.0f;
+                    }
                     col[o + 0] += rad.x; col[o + 1] += rad.y; col[o + 2] += rad.z;
                     alb[o + 0] += ga.x;  alb[o + 1] += ga.y;  alb[o + 2] += ga.z;
                     nor[o + 0] += gn.x;  nor[o + 1] += gn.y;  nor[o + 2] += gn.z;
@@ -902,12 +997,67 @@ std::vector<uint8_t> CpuTracer::resolve(bool denoise) const {
     return out;
 }
 
-std::vector<uint8_t> CpuTracer::resolveDisplay(bool denoise) const {
+void CpuTracer::setHighlight(std::vector<std::array<float, 4>> netColour,
+                             std::vector<std::array<float, 4>> netSpan) {
+    netColour_ = std::move(netColour);
+    netSpan_ = std::move(netSpan);
+    netOn_ = false;
+    for (const std::array<float, 4>& c : netColour_)
+        if (c[3] > 0.0f) { netOn_ = true; break; }
+    // The tag AOV describes the PREVIOUS highlight; drop it so a stale net
+    // cannot keep chasing after the selection changes. The caller restarts
+    // accumulation, which reallocates it.
+    phaseAov_.clear();
+}
+
+namespace {
+// The chase curve. KEEP IN STEP with netChase() in board.frag and
+// tonemap.frag -- three copies exist because GLSL and C++ cannot share code.
+float netChase(float phase, uint32_t timeMs, bool animate) {
+    if (!animate) return 1.0f;
+    const float t = static_cast<float>(timeMs) * 0.001f;
+
+    const float kWipe = 2.2f;  // seconds for the head to run the net
+    if (t < kWipe) {
+        const float head = t / kWipe;
+        if (phase > head) return 0.0f;  // not reached yet
+        // Bright at the head, settling to full behind it.
+        const float k = std::clamp((head - phase) * 5.0f, 0.0f, 1.0f);
+        return 2.4f + (1.0f - 2.4f) * k;
+    }
+
+    // Travelling gradient, 1.5 cycles across the net. The floor sits well
+    // below 1 because the highlight is already multiplied by the glow
+    // strength -- a shallower trough clips past white and the whole cycle
+    // renders as one flat colour. See netChase() in board.frag.
+    float g = phase * 1.5f - (t - kWipe) * 0.275f;
+    g = g - std::floor(g);
+    const float kPulse = 0.13f;
+    const float d = std::min(g, 1.0f - g);  // distance to the pulse centre
+    const float e = std::clamp(d / kPulse, 0.0f, 1.0f);
+    const float smooth = e * e * (3.0f - 2.0f * e);  // smoothstep(0, kPulse, d)
+    const float band = 1.0f - smooth;
+    return 0.12f + 0.88f * band;
+}
+}  // namespace
+
+std::vector<uint8_t> CpuTracer::resolveDisplay(bool denoise, uint32_t chaseMs,
+                                               bool animate) const {
     const size_t n = static_cast<size_t>(width_) * height_;
     std::vector<uint8_t> out(n * 4, 0);
     if (accumSamples_ <= 0) return out;
     std::vector<float> lin;
     resolveLinear(lin, denoise);
+    // The chase, applied at DISPLAY time so it costs no convergence -- the
+    // same trick as the GPU's tonemap pass.
+    if (animate && netOn_ && phaseAov_.size() == n * 2) {
+        for (size_t i = 0; i < n; ++i) {
+            if (phaseAov_[i * 2 + 1] <= 0.5f) continue;
+            const float k = netChase(phaseAov_[i * 2], chaseMs, true);
+            for (int cc = 0; cc < 3; ++cc)
+                lin[i * 3 + cc] = std::clamp(lin[i * 3 + cc] * k, 0.0f, 1.0f);
+        }
+    }
     for (size_t i = 0; i < n; ++i) {
         // BGRA order for B8G8R8A8; store sRGB-encoded values so the SRGB image
         // decodes them back to the linear tonemapped colour on read.

@@ -938,9 +938,23 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
     const bool converged = s >= target;
     const bool wantDenoise = !preview && denoisingEnabled_ && s >= 4 &&
                              (milestone || converged);
-    const bool refresh =
-        wantDenoise || preview || !denoisingEnabled_ || cpuDisplayCache_.empty();
-    if (refresh) cpuDisplayCache_ = cpuTracer_->resolveDisplay(wantDenoise);
+    // While a net is chasing, the DISPLAY must refresh every frame even though
+    // the accumulation is finished -- the modulation lives in resolveDisplay,
+    // not in the traced radiance. Denoising still runs only on its milestones,
+    // so this costs a resolve, not an OIDN pass.
+    const bool chasing = netAnimating();
+    const bool refresh = wantDenoise || preview || !denoisingEnabled_ ||
+                         cpuDisplayCache_.empty() || chasing;
+    if (refresh) {
+        const uint32_t chaseMs =
+            chasing ? static_cast<uint32_t>(
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - highlightStart_)
+                              .count())
+                    : 0u;
+        cpuDisplayCache_ =
+            cpuTracer_->resolveDisplay(wantDenoise, chaseMs, chasing);
+    }
 
     // This frame slot's fence was waited at the top of drawFrame, so ITS staging
     // buffer is idle; other slots may still be copying theirs.
@@ -2940,6 +2954,10 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
             e[3] = 1.0f / span;
         }
 
+        netSpanCpu_.assign(spans.size() / 4, {0.0f, 0.0f, 0.0f, 0.0f});
+        for (size_t i = 0; i < netSpanCpu_.size(); ++i)
+            for (int k = 0; k < 4; ++k) netSpanCpu_[i][k] = spans[i * 4 + k];
+
         destroyBuffer(netSpanBuffer_);
         const VkDeviceSize ssize = spans.size() * sizeof(float);
         netSpanBuffer_ = createBuffer(
@@ -3130,6 +3148,18 @@ void Renderer::uploadNetColors(
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     uploadViaStaging(netColorBuffer_, table.data(), size);
 
+    // The Embree tracer keeps its own copy: it does not read Vulkan buffers.
+    if (cpuMode_ && cpuTracer_) {
+        std::vector<std::array<float, 4>> cols(netCount_);
+        for (uint32_t i = 0; i < netCount_; ++i)
+            cols[i] = {table[i * 4], table[i * 4 + 1], table[i * 4 + 2],
+                       table[i * 4 + 3]};
+        cpuTracer_->setHighlight(std::move(cols), netSpanCpu_);
+        cpuTracer_->setNetGlow(netGlow_);
+        cpuPass_ = 0;  // the highlight changes the image; restart accumulation
+        cpuDisplayCache_.clear();
+    }
+
     // Rebind: the raster set reads it every frame, and a stale handle here is
     // a device-lost rather than a wrong colour.
     VkDescriptorBufferInfo info{netColorBuffer_.handle, 0, VK_WHOLE_SIZE};
@@ -3202,6 +3232,11 @@ void Renderer::setNetGlow(float strength) {
     strength = std::clamp(strength, 0.0f, 40.0f);
     if (std::abs(strength - netGlow_) < 1e-3f) return;
     netGlow_ = strength;
+    if (cpuMode_ && cpuTracer_) {
+        cpuTracer_->setNetGlow(strength);
+        cpuPass_ = 0;
+        cpuDisplayCache_.clear();
+    }
     resetAccumulation();  // the emitter changed, so the converged image is stale
     ptDenoisedValid_ = false;
 }
