@@ -945,23 +945,50 @@ V3 shoulder(V3 x) {
     const float mo = knee + (1.0f - knee) * t / (t + (1.0f - knee));
     return x * (mo / m);
 }
+
+// Split [0, n) across the hardware threads, calling fn(lo, hi) on each. Every
+// index is independent (each pixel writes only its own output), so the resolve,
+// tonemap and sRGB-encode passes -- which used to run on a single thread and,
+// on a converged image being chased, were the ENTIRE frame -- now use every
+// core the trace does. This is what keeps the display refresh from pinning one
+// core while the other 31 sit idle.
+template <class F>
+void parallelFor(size_t n, F&& fn) {
+    if (n == 0) return;
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    const size_t nThreads = std::min<size_t>(hw, n);
+    if (nThreads <= 1) { fn(size_t(0), n); return; }
+    std::vector<std::thread> pool;
+    pool.reserve(nThreads);
+    for (size_t t = 0; t < nThreads; ++t) {
+        const size_t i0 = t * n / nThreads;
+        const size_t i1 = (t + 1) * n / nThreads;
+        pool.emplace_back([&fn, i0, i1] { fn(i0, i1); });
+    }
+    for (std::thread& th : pool) th.join();
+}
 }  // namespace
 
 void CpuTracer::denoiseInto(std::vector<float>& colorOut) const {
     const size_t n = static_cast<size_t>(width_) * height_;
     const float inv = 1.0f / static_cast<float>(std::max(accumSamples_, 1));
     std::vector<float> col(n * 3), alb(n * 3), nor(n * 3);
-    for (size_t i = 0; i < n; ++i) {
-        for (int k = 0; k < 3; ++k) {
-            col[i * 3 + k] = accumColor_[i * 3 + k] * inv;
-            alb[i * 3 + k] = std::clamp(accumAlbedo_[i * 3 + k] * inv, 0.0f, 1.0f);
+    parallelFor(n, [&](size_t a, size_t b) {
+        for (size_t i = a; i < b; ++i) {
+            for (int k = 0; k < 3; ++k) {
+                col[i * 3 + k] = accumColor_[i * 3 + k] * inv;
+                alb[i * 3 + k] =
+                    std::clamp(accumAlbedo_[i * 3 + k] * inv, 0.0f, 1.0f);
+            }
+            float nx = accumNormal_[i * 3] * inv,
+                  ny = accumNormal_[i * 3 + 1] * inv,
+                  nz = accumNormal_[i * 3 + 2] * inv;
+            const float l = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (l > 1e-6f) { nx /= l; ny /= l; nz /= l; }
+            nor[i * 3] = nx; nor[i * 3 + 1] = ny; nor[i * 3 + 2] = nz;
         }
-        float nx = accumNormal_[i * 3] * inv, ny = accumNormal_[i * 3 + 1] * inv,
-              nz = accumNormal_[i * 3 + 2] * inv;
-        const float l = std::sqrt(nx * nx + ny * ny + nz * nz);
-        if (l > 1e-6f) { nx /= l; ny /= l; nz /= l; }
-        nor[i * 3] = nx; nor[i * 3 + 1] = ny; nor[i * 3 + 2] = nz;
-    }
+    });
 
     if (!oidn_) {
         OIDNDevice d = oidnNewDevice(OIDN_DEVICE_TYPE_CPU);
@@ -1019,21 +1046,27 @@ void CpuTracer::resolveLinear(std::vector<float>& lin, bool denoise) const {
     } else {
         color.resize(n * 3);
         const float inv = 1.0f / static_cast<float>(std::max(accumSamples_, 1));
-        for (size_t i = 0; i < n * 3; ++i) color[i] = accumColor_[i] * inv;
+        parallelFor(n * 3, [&](size_t a, size_t b) {
+            for (size_t i = a; i < b; ++i) color[i] = accumColor_[i] * inv;
+        });
     }
     lin.resize(n * 3);
     if (preview_) {
         // The raster pipeline writes lit colour straight to the sRGB target --
         // no tonemap, no exposure. Matching that keeps CPU RT colour-identical
         // to GPU RT instead of 0.85x darker with a shoulder.
-        for (size_t i = 0; i < n * 3; ++i) lin[i] = std::clamp(color[i], 0.0f, 1.0f);
+        parallelFor(n * 3, [&](size_t a, size_t b) {
+            for (size_t i = a; i < b; ++i) lin[i] = std::clamp(color[i], 0.0f, 1.0f);
+        });
         return;
     }
-    for (size_t i = 0; i < n; ++i) {
-        const V3 t = shoulder(V3{color[i * 3], color[i * 3 + 1], color[i * 3 + 2]} *
-                              kExposure);
-        lin[i * 3] = t.x; lin[i * 3 + 1] = t.y; lin[i * 3 + 2] = t.z;
-    }
+    parallelFor(n, [&](size_t a, size_t b) {
+        for (size_t i = a; i < b; ++i) {
+            const V3 t = shoulder(
+                V3{color[i * 3], color[i * 3 + 1], color[i * 3 + 2]} * kExposure);
+            lin[i * 3] = t.x; lin[i * 3 + 1] = t.y; lin[i * 3 + 2] = t.z;
+        }
+    });
 }
 
 std::vector<uint8_t> CpuTracer::resolve(bool denoise) const {
@@ -1142,21 +1175,25 @@ std::vector<uint8_t> CpuTracer::resolveDisplay(bool denoise, uint32_t chaseMs,
     // The chase, applied at DISPLAY time so it costs no convergence -- the
     // same trick as the GPU's tonemap pass.
     if (animate && netOn_ && phaseAov_.size() == n * 2) {
-        for (size_t i = 0; i < n; ++i) {
-            if (phaseAov_[i * 2 + 1] <= 0.5f) continue;
-            const float k = netChase(phaseAov_[i * 2], chaseMs, true);
-            for (int cc = 0; cc < 3; ++cc)
-                lin[i * 3 + cc] = std::clamp(lin[i * 3 + cc] * k, 0.0f, 1.0f);
+        parallelFor(n, [&](size_t a, size_t b) {
+            for (size_t i = a; i < b; ++i) {
+                if (phaseAov_[i * 2 + 1] <= 0.5f) continue;
+                const float k = netChase(phaseAov_[i * 2], chaseMs, true);
+                for (int cc = 0; cc < 3; ++cc)
+                    lin[i * 3 + cc] = std::clamp(lin[i * 3 + cc] * k, 0.0f, 1.0f);
+            }
+        });
+    }
+    parallelFor(n, [&](size_t a, size_t b) {
+        for (size_t i = a; i < b; ++i) {
+            // BGRA order for B8G8R8A8; store sRGB-encoded values so the SRGB
+            // image decodes them back to the linear tonemapped colour on read.
+            out[i * 4 + 0] = encodeSrgb(lin[i * 3 + 2]);  // B
+            out[i * 4 + 1] = encodeSrgb(lin[i * 3 + 1]);  // G
+            out[i * 4 + 2] = encodeSrgb(lin[i * 3 + 0]);  // R
+            out[i * 4 + 3] = 255;
         }
-    }
-    for (size_t i = 0; i < n; ++i) {
-        // BGRA order for B8G8R8A8; store sRGB-encoded values so the SRGB image
-        // decodes them back to the linear tonemapped colour on read.
-        out[i * 4 + 0] = encodeSrgb(lin[i * 3 + 2]);  // B
-        out[i * 4 + 1] = encodeSrgb(lin[i * 3 + 1]);  // G
-        out[i * 4 + 2] = encodeSrgb(lin[i * 3 + 0]);  // R
-        out[i * 4 + 3] = 255;
-    }
+    });
     return out;
 }
 

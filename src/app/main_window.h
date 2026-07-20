@@ -47,6 +47,8 @@ private slots:
     void onLayerToggled(QTreeWidgetItem* item, int column);
     void onLayerSelected();
     void onRenderScaleChanged(int sliderValue);
+    void applyInternalResForDevice();
+    void syncInternalResUi(float scale);
     void onFrameRendered();
     void onOpen();
     void onOpenFolder();
@@ -189,11 +191,11 @@ private:
     QLabel* toolbarInfo_ = nullptr;
     QLabel* scaleLabel_ = nullptr;
     QSlider* scaleSlider_ = nullptr;
-    // Set by rebuildViewport (device switch) to the scale the dying renderer
-    // had; the new renderer picks it up once it exists. Negative = nothing
-    // pending, which is what keeps a normal board load from clobbering the
-    // PCBVIEW_RENDER_SCALE override.
-    float pendingRenderScale_ = -1.0f;
+    // Cleared on every viewport (device) rebuild; applyInternalResForDevice
+    // sets it once the fresh renderer exists, so a device gets its remembered
+    // internal-resolution scale exactly once and later board loads leave the
+    // user's chosen scale alone.
+    bool deviceScaleApplied_ = false;
     QLabel* explodeLabel_ = nullptr;
 
     int frameCounter_ = 0;

@@ -433,14 +433,10 @@ void MainWindow::buildViewport() {
     connect(viewport_, &VulkanWindow::boardUploaded, this, [this] {
         populateStackup();
         applyAppearance();
-        // A rebuilt viewport (device switch) brings a fresh renderer at 1.00x,
-        // so carry the scale across. Only on a REBUILD: doing it on every load
-        // would overwrite the PCBVIEW_RENDER_SCALE headless override, which is
-        // applied before the first frame.
-        if (pendingRenderScale_ > 0.0f && viewport_->renderer()) {
-            viewport_->renderer()->setRenderScale(pendingRenderScale_);
-            pendingRenderScale_ = -1.0f;
-        }
+        // Pick the internal-resolution scale for whatever device came up. Once
+        // per device (guarded inside), so ordinary board loads never disturb a
+        // scale the user has since dialled in.
+        applyInternalResForDevice();
     });
     connect(viewport_, &VulkanWindow::explodeChanged, this,
             [this](float progress, float maxProgress) {
@@ -523,10 +519,9 @@ void MainWindow::rebuildViewport() {
     // settings inside the new window's initialise().
     const Camera cam = viewport_->camera();
     const float explode = viewport_->explodeProgress();
-    // The internal-resolution scale lives on the renderer, which is about to
-    // die with this viewport; hand it to the replacement.
-    if (viewport_->renderer())
-        pendingRenderScale_ = viewport_->renderer()->renderScale();
+    // Each device keeps its OWN internal-resolution scale (the software
+    // renderer defaults lower); the replacement re-applies it on first upload.
+    deviceScaleApplied_ = false;
 
     VulkanWindow* oldViewport = viewport_;
     QWidget* oldContainer = viewportContainer_;
@@ -2320,7 +2315,46 @@ void MainWindow::onRenderScaleChanged(int sliderValue) {
     if (scaleLabel_) scaleLabel_->setText(QString::number(scale, 'f', 2) + "×");
     if (!viewport_->renderer()) return;
     viewport_->renderer()->setRenderScale(scale);
+    // Remember it PER DEVICE: the software renderer wants a low scale for speed,
+    // a GPU wants native or a supersample -- so switching devices should not
+    // drag one's choice onto the other.
+    appSettings().setValue(
+        viewport_->cpuRender() ? "cpuRenderScale" : "gpuRenderScale", scale);
     viewport_->requestUpdate();
+}
+
+// Set the internal-resolution scale for the current device, once per device
+// build. The software (CPU/llvmpipe) renderer is pixel-bound -- every mode is
+// literally slower per pixel -- so it defaults to HALF internal resolution
+// (~4x fewer pixels to trace, rasterise, resolve and present), upscaled to the
+// window while the interface stays native. A GPU defaults to native. Either is
+// adjustable via the Internal res slider and remembered across sessions.
+void MainWindow::applyInternalResForDevice() {
+    if (deviceScaleApplied_ || !viewport_->renderer()) return;
+    deviceScaleApplied_ = true;
+    // A headless PCBVIEW_RENDER_SCALE override is applied before the first frame
+    // -- leave it untouched.
+    if (qEnvironmentVariableIsSet("PCBVIEW_RENDER_SCALE")) {
+        syncInternalResUi(viewport_->renderer()->renderScale());
+        return;
+    }
+    const bool cpu = viewport_->cpuRender();
+    const float s = appSettings()
+                        .value(cpu ? "cpuRenderScale" : "gpuRenderScale",
+                               cpu ? 0.5f : 1.0f)
+                        .toFloat();
+    viewport_->renderer()->setRenderScale(s);
+    syncInternalResUi(s);
+}
+
+// Reflect a scale onto the slider + label WITHOUT re-entering the change slot
+// (which would persist and request a redraw).
+void MainWindow::syncInternalResUi(float scale) {
+    if (scaleSlider_) {
+        const QSignalBlocker block(scaleSlider_);
+        scaleSlider_->setValue(static_cast<int>(std::lround(scale * 100.0f)));
+    }
+    if (scaleLabel_) scaleLabel_->setText(QString::number(scale, 'f', 2) + "×");
 }
 
 void MainWindow::onFrameRendered() {

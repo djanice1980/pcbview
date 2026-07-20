@@ -548,8 +548,35 @@ void Renderer::rebuildTracedGeometry(float progress) {
 
 void Renderer::setRenderMode(RenderMode m) {
     if (m == mode_) return;
+    const bool wasTracing = mode_ == RenderMode::PathTraced || rtRequested_;
     mode_ = m;
+    refreshCpuSceneScale(wasTracing);
     resetAccumulation();
+}
+
+void Renderer::setRayTracing(bool on) {
+    if (on == rtRequested_) return;
+    const bool wasTracing = mode_ == RenderMode::PathTraced || rtRequested_;
+    rtRequested_ = on;
+    refreshCpuSceneScale(wasTracing);
+}
+
+// The effective scene scale depends on whether we are tracing (see
+// effectiveRenderScale), so on the CPU device the scene targets must be rebuilt
+// when a mode change flips that -- but only if a non-native scale is in play,
+// since otherwise the extent is unchanged. Rebuilding resizes every scene image
+// and restarts accumulation, exactly as the slider does.
+void Renderer::refreshCpuSceneScale(bool wasTracing) {
+    if (!cpuMode_ || std::abs(renderScale_ - 1.0f) < 1e-4f) return;
+    const bool nowTracing = mode_ == RenderMode::PathTraced || rtRequested_;
+    if (wasTracing == nowTracing) return;
+    vkDeviceWaitIdle(device_.handle);
+    destroySceneTargets();
+    createSceneTargets();
+    createBloomTargets();
+    resetAccumulation();
+    cpuDisplayCache_.clear();
+    cpuPass_ = 0;
 }
 
 void Renderer::setRayCamera(const float eye[3], const float fwd[3],
@@ -955,7 +982,6 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
         cpuDisplayCache_ =
             cpuTracer_->resolveDisplay(wantDenoise, chaseMs, chasing);
     }
-
     // This frame slot's fence was waited at the top of drawFrame, so ITS staging
     // buffer is idle; other slots may still be copying theirs.
     Buffer& staging = cpuStaging_[frame_];
@@ -1765,16 +1791,30 @@ void Renderer::destroyImage(Image& image) {
     image = {};
 }
 
+float Renderer::effectiveRenderScale() const {
+    // On the software (CPU/llvmpipe) renderer, a reduced scene scale only pays
+    // off when the frame is TRACE-bound. Plain raster is cheap to draw, but the
+    // linear upscale blit back to the window is expensive on llvmpipe -- so a
+    // reduced scale makes raster measurably SLOWER (it adds a big blit and saves
+    // little rasterisation). The traced modes (path tracing, and the RT preview)
+    // are dominated by ray cost, which the reduced scale cuts by the pixel
+    // ratio -- a large net win. So the slider governs the TRACED resolution and
+    // plain raster always renders native. On a real GPU the blit is free and
+    // supersampling (>1) is wanted, so the scale always applies there.
+    const bool tracing = mode_ == RenderMode::PathTraced || rtRequested_;
+    if (cpuMode_ && !tracing) return 1.0f;
+    return renderScale_;
+}
+
 void Renderer::createSceneTargets() {
     // Scene resolution is the window scaled, clamped so a silly slider value
     // cannot ask for a zero-sized or device-limit-busting image.
+    const float scale = effectiveRenderScale();
     const uint32_t maxDim = device_.gpu.maxImageDimension2D;
     sceneExtent_.width = std::clamp(
-        static_cast<uint32_t>(std::lround(extent_.width * renderScale_)), 1u,
-        maxDim);
+        static_cast<uint32_t>(std::lround(extent_.width * scale)), 1u, maxDim);
     sceneExtent_.height = std::clamp(
-        static_cast<uint32_t>(std::lround(extent_.height * renderScale_)), 1u,
-        maxDim);
+        static_cast<uint32_t>(std::lround(extent_.height * scale)), 1u, maxDim);
 
     // SAMPLED so the bloom extract pass can read the finished scene.
     sceneColor_ = createImage(sceneExtent_, colorFormat_,
