@@ -1,0 +1,177 @@
+name: build
+
+# Builds pcbview on a clean runner, and on a tag builds the release packages.
+#
+# The point is not only automation: it is that the artifact people download is
+# the one CI built from a known commit. Building locally and uploading by hand
+# lets the published asset drift from the source that supposedly produced it --
+# which has already happened twice here, caught only by re-downloading the asset
+# and comparing hashes. A CI-built release cannot drift.
+#
+# On a tag the release is created as a DRAFT. Publishing stays a human decision.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Qt cannot be fetched by CMake; it is installed below. Any 6.5+ MSVC kit
+  # works -- bump this when a newer one is wanted, it is not pinned to whatever
+  # a developer happens to have locally.
+  QT_VERSION: '6.8.1'
+  VULKAN_SDK_VERSION: '1.4.309.0'
+
+# Needed by the release step; the default token is read-only on many repos.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Qt, matching the compiler. A MinGW kit is ABI-incompatible with MSVC,
+      # which is why the architecture is pinned rather than left to default.
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          cache: true
+
+      # The Vulkan SDK is installed from LunarG directly rather than through a
+      # third-party action: one less dependency to rot, and the silent-install
+      # switches are visible here instead of hidden behind someone else's YAML.
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          $ver = '${{ env.VULKAN_SDK_VERSION }}'
+          $url = "https://sdk.lunarg.com/sdk/download/$ver/windows/VulkanSDK-$ver-Installer.exe"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile vulkan-sdk.exe -UseBasicParsing
+          Start-Process .\vulkan-sdk.exe -ArgumentList `
+            '--accept-licenses','--default-answer','--confirm-command','install' -Wait
+          $sdk = "C:\VulkanSDK\$ver"
+          if (-not (Test-Path "$sdk\Include\vulkan\vulkan.h")) {
+            throw "Vulkan SDK headers not found at $sdk -- install failed"
+          }
+          "VULKAN_SDK=$sdk"  | Out-File -Append $env:GITHUB_ENV
+          "$sdk\Bin"         | Out-File -Append $env:GITHUB_PATH
+
+      # FetchContent pulls several hundred MB (OIDN, Embree, Mesa). Cached on
+      # the CMakeLists hash, since that is what pins every version.
+      - name: Cache fetched dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            "-DQT_ROOT=$env:QT_ROOT_DIR"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      # Stages the Qt runtime beside the exe. Everything shipped comes from
+      # this directory, so the portable zip and the installer contain exactly
+      # the same payload.
+      - name: Stage Qt runtime
+        run: cmake --build build --config Release --target deploy
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = 'build\Release\pcbview.exe'
+          if (-not (Test-Path $exe)) { throw "pcbview.exe was not produced" }
+          $v = (Get-Item $exe).VersionInfo.FileVersion.Trim()
+          Write-Host "built pcbview $v"
+          # --gpu-info exits without opening a window, so it proves the binary
+          # LOADS: that every Qt and Vulkan dependency resolved and the app got
+          # as far as probing devices. That is the deploy correctness CI can
+          # actually assert.
+          #
+          # It deliberately does not require a device to be found. A runner has
+          # no GPU; a bundled CPU driver (lavapipe) usually answers, but that is
+          # not something to fail a build over. What IS fatal is the 0xC0000000
+          # range -- STATUS_DLL_NOT_FOUND and friends -- which is exactly what a
+          # missing runtime DLL produces, and is the failure this step exists to
+          # catch.
+          & $exe --gpu-info
+          $code = $LASTEXITCODE
+          Write-Host "--gpu-info exit code: $code"
+          if ($code -lt 0) {
+            throw "pcbview crashed or failed to load (0x{0:X8}) -- a runtime DLL is probably missing from the deploy" -f $code
+          }
+
+      - name: Check the tag matches the built version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}' -replace '^v',''
+          $built = (Get-Item 'build\Release\pcbview.exe').VersionInfo.FileVersion.Trim()
+          Write-Host "tag $tag, built $built"
+          # The version lives in four files; a tag that disagrees with the
+          # binary means one of them was missed, and the release would ship
+          # mislabelled.
+          if ($built -notlike "$tag*") {
+            throw "tag v$tag does not match built version $built -- check CMakeLists, pcbview.rc, the About dialog and pcbview.iss"
+          }
+
+      - name: Build installer and portable zip
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after install" }
+          & $iscc installer\pcbview.iss
+          if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
+          $ver = '${{ github.ref_name }}' -replace '^v',''
+          Compress-Archive -Path 'build\Release\*' `
+            -DestinationPath "installer\Output\pcbview-$ver-portable.zip" `
+            -CompressionLevel Optimal -Force
+          Get-ChildItem installer\Output -Filter "*$ver*" |
+            ForEach-Object { "{0}  {1:N1} MB  sha256={2}" -f $_.Name,
+              ($_.Length/1MB), (Get-FileHash $_.FullName -Algorithm SHA256).Hash }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcbview-${{ github.sha }}
+          path: |
+            build/Release/pcbview.exe
+            installer/Output/*.exe
+            installer/Output/*.zip
+          if-no-files-found: warn
+
+      # Draft, deliberately. A tag push should not publish to the world on its
+      # own; a human decides when the notes are right and the assets are
+      # checked. `gh` rather than a marketplace action keeps the auth path and
+      # behaviour obvious.
+      - name: Attach packages to a draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $existing = gh release view $tag --json isDraft --jq '.isDraft' 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --draft --title "pcbview $($tag -replace '^v','')" `
+              --notes "Built by CI from $env:GITHUB_SHA. Replace these notes before publishing."
+          } elseif ($existing -ne 'true') {
+            # Refuse to touch a published release: its assets are already
+            # referenced by checksum elsewhere (winget pins InstallerSha256).
+            throw "release $tag is already published -- refusing to overwrite its assets"
+          }
+          gh release upload $tag (Get-ChildItem installer\Output\*.exe, installer\Output\*.zip | ForEach-Object FullName) --clobber
