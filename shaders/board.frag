@@ -101,8 +101,21 @@ float netChase(float phase) {
     // trough above ~0.4 still clips past white and the whole cycle renders as
     // one flat saturated colour -- measurably identical frames. 0.12 at the
     // trough is what makes the band actually read as moving.
+    // Duty cycle is deliberately skewed dark. A plain cosine is symmetric --
+    // half the net lit at any moment -- which reads as a pulsing net rather
+    // than a travelling band. Raising the band to a power narrows the bright
+    // pulse and stretches the gap between passes, so the eye tracks one head
+    // moving instead of the whole run breathing.
     const float g = fract(phase * 1.5 - (t - kWipe) * 0.275);
-    return 0.12 + 0.88 * (0.5 + 0.5 * cos(6.2831853 * g));
+    // An explicit pulse rather than a cosine. A cosine is symmetric -- half
+    // the net lit at any instant -- which reads as the whole run breathing
+    // rather than one head travelling along it. kPulse is the lit half-width
+    // in cycles, so the net is lit ~2*kPulse of the time and dark the rest:
+    // at 0.13 that is roughly a quarter lit, three quarters dark.
+    const float kPulse = 0.13;
+    const float d = min(g, 1.0 - g);          // distance to the pulse centre
+    const float band = 1.0 - smoothstep(0.0, kPulse, d);
+    return 0.12 + 0.88 * band;
 }
 
 vec4 netHighlight() {
