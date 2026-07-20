@@ -1161,6 +1161,9 @@ interactive run. All are opt-in. Grouped by purpose:
   `fastMovementGpu`, default on for the CPU renderer, off for a GPU).
 
 **Capture / verification**
+- `PCBVIEW_START_PT=1` — enable path tracing at startup. PT is a menu toggle the
+  capture harness cannot reach, so anything PT-specific (net chase, emission,
+  denoiser) is unverifiable without this.
 - `PCBVIEW_CAPTURE=<out.bmp>` — grab the presented Vulkan frame after a settle
   delay, then quit.
 - `PCBVIEW_CAPTURE_DELAY_MS=<ms>` — override the pre-grab settle delay (default
@@ -1343,6 +1346,32 @@ readout can never disagree.
     create the module). And the net colour/light buffers are referenced by
     live descriptor sets, so they need a `vkDeviceWaitIdle` before being
     freed on a highlight change.
+- **The chase animation runs at DISPLAY time in the path tracer**, and this is
+  the crux of the whole feature. pcbview's PT is an offline-style progressive
+  accumulator: it averages N samples of a frozen scene and resets on any
+  change. Animating the scene would reset convergence every frame, so a
+  highlighted net would render as one noisy sample forever. Instead the net is
+  traced ONCE at full emission while `pathtrace.comp` writes a first-hit AOV
+  (`ptNetPhase_`: .r = position along the net, .g = 1 on highlighted copper),
+  and `tonemap.frag` modulates those pixels as it resolves. Repainting re-runs
+  only the display resolve — `resetAccumulation()` is never called — so a
+  converged image animates.
+  - Games solve the general form of this differently: 1 spp plus reprojection
+    with motion vectors, ReSTIR reservoir resampling, and an ML denoiser
+    (NRD/DLSS-RR). That is a real-time architecture; it would be a rewrite
+    here, and pcbview's PT earns its quality precisely by *not* being one.
+  - **Known limitation, by construction:** only copper the camera sees
+    DIRECTLY animates. The red spill onto surrounding copper and laminate is
+    baked into the accumulated radiance and cannot be unbaked per pixel, so it
+    stays steady while the band travels. It reads as a moving filament inside a
+    stable glow, which is defensible, but it is not what a physically moving
+    emitter would do.
+  - `netChase()` is duplicated in `board.frag`, `board_rt.frag` and
+    `tonemap.frag` and MUST stay in step. The per-triangle net buffer is
+    likewise read by three shaders under two different array names (`tris` and
+    `triNet`) — which is exactly how the path tracer got missed when the buffer
+    grew a phase field, silently reading 8-byte entries as 4-byte ints and
+    lighting up unrelated copper. Grep for the binding, not the name.
 - **The highlight is EMISSIVE, in every mode.** The net is red — copper is
   gold and laminate green, so red is the one hue that cannot be mistaken for
   either — and it is emitted rather than shaded:

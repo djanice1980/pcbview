@@ -222,6 +222,12 @@ MainWindow::MainWindow(const QString& path) {
 
     // Headless orthographic-projection hook (the O toggle can't be driven by
     // synthetic input; exists to verify ortho in the traced modes).
+    // Headless path-trace hook. PT is a menu toggle the capture harness cannot
+    // reach, so verifying anything PT-specific (the net chase, emission, the
+    // denoiser) needs a way in from the environment.
+    if (qEnvironmentVariable("PCBVIEW_START_PT").toInt() != 0)
+        QTimer::singleShot(200, this, [this] { viewport_->setPathTracing(true); });
+
     if (qEnvironmentVariable("PCBVIEW_START_ORTHO").toInt() != 0) {
         viewport_->camera().orthographic = true;
         if (orthoAction_) {

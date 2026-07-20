@@ -72,7 +72,8 @@ struct PtPush {
 struct TonemapPush {
     uint32_t dim[2];
     uint32_t sampleCount;
-    uint32_t flags;
+    uint32_t flags;    // bit 0 = denoised source, bit 1 = run the net chase
+    uint32_t timeMs;   // milliseconds since the selection, for the chase
 };
 
 // Round `v` up to a multiple of `a` (a power of two).
@@ -564,8 +565,10 @@ void Renderer::createPathTracer() {
     // 8 = per-triangle net, for the highlight glow.
     // 9 = the highlighted net as a sampleable area light (next-event
     // estimation), so it actually illuminates its surroundings.
-    VkDescriptorSetLayoutBinding b[11]{};
-    for (uint32_t i = 0; i < 11; ++i) {
+    // 11 = first-hit net phase, written as an AOV so the chase animation can
+    // run as a display-time modulation without disturbing accumulation.
+    VkDescriptorSetLayoutBinding b[12]{};
+    for (uint32_t i = 0; i < 12; ++i) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -576,17 +579,18 @@ void Renderer::createPathTracer() {
     b[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     VkDescriptorSetLayoutCreateInfo li{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 11;
+    li.bindingCount = 12;
     li.pBindings = b;
     check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr, &ptSetLayout_),
           "pt set layout");
 
     // Tonemap reads binding 0 (raw accumulation) or 1 (OIDN-denoised); a push
     // flag chooses.
-    VkDescriptorSetLayoutBinding tb[2]{};
-    for (int i = 0; i < 2; ++i) {
+    VkDescriptorSetLayoutBinding tb[3]{};
+    for (int i = 0; i < 3; ++i) {
         tb[i].binding = i;
         tb[i].descriptorCount = 1;
         tb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -594,7 +598,7 @@ void Renderer::createPathTracer() {
     }
     VkDescriptorSetLayoutCreateInfo tli{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    tli.bindingCount = 2;
+    tli.bindingCount = 3;  // + the net-phase AOV, for the chase animation
     tli.pBindings = tb;
     check(vkCreateDescriptorSetLayout(device_.handle, &tli, nullptr,
                                       &tonemapSetLayout_),
@@ -603,7 +607,7 @@ void Renderer::createPathTracer() {
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},  // + netColour
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5}};  // 3 pt + 2 tonemap
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7}};  // 4 pt + 3 tonemap
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 2;
     pi.poolSizeCount = 3;
@@ -778,6 +782,7 @@ void Renderer::destroyPathTracer() {
     destroyImage(ptAccum_);
     destroyImage(ptAlbedo_);
     destroyImage(ptNormal_);
+    destroyImage(ptNetPhase_);
     destroyImage(ptDenoised_);
 }
 
@@ -798,8 +803,8 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    VkWriteDescriptorSet w[11]{};
-    for (int i = 0; i < 11; ++i) {
+    VkWriteDescriptorSet w[12]{};
+    for (int i = 0; i < 12; ++i) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = ptSet_;
         w[i].dstBinding = i;
@@ -825,11 +830,14 @@ void Renderer::updatePathTraceDescriptors() {
     w[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[9].pBufferInfo = &lights;
     VkDescriptorBufferInfo ncol{netColorBuffer_.handle != VK_NULL_HANDLE ? netColorBuffer_.handle : triNetBuffer_.handle, 0, VK_WHOLE_SIZE};
     w[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[10].pBufferInfo = &ncol;
-    vkUpdateDescriptorSets(device_.handle, 11, w, 0, nullptr);
+    VkDescriptorImageInfo phase{VK_NULL_HANDLE, ptNetPhase_.view,
+                                VK_IMAGE_LAYOUT_GENERAL};
+    w[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[11].pImageInfo = &phase;
+    vkUpdateDescriptorSets(device_.handle, 12, w, 0, nullptr);
 
     VkDescriptorImageInfo den{VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet tw[2]{};
-    for (int i = 0; i < 2; ++i) {
+    VkWriteDescriptorSet tw[3]{};
+    for (int i = 0; i < 3; ++i) {
         tw[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         tw[i].dstSet = tonemapSet_;
         tw[i].dstBinding = i;
@@ -838,7 +846,8 @@ void Renderer::updatePathTraceDescriptors() {
     }
     tw[0].pImageInfo = &acc;
     tw[1].pImageInfo = &den;
-    vkUpdateDescriptorSets(device_.handle, 2, tw, 0, nullptr);
+    tw[2].pImageInfo = &phase;
+    vkUpdateDescriptorSets(device_.handle, 3, tw, 0, nullptr);
     resetAccumulation();
     ptDenoisedValid_ = false;
 }
@@ -954,7 +963,8 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
 
     // First use: UNDEFINED -> GENERAL for the storage images.
     if (!ptImagesInitialised_) {
-        Image* imgs[4] = {&ptAccum_, &ptAlbedo_, &ptNormal_, &ptDenoised_};
+        Image* imgs[5] = {&ptAccum_, &ptAlbedo_, &ptNormal_, &ptNetPhase_,
+                          &ptDenoised_};
         VkImageMemoryBarrier2 tb[4]{};
         for (int i = 0; i < 4; ++i) {
             tb[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -1087,6 +1097,15 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
     tp.sampleCount = showDenoised ? 1u
                                   : static_cast<uint32_t>(std::max(ptSampleCount_, 1));
     tp.flags = showDenoised ? 1u : 0u;
+    // The chase runs as a display-time modulation here, so it costs nothing in
+    // convergence: the accumulated radiance is never touched.
+    if (netAnimating()) {
+        tp.flags |= 2u;
+        tp.timeMs = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - highlightStart_)
+                .count());
+    }
     vkCmdPushConstants(cmd, tonemapLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(tp), &tp);
     vkCmdDraw(cmd, 3, 1, 0, 0);
@@ -1740,6 +1759,7 @@ void Renderer::createSceneTargets() {
         destroyImage(ptAccum_);
         destroyImage(ptAlbedo_);
         destroyImage(ptNormal_);
+        destroyImage(ptNetPhase_);
         destroyImage(ptDenoised_);
         // STORAGE for compute R/W, TRANSFER_SRC/DST for the denoise readback and
         // write-back copies.
@@ -1752,6 +1772,11 @@ void Renderer::createSceneTargets() {
                                 VK_IMAGE_ASPECT_COLOR_BIT);
         ptNormal_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
                                 VK_IMAGE_ASPECT_COLOR_BIT);
+        // First-hit net phase AOV: .r = phase along the net, .g = 1 when this
+        // pixel directly shows highlighted copper. Lets the chase run as a
+        // display-time modulation, leaving the accumulated radiance untouched.
+        ptNetPhase_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                                  VK_IMAGE_ASPECT_COLOR_BIT);
         ptDenoised_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
                                   VK_IMAGE_ASPECT_COLOR_BIT);
         ptImagesInitialised_ = false;  // need the UNDEFINED->GENERAL transition

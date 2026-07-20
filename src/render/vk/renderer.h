@@ -543,6 +543,11 @@ private:
     Image ptAccum_;             // RGBA32F running radiance sum
     Image ptAlbedo_;            // first-hit albedo (denoiser guide)
     Image ptNormal_;            // first-hit normal (denoiser guide)
+    // First-hit net phase: .r = position along the net, .g = 1 where the pixel
+    // directly shows highlighted copper. Written during tracing so the chase
+    // can be applied at DISPLAY time -- animating the accumulated radiance
+    // itself would reset convergence every frame and never resolve.
+    Image ptNetPhase_;
     Image ptDenoised_;          // OIDN output, shown when valid
     bool ptImagesInitialised_ = false;  // GENERAL-layout transition done
     bool denoisingEnabled_ = false;

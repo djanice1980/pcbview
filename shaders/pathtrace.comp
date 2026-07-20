@@ -29,6 +29,13 @@ layout(std430, set = 0, binding = 8) readonly buffer TriNet { TriInfo triNet[]; 
 layout(std430, set = 0, binding = 9) readonly buffer NetLights { vec4 netLit[]; };
 // Per-net glow colour; a = 1 when highlighted. Indexed by net id.
 layout(std430, set = 0, binding = 10) readonly buffer NetColours { vec4 netCol[]; };
+
+// First-hit net phase AOV. .r = how far along its net this pixel's copper sits,
+// .g = 1 when the pixel directly shows highlighted copper. Written on the
+// camera ray only; the tonemap pass uses it to run the chase animation at
+// display time, which is the only way to animate here without resetting
+// accumulation and destroying convergence every frame.
+layout(rgba32f, set = 0, binding = 11) uniform image2D netPhaseImg;
 // params: x roughness, y metallic, z explode rank, w = 1 if it fades on peel.
 // `extra` is fragment-stage data (the raster net-highlight triangle base);
 // declared so this SSBO's stride matches MaterialGpu exactly.
@@ -178,6 +185,11 @@ void main() {
     if (px.x >= pc.dim.x || px.y >= pc.dim.y) return;
 
     uint sampleIndex = uint(pc.eye.w);
+
+    // Clear the phase AOV first: a camera ray that hits nothing (or hits
+    // non-copper) never reaches the write below, and a stale value from a
+    // previous camera position would animate background pixels.
+    imageStore(netPhaseImg, ivec2(px), vec4(0.0, 0.0, 0.0, 1.0));
     // XOR-chained hash stages, NOT additive mixing: `hashu(px.x + hashu(px.y +
     // ...))` builds correlation planes (an additive lattice), which showed up as
     // faint screen-anchored lines/squares of biased stochastic-alpha outcomes
@@ -312,6 +324,10 @@ void main() {
         if (int(pc.counts.y) >= 0) {
             const int hnet = triNet[prim].net;
             const vec4 hcol = hnet >= 0 ? netCol[hnet] : vec4(0.0);
+            if (depth == 0)
+                imageStore(netPhaseImg, ivec2(gl_GlobalInvocationID.xy),
+                           vec4(triNet[prim].phase, hcol.a > 0.0 ? 1.0 : 0.0,
+                                0.0, 1.0));
             if (hcol.a > 0.0) {
                 // Emission only on the CAMERA ray. Indirect light from the net
                 // arrives through next-event estimation below, so adding it

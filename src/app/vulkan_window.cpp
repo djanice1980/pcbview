@@ -675,11 +675,13 @@ void VulkanWindow::render() {
 
     // Keep the loop alive while the peel moves OR a progressive tracer (GPU PT,
     // CPU PT, or the CPU RT preview) is still accumulating toward convergence
-    // OR a net chase is running. The chase is excluded under path tracing: it
-    // would restart accumulation every frame and the image would never resolve.
-    if (stillAnimating || renderer_->accumulating() ||
-        (renderer_->netAnimating() &&
-         renderer_->renderMode() != pcbview::vk::RenderMode::PathTraced))
+    // OR a net chase is running.
+    //
+    // The chase now runs in path tracing too, because it is applied in the
+    // TONEMAP pass rather than during tracing -- repainting re-runs only the
+    // display resolve, and accumulation is never reset. That is what lets a
+    // converged image animate instead of collapsing back to one noisy sample.
+    if (stillAnimating || renderer_->accumulating() || renderer_->netAnimating())
         requestUpdate();
 }
 
