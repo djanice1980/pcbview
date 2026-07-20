@@ -1,5 +1,7 @@
 #include "io/kicad/kicad_importer.h"
 
+#include "text/stroke_text.h"
+
 #include <algorithm>
 #include <cmath>
 #include <set>
@@ -163,7 +165,7 @@ void auditUnhandledNodes(const Node& root, BoardModel& board) {
     static const std::set<std::string_view> kHandled = {
         // Geometry we read.
         "footprint", "zone", "segment", "arc", "via", "gr_line", "gr_rect",
-        "gr_circle", "gr_arc", "gr_poly", "gr_curve", "gr_text", "dimension",
+        "gr_circle", "gr_arc", "gr_poly", "gr_curve", "gr_text", "gr_text_box", "dimension",
         // Structure and metadata: no geometry to lose.
         "version", "generator", "generator_version", "general", "paper",
         "title_block", "layers", "setup", "net", "net_class", "property",
@@ -582,6 +584,100 @@ void readGraphics(const Node& parent, const Component* comp, BoardModel& board) 
 // Read a text node -- a footprint `property`/`fp_text`, or a top-level `gr_text`.
 // `contentIndex` is where the string lives: property is (property "Key" "Value"),
 // gr_text is (gr_text "Value").
+// KiCad 7+ text boxes: `(gr_text_box "..." (start x y) (end x y) ...)`, and
+// the fp_ form inside footprints. Real silkscreen -- on a two-line fixture
+// KiCad plots 92 draw operations for one box -- and it was going unread
+// entirely, which the node audit is what surfaced.
+//
+// The box is reduced to a single anchored text item. KiCad WRAPS text to the
+// box width and this does not, so a box whose content is long enough to wrap
+// will render on one line instead of several; that is warned about rather than
+// silently drawn wrong. Boxes are overwhelmingly short labels in practice.
+void readTextBox(const Node& node, const Component* comp, BoardModel& board) {
+    if (node.child("hide") && node.child("hide")->str(1) == "yes") return;
+    if (node.hasAtom("hide")) return;
+
+    const int layer = board.layerIndex(node.childStr("layer", ""));
+    if (layer < 0) return;
+
+    TextItem t;
+    t.content = std::string(node.str(1));
+    if (t.content.empty()) return;
+    t.layer = layer;
+
+    // Corners: either (start)/(end), or a (pts) quad once the box is rotated.
+    Vec2 lo{0, 0}, hi{0, 0};
+    bool haveBox = false;
+    if (const Node* a = node.child("start")) {
+        if (const Node* b = node.child("end")) {
+            const Vec2 p = readXY(*a), q = readXY(*b);
+            lo = {std::min(p.x, q.x), std::min(p.y, q.y)};
+            hi = {std::max(p.x, q.x), std::max(p.y, q.y)};
+            haveBox = true;
+        }
+    }
+    if (!haveBox) {
+        if (const Node* pts = node.child("pts")) {
+            bool first = true;
+            for (const Node* xy : pts->childList("xy")) {
+                const Vec2 p{xy->num(1), xy->num(2)};
+                if (first) { lo = hi = p; first = false; continue; }
+                lo = {std::min(lo.x, p.x), std::min(lo.y, p.y)};
+                hi = {std::max(hi.x, p.x), std::max(hi.y, p.y)};
+                haveBox = true;
+            }
+        }
+    }
+    if (!haveBox) return;
+
+    if (const Node* effects = node.child("effects")) {
+        if (const Node* font = effects->child("font")) {
+            if (const Node* size = font->child("size"))
+                t.size = Vec2{size->num(2, 1.0), size->num(1, 1.0)};
+            t.thickness = font->childNum("thickness", 0.15);
+            t.italic = font->hasAtom("italic");
+        }
+    }
+    t.rotation = node.childNum("angle", 0.0);
+
+    // TextItem is CENTRED on `at` (stroke layout centres on its origin), so a
+    // justified box has to be converted to a centre. Vertical centring uses the
+    // em height; horizontal uses the measured advance width, so the anchor
+    // matches what will actually be drawn rather than an assumed width.
+    text::TextStyle st;
+    st.size = {t.size.x, t.size.y};
+    st.thickness = t.thickness;
+    st.italic = t.italic;
+    const double w = text::measure(t.content, st);
+    const double h = t.size.y;
+
+    double cx = (lo.x + hi.x) * 0.5, cy = (lo.y + hi.y) * 0.5;
+    if (const Node* effects = node.child("effects")) {
+        if (const Node* j = effects->child("justify")) {
+            for (size_t i = 1; i < j->kids.size(); ++i) {
+                const std::string_view v = j->kids[i].atom;
+                if (v == "left") cx = lo.x + w * 0.5;
+                else if (v == "right") cx = hi.x - w * 0.5;
+                else if (v == "top") cy = lo.y + h * 0.5;
+                else if (v == "bottom") cy = hi.y - h * 0.5;
+            }
+        }
+    }
+    const Vec2 local{cx, cy};
+    t.at = comp ? applyTransform(local, comp->at, comp->rotation) : local;
+    if (comp) t.mirror = comp->bottom;
+
+    // Rough wrap check: warn only when the content genuinely overflows.
+    if (w > (hi.x - lo.x) * 1.02) {
+        board.warnings.push_back(
+            "text box \"" + t.content +
+            "\" is wider than its box; KiCad would wrap it onto several lines "
+            "and pcbview draws it on one");
+    }
+
+    board.texts.push_back(std::move(t));
+}
+
 void readText(const Node& node, size_t contentIndex, const Component* comp,
               BoardModel& board) {
     // KiCad marks unplotted text hidden; it is not on the physical board.
@@ -640,6 +736,7 @@ void readFootprint(const Node& fp, BoardModel& board) {
     }
     for (const Node* prop : fp.childList("property")) readText(*prop, 2, &comp, board);
     for (const Node* txt : fp.childList("fp_text")) readText(*txt, 2, &comp, board);
+    for (const Node* tb : fp.childList("fp_text_box")) readTextBox(*tb, &comp, board);
 
     const int index = static_cast<int>(board.components.size());
     for (const Node* pad : fp.childList("pad")) readPad(*pad, comp, index, board);
@@ -968,6 +1065,7 @@ BoardModel importPcb(const std::string& path) {
     for (const Node* zone : root.childList("zone")) readZone(*zone, board);
     readGraphics(root, nullptr, board);
     for (const Node* txt : root.childList("gr_text")) readText(*txt, 1, nullptr, board);
+    for (const Node* tb : root.childList("gr_text_box")) readTextBox(*tb, nullptr, board);
     readOutline(root, board);
 
     auditUnhandledNodes(root, board);
