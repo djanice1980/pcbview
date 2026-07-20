@@ -92,6 +92,173 @@ Path64 roundRectPath(Vec2 center, Vec2 size, double corner, double degrees,
 // Takes no segment count: like trackPaths, arc quality here comes from
 // ClipperOffset's ArcTolerance rather than a fixed subdivision. Only the
 // hand-built circle/roundrect paths use TessellateOptions::circleSegments.
+// Chord a three-point arc (start, mid, end) into a polyline, mapping each
+// point through `place` so the caller controls the frame. Collinear points
+// degrade to the straight chord rather than dividing by ~0 -- the same
+// treatment KiCad arc TRACKS get.
+template <typename Place>
+Path64 arcThrough(Vec2 a, Vec2 m, Vec2 b, Place place) {
+    const double d = 2.0 * (a.x * (m.y - b.y) + m.x * (b.y - a.y) +
+                            b.x * (a.y - m.y));
+    if (std::abs(d) < 1e-12) return Path64{place(a), place(b)};
+
+    const double a2 = a.x * a.x + a.y * a.y, m2 = m.x * m.x + m.y * m.y;
+    const double b2 = b.x * b.x + b.y * b.y;
+    const double ox = (a2 * (m.y - b.y) + m2 * (b.y - a.y) + b2 * (a.y - m.y)) / d;
+    const double oy = (a2 * (b.x - m.x) + m2 * (a.x - b.x) + b2 * (m.x - a.x)) / d;
+    const double r = std::hypot(a.x - ox, a.y - oy);
+
+    const double twoPi = 2.0 * std::numbers::pi;
+    const auto norm = [twoPi](double v) {
+        while (v < 0) v += twoPi;
+        while (v >= twoPi) v -= twoPi;
+        return v;
+    };
+    const double a0 = std::atan2(a.y - oy, a.x - ox);
+    const double am = std::atan2(m.y - oy, m.x - ox);
+    const double a1 = std::atan2(b.y - oy, b.x - ox);
+    const bool ccw = norm(am - a0) < norm(a1 - a0);
+    const double sweep = ccw ? norm(a1 - a0) : -norm(a0 - a1);
+
+    const int segs = std::max(
+        2, static_cast<int>(std::ceil(std::abs(sweep) / twoPi * 48)));
+    Path64 out;
+    for (int k = 0; k <= segs; ++k) {
+        const double t = a0 + sweep * k / segs;
+        out.push_back(place(Vec2{ox + r * std::cos(t), oy + r * std::sin(t)}));
+    }
+    return out;
+}
+
+// A trapezoid pad. KiCad skews the rect's opposite edges by half the delta;
+// this reproduces its corner formula exactly rather than approximating with
+// the bounding rect, which over-reported copper on every tapered pad.
+Path64 trapezoidPath(const Pad& pad) {
+    const double dx = pad.size.x * 0.5, dy = pad.size.y * 0.5;
+    const double ddx = pad.rectDelta.x * 0.5, ddy = pad.rectDelta.y * 0.5;
+    const Vec2 local[4] = {{-dx - ddy, -dy - ddx},
+                           {-dx + ddy, dy + ddx},
+                           {dx - ddy, dy - ddx},
+                           {dx + ddy, -dy + ddx}};
+    Path64 out;
+    for (const Vec2& v : local) {
+        const Vec2 r = rotateKicad(v, pad.rotation);
+        out.push_back(toClipper(Vec2{pad.at.x + r.x, pad.at.y + r.y}));
+    }
+    return out;
+}
+
+// A custom pad: the anchor shape unioned with every drawn primitive.
+//
+// Primitives are authored in the pad's own un-rotated frame, so each is built
+// locally and then rotated with the pad. Strokes are offset by half their
+// width with round caps -- the same treatment tracks get, because that is what
+// KiCad draws.
+Paths64 customPadPaths(const Pad& pad, int segments) {
+    // The anchor. KiCad's custom pads carry a circle or rect anchor sized by
+    // `size`; without it a pad made only of strokes would lose its centre.
+    Paths64 out;
+    if (pad.size.x > 0.0 && pad.size.y > 0.0) {
+        if (std::abs(pad.size.x - pad.size.y) < 1e-9)
+            out.push_back(circlePath(pad.at, pad.size.x * 0.5, segments));
+        else
+            out.push_back(
+                roundRectPath(pad.at, pad.size, 0.0, pad.rotation, segments));
+    }
+
+    const auto place = [&](Vec2 v) {
+        const Vec2 r = rotateKicad(v, pad.rotation);
+        return toClipper(Vec2{pad.at.x + r.x, pad.at.y + r.y});
+    };
+    const auto stroke = [&](const Path64& spine, double width, bool closed) {
+        ClipperOffset co;
+        co.ArcTolerance(kScale * 0.001);
+        co.AddPath(spine, JoinType::Round,
+                   closed ? EndType::Joined : EndType::Round);
+        Paths64 r;
+        co.Execute(std::max(width, 1e-6) * 0.5 * kScale, r);
+        return r;
+    };
+
+    for (const Pad::Primitive& p : pad.primitives) {
+        Paths64 shape;
+        switch (p.kind) {
+            case Pad::Primitive::Kind::Poly: {
+                if (p.pts.size() < 3) break;
+                Path64 poly;
+                for (const Vec2& v : p.pts) poly.push_back(place(v));
+                if (p.filled) {
+                    shape.push_back(poly);
+                    // A filled poly with a stroke width is fill PLUS outline.
+                    if (p.width > 0.0) {
+                        Paths64 e = stroke(poly, p.width, true);
+                        shape.insert(shape.end(), e.begin(), e.end());
+                    }
+                } else {
+                    shape = stroke(poly, p.width, true);
+                }
+                break;
+            }
+            case Pad::Primitive::Kind::Line: {
+                if (p.pts.size() < 2) break;
+                shape = stroke(Path64{place(p.pts[0]), place(p.pts[1])}, p.width,
+                               false);
+                break;
+            }
+            case Pad::Primitive::Kind::Rect: {
+                if (p.pts.size() < 2) break;
+                const Vec2 a = p.pts[0], b = p.pts[1];
+                Path64 r{place(a), place(Vec2{b.x, a.y}), place(b),
+                         place(Vec2{a.x, b.y})};
+                if (p.filled) {
+                    shape.push_back(r);
+                    if (p.width > 0.0) {
+                        Paths64 e = stroke(r, p.width, true);
+                        shape.insert(shape.end(), e.begin(), e.end());
+                    }
+                } else {
+                    shape = stroke(r, p.width, true);
+                }
+                break;
+            }
+            case Pad::Primitive::Kind::Circle: {
+                if (p.pts.size() < 2) break;
+                const double rad = std::hypot(p.pts[1].x - p.pts[0].x,
+                                              p.pts[1].y - p.pts[0].y);
+                const Vec2 c = rotateKicad(p.pts[0], pad.rotation);
+                const Vec2 world{pad.at.x + c.x, pad.at.y + c.y};
+                if (p.filled) {
+                    shape.push_back(circlePath(world, rad + p.width * 0.5,
+                                               segments));
+                } else {
+                    // A ring: outer minus inner.
+                    Paths64 outer{circlePath(world, rad + p.width * 0.5, segments)};
+                    Paths64 inner{circlePath(world, std::max(rad - p.width * 0.5, 0.0),
+                                             segments)};
+                    shape = BooleanOp(ClipType::Difference, FillRule::NonZero,
+                                      outer, inner);
+                }
+                break;
+            }
+            case Pad::Primitive::Kind::Arc: {
+                if (p.pts.size() < 2) break;
+                // Chorded through the recorded mid point, then stroked. Three
+                // points define the arc exactly; see the KiCad arc-track note.
+                Path64 spine = arcThrough(p.pts[0], p.arcMid, p.pts[1], place);
+                if (spine.size() >= 2) shape = stroke(spine, p.width, false);
+                break;
+            }
+        }
+        out.insert(out.end(), std::make_move_iterator(shape.begin()),
+                   std::make_move_iterator(shape.end()));
+    }
+
+    if (out.empty())
+        return Paths64{roundRectPath(pad.at, pad.size, 0.0, pad.rotation, segments)};
+    // One region, not a pile of overlapping stamps.
+    return BooleanOp(ClipType::Union, FillRule::NonZero, out, Paths64{});
+}
+
 Paths64 ovalPath(Vec2 center, Vec2 size, double degrees) {
     const double radius = std::min(size.x, size.y) * 0.5;
     const double span = std::max(size.x, size.y) * 0.5 - radius;
@@ -128,9 +295,11 @@ Paths64 padPaths(const Pad& pad, int segments) {
         }
         case PadShape::Oval:
             return ovalPath(pad.at, pad.size, pad.rotation);
+        case PadShape::Trapezoid:
+            return Paths64{trapezoidPath(pad)};
+        case PadShape::Custom:
+            return customPadPaths(pad, segments);
         default:
-            // Custom pads are not implemented; fall back to the bounding rect so
-            // the copper is over- rather than under-reported.
             return Paths64{
                 roundRectPath(pad.at, pad.size, 0.0, pad.rotation, segments)};
     }
@@ -396,10 +565,25 @@ Paths64 graphicPaths(const Graphic& g, int segments, BoardModel* warnings) {
     return out;
 }
 
+// One hole's outline: a circle, or a stadium for an oval drill.
+//
+// An oval drill is a SLOT -- the fab routes it rather than drilling it -- and
+// approximating it with a circle on the larger axis removes copper the board
+// actually has, in the one place (a mounting slot, a locating pin) where the
+// size is load-bearing. `ovalPath` is the same helper oval PADS already use,
+// so a slot and the pad around it are built from identical geometry.
+Paths64 drillShape(const Drill& drill, int segments) {
+    if (!drill.isSlot())
+        return {circlePath(drill.at, drill.diameter * 0.5, segments)};
+    return ovalPath(drill.at, drill.size, drill.rotation);
+}
+
 Paths64 drillPaths(const BoardModel& board, int segments) {
     Paths64 holes;
     for (const Drill& drill : board.drills) {
-        holes.push_back(circlePath(drill.at, drill.diameter * 0.5, segments));
+        Paths64 shape = drillShape(drill, segments);
+        holes.insert(holes.end(), std::make_move_iterator(shape.begin()),
+                     std::make_move_iterator(shape.end()));
     }
     normalizeWinding(holes);
     return holes;
@@ -430,9 +614,12 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
     art.warnings = board.warnings;
     art.drills = drillPaths(board, opts.circleSegments);
     for (const Drill& drill : board.drills) {
-        if (drill.plated)
-            art.barrels.push_back(
-                circlePath(drill.at, drill.diameter * 0.5, opts.circleSegments));
+        if (!drill.plated) continue;
+        // A plated slot gets a plated WALL, following the same stadium.
+        Paths64 shape = drillShape(drill, opts.circleSegments);
+        art.barrels.insert(art.barrels.end(),
+                           std::make_move_iterator(shape.begin()),
+                           std::make_move_iterator(shape.end()));
     }
     normalizeWinding(art.barrels);
 

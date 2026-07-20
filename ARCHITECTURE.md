@@ -1220,10 +1220,22 @@ Things we currently render differently from what the plant would produce:
    z=0.880 against a true 1.180. The block is authoritative for POSITION; if
    its films disagree with `(general (thickness))` the stackup wins and the
    difference is warned about rather than silently reconciled.
-2. **Oval drills are approximated as round** (larger axis). Warned, not silent.
-   Real slots need proper geometry.
-3. **Custom / trapezoid pads fall back to the bounding rect.** Warned. Over-
-   reports copper rather than under-reporting it.
+2. ~~Oval drills are approximated as round.~~ **FIXED 2026-07-20.** An oval
+   drill is a SLOT -- routed, not drilled -- and is now built as a stadium via
+   the same `ovalPath` helper oval PADS use, so a slot and its pad share
+   geometry. Plated slots get a matching stadium wall. Measured on a 1.0x3.0
+   fixture: 2.783 mm2 against an analytic 2.785, where the round approximation
+   removed 7.07 mm2 -- two and a half times too much material, in exactly the
+   place (a mounting slot, a locating pin) where the size is load-bearing.
+3. ~~Custom / trapezoid pads fall back to the bounding rect.~~ **FIXED
+   2026-07-20.** Trapezoids reproduce KiCad's corner formula exactly (the delta
+   skews opposite edges). Note the area is UNCHANGED by the delta, so only the
+   SHAPE differs -- a 2.0x4.0 pad with delta 2.0 spans 4.0 mm, not 2.0.
+   Custom pads union the anchor with every drawn primitive (poly/line/rect/
+   circle/arc, filled or stroked, strokes offset by half their width like
+   tracks). The old comment claimed the fallback over-reported copper; it
+   UNDER-reported whenever a primitive reached beyond `size`, which is the
+   normal case -- a fixture pad measured 1.0 mm2 against a true 2.785.
 4. ~~No surface finish distinction.~~ **FIXED 2026-07-20.** Exposed copper was
    never "bare" -- it was hardcoded gold, so a HASL board rendered as ENIG.
    `(copper_finish ...)` now drives colour AND roughness (`classifyFinish`):

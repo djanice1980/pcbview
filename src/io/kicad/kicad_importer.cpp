@@ -249,17 +249,65 @@ Vec2 applyTransform(Vec2 local, Vec2 origin, double degrees) {
                 origin.y + local.x * s + local.y * c};
 }
 
+// Custom-pad primitives, in PAD-LOCAL coordinates (the pad's own origin and
+// un-rotated frame). Kept raw -- strokes keep their width so the tessellator
+// can offset them properly instead of the importer flattening to a guess.
+void readPadPrimitives(const Node& padNode, Pad& pad) {
+    const Node* prims = padNode.child("primitives");
+    if (!prims) return;
+
+    const auto readPts = [](const Node& n, std::vector<Vec2>& out) {
+        if (const Node* pts = n.child("pts"))
+            for (const Node* xy : pts->childList("xy"))
+                out.push_back(Vec2{xy->num(1), xy->num(2)});
+    };
+
+    for (const Node& kid : prims->kids) {
+        if (!kid.isList) continue;
+        const std::string_view head = kid.head();
+        Pad::Primitive p;
+        p.width = kid.childNum("width", 0.0);
+        // KiCad marks solid fills with (fill yes) on newer files; a zero-width
+        // polygon is filled by definition on older ones.
+        const std::string_view fill = kid.childStr("fill", "");
+        p.filled = (fill == "yes" || fill == "solid") || p.width <= 0.0;
+
+        if (head == "gr_poly") {
+            p.kind = Pad::Primitive::Kind::Poly;
+            readPts(kid, p.pts);
+        } else if (head == "gr_line") {
+            p.kind = Pad::Primitive::Kind::Line;
+            if (const Node* a = kid.child("start")) p.pts.push_back(readXY(*a));
+            if (const Node* b = kid.child("end")) p.pts.push_back(readXY(*b));
+            p.filled = false;  // a line is always a stroke
+        } else if (head == "gr_rect") {
+            p.kind = Pad::Primitive::Kind::Rect;
+            if (const Node* a = kid.child("start")) p.pts.push_back(readXY(*a));
+            if (const Node* b = kid.child("end")) p.pts.push_back(readXY(*b));
+        } else if (head == "gr_circle") {
+            p.kind = Pad::Primitive::Kind::Circle;
+            if (const Node* c = kid.child("center")) p.pts.push_back(readXY(*c));
+            if (const Node* e = kid.child("end")) p.pts.push_back(readXY(*e));
+        } else if (head == "gr_arc") {
+            p.kind = Pad::Primitive::Kind::Arc;
+            if (const Node* a = kid.child("start")) p.pts.push_back(readXY(*a));
+            if (const Node* m = kid.child("mid")) p.arcMid = readXY(*m);
+            if (const Node* b = kid.child("end")) p.pts.push_back(readXY(*b));
+            p.filled = false;
+        } else {
+            continue;
+        }
+        if (!p.pts.empty()) pad.primitives.push_back(std::move(p));
+    }
+}
+
 PadShape parsePadShape(std::string_view s, BoardModel& board) {
     if (s == "circle") return PadShape::Circle;
     if (s == "rect") return PadShape::Rect;
     if (s == "roundrect") return PadShape::RoundRect;
     if (s == "oval") return PadShape::Oval;
     if (s == "custom") return PadShape::Custom;
-    if (s == "trapezoid") {
-        board.warnings.push_back(
-            "pad shape 'trapezoid' not implemented; treated as rect");
-        return PadShape::Rect;
-    }
+    if (s == "trapezoid") return PadShape::Trapezoid;
     board.warnings.push_back("unknown pad shape '" + std::string(s) +
                              "'; treated as rect");
     return PadShape::Rect;
@@ -305,17 +353,20 @@ void readPad(const Node& padNode, const Component& comp, int componentIndex,
 
     if (const Node* size = padNode.child("size")) pad.size = readXY(*size);
     pad.roundrectRatio = padNode.childNum("roundrect_rratio", 0.0);
+    if (const Node* rd = padNode.child("rect_delta")) pad.rectDelta = readXY(*rd);
+    readPadPrimitives(padNode, pad);
     pad.net = std::string(padNode.childStr("net", ""));
 
     if (const Node* drill = padNode.child("drill")) {
-        // (drill 0.8) or (drill oval 0.8 1.2) -- oval drills take the larger
-        // axis for now; proper slot geometry is a phase 3 concern.
+        // (drill 0.8) round, or (drill oval 0.8 1.2) -- a SLOT, which the fab
+        // routes rather than drills. Both axes are kept so the geometry can be
+        // a real stadium; the scalar stays the larger axis for reporting.
         if (drill->str(1) == "oval") {
-            pad.drill = std::max(drill->num(2), drill->num(3));
-            board.warnings.push_back("oval drill on pad " + pad.number +
-                                     " approximated as round");
+            pad.drillSize = Vec2{drill->num(2), drill->num(3)};
+            pad.drill = std::max(pad.drillSize.x, pad.drillSize.y);
         } else {
             pad.drill = drill->num(1);
+            pad.drillSize = Vec2{pad.drill, pad.drill};
         }
         if (const Node* offset = drill->child("offset")) {
             pad.drillOffset = readXY(*offset);
@@ -355,6 +406,10 @@ void readPad(const Node& padNode, const Component& comp, int componentIndex,
         Drill drill;
         drill.at = Vec2{pad.at.x + pad.drillOffset.x, pad.at.y + pad.drillOffset.y};
         drill.diameter = pad.drill;
+        drill.size = pad.drillSize;
+        // A slot follows the PAD's rotation -- it is the same feature, and a
+        // rotated footprint carries its slot round with it.
+        drill.rotation = pad.rotation;
         drill.plated = (pad.type != PadType::NpThruHole);
         board.drills.push_back(drill);
     }
@@ -830,7 +885,8 @@ BoardModel importPcb(const std::string& path) {
                      board.layers[via.toLayer].stackIndex) == lastCopperStack;
 
         if (via.drill > 0.0 && spansOuterFaces) {
-            board.drills.push_back(Drill{via.at, via.drill, true});
+            board.drills.push_back(
+                Drill{via.at, via.drill, Vec2{via.drill, via.drill}, 0.0, true});
         }
     }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 // BoardModel: the format-neutral intermediate representation.
 //
 // Both the KiCad and Gerber importers converge here; renderers only ever see
@@ -56,7 +58,7 @@ struct Via {
     std::string net;
 };
 
-enum class PadShape { Circle, Rect, RoundRect, Oval, Custom };
+enum class PadShape { Circle, Rect, RoundRect, Oval, Trapezoid, Custom };
 enum class PadType { Smd, ThruHole, NpThruHole, Connect };
 
 struct Pad {
@@ -67,8 +69,25 @@ struct Pad {
     double rotation = 0.0;  // degrees
     Vec2 size;
     double roundrectRatio = 0.0;
+    // Trapezoid only: KiCad's `(rect_delta dx dy)`. The pad is a rect whose
+    // opposite edges are skewed by half the delta -- the classic tapered pad.
+    Vec2 rectDelta;
 
-    double drill = 0.0;  // 0 when none
+    // Custom pads (`(primitives ...)`): drawn shapes in PAD-LOCAL coordinates,
+    // unioned with the anchor pad. Each carries a stroke width; a filled poly
+    // has width 0. Stored raw so the tessellator can offset strokes properly
+    // rather than the importer flattening to an approximation.
+    struct Primitive {
+        enum class Kind { Poly, Line, Rect, Circle, Arc } kind = Kind::Poly;
+        std::vector<Vec2> pts;  // poly: outline; line/rect: 2; circle: centre+edge
+        Vec2 arcMid;            // Arc only
+        double width = 0.0;
+        bool filled = false;
+    };
+    std::vector<Primitive> primitives;
+
+    double drill = 0.0;  // 0 when none; larger axis for an oval drill
+    Vec2 drillSize;      // both axes; equal for round
     Vec2 drillOffset;
 
     std::vector<int> layers;  // copper layer indices this pad appears on
@@ -95,8 +114,17 @@ struct ZoneFill {
 
 struct Drill {
     Vec2 at;
+    // Diameter of a round hole, and the LARGER axis of a slot. Kept because
+    // reporting and validation want one number for "how big is this hole".
     double diameter = 0.0;
+    // Both axes. Equal for a round drill; unequal for an oval one, which is a
+    // SLOT -- routed, not drilled, and shaped like a stadium. KiCad writes
+    // these as `(drill oval w h)` and orients them with the pad's rotation.
+    Vec2 size;
+    double rotation = 0.0;  // degrees, from the owning pad
     bool plated = true;
+
+    bool isSlot() const { return std::abs(size.x - size.y) > 1e-9; }
 };
 
 struct Component {
