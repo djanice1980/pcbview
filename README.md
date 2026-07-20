@@ -54,7 +54,7 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   at 0.1–0.8 mm), make the substrate translucent, and recolor the substrate and the
   soldermask — including the **mask opacity**, which drives how strongly traces
   read through the film in both render modes.
-- **Net highlighting (KiCad).** Pick a net from the searchable **Nets** panel
+- **Net highlighting (KiCad *and* Gerber).** Pick a net from the searchable **Nets** panel
   or just click a pad or via on the board: that signal **glows red** across
   every layer while the rest of the board mutes to grey, so a run can be
   followed through the stack and into the exploded view. **Ctrl+click (or
@@ -157,7 +157,10 @@ sit on one net, that net's **shortest routed path**. Here the two RST5 vias are
 ## Net highlighting
 
 Click a net in the **Nets** panel to light it up; `Ctrl`-click to add more, each
-in its own colour. The rest of the board desaturates and drops back so the
+in its own colour. This works for **Gerber packages too, not just KiCad boards**:
+Gerbers carry no schematic, but Gerber X2 tags each object with its net via the
+`%TO.N%` attribute (KiCad emits these by default), and pcbview reads them — so a
+fab package alone is enough to trace a signal and get its routed length. The rest of the board desaturates and drops back so the
 signals you care about are the only thing your eye lands on.
 
 The highlight is **emissive, not painted on**. In raster and ray-traced modes

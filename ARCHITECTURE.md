@@ -1346,6 +1346,21 @@ readout can never disagree.
     create the module). And the net colour/light buffers are referenced by
     live descriptor sets, so they need a `vkDeviceWaitIdle` before being
     freed on a highlight change.
+- **Gerber nets come from X2 `%TO.N%` object attributes**, not from a
+  schematic (Gerbers have none). The attribute names the net for every object
+  drawn until it is replaced or `%TD*%` deletes it, so the parser tracks it as
+  state and tags geometry in `addDark` -- the single funnel all dark geometry
+  passes through -- BEFORE compositing, because `image_` is one merged union in
+  which per-object identity is gone. Linear draws additionally become
+  `netSegments` graph edges (and routed length); arcs and flashes contribute
+  area but no edge, and region fills are excluded because a zone outline is not
+  a route. Clear-polarity objects are never tagged: a thermal relief belongs to
+  no net, and subtracting it would misreport a relief as a break.
+  - The net index must be GLOBAL to the board, not per file -- a net appears on
+    several layers, and highlighting, the Nets panel and the measure tool all
+    key off one identity.
+  - Packages without `TO.N` are unaffected: the net list is empty and every
+    region stays in the -1 bucket, exactly as before.
 - **The chase animation runs at DISPLAY time in the path tracer**, and this is
   the crux of the whole feature. pcbview's PT is an offline-style progressive
   accumulator: it averages N samples of a frozen scene and resets on any

@@ -654,6 +654,7 @@ geom::LayerArt importPackage(const std::string& path) {
     struct ParsedLayer {
         FileFunction fn;
         Paths64 dark;
+        std::vector<NetArea> nets;  // from %TO.N%, empty when absent
     };
     std::vector<ParsedLayer> copper, masks, silks;
     Paths64 profileDark;
@@ -678,13 +679,13 @@ geom::LayerArt importPackage(const std::string& path) {
 
         switch (fn.kind) {
             case FileFunction::Kind::Copper:
-                copper.push_back({fn, std::move(img.dark)});
+                copper.push_back({fn, std::move(img.dark), std::move(img.nets)});
                 break;
             case FileFunction::Kind::Soldermask:
-                masks.push_back({fn, std::move(img.dark)});
+                masks.push_back({fn, std::move(img.dark), {}});
                 break;
             case FileFunction::Kind::Silkscreen:
-                silks.push_back({fn, std::move(img.dark)});
+                silks.push_back({fn, std::move(img.dark), {}});
                 break;
             case FileFunction::Kind::Profile:
                 profileDark = std::move(img.dark);
@@ -773,6 +774,26 @@ geom::LayerArt importPackage(const std::string& path) {
     art.silkThickness = 0.010;
 
     const double pitch = copperT + dielT;
+    // Net table across every copper layer. A net normally appears on several
+    // layers, so the index must be global to the board -- the same identity the
+    // KiCad path produces, which is what net highlighting, the Nets panel and
+    // the measure tool all key off.
+    std::map<std::string, int> netIndex;
+    for (const ParsedLayer& pl : copper) {
+        for (const NetArea& na : pl.nets) {
+            auto [it, inserted] = netIndex.emplace(na.name,
+                                                   static_cast<int>(art.nets.size()));
+            if (inserted) art.nets.push_back({na.name, 0.0, 0});
+            art.nets[it->second].routedMm += na.routedMm;
+            for (const NetArea::Seg& sg : na.segments)
+                art.netSegments.push_back({sg.ax, sg.ay, sg.bx, sg.by, it->second});
+        }
+    }
+    if (!art.nets.empty())
+        art.warnings.push_back(
+            "Gerber X2 net attributes found: " + std::to_string(art.nets.size()) +
+            " nets (net highlighting and routed length available)");
+
     for (int i = 0; i < nCopper; ++i) {
         geom::ArtLayer al;
         al.name = copper[i].fn.top ? "F.Cu"
@@ -782,6 +803,15 @@ geom::LayerArt importPackage(const std::string& path) {
         al.thickness = copperT;
         al.z = total - maskT - static_cast<double>(i) * pitch - copperT;
         al.art = std::move(copper[i].dark);
+        // Per-net split of this layer's copper, so the mesh keeps net identity
+        // per triangle. Anything with no TO.N stays in the -1 bucket and
+        // behaves exactly as Gerber always has.
+        for (NetArea& na : copper[i].nets) {
+            geom::ArtLayer::NetRegion nr;
+            nr.net = netIndex[na.name];
+            nr.paths = std::move(na.area);
+            al.netArt.push_back(std::move(nr));
+        }
         art.layers.push_back(std::move(al));
     }
 

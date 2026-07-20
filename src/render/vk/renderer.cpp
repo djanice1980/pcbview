@@ -963,10 +963,15 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
 
     // First use: UNDEFINED -> GENERAL for the storage images.
     if (!ptImagesInitialised_) {
-        Image* imgs[5] = {&ptAccum_, &ptAlbedo_, &ptNormal_, &ptNetPhase_,
-                          &ptDenoised_};
-        VkImageMemoryBarrier2 tb[4]{};
-        for (int i = 0; i < 4; ++i) {
+        Image* imgs[] = {&ptAccum_, &ptAlbedo_, &ptNormal_, &ptNetPhase_,
+                         &ptDenoised_};
+        // Counts derived from the array, never written twice: adding an image
+        // here while a hand-written count stayed behind silently dropped the
+        // LAST entry from the transition, leaving it UNDEFINED for the tonemap
+        // that samples it -- a black frame and a validation error.
+        constexpr uint32_t kPtImages = uint32_t(std::size(imgs));
+        VkImageMemoryBarrier2 tb[kPtImages]{};
+        for (uint32_t i = 0; i < kPtImages; ++i) {
             tb[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
             tb[i].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
             tb[i].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -977,7 +982,7 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             tb[i].image = imgs[i]->handle;
             tb[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         }
-        barrier(tb, 4);
+        barrier(tb, kPtImages);
         ptImagesInitialised_ = true;
     }
 

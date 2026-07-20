@@ -91,8 +91,8 @@ struct ArtLayer {
     //
     // Splitting is lossless: design rules keep different nets apart, so
     // unioning each net separately covers exactly the same area as unioning
-    // them together. `net` indexes LayerArt::nets; -1 means unknown (every
-    // Gerber layer, and KiCad copper with no net).
+    // them together. `net` indexes LayerArt::nets; -1 means unknown -- copper
+    // with no net in KiCad, and any Gerber object with no %TO.N% attribute.
     struct NetRegion {
         int net = -1;
         Clipper2Lib::Paths64 paths;
@@ -142,9 +142,10 @@ struct LayerArt {
     std::vector<ArtLayer> layers;
     std::vector<std::string> warnings;
 
-    // Net table (KiCad only -- Gerber has no nets): name plus the routed
-    // copper length (sum of that net's track segments) and via count, for the
-    // measure tool's net panel.
+    // Net table: name plus the routed copper length (sum of that net's track
+    // segments) and via count, for the measure tool's net panel. Filled from
+    // KiCad connectivity, or from Gerber X2 %TO.N% object attributes when the
+    // package carries them (many do -- KiCad emits them by default).
     struct NetInfo {
         std::string name;
         double routedMm = 0.0;
@@ -164,8 +165,9 @@ struct LayerArt {
     std::vector<NetSeg> netSegments;
 
     // Measurement snap targets the importers know exactly: pad and via
-    // centres (KiCad only -- Gerber flashes are not distinguishable from any
-    // other exposure), in mm with the Y flip applied, z = 3D height for the
+    // centres (KiCad only -- a Gerber flash is not distinguishable from any
+    // other exposure, even with net attributes present), in mm with the Y flip
+    // applied, z = 3D height for the
     // marker, net = index into `nets` (-1 for none). Drill/bore centres and
     // outline vertices are derived in assemble() from the geometry above and
     // do not need to be listed here.

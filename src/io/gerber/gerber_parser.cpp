@@ -332,6 +332,18 @@ public:
 
         GerberImage img;
         img.dark = std::move(image_);
+        // Union each net's own geometry: the objects overlap heavily (every
+        // trace corner is two draws sharing a stroke cap), and the consumer
+        // wants one region per net, not thousands of stamped shapes.
+        for (auto& [name, paths] : netPaths_) {
+            NetArea na;
+            na.name = name;
+            na.area = BooleanOp(ClipType::Union, FillRule::NonZero, paths,
+                                Paths64{});
+            na.routedMm = netLen_[name];
+            na.segments = netSegs_[name];
+            img.nets.push_back(std::move(na));
+        }
         // Do NOT normalize winding here. image_ is the result of Clipper boolean
         // ops, so it is already correctly wound -- outer contours positive, holes
         // (antipad clearances in a plane, ring interiors) negative. Forcing every
@@ -369,6 +381,10 @@ private:
     // accumulation with batched polarity
     Paths64 image_;
     Paths64 pending_;
+    std::string currentNet_;                       // active %TO.N%, "" if none
+    std::map<std::string, Paths64> netPaths_;
+    std::map<std::string, double> netLen_;
+    std::map<std::string, std::vector<NetArea::Seg>> netSegs_;
     bool pendingDark_ = true;
 
     FileFunction function_;
@@ -389,6 +405,15 @@ private:
     void addDark(Paths64 shape) {
         if (!polarityDark_ != !pendingDark_ && !pending_.empty()) flush();
         pendingDark_ = polarityDark_;
+        // Tag dark geometry with the current net BEFORE it is composited --
+        // `image_` is one merged union in which per-object identity is gone.
+        // Clear polarity is deliberately not recorded: a clear region belongs
+        // to no net, and subtracting it from the net area would misreport a
+        // thermal relief as a break in the net.
+        if (polarityDark_ && !currentNet_.empty()) {
+            Paths64& bucket = netPaths_[currentNet_];
+            bucket.insert(bucket.end(), shape.begin(), shape.end());
+        }
         for (Path64& p : shape) pending_.push_back(std::move(p));
     }
 
@@ -459,11 +484,25 @@ private:
         } else if (cmd.rfind("TF.FileFunction,", 0) == 0) {
             function_ = parseFileFunction(cmd.substr(16));
             hasFunction_ = true;
+        } else if (cmd.rfind("TO.N,", 0) == 0) {
+            // The object attribute that names a net. Applies to every object
+            // drawn from here until it is replaced or deleted -- this is how a
+            // Gerber package carries connectivity without a schematic.
+            currentNet_ = cmd.substr(5);
+            // Multi-valued attributes are comma-separated; the net name is the
+            // first field. "N/C" marks a deliberately unconnected object.
+            const size_t comma = currentNet_.find(',');
+            if (comma != std::string::npos) currentNet_.resize(comma);
+            if (currentNet_ == "N/C" || currentNet_.empty()) currentNet_.clear();
+        } else if (cmd.rfind("TD", 0) == 0) {
+            // %TD*% deletes ALL object attributes; %TD.N*% just the net one.
+            const std::string which = cmd.substr(2);
+            if (which.empty() || which == ".N") currentNet_.clear();
         } else if (cmd.rfind("TF", 0) == 0 || cmd.rfind("TA", 0) == 0 ||
-                   cmd.rfind("TO", 0) == 0 || cmd.rfind("TD", 0) == 0 ||
+                   cmd.rfind("TO", 0) == 0 ||
                    cmd.rfind("IP", 0) == 0 || cmd.rfind("IN", 0) == 0 ||
                    cmd.rfind("LN", 0) == 0) {
-            // attributes / image name / positive polarity image -- no geometry
+            // other attributes / image name / polarity -- no geometry
         } else if (cmd.rfind("SR", 0) == 0 || cmd.rfind("AB", 0) == 0) {
             warn("step-and-repeat / aperture blocks not implemented (" + cmd + ")");
         } else if (cmd.rfind("MI", 0) == 0 || cmd.rfind("OF", 0) == 0 ||
@@ -665,6 +704,20 @@ private:
     }
 
     void operationDraw(double x, double y, double i, double j, bool hasIJ) {
+        // Record LINEAR draws on a net as graph segments: this is the same
+        // track-endpoint graph the KiCad path builds, and what lets the
+        // measure tool report distance ALONG a net rather than through the
+        // air. Region fills are excluded -- a zone outline is not a route --
+        // and so are arcs, which contribute copper but would need chording to
+        // become graph edges.
+        if (!regionMode_ && interp_ == 1 && !currentNet_.empty()) {
+            const double dx = x - curX_, dy = y - curY_;
+            const double len = std::sqrt(dx * dx + dy * dy);
+            if (len > 1e-9) {
+                netLen_[currentNet_] += len;
+                netSegs_[currentNet_].push_back({curX_, curY_, x, y});
+            }
+        }
         if (regionMode_) {
             if (regionContour_.empty()) regionContour_.push_back(toClip(curX_, curY_));
             if (interp_ == 1) {

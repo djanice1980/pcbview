@@ -3,7 +3,8 @@
 // RS-274X (Gerber X2) parser: one file -> filled polygons.
 //
 // Produces the DARK image of a single Gerber layer as Clipper paths (Y already
-// flipped, ready for LayerArt). Handles the feature set KiCad emits and that
+// flipped, ready for LayerArt), plus per-net copper when the file carries X2
+// %TO.N% attributes. Handles the feature set KiCad emits and that
 // real fab packages use; anything unsupported is reported in `warnings` rather
 // than silently mis-drawn -- a viewer that renders what the fab will build must
 // not guess.
@@ -25,6 +26,23 @@ struct FileFunction {
     bool bottom = false;
 };
 
+// Copper tagged with its net, from the Gerber X2 %TO.N,<netname>*% object
+// attribute. KiCad emits these when "Use extended X2 format" is on; plenty of
+// packages have no net attributes at all, in which case this is simply empty
+// and the layer behaves as it always has.
+//
+// `area` is the geometry drawn while that net was current, in the same Clipper
+// units and orientation as `dark`. `segments` are the LINEAR draws only (mm),
+// which is what the measure tool can walk as a graph; arcs and flashes
+// contribute area but no segment.
+struct NetArea {
+    std::string name;
+    Clipper2Lib::Paths64 area;
+    double routedMm = 0.0;
+    struct Seg { double ax, ay, bx, by; };
+    std::vector<Seg> segments;
+};
+
 struct GerberImage {
     // Final dark image after all polarity operations, in Clipper units with Y
     // flipped. Positive winding.
@@ -32,6 +50,9 @@ struct GerberImage {
 
     FileFunction function;
     bool hasFunction = false;
+
+    // Per-net copper, empty when the file carries no TO.N attributes.
+    std::vector<NetArea> nets;
 
     std::vector<std::string> warnings;
     bool ok = false;  // false if a fatal parse error left the image unusable
