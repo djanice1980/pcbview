@@ -92,19 +92,15 @@ public:
     // accepting one from outside just invites the two to drift apart -- which
     // is exactly the bug that made an unrelated plane light up.
     //
-    // `netColour` is rgb + a, where a > 0 marks a net as highlighted.
-    //
-    // KNOWN DIFFERENCE from the GPU tracer: pathtrace.comp also samples the
-    // highlighted net explicitly as an area light (next-event estimation), so
-    // its red spill lands on the copper and laminate AROUND the net. This
-    // tracer only emits from the net itself, so the net reads correctly but
-    // its surroundings stay darker -- measured as ~7k pixels of missing spill
-    // on cx4multicart_v3/GND at 2152x1738. Everything else (emission, the
-    // 0.18 scene dim, the desaturation of other geometry, and the chase) is
-    // matched. `netSpan` is the per-net chase origin (xyz) and inverse span
-    // (w) -- phase is computed from the HIT POSITION against it, so the sweep
-    // follows the copper's shape rather than its triangulation, exactly as the
-    // GPU paths do. Empty vectors turn highlighting off.
+    // `netColour` is rgb + a, where a > 0 marks a net as highlighted. The
+    // highlighted net is both an emitter and, via next-event estimation
+    // (rebuildNetLights + the NEE block in trace()), an explicitly-sampled area
+    // light, so its red glow spills onto the surrounding copper and laminate --
+    // matching the GPU tracer within ~1% of reddish pixels on cx4multicart_v3/
+    // GND. `netSpan` is the per-net chase origin (xyz) and inverse span (w) --
+    // phase is computed from the HIT POSITION against it, so the sweep follows
+    // the copper's shape rather than its triangulation, exactly as the GPU
+    // paths do. Empty vectors turn highlighting off.
     void setHighlight(std::vector<std::array<float, 4>> netColour,
                       std::vector<std::array<float, 4>> netSpan);
     void setNetGlow(float strength) { netGlow_ = strength; }
@@ -210,6 +206,15 @@ private:
     std::vector<std::array<float, 4>> netSpan_;
     bool netOn_ = false;
     float netGlow_ = 1.0f;
+    // The highlighted nets' triangles, as an emitter list for next-event
+    // estimation -- 11 floats each: corners a,b,c (xyz), triangle area, and the
+    // net id as a float. Built from the BAKED geometry (post-explode/-hide) so
+    // the shadow ray and the traced scene agree; rebuilt whenever either the
+    // highlight or the bake changes. Mirrors the GPU's netLit buffer, except the
+    // GPU builds its copy once from rest positions.
+    std::vector<float> netLights_;
+    static constexpr int kNetLightStride = 11;
+    void rebuildNetLights();
     // First-hit chase AOV, 2 floats per pixel: phase along the net, and 1 when
     // the pixel shows highlighted copper directly. The GPU keeps this as a
     // storage image for the same reason -- the chase is a display-time

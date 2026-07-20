@@ -329,6 +329,7 @@ void CpuTracer::bake(float progress, float stepMm) {
             vertsPadded_[4u * v + 2u] += dz;
     }
     rebuildScene(/*fastBuild=*/true);
+    rebuildNetLights();  // emitter positions moved with the geometry
 }
 
 bool CpuTracer::setPartVisible(const std::string& name, bool visible) {
@@ -393,6 +394,10 @@ struct Ctx {
     uint32_t netCount = 0;
     bool netOn = false;
     float netGlow = 1.0f;
+    // Emitter triangles for next-event estimation: 11 floats each (a,b,c,area,
+    // net). See CpuTracer::rebuildNetLights.
+    const float* netLights = nullptr;
+    uint32_t netLightCount = 0;
 };
 
 // Highlighting a net turns the lights down -- see sceneDim() in
@@ -746,6 +751,54 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
                            kSunColor * (ndl * sceneDim(c));
         }
 
+        // --- Next-event estimation toward the highlighted net --------------
+        //
+        // The net is a ~0.25mm filament: a diffuse bounce almost never lands on
+        // it, so emission alone lit the net and nothing around it. Sampling it
+        // explicitly as an area light is what spills its glow onto the
+        // surrounding copper and laminate. Uniform over triangles, weighted by
+        // area in the estimator -- traces tessellate into similar-sized
+        // triangles, so a full area CDF buys little. Mirrors pathtrace.comp.
+        if (c.netLightCount > 0u) {
+            const uint32_t li =
+                std::min<uint32_t>(static_cast<uint32_t>(rng.next() *
+                                       static_cast<float>(c.netLightCount)),
+                                   c.netLightCount - 1u);
+            const float* L = &c.netLights[static_cast<size_t>(li) * 11u];
+            const V3 la{L[0], L[1], L[2]};
+            const V3 lb{L[3], L[4], L[5]};
+            const V3 lc{L[6], L[7], L[8]};
+            const float area = L[9];
+            const int lnet = static_cast<int>(L[10]);
+            const V3 lcol{c.netCol[lnet * 4 + 0], c.netCol[lnet * 4 + 1],
+                          c.netCol[lnet * 4 + 2]};
+
+            // Uniform barycentric point on the triangle.
+            float su = rng.next(), sv = rng.next();
+            if (su + sv > 1.0f) { su = 1.0f - su; sv = 1.0f - sv; }
+            const V3 lp = la + (lb - la) * su + (lc - la) * sv;
+
+            V3 toL = lp - p;
+            const float dist2 = std::max(dot(toL, toL), 1e-6f);
+            const float dist = std::sqrt(dist2);
+            toL = toL * (1.0f / dist);
+
+            const float ndl2 = dot(n, toL);
+            if (ndl2 > 0.0f) {
+                const V3 ln = normalize(cross(lb - la, lc - la));
+                const float lndl = std::fabs(dot(ln, toL * -1.0f));  // two-sided
+                if (lndl > 0.0f &&
+                    !occluded(c, p + gn * 0.03f, toL, dist - 0.05f)) {
+                    // pdf = 1 / (count * area); the area-to-solid-angle Jacobian
+                    // is lndl / dist^2.
+                    const float weight =
+                        static_cast<float>(c.netLightCount) * area * lndl / dist2;
+                    const float k = ndl2 * (1.0f / PI) * c.netGlow * weight;
+                    radiance = radiance + throughput * albedo * lcol * k;
+                }
+            }
+        }
+
         // Next direction.
         origin = p + gn * 0.03f;
         if (rng.next() < metallicOverride) {
@@ -808,6 +861,9 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
     c.netCount = static_cast<uint32_t>(netColour_.size());
     c.netOn = netOn_;
     c.netGlow = netGlow_;
+    c.netLights = netLights_.empty() ? nullptr : netLights_.data();
+    c.netLightCount =
+        static_cast<uint32_t>(netLights_.size() / CpuTracer::kNetLightStride);
 
     const uint32_t baseSample = static_cast<uint32_t>(accumSamples_);
     const int maxDepth = 6;
@@ -1008,6 +1064,41 @@ void CpuTracer::setHighlight(std::vector<std::array<float, 4>> netColour,
     // cannot keep chasing after the selection changes. The caller restarts
     // accumulation, which reallocates it.
     phaseAov_.clear();
+    rebuildNetLights();
+}
+
+// Collect the highlighted nets' triangles into the emitter list next-event
+// estimation samples. Built from the BAKED vertices (vertsPadded_), so the
+// sampled points, the geometric term and the shadow ray all live in the same
+// space as the traced scene -- including when the board is exploded or a layer
+// is hidden. Rebuilt on every highlight change and every bake.
+void CpuTracer::rebuildNetLights() {
+    netLights_.clear();
+    if (!netOn_ || triNet_.empty() || indices_.empty()) return;
+    const size_t tris = std::min(triNet_.size(), indices_.size() / 3);
+    for (size_t t = 0; t < tris; ++t) {
+        const int net = triNet_[t];
+        if (net < 0 || static_cast<size_t>(net) >= netColour_.size()) continue;
+        if (netColour_[net][3] <= 0.0f) continue;  // net not highlighted
+        const uint32_t i0 = indices_[t * 3 + 0], i1 = indices_[t * 3 + 1],
+                       i2 = indices_[t * 3 + 2];
+        const float* A = &vertsPadded_[static_cast<size_t>(i0) * 4];
+        const float* B = &vertsPadded_[static_cast<size_t>(i1) * 4];
+        const float* C = &vertsPadded_[static_cast<size_t>(i2) * 4];
+        // A hidden part carries a NaN x (bake()); its triangles are not in the
+        // traced scene, so they must not emit either. NaN != NaN.
+        if (A[0] != A[0] || B[0] != B[0] || C[0] != C[0]) continue;
+        const float e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+        const float e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
+        const float cx = e1[1] * e2[2] - e1[2] * e2[1];
+        const float cy = e1[2] * e2[0] - e1[0] * e2[2];
+        const float cz = e1[0] * e2[1] - e1[1] * e2[0];
+        const float area = 0.5f * std::sqrt(cx * cx + cy * cy + cz * cz);
+        if (area <= 0.0f) continue;  // degenerate; a zero-area light divides by 0
+        netLights_.insert(netLights_.end(),
+                          {A[0], A[1], A[2], B[0], B[1], B[2], C[0], C[1], C[2],
+                           area, static_cast<float>(net)});
+    }
 }
 
 namespace {
