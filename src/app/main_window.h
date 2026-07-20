@@ -47,7 +47,8 @@ private slots:
     void onLayerToggled(QTreeWidgetItem* item, int column);
     void onLayerSelected();
     void onRenderScaleChanged(int sliderValue);
-    void applyInternalResForDevice();
+    void applyInternalResForMode();
+    QString internalResKey() const;
     void syncInternalResUi(float scale);
     void onFrameRendered();
     void onOpen();
@@ -191,11 +192,6 @@ private:
     QLabel* toolbarInfo_ = nullptr;
     QLabel* scaleLabel_ = nullptr;
     QSlider* scaleSlider_ = nullptr;
-    // Cleared on every viewport (device) rebuild; applyInternalResForDevice
-    // sets it once the fresh renderer exists, so a device gets its remembered
-    // internal-resolution scale exactly once and later board loads leave the
-    // user's chosen scale alone.
-    bool deviceScaleApplied_ = false;
     QLabel* explodeLabel_ = nullptr;
 
     int frameCounter_ = 0;

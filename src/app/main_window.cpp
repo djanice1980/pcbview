@@ -229,7 +229,10 @@ MainWindow::MainWindow(const QString& path) {
     // reach, so verifying anything PT-specific (the net chase, emission, the
     // denoiser) needs a way in from the environment.
     if (qEnvironmentVariable("PCBVIEW_START_PT").toInt() != 0)
-        QTimer::singleShot(200, this, [this] { viewport_->setPathTracing(true); });
+        QTimer::singleShot(200, this, [this] {
+            viewport_->setPathTracing(true);
+            applyInternalResForMode();
+        });
 
     if (qEnvironmentVariable("PCBVIEW_START_ORTHO").toInt() != 0) {
         viewport_->camera().orthographic = true;
@@ -433,10 +436,10 @@ void MainWindow::buildViewport() {
     connect(viewport_, &VulkanWindow::boardUploaded, this, [this] {
         populateStackup();
         applyAppearance();
-        // Pick the internal-resolution scale for whatever device came up. Once
-        // per device (guarded inside), so ordinary board loads never disturb a
-        // scale the user has since dialled in.
-        applyInternalResForDevice();
+        // Point the internal-resolution slider at the scale remembered for this
+        // device + mode. Idempotent (setRenderScale early-returns if unchanged),
+        // so ordinary board loads never disturb a scale already dialled in.
+        applyInternalResForMode();
     });
     connect(viewport_, &VulkanWindow::explodeChanged, this,
             [this](float progress, float maxProgress) {
@@ -519,9 +522,9 @@ void MainWindow::rebuildViewport() {
     // settings inside the new window's initialise().
     const Camera cam = viewport_->camera();
     const float explode = viewport_->explodeProgress();
-    // Each device keeps its OWN internal-resolution scale (the software
-    // renderer defaults lower); the replacement re-applies it on first upload.
-    deviceScaleApplied_ = false;
+    // The internal-resolution scale is remembered per device + mode and
+    // re-applied on the first board upload (applyInternalResForMode), so nothing
+    // needs to be carried across the rebuild here.
 
     VulkanWindow* oldViewport = viewport_;
     QWidget* oldContainer = viewportContainer_;
@@ -1308,13 +1311,17 @@ void MainWindow::buildMenus() {
 
     QAction* rt = render->addAction("&Ray-traced shadows + AO");
     rt->setCheckable(true);
-    connect(rt, &QAction::toggled, this,
-            [this](bool on) { viewport_->setRayTracing(on); });
+    connect(rt, &QAction::toggled, this, [this](bool on) {
+        viewport_->setRayTracing(on);
+        applyInternalResForMode();  // traced modes carry their own scale
+    });
 
     QAction* pt = render->addAction("&Path tracing (full-scene lighting)");
     pt->setCheckable(true);
-    connect(pt, &QAction::toggled, this,
-            [this](bool on) { viewport_->setPathTracing(on); });
+    connect(pt, &QAction::toggled, this, [this](bool on) {
+        viewport_->setPathTracing(on);
+        applyInternalResForMode();
+    });
 
     QAction* oidn = render->addAction("Neural &denoise (Open Image Denoise)");
     oidn->setCheckable(true);
@@ -2315,35 +2322,45 @@ void MainWindow::onRenderScaleChanged(int sliderValue) {
     if (scaleLabel_) scaleLabel_->setText(QString::number(scale, 'f', 2) + "×");
     if (!viewport_->renderer()) return;
     viewport_->renderer()->setRenderScale(scale);
-    // Remember it PER DEVICE: the software renderer wants a low scale for speed,
-    // a GPU wants native or a supersample -- so switching devices should not
-    // drag one's choice onto the other.
-    appSettings().setValue(
-        viewport_->cpuRender() ? "cpuRenderScale" : "gpuRenderScale", scale);
+    // Remember it PER MODE (see applyInternalResForMode): a scale dialled in for
+    // path tracing should not follow you back to plain raster, and vice versa.
+    appSettings().setValue(internalResKey(), scale);
     viewport_->requestUpdate();
 }
 
-// Set the internal-resolution scale for the current device, once per device
-// build. The software (CPU/llvmpipe) renderer is pixel-bound -- every mode is
-// literally slower per pixel -- so it defaults to HALF internal resolution
-// (~4x fewer pixels to trace, rasterise, resolve and present), upscaled to the
-// window while the interface stays native. A GPU defaults to native. Either is
-// adjustable via the Internal res slider and remembered across sessions.
-void MainWindow::applyInternalResForDevice() {
-    if (deviceScaleApplied_ || !viewport_->renderer()) return;
-    deviceScaleApplied_ = true;
+// Which persisted scale governs what is on screen right now. On the software
+// (CPU) device the traced modes and plain raster keep SEPARATE scales; a GPU
+// keeps one.
+QString MainWindow::internalResKey() const {
+    if (!viewport_ || !viewport_->cpuRender()) return "gpuRenderScale";
+    const bool tracing = viewport_->pathTracing() || viewport_->rayTracing();
+    return tracing ? "cpuTraceScale" : "cpuRasterScale";
+}
+
+// Point the internal-resolution slider (and the renderer) at the scale for the
+// current device AND render mode. Called whenever any of those change, so the
+// slider always reflects -- and controls -- what is actually on screen.
+//
+// The software renderer is ray-bound in the traced modes, so those default to
+// HALF internal resolution (~4x fewer rays, upscaled to the window while the UI
+// stays native) -- a big speedup. Plain raster defaults to NATIVE: a reduced
+// scale there just buys an expensive linear upscale blit on llvmpipe for almost
+// no rasterisation saved, so it would only make raster slower. Both remain
+// fully adjustable with the slider and are remembered separately; a GPU keeps a
+// single native default.
+void MainWindow::applyInternalResForMode() {
+    if (!viewport_->renderer()) return;
     // A headless PCBVIEW_RENDER_SCALE override is applied before the first frame
-    // -- leave it untouched.
+    // -- never fight it, just reflect it.
     if (qEnvironmentVariableIsSet("PCBVIEW_RENDER_SCALE")) {
         syncInternalResUi(viewport_->renderer()->renderScale());
         return;
     }
-    const bool cpu = viewport_->cpuRender();
-    const float s = appSettings()
-                        .value(cpu ? "cpuRenderScale" : "gpuRenderScale",
-                               cpu ? 0.5f : 1.0f)
-                        .toFloat();
-    viewport_->renderer()->setRenderScale(s);
+    const bool tracing = viewport_->cpuRender() &&
+                         (viewport_->pathTracing() || viewport_->rayTracing());
+    const float def = tracing ? 0.5f : 1.0f;  // raster and GPU default native
+    const float s = appSettings().value(internalResKey(), def).toFloat();
+    viewport_->renderer()->setRenderScale(s);  // early-returns if unchanged
     syncInternalResUi(s);
 }
 

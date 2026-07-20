@@ -200,7 +200,7 @@ public:
     // from the fragment shader against an acceleration structure over the board.
     // A no-op if the device has no ray_query support (checked at construction).
     // Toggled per-frame via a push constant -- no pipeline switch.
-    void setRayTracing(bool on);
+    void setRayTracing(bool on) { rtRequested_ = on; }
     bool rayTracingSupported() const { return rtSupported_; }
 
     // Path tracing. Needs the same ray_query support as RT shadows. The camera ray
@@ -303,11 +303,6 @@ private:
     void destroySwapchain();
     void createSceneTargets();
     void destroySceneTargets();
-    // Scene scale actually used: renderScale_, except plain raster on the CPU
-    // device renders native (see the definition for why). Rebuild targets when
-    // a mode change flips that on the CPU device.
-    float effectiveRenderScale() const;
-    void refreshCpuSceneScale(bool wasTracing);
     void createPipeline();
     // Bloom: threshold+downsample the scene into a quarter-res target, then
     // add it back with additive blending. One level is enough for a halo
