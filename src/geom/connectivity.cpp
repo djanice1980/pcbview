@@ -106,7 +106,12 @@ double areaOf(const Paths64& p) { return std::abs(Area(p)); }
 
 }  // namespace
 
-PseudoNetStats extractPseudoNets(LayerArt& art) {
+PseudoNetStats extractPseudoNets(LayerArt& art, const ProgressFn& progress) {
+    // Nothing below mutates `art` until the publish step at the end, so
+    // bailing out here leaves the board untouched.
+    const auto report = [&](const std::string& stage, int pct) {
+        return progress ? progress(stage, pct) : true;
+    };
     // Never overwrite a real netlist.
     if (!art.nets.empty()) return {};
 
@@ -118,6 +123,9 @@ PseudoNetStats extractPseudoNets(LayerArt& art) {
     std::vector<std::vector<Island>> perLayer(copper.size());
     size_t total = 0;
     for (size_t i = 0; i < copper.size(); ++i) {
+        if (!report("Finding copper islands on " + copper[i]->name,
+                    static_cast<int>(i * 30 / copper.size())))
+            return {};
         perLayer[i] = islandsOf(copper[i]->art);
         total += perLayer[i].size();
     }
@@ -131,7 +139,14 @@ PseudoNetStats extractPseudoNets(LayerArt& art) {
     // Plated through-holes span the WHOLE stack, so one barrel joins every
     // layer it lands on. Unplated holes are deliberately absent from `barrels`
     // (they conduct nothing), which is exactly the behaviour wanted here.
+    // The dominant cost: every barrel is tested against every layer's islands.
+    size_t done = 0;
     for (const Path64& barrel : art.barrels) {
+        if ((done++ & 0x3F) == 0 &&
+            !report("Following " + std::to_string(art.barrels.size()) +
+                        " plated holes through the stack",
+                    30 + static_cast<int>(done * 60 / std::max<size_t>(art.barrels.size(), 1))))
+            return {};
         const Point64 c = centreOf(barrel);
         int first = -1;
         for (size_t i = 0; i < copper.size(); ++i) {
@@ -170,6 +185,7 @@ PseudoNetStats extractPseudoNets(LayerArt& art) {
         double area = 0.0;
         std::vector<std::pair<size_t, size_t>> members;  // (layer, island)
     };
+    if (!report("Grouping connected copper", 92)) return {};
     std::vector<Group> groups;
     std::vector<int> rootToGroup(total, -1);
     for (size_t li = 0; li < perLayer.size(); ++li)
@@ -188,6 +204,7 @@ PseudoNetStats extractPseudoNets(LayerArt& art) {
 
     // Publish. The "~" prefix is the signal that these are derived; the UI
     // says so too, but a name that travels with the data cannot be lost.
+    report("Publishing nets", 98);
     art.nets.clear();
     for (ArtLayer* al : copper) al->netArt.clear();
     for (size_t g = 0; g < groups.size(); ++g) {

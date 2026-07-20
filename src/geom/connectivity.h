@@ -23,6 +23,9 @@
 // Callers must present the result as derived, never as ground truth. See
 // LayerArt::netsArePseudo.
 
+#include <functional>
+#include <string>
+
 #include "geom/layer_art.h"
 
 namespace pcbview::geom {
@@ -45,6 +48,12 @@ struct PseudoNetStats {
 //
 // Does nothing and returns zeroes when the board already has real nets:
 // inferred data must never overwrite a netlist.
-PseudoNetStats extractPseudoNets(LayerArt& art);
+// Progress callback: (stage description, 0-100). Return false to CANCEL.
+//
+// Cancelling is safe at any point: `art` is not touched until the very last
+// step, so an abandoned run leaves the board exactly as it was.
+using ProgressFn = std::function<bool(const std::string& stage, int percent)>;
+
+PseudoNetStats extractPseudoNets(LayerArt& art, const ProgressFn& progress = {});
 
 }  // namespace pcbview::geom

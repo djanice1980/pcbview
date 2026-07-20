@@ -691,8 +691,19 @@ geom::LayerArt importPackage(const std::string& path) {
                 profileDark = std::move(img.dark);
                 haveProfile = true;
                 break;
+            case FileFunction::Kind::Paste:
+                // Recognised, deliberately unused: solder paste is a stencil
+                // aperture, not something on the finished board. Calling it
+                // "unclassified" implied the importer failed to understand it.
+                art.warnings.push_back("solder paste layer not rendered (it is "
+                                       "a stencil, not board copper): " +
+                                       f.name);
+                break;
             default:
-                art.warnings.push_back("unclassified gerber ignored: " + f.name);
+                art.warnings.push_back(
+                    "unrecognised gerber ignored (no TF.FileFunction, and the "
+                    "name matches no known layer -- drill maps and fab "
+                    "drawings land here): " + f.name);
                 break;
         }
     }

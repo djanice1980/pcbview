@@ -99,6 +99,10 @@ private:
     void reassemble();  // rebuild mesh_ from baseArt_ + current thickness override
     // Derive nets from copper connectivity for a package with no netlist.
     void inferNetsFromCopper();
+    // Every warning from the last import. The status line shows only the
+    // first, so this is the only way to see the rest.
+    void showImportWarnings();
+    QStringList importWarnings_;
 
     // Append the cached component parts onto mesh_ (fresh copies, so repeated
     // reassembles don't accumulate), shifting top-mounted parts to sit on the

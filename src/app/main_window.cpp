@@ -21,6 +21,8 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QLabel>
+#include <QPlainTextEdit>
+#include <QProgressDialog>
 #include <QLineEdit>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -649,9 +651,20 @@ bool MainWindow::loadBoard(const QString& path) {
     QApplication::restoreOverrideCursor();
 
     warnings.removeDuplicates();
+    // Keep the full list: the status line can only show the first, and a
+    // transient one-of-five with no way to see the rest tells the user a
+    // problem exists while withholding what it is.
+    importWarnings_ = warnings;
+    // Also to stdout. On a windowed build this goes nowhere unless someone
+    // redirects it, so it costs a normal user nothing -- but it makes the
+    // warning list retrievable from a headless run, and "paste me the output"
+    // is a far better support question than "what did the status bar say".
+    for (const QString& w : warnings)
+        std::fprintf(stderr, "[import warning] %s\n", w.toUtf8().constData());
+    std::fflush(stderr);
     if (!warnings.isEmpty()) {
         statusBar()->showMessage(
-            QString("%1 import warning(s): %2")
+            QString("%1 import warning(s): %2  —  View ▸ Import warnings…")
                 .arg(warnings.size())
                 .arg(warnings.first()),
             10000);
@@ -1343,6 +1356,14 @@ void MainWindow::buildMenus() {
         viewport_->requestUpdate();
     });
 
+    {
+        auto* warn = view->addAction("Import warnings…");
+        warn->setStatusTip(
+            "Everything the importer could not use from this package");
+        connect(warn, &QAction::triggered, this, &MainWindow::showImportWarnings);
+    }
+    view->addSeparator();
+
     // The chase, on by default -- it is the fastest way to see which way a
     // signal runs, but it is motion, so it needs an off switch.
     {
@@ -1650,16 +1671,73 @@ void MainWindow::buildNetDock() {
     netDock_ = dock;
 }
 
+void MainWindow::showImportWarnings() {
+    QDialog dlg(this);
+    dlg.setWindowTitle("Import warnings");
+    auto* lay = new QVBoxLayout(&dlg);
+    if (importWarnings_.isEmpty()) {
+        lay->addWidget(new QLabel("No warnings — everything in the package "
+                                  "was recognised and used.",
+                                  &dlg));
+    } else {
+        lay->addWidget(new QLabel(
+            QString("%1 warning(s) from the last import:").arg(importWarnings_.size()),
+            &dlg));
+        auto* list = new QPlainTextEdit(&dlg);
+        list->setReadOnly(true);
+        list->setPlainText(importWarnings_.join("\n"));
+        list->setMinimumSize(720, 260);
+        lay->addWidget(list);
+    }
+    auto* close = new QPushButton("Close", &dlg);
+    connect(close, &QPushButton::clicked, &dlg, &QDialog::accept);
+    lay->addWidget(close);
+    dlg.exec();
+}
+
 void MainWindow::inferNetsFromCopper() {
     if (!loaded_) return;
-    QApplication::setOverrideCursor(Qt::WaitCursor);
+
+    // A progress dialog rather than a wait cursor: on a dense board this takes
+    // long enough to look like a hang, and a frozen window with no explanation
+    // is indistinguishable from a crash. Cancellable, because the user who
+    // starts it on a huge board is exactly the one who needs a way out --
+    // extractPseudoNets does not touch the board until its final step, so
+    // cancelling leaves everything as it was.
+    QProgressDialog dlg("Analysing copper connectivity…", "Cancel", 0, 100, this);
+    dlg.setWindowTitle("Infer nets");
+    dlg.setWindowModality(Qt::WindowModal);
+    dlg.setMinimumDuration(0);
+    dlg.setAutoClose(false);
+    dlg.setValue(0);
+
     // Runs on baseArt_ so it survives a thickness change or any other
     // reassemble -- recomputing per rebuild would be wasted work, and the
     // connectivity does not depend on Z.
-    const geom::PseudoNetStats found = geom::extractPseudoNets(baseArt_);
-    QApplication::restoreOverrideCursor();
+    const geom::PseudoNetStats found = geom::extractPseudoNets(
+        baseArt_, [&dlg](const std::string& stage, int pct) {
+            dlg.setLabelText(QString::fromStdString(stage) + "…");
+            dlg.setValue(pct);
+            QApplication::processEvents();
+            return !dlg.wasCanceled();
+        });
+
+    if (dlg.wasCanceled()) {
+        dlg.close();
+        statusBar()->showMessage("Net inference cancelled — board unchanged.",
+                                 5000);
+        return;
+    }
+
+    // The rebuild is a second, comparable wait: the mesh carries per-triangle
+    // net ids, so every triangle is regenerated. Say so rather than freezing
+    // again right after the progress dialog claimed to be finished.
+    dlg.setLabelText("Rebuilding board with the new nets…");
+    dlg.setValue(99);
+    QApplication::processEvents();
 
     if (found.groups <= 0) {
+        dlg.close();
         statusBar()->showMessage(
             "No connectivity could be derived — the board has no copper, or "
             "already has a netlist.",
@@ -1668,6 +1746,7 @@ void MainWindow::inferNetsFromCopper() {
     }
     reassemble();      // netArt changed, so the mesh must carry the new net ids
     populateNets();
+    dlg.close();
     // Quote both numbers. The total alone reads as an explosion on a dense
     // board, when most of what it found is copper that really is isolated.
     statusBar()->showMessage(
