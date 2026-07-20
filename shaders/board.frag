@@ -95,8 +95,14 @@ float netChase(float phase) {
 
     // Travelling gradient. 1.5 cycles across the net reads as motion without
     // turning into a barber pole on a long run.
+    //
+    // The floor has to go WELL below 1, not just dip a little: the highlight
+    // is already multiplied by the glow strength (~2.5 by default), so any
+    // trough above ~0.4 still clips past white and the whole cycle renders as
+    // one flat saturated colour -- measurably identical frames. 0.12 at the
+    // trough is what makes the band actually read as moving.
     const float g = fract(phase * 1.5 - (t - kWipe) * 0.55);
-    return 0.55 + 0.95 * (0.5 + 0.5 * cos(6.2831853 * g));
+    return 0.12 + 0.88 * (0.5 + 0.5 * cos(6.2831853 * g));
 }
 
 vec4 netHighlight() {

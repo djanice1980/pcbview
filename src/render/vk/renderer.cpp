@@ -2846,7 +2846,10 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
             nsize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        uploadViaStaging(triNetBuffer_, triNet.data(), nsize);
+        // From info, NOT triNet: nsize counts 8-byte TriInfo entries, so
+        // staging from the 4-byte-per-triangle net array reads twice its
+        // length and walks off the end of the heap block.
+        uploadViaStaging(triNetBuffer_, info.data(), nsize);
     }
 
     const VkDeviceSize msize = materials.size() * sizeof(MaterialGpu);

@@ -68,8 +68,10 @@ float netChase(float phase) {
         if (phase > head) return 0.0;
         return mix(2.4, 1.0, clamp((head - phase) * 5.0, 0.0, 1.0));
     }
+    // Trough well below 1 so the band clears the glow multiplier's clipping
+    // point -- see board.frag.
     const float g = fract(phase * 1.5 - (t - kWipe) * 0.55);
-    return 0.55 + 0.95 * (0.5 + 0.5 * cos(6.2831853 * g));
+    return 0.12 + 0.88 * (0.5 + 0.5 * cos(6.2831853 * g));
 }
 
 vec4 netHighlight() {
