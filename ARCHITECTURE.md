@@ -1249,12 +1249,19 @@ text has been rendered since phase 1.5.)
 
 ### Not yet verified — TO FIX (needs a test board, not just code)
 
-- **Rotations other than 0 / ±90.** No test board has one. Until one exists
-  the rotation convention (see the pad-rotation note above) is unproven for
-  arbitrary angles, and that convention is exactly the kind of sign error
-  that hides until a 30-degree footprint shows up.
-- **Custom / trapezoid pad shapes.** Not implemented; fall back to the bounding
-  rect and emit a warning. No test board uses them.
+- ~~Rotations other than 0 / ±90.~~ **VERIFIED 2026-07-20**, and it found two
+  bugs, so the suspicion was justified. A fixture with footprints at 0/30/45/137
+  degrees was imported directly AND via gerbers plotted by `kicad-cli`, then
+  compared shape by shape: 12 of 12 pads now agree on area, centroid and
+  ORIENTATION (6 differed before). The two defects were a mirrored trapezoid
+  taper and Gerber aperture-macro rotation being parsed but never applied.
+- ~~Custom / trapezoid pad shapes.~~ **IMPLEMENTED 2026-07-20** with real
+  geometry, and covered by the fixture above.
+
+Both hid because area, centroid and bounding box are ALL invariant under
+mirroring and under swapping a rotation's sign. Whatever replaces this list
+should assume the same: a metric that cannot distinguish a shape from its
+mirror will not notice when one appears.
 - `validatePadConnectivity` is meaningless on an unrouted board — CPS3brd1 has
   zero tracks, so it reports top 0/79. Read the top-vs-bottom *gap*, not the rate.
 
