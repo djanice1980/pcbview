@@ -341,6 +341,19 @@ MainWindow::MainWindow(const QString& path) {
             subOpacity_ = p[3].toFloat();
         }
     }
+    // Silk clipping changes GEOMETRY, so the board must be re-assembled -- by
+    // this point in the constructor it has already been built once with the
+    // default. Same pattern as PCBVIEW_THICKNESS above.
+    {
+        const bool clipSilk =
+            appSettings().value("subtractMaskFromSilk", false).toBool() ||
+            qEnvironmentVariable("PCBVIEW_SILK_CLIP").toInt() != 0;
+        if (clipSilk != subtractMaskFromSilk_) {
+            subtractMaskFromSilk_ = clipSilk;
+            reassemble();
+        }
+    }
+
     if (qEnvironmentVariableIsSet("PCBVIEW_MASK")) {
         const QStringList p = qEnvironmentVariable("PCBVIEW_MASK").split(',');
         if (p.size() >= 3)
@@ -720,9 +733,9 @@ bool MainWindow::loadBoard(const QString& path) {
                 ? [&] {
                       geom::LayerArt a = baseArt_;
                       geom::applyThickness(a, thicknessOverride_);
-                      return geom::assemble(a);
+                      return geom::assemble(a, tessellateOptions());
                   }()
-                : geom::assemble(baseArt_);
+                : geom::assemble(baseArt_, tessellateOptions());
 
     // Component bodies, KiCad only. Sourced through kicad-cli (which owns the
     // STEP tessellation) into a cached GLB -- see component_import. Gerbers have
@@ -825,11 +838,19 @@ void MainWindow::applyAppearance() {
     viewport_->requestUpdate();
 }
 
+// Tessellation options assembled from persisted view settings. Anything here
+// changes GEOMETRY, so callers must re-assemble rather than just redraw.
+geom::TessellateOptions MainWindow::tessellateOptions() const {
+    geom::TessellateOptions o;
+    o.subtractMaskFromSilk = subtractMaskFromSilk_;
+    return o;
+}
+
 void MainWindow::reassemble() {
     if (!loaded_) return;
     geom::LayerArt a = baseArt_;
     if (thicknessOverride_ > 0.0) geom::applyThickness(a, thicknessOverride_);
-    mesh_ = geom::assemble(a);
+    mesh_ = geom::assemble(a, tessellateOptions());
     appendComponents();          // survive the rebuild; ride the new surface
     viewport_->setMesh(&mesh_);  // re-uploads; substrate appearance persists
     updateStatus();
@@ -1490,6 +1511,25 @@ void MainWindow::buildMenus() {
             viewport_->setCameraHud(v);
         });
         viewport_->setCameraHud(on);
+    }
+    // Silkscreen clipping. KiCad's own (subtractmaskfromsilk) decides what is
+    // PLOTTED and defaults to off, so by default we draw the ink the file
+    // carries -- including over pads. Many fabs clip it anyway, because ink
+    // will not stick to solder, so this shows the board as such a house builds
+    // it. Changing it re-tessellates.
+    {
+        auto* clip = view->addAction("Clip silkscreen off pads");
+        clip->setCheckable(true);
+        clip->setStatusTip(
+            "Remove silkscreen ink that lands on exposed copper, as a fab that "
+            "clips silk would build it");
+        clip->setChecked(subtractMaskFromSilk_);
+        connect(clip, &QAction::toggled, this, [this](bool on) {
+            subtractMaskFromSilk_ = on;
+            appSettings().setValue("subtractMaskFromSilk", on);
+            reassemble();
+            viewport_->requestUpdate();
+        });
     }
     view->addSeparator();
 

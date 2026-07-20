@@ -1073,6 +1073,10 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
     for (const ArtLayer& al : art.layers) {
         ClipType op = ClipType::Union;
         Material material = Material::Copper;
+        const bool front = al.name.rfind("F.", 0) == 0;
+        // Storage for the silk-minus-mask result, when that option is on. Must
+        // outlive the switch, because `subject` points into it.
+        Paths64 silkClipped;
         // The subject and clip for this layer's one boolean. Held as pointers
         // so copper can swap the subject per net while everything else about
         // the operation stays identical.
@@ -1121,14 +1125,44 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 }
                 break;
 
-            case LayerKind::Silkscreen:
-                // Ink is clipped to the profile but NOT to the mask openings --
-                // KiCad's (subtractmaskfromsilk no), which is what the fab does.
+            case LayerKind::Silkscreen: {
+                // Ink is clipped to the profile. Whether it is ALSO clipped off
+                // the mask openings is the caller's choice: KiCad's
+                // (subtractmaskfromsilk) decides what is plotted and defaults
+                // to off, so by default we render the ink exactly as the file
+                // carries it -- including over pads.
                 material = Material::Silkscreen;
                 if (art.outline.empty()) continue;
                 clip = &art.outline;
                 op = ClipType::Intersection;
+                if (opts.subtractMaskFromSilk) {
+                    // Openings on THIS side only: front ink is not clipped by
+                    // the back mask.
+                    Paths64 openings;
+                    for (const ArtLayer& other : art.layers) {
+                        if (other.kind != LayerKind::Soldermask) continue;
+                        if ((other.name.rfind("F.", 0) == 0) != front) continue;
+                        openings.insert(openings.end(), other.art.begin(),
+                                        other.art.end());
+                    }
+                    if (!openings.empty()) {
+                        silkClipped = BooleanOp(ClipType::Difference,
+                                                FillRule::NonZero,
+                                                BooleanOp(ClipType::Intersection,
+                                                          FillRule::NonZero,
+                                                          *subject, art.outline),
+                                                openings);
+                        subject = &silkClipped;
+                        // The subject is already fully clipped, so the
+                        // downstream pass must UNION it, not intersect it:
+                        // Clipper intersecting against no clip paths returns
+                        // empty, which silently deletes the whole layer.
+                        clip = nullptr;
+                        op = ClipType::Union;
+                    }
+                }
                 break;
+            }
 
             default:
                 continue;

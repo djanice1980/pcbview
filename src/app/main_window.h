@@ -96,6 +96,9 @@ private:
     void rememberRecent(const QString& path);
     void rebuildRecentMenu();
 
+    geom::TessellateOptions tessellateOptions() const;
+    // Clip silkscreen off exposed copper. Persisted; changes geometry.
+    bool subtractMaskFromSilk_ = false;
     void reassemble();  // rebuild mesh_ from baseArt_ + current thickness override
     // Derive nets from copper connectivity for a package with no netlist.
     void inferNetsFromCopper();

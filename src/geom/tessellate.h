@@ -125,6 +125,16 @@ struct TessellateOptions {
     bool soldermask = true;
     // Emit silkscreen parts. Graphics only for now -- text needs a stroke font.
     bool silkscreen = true;
+    // Clip silkscreen against the soldermask OPENINGS, i.e. remove ink that
+    // would land on exposed copper.
+    //
+    // KiCad's own `(subtractmaskfromsilk)` decides what gets PLOTTED, and it
+    // defaults to off, so a gerber normally contains ink over pads and pcbview
+    // renders it faithfully. But many fabs clip it anyway -- ink will not
+    // adhere to solder and contaminates the joint -- so this shows the board
+    // as a clipping house would actually build it. Off by default: the file is
+    // what the file says.
+    bool subtractMaskFromSilk = false;
 };
 
 // BoardModel -> LayerArt. Resolves KiCad's semantics (tracks, pads, vias, zones,
