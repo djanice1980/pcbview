@@ -14,6 +14,8 @@ layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(std430, set = 0, binding = 1) readonly buffer Verts { float vtx[]; };
 layout(std430, set = 0, binding = 2) readonly buffer Idx { uint idx[]; };
 layout(std430, set = 0, binding = 3) readonly buffer TriMat { uint triMat[]; };
+// Per-triangle net, for highlighting. Same global order as the index buffer.
+layout(std430, set = 0, binding = 8) readonly buffer TriNet { int triNet[]; };
 // params: x roughness, y metallic, z explode rank, w = 1 if it fades on peel.
 // `extra` is fragment-stage data (the raster net-highlight triangle base);
 // declared so this SSBO's stride matches MaterialGpu exactly.
@@ -109,6 +111,13 @@ vec3 cosineHemisphere(vec3 n) {
 const float kSubstratePeelAlpha = 0.42;
 
 // Effective opacity of a hit. The soldermask is a fixed translucent coating;
+// Net highlight colour. Deliberately a saturated red: copper is gold and the
+// laminate green, so red is the one hue that cannot be mistaken for either.
+// The strength is what makes it read as a glowing filament rather than red
+// paint -- it is added as radiance, so it also spills onto its surroundings.
+const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
+const float kNetGlowStrength = 3.2;
+
 // the substrate (params.w > 0.5) is opaque at rest and fades toward
 // kSubstratePeelAlpha as the board peels (pc.misc.x).
 float effAlpha(uint prim) {
@@ -272,6 +281,23 @@ void main() {
         Mat m = mats[triMat[prim]];
         vec3 albedo = m.albedo.rgb;
         float metallic = m.params.y;
+
+        // Net highlighting. The chosen net is turned into an EMITTER rather
+        // than merely tinted: it adds radiance on every hit, so it lights the
+        // copper and laminate around it and shows up in reflections -- the
+        // path tracer already carries that light everywhere for free. Other
+        // geometry desaturates and darkens so the glow dominates.
+        if (int(pc.counts.y) >= 0) {
+            if (triNet[prim] == int(pc.counts.y)) {
+                radiance += throughput * kNetGlow * kNetGlowStrength;
+                albedo = mix(albedo, kNetGlow, 0.85);
+                metallic = 0.0;  // an emitter should not also mirror the sky
+            } else {
+                albedo = mix(albedo,
+                             vec3(dot(albedo, vec3(0.299, 0.587, 0.114))),
+                             0.85) * 0.42;
+            }
+        }
 
         // TRANSMISSION through the peeling laminate: with probability 1-alpha
         // the ray continues through the slab, scattered into a small cone and

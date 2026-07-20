@@ -55,10 +55,12 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   soldermask — including the **mask opacity**, which drives how strongly traces
   read through the film in both render modes.
 - **Net highlighting (KiCad).** Pick a net from the searchable **Nets** panel
-  or just click a pad or via on the board: that signal lights up across every
-  layer while the rest of the board mutes, so a run can be followed through
-  the stack and into the exploded view. The status bar reports the net's
-  routed length and via count. Raster and ray-traced modes.
+  or just click a pad or via on the board: that signal **glows red** across
+  every layer while the rest of the board mutes to grey, so a run can be
+  followed through the stack and into the exploded view. In path-traced mode
+  the net is a genuine emitter — it casts red light onto the copper around it
+  and appears in reflections. The status bar reports the net's routed length
+  and via count.
 - **Layer control.** Per-layer visibility, a one-click components toggle, and
   auto-hiding side panels (pin, or peek-on-hover).
 - **Print & export.** Print as-shown, flat (overhead orthographic), or **flat at

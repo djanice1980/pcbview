@@ -534,8 +534,9 @@ VkShaderModule makeModule(VkDevice dev, const uint32_t* code, size_t bytes) {
 void Renderer::createPathTracer() {
     // Compute set: 0 TLAS, 1 vtx, 2 idx, 3 triMat, 4 mats, 5 accum, 6 albedo,
     // 7 normal.
-    VkDescriptorSetLayoutBinding b[8]{};
-    for (uint32_t i = 0; i < 8; ++i) {
+    // 8 = per-triangle net, for the highlight glow.
+    VkDescriptorSetLayoutBinding b[9]{};
+    for (uint32_t i = 0; i < 9; ++i) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -543,9 +544,10 @@ void Renderer::createPathTracer() {
     b[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     for (int i = 1; i <= 4; ++i) b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     for (int i = 5; i <= 7; ++i) b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     VkDescriptorSetLayoutCreateInfo li{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 8;
+    li.bindingCount = 9;
     li.pBindings = b;
     check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr, &ptSetLayout_),
           "pt set layout");
@@ -569,7 +571,7 @@ void Renderer::createPathTracer() {
 
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5},  // vtx, idx, triMat, mats, triNet
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5}};  // 3 pt + 2 tonemap
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 2;
@@ -760,12 +762,13 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorBufferInfo idx{indexBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo tri{triMaterialBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo mat{materialBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo net{triNetBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo acc{VK_NULL_HANDLE, ptAccum_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    VkWriteDescriptorSet w[8]{};
-    for (int i = 0; i < 8; ++i) {
+    VkWriteDescriptorSet w[9]{};
+    for (int i = 0; i < 9; ++i) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = ptSet_;
         w[i].dstBinding = i;
@@ -780,7 +783,8 @@ void Renderer::updatePathTraceDescriptors() {
     w[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[5].pImageInfo = &acc;
     w[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[6].pImageInfo = &alb;
     w[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[7].pImageInfo = &nrm;
-    vkUpdateDescriptorSets(device_.handle, 8, w, 0, nullptr);
+    w[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[8].pBufferInfo = &net;
+    vkUpdateDescriptorSets(device_.handle, 9, w, 0, nullptr);
 
     VkDescriptorImageInfo den{VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet tw[2]{};
@@ -980,6 +984,8 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             p.misc[1] = std::cos(shadowSoftness_ * 8.0f * 3.14159265f / 180.0f);
             p.misc[2] = rayOrtho_ ? 1.0f : 0.0f;
             p.counts[0] = opaqueTriCount_;
+            // Highlighted net, as int bits (-1 = none).
+            p.counts[1] = static_cast<uint32_t>(highlightNet_);
             vkCmdPushConstants(cmd, ptLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(p), &p);
             vkCmdDispatch(cmd, (sceneExtent_.width + 7) / 8,
@@ -2570,6 +2576,15 @@ void Renderer::setShadowSoftness(float s01) {
         const float rad = shadowSoftness_ * 8.0f * 3.14159265f / 180.0f;
         cpuTracer_->setSunCosMax(std::cos(rad));
     }
+    resetAccumulation();
+    ptDenoisedValid_ = false;
+}
+
+void Renderer::setHighlightNet(int net) {
+    if (net == highlightNet_) return;
+    highlightNet_ = net;
+    // The path tracer treats the highlighted net as an emitter, so the
+    // converged image is no longer valid.
     resetAccumulation();
     ptDenoisedValid_ = false;
 }

@@ -1327,11 +1327,24 @@ readout can never disagree.
   struct had to change in **all four** shaders that read the material SSBO --
   board.vert, board.frag, board_rt.frag AND pathtrace.comp -- or they read at
   the wrong stride.
-- **Raster and RT-raster only.** The path tracers shade from their own
-  material fetch and ignore the highlight; highlighting while path tracing
-  says so in the status bar rather than appearing broken. Adding it there
-  means binding the net buffer into the PT descriptor set and resetting
-  accumulation on change.
+- **The highlight is EMISSIVE, in every mode.** The net is red — copper is
+  gold and laminate green, so red is the one hue that cannot be mistaken for
+  either — and it is emitted rather than shaded:
+  - *Raster / RT*: the fragment shader outputs the glow colour directly and
+    returns before any lighting. Running it through the rig instead let the
+    white specular and environment terms wash the red out to salmon, and put
+    the trace back in shadow under a component — the opposite of what
+    "follow this signal" needs. It also skips the shadow and AO rays, so
+    highlighting is if anything slightly cheaper.
+  - *Path tracer*: the net is a real **emitter** — `radiance += throughput *
+    glow` at every hit — so it lights the copper and laminate around it and
+    shows up in reflections, which the path tracer carries everywhere for
+    free. Its metallic is forced to 0 so an emitter does not also mirror the
+    sky. `triNet` binds at PT set 0 binding 8, and the highlight rides in
+    `PtPush::counts.y`; changing it **resets accumulation** (`setHighlightNet`
+    does this), since the converged image is no longer valid.
+  - The CPU/Embree tracer does not implement it yet — that path has its own
+    material fetch and would need the same triangle-net array.
 - Gerber packages carry no nets, so the dock says so instead of showing an
   empty list. Verified the Gerber path is untouched (F.Cu still 293.224 mm²).
 

@@ -45,18 +45,25 @@ layout(push_constant) uniform Push {
 // everything else desaturates toward the laminate so the signal reads at a
 // glance across layers. Returns the albedo unchanged when nothing is picked,
 // so a board with no highlight is bit-identical to before.
-vec3 applyNetHighlight(vec3 albedo) {
-    if (push.highlight.x < 0) return albedo;
+// Net highlight colour: a saturated red. Copper is gold and the laminate
+// green, so red is the one hue that cannot be mistaken for either. Keep in
+// step with pathtrace.comp, which uses the same colour as an EMITTER.
+const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
+
+// True when this fragment belongs to the highlighted net. The raster stage
+// only gets gl_PrimitiveID, which restarts every draw, so the material's
+// triangle base rebases it into the global per-triangle net table.
+bool onHighlightedNet() {
+    if (push.highlight.x < 0) return false;
     const uint tri = materialTable.materials[inMaterial].extra.x +
                      uint(gl_PrimitiveID);
-    if (triNetTable.nets[tri] == push.highlight.x) {
-        // Copper is already gold, so a hue shift alone would not separate the
-        // net from its neighbours -- go bright and warm, and let the raised
-        // value do most of the work.
-        return mix(albedo, vec3(1.0, 0.80, 0.30), 0.85) * 2.1;
-    }
-    // Everything else desaturates and drops well below the highlight, so the
-    // eye lands on the net rather than having to hunt for it.
+    return triNetTable.nets[tri] == push.highlight.x;
+}
+
+// Everything NOT on the highlighted net desaturates and drops well below it,
+// so the eye lands on the net rather than having to hunt for it.
+vec3 applyNetHighlight(vec3 albedo) {
+    if (push.highlight.x < 0) return albedo;
     return mix(albedo, vec3(dot(albedo, vec3(0.299, 0.587, 0.114))), 0.85) *
            0.42;
 }
@@ -85,6 +92,17 @@ const float kSubstratePeelAlpha = 0.42;
 
 void main() {
     Material m = materialTable.materials[inMaterial];
+
+    // A highlighted net is EMISSIVE: output the glow directly and skip
+    // shading entirely. Running it through the lighting rig instead let the
+    // white specular and environment terms wash the red out to salmon, and
+    // put the trace back in shadow under a component -- the opposite of what
+    // "follow this signal" needs. Matches the path tracer, which adds the
+    // same colour as radiance.
+    if (onHighlightedNet()) {
+        outColor = vec4(kNetGlow * 2.6, 1.0);
+        return;
+    }
 
     vec3 n = normalize(inNormal);
     vec3 viewDir = viewVector(inWorldPos);

@@ -1595,16 +1595,11 @@ void MainWindow::highlightNet(int net) {
         return;
     }
     const auto& n = mesh_.nets[net];
-    QString msg = QString("Net %1  ·  %2 mm routed  ·  %3 via%4")
-                      .arg(QString::fromStdString(n.name))
-                      .arg(n.routedMm, 0, 'f', 3)
-                      .arg(n.viaCount)
-                      .arg(n.viaCount == 1 ? "" : "s");
-    // The tracers shade from their own material fetch, so the tint never
-    // reaches them. Say so rather than letting the board look unchanged.
-    if (viewport_->pathTracing())
-        msg += "   (highlight shows in raster / RT, not path tracing)";
-    statusBar()->showMessage(msg);
+    statusBar()->showMessage(QString("Net %1  ·  %2 mm routed  ·  %3 via%4")
+                                 .arg(QString::fromStdString(n.name))
+                                 .arg(n.routedMm, 0, 'f', 3)
+                                 .arg(n.viaCount)
+                                 .arg(n.viaCount == 1 ? "" : "s"));
 
     // Keep the list in step when the highlight came from somewhere else.
     if (netList_) {

@@ -136,12 +136,14 @@ public:
     // resolution, over every render mode. An empty vector clears it.
     void setOverlay(std::vector<float> tris) { overlayTris_ = std::move(tris); }
 
-    // Net highlighting: tint every triangle on `net` (an index into the
+    // Net highlighting: light up every triangle on `net` (an index into the
     // BoardMesh net table) and mute the rest, so one signal can be followed
-    // across layers and through the exploded view. -1 clears. Raster and
-    // ray-traced raster only -- the path tracers shade from their own
-    // material fetch and ignore it.
-    void setHighlightNet(int net) { highlightNet_ = net; }
+    // across layers and through the exploded view. -1 clears.
+    //
+    // In the path tracer the net becomes an EMITTER, so it spills red light
+    // onto its surroundings and appears in reflections. That changes the
+    // image, hence the accumulation restart.
+    void setHighlightNet(int net);
     int highlightNet() const { return highlightNet_; }
 
     // Exploded view, peeled outside-in.

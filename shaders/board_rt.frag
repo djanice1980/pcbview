@@ -43,13 +43,18 @@ layout(std430, set = 0, binding = 2) readonly buffer TriNets {
     int nets[];
 } triNetTable;
 
-vec3 applyNetHighlight(vec3 albedo) {
-    if (push.highlight.x < 0) return albedo;
+// Keep in step with board.frag and pathtrace.comp.
+const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
+
+bool onHighlightedNet() {
+    if (push.highlight.x < 0) return false;
     const uint tri = materialTable.materials[inMaterial].extra.x +
                      uint(gl_PrimitiveID);
-    if (triNetTable.nets[tri] == push.highlight.x) {
-        return mix(albedo, vec3(1.0, 0.80, 0.30), 0.85) * 2.1;
-    }
+    return triNetTable.nets[tri] == push.highlight.x;
+}
+
+vec3 applyNetHighlight(vec3 albedo) {
+    if (push.highlight.x < 0) return albedo;
     return mix(albedo, vec3(dot(albedo, vec3(0.299, 0.587, 0.114))), 0.85) *
            0.42;
 }
@@ -106,6 +111,14 @@ float ambientOcclusion(vec3 p, vec3 n) {
 
 void main() {
     Material m = materialTable.materials[inMaterial];
+
+    // Emissive highlight, before any shading -- see board.frag. Also skips
+    // the shadow and AO rays for these fragments, so highlighting is if
+    // anything slightly cheaper.
+    if (onHighlightedNet()) {
+        outColor = vec4(kNetGlow * 2.6, 1.0);
+        return;
+    }
 
     vec3 n = normalize(inNormal);
     vec3 viewDir = viewVector(inWorldPos);
