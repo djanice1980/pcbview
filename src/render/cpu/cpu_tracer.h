@@ -15,8 +15,11 @@
 // code. KEEP THE TWO IN STEP when either changes.
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "geom/tessellate.h"
@@ -141,6 +144,39 @@ public:
     std::vector<uint8_t> renderImage(const TraceCamera& cam, uint32_t width,
                                      uint32_t height, int spp, bool denoise);
 
+    // --- Cheap per-frame chase update -------------------------------------
+    //
+    // A converged image being chased must refresh every frame, but only the
+    // tagged (highlighted-net) pixels actually change -- a few percent of the
+    // image. resolveDisplay and the async denoise record, alongside the buffer
+    // they produce, each tagged pixel's UNmodulated linear colour and phase;
+    // patchChase re-modulates and re-encodes just those pixels in place.
+    // (Display buffers are produced UNmodulated -- the chase is only ever
+    // applied by this call, so patching and full resolves compose.)
+    //
+    // Returns false when no patch list matches `bgra`. With `allowStale`
+    // false the list must also match the CURRENT sample count -- the caller
+    // wants a fresh base once accumulation has moved on. With it true a
+    // stale base is fine (the denoised-display path: its base refreshes on
+    // milestones, and patching it beats showing unfiltered noise).
+    bool patchChase(std::vector<uint8_t>& bgra, uint32_t chaseMs,
+                    bool allowStale) const;
+
+    // --- Asynchronous denoise + resolve -----------------------------------
+    //
+    // OIDN takes ~0.5s on a full frame; running it inline froze the frame
+    // loop at every milestone. kickDenoiseResolve snapshots the accumulators
+    // on the CALLING thread (the only writer, so no race) and hands them to a
+    // worker that denoises, tonemaps and encodes; fetchDenoiseResolve polls
+    // for the finished image and swaps it into `bgra` (installing its chase
+    // patch list) when ready. A kick while busy, or for a sample count
+    // already kicked, is a no-op. discardDenoise invalidates anything kicked
+    // or in flight -- call on accumulation restart, so a result traced from
+    // the OLD camera can never be shown under the new one.
+    void kickDenoiseResolve(bool animate);
+    bool fetchDenoiseResolve(std::vector<uint8_t>& bgra);
+    void discardDenoise();
+
 private:
     void releaseScene();
     // (Re)build the Embree scene from vertsPadded_/indices_. `fastBuild` trades
@@ -187,6 +223,59 @@ private:
     int accumSamples_ = 0;
     uint32_t width_ = 0, height_ = 0;
     TraceCamera cam_{};
+
+    // Adaptive sampling (PT only): per-pixel sample counts plus luminance sum
+    // and sum-of-squares. A pixel whose relative standard error drops below
+    // threshold stops receiving samples, so the flat background -- most of the
+    // image -- goes quiet after a handful of batches while edges and glints
+    // keep refining. All resolve paths divide by the PER-PIXEL count.
+    std::vector<uint16_t> pixSamples_;
+    std::vector<float> lumSum_, lumSum2_;
+
+    // Chase patch list for patchChase: pixel index, phase, unmodulated linear
+    // colour. Tied to the display buffer it was built beside;
+    // chasePatchSamples_ records the sample count that buffer resolved, so
+    // patchChase can tell a stale base from a current one.
+    struct ChasePatch {
+        uint32_t px;
+        float phase, r, g, b;
+    };
+    mutable std::vector<ChasePatch> chasePatches_;
+    mutable bool chasePatchesValid_ = false;
+    mutable int chasePatchSamples_ = -1;
+
+    // Encode a tonemapped linear image to display BGRA (pooled, LUT sRGB),
+    // recording the chase patch list when `animate`. Never modulates -- see
+    // patchChase.
+    void encodeDisplay(const std::vector<float>& lin,
+                       const std::vector<float>& aov, bool animate,
+                       std::vector<uint8_t>& out,
+                       std::vector<ChasePatch>& patches, bool& valid) const;
+
+    // Normalise (per-pixel counts) + OIDN, from explicit buffers so the async
+    // worker can run it on a snapshot while accumulation continues.
+    void denoiseBuffers(const float* col, const float* alb, const float* nor,
+                        const uint16_t* cnt, int globalSamples, uint32_t w,
+                        uint32_t h, std::vector<float>& out) const;
+
+    // Async denoise state. The snapshot is taken on the render thread (the
+    // only accumulator writer, so it is race-free); the worker owns it and
+    // the cached OIDN objects until done. Results carry a sequence number so
+    // discardDenoise can drop an in-flight job's output.
+    std::thread dnThread_;
+    mutable std::mutex dnMutex_;
+    std::condition_variable dnCv_;
+    bool dnKick_ = false, dnStop_ = false, dnBusy_ = false, dnReady_ = false;
+    int dnKickedSamples_ = -1;
+    int dnPatchSamples_ = -1;  // samples of the READY result
+    uint64_t dnSeq_ = 0, dnMinSeq_ = 0;
+    bool dnAnimate_ = false;
+    uint32_t dnW_ = 0, dnH_ = 0;
+    std::vector<float> dnCol_, dnAlb_, dnNor_, dnPhase_;
+    std::vector<uint16_t> dnCnt_;
+    std::vector<uint8_t> dnOut_;
+    std::vector<ChasePatch> dnPatches_;
+    void denoiseWorker();
 
     // Cached OIDN state (CPU device), rebuilt on resolution change. Mutable so
     // resolve() stays const like the rest of the read path.

@@ -4,9 +4,14 @@
 #include <embree4/rtcore.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -119,6 +124,13 @@ Material makeMaterial(const geom::Part& part) {
 CpuTracer::CpuTracer() { device_ = rtcNewDevice(nullptr); }
 
 CpuTracer::~CpuTracer() {
+    // Stop the denoise worker FIRST -- it uses the OIDN objects below.
+    {
+        std::lock_guard<std::mutex> lk(dnMutex_);
+        dnStop_ = true;
+    }
+    dnCv_.notify_all();
+    if (dnThread_.joinable()) dnThread_.join();
     releaseScene();
     if (device_) rtcReleaseDevice(static_cast<RTCDevice>(device_));
     if (oidnFilter_) oidnReleaseFilter(static_cast<OIDNFilter>(oidnFilter_));
@@ -827,6 +839,116 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
 
 }  // namespace
 
+namespace {
+
+// A persistent worker pool with dynamically scheduled chunks.
+//
+// Two reasons this exists instead of spawning std::threads per call. First,
+// the resolve/encode passes run every displayed frame; spawning ~32 threads
+// per pass -- several passes per frame -- was measurable overhead and left
+// the cores idle between spawns. Second, dynamic chunking: a static split of
+// rows gave the edge threads (all background, rays that miss instantly) a
+// fraction of the centre threads' work, so half the pool finished early and
+// waited. Workers pull chunks from an atomic cursor until the range is dry.
+//
+// One job runs at a time (serialised internally); the CALLING thread chews
+// chunks too, so all hardware threads participate.
+class WorkPool {
+public:
+    static WorkPool& get() {
+        static WorkPool p;
+        return p;
+    }
+
+    void forRange(size_t n, size_t grain,
+                  const std::function<void(size_t, size_t)>& fn) {
+        if (n == 0) return;
+        if (threads_.empty()) {  // single-core machine: run inline
+            fn(0, n);
+            return;
+        }
+        std::lock_guard<std::mutex> serial(serial_);
+        job_ = &fn;
+        n_ = n;
+        grain_ = std::max<size_t>(grain, 1);
+        next_.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            running_ = static_cast<int>(threads_.size());
+            ++gen_;
+        }
+        cvStart_.notify_all();
+        chew();
+        std::unique_lock<std::mutex> lk(m_);
+        cvDone_.wait(lk, [&] { return running_ == 0; });
+        job_ = nullptr;
+    }
+
+private:
+    WorkPool() {
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw < 2) return;  // forRange runs inline
+        threads_.reserve(hw - 1);  // the caller is the hw-th participant
+        for (unsigned i = 0; i + 1 < hw; ++i)
+            threads_.emplace_back([this] { worker(); });
+    }
+    ~WorkPool() {
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            stop_ = true;
+        }
+        cvStart_.notify_all();
+        for (std::thread& t : threads_) t.join();
+    }
+
+    void chew() {
+        const std::function<void(size_t, size_t)>& fn = *job_;
+        for (;;) {
+            const size_t lo = next_.fetch_add(grain_, std::memory_order_relaxed);
+            if (lo >= n_) break;
+            fn(lo, std::min(lo + grain_, n_));
+        }
+    }
+
+    void worker() {
+        uint64_t seen = 0;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cvStart_.wait(lk, [&] { return stop_ || gen_ != seen; });
+                if (stop_) return;
+                seen = gen_;
+            }
+            chew();
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                if (--running_ == 0) cvDone_.notify_one();
+            }
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::mutex m_, serial_;
+    std::condition_variable cvStart_, cvDone_;
+    const std::function<void(size_t, size_t)>* job_ = nullptr;
+    std::atomic<size_t> next_{0};
+    size_t n_ = 0, grain_ = 1;
+    uint64_t gen_ = 0;
+    int running_ = 0;
+    bool stop_ = false;
+};
+
+// Pooled loop over [0, n) -- for the per-pixel resolve/encode passes. Grain
+// gives each thread ~8 chunks for balance without hammering the cursor.
+inline void parallelFor(size_t n, const std::function<void(size_t, size_t)>& fn) {
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    const size_t grain = std::max<size_t>(n / (size_t(hw) * 8 + 1), 1024);
+    WorkPool::get().forRange(n, grain, fn);
+}
+
+}  // namespace
+
 void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
                            uint32_t height, int spp, uint32_t frame) {
     if (!scene_ || width == 0 || height == 0) return;
@@ -840,10 +962,21 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
         accumAlbedo_.assign(static_cast<size_t>(width) * height * 3, 0.0f);
         accumNormal_.assign(static_cast<size_t>(width) * height * 3, 0.0f);
         phaseAov_.assign(static_cast<size_t>(width) * height * 2, 0.0f);
+        pixSamples_.assign(static_cast<size_t>(width) * height, 0);
+        lumSum_.assign(static_cast<size_t>(width) * height, 0.0f);
+        lumSum2_.assign(static_cast<size_t>(width) * height, 0.0f);
         accumSamples_ = 0;
+        chasePatchesValid_ = false;
+        chasePatchSamples_ = -1;
+        discardDenoise();  // an in-flight result belongs to the OLD view
     }
     if (phaseAov_.size() != static_cast<size_t>(width_) * height_ * 2)
         phaseAov_.assign(static_cast<size_t>(width_) * height_ * 2, 0.0f);
+    if (pixSamples_.size() != static_cast<size_t>(width_) * height_) {
+        pixSamples_.assign(static_cast<size_t>(width_) * height_, 0);
+        lumSum_.assign(static_cast<size_t>(width_) * height_, 0.0f);
+        lumSum2_.assign(static_cast<size_t>(width_) * height_, 0.0f);
+    }
 
     Ctx c;
     c.scene = static_cast<RTCScene>(scene_);
@@ -872,15 +1005,48 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
     float* alb = accumAlbedo_.data();
     float* nor = accumNormal_.data();
     float* aov = phaseAov_.data();
+    uint16_t* cnt = pixSamples_.data();
+    float* lumS = lumSum_.data();
+    float* lumS2 = lumSum2_.data();
     const uint32_t w = width_, h = height_;
 
-    // Parallelise over rows with a plain thread pool -- each pixel writes only
-    // its own accumulator slots, so there are no data races. std::thread keeps
-    // the dependency surface to Embree alone (no TBB headers needed).
-    const auto renderRows = [&](uint32_t y0, uint32_t y1) {
-        for (uint32_t y = y0; y < y1; ++y) {
-            for (uint32_t x = 0; x < w; ++x) {
-                const size_t o = (static_cast<size_t>(y) * w + x) * 3;
+    // Adaptive stop (PT only): once a pixel has kAdaptMin samples and its
+    // luminance mean's relative standard error drops below kAdaptErr, stop
+    // sampling it. The background -- most of a board image -- hits this after
+    // a handful of batches, so late batches spend their rays only on edges,
+    // glints and penumbras. Resolve divides by the PER-PIXEL count, so a
+    // stopped pixel stays correct. The 0.02 floor keeps near-black pixels
+    // from chasing a relative target on a signal the eye cannot see.
+    constexpr uint16_t kAdaptMin = 32;
+    constexpr float kAdaptErr = 0.015f;
+    const bool adaptive = !preview_;
+
+    // 32x32 tiles, dynamically scheduled: neighbouring rays traverse the same
+    // BVH nodes (cache-warm), and the atomic cursor keeps every thread busy
+    // however unevenly the work is spread across the board.
+    constexpr uint32_t kTile = 32;
+    const uint32_t tilesX = (w + kTile - 1) / kTile;
+    const uint32_t tilesY = (h + kTile - 1) / kTile;
+
+    WorkPool::get().forRange(
+        static_cast<size_t>(tilesX) * tilesY, 1, [&](size_t lo, size_t hi) {
+        for (size_t t = lo; t < hi; ++t) {
+            const uint32_t x0 = static_cast<uint32_t>(t % tilesX) * kTile;
+            const uint32_t y0 = static_cast<uint32_t>(t / tilesX) * kTile;
+            const uint32_t x1 = std::min(x0 + kTile, w);
+            const uint32_t y1 = std::min(y0 + kTile, h);
+            for (uint32_t y = y0; y < y1; ++y) {
+            for (uint32_t x = x0; x < x1; ++x) {
+                const size_t p = static_cast<size_t>(y) * w + x;
+                if (adaptive && cnt[p] >= kAdaptMin) {
+                    const float ns = static_cast<float>(cnt[p]);
+                    const float mean = lumS[p] / ns;
+                    const float var =
+                        std::max(lumS2[p] / ns - mean * mean, 0.0f);
+                    if (std::sqrt(var / ns) / std::max(mean, 0.02f) < kAdaptErr)
+                        continue;  // converged; spend the rays elsewhere
+                }
+                const size_t o = p * 3;
                 for (int s = 0; s < spp; ++s) {
                     const uint32_t gs = baseSample + static_cast<uint32_t>(s);
                     Rng rng;
@@ -910,30 +1076,26 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
                     const V3 rad =
                         trace(c, origin, dir, rng, ga, gn, maxDepth, ph);
                     if (ph[1] > 0.0f) {
-                        const size_t a = (static_cast<size_t>(y) * w + x) * 2;
-                        aov[a] = ph[0];
-                        aov[a + 1] = 1.0f;
+                        aov[p * 2] = ph[0];
+                        aov[p * 2 + 1] = 1.0f;
                     }
                     col[o + 0] += rad.x; col[o + 1] += rad.y; col[o + 2] += rad.z;
                     alb[o + 0] += ga.x;  alb[o + 1] += ga.y;  alb[o + 2] += ga.z;
                     nor[o + 0] += gn.x;  nor[o + 1] += gn.y;  nor[o + 2] += gn.z;
+                    const float lum =
+                        0.2126f * rad.x + 0.7152f * rad.y + 0.0722f * rad.z;
+                    lumS[p] += lum;
+                    lumS2[p] += lum * lum;
+                    if (cnt[p] < 65535) ++cnt[p];
                 }
             }
+            }
         }
-    };
-
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 4;
-    const uint32_t nThreads = std::min<uint32_t>(hw, h);
-    std::vector<std::thread> pool;
-    pool.reserve(nThreads);
-    for (uint32_t t = 0; t < nThreads; ++t) {
-        const uint32_t y0 = t * h / nThreads;
-        const uint32_t y1 = (t + 1) * h / nThreads;
-        pool.emplace_back(renderRows, y0, y1);
-    }
-    for (std::thread& th : pool) th.join();
+    });
     accumSamples_ += spp;
+    // chasePatches_ stays valid: it describes the last DISPLAY buffer, which
+    // is unchanged by accumulation. patchChase compares chasePatchSamples_
+    // against the new count to tell callers the base is now stale.
 }
 
 namespace {
@@ -946,44 +1108,34 @@ V3 shoulder(V3 x) {
     return x * (mo / m);
 }
 
-// Split [0, n) across the hardware threads, calling fn(lo, hi) on each. Every
-// index is independent (each pixel writes only its own output), so the resolve,
-// tonemap and sRGB-encode passes -- which used to run on a single thread and,
-// on a converged image being chased, were the ENTIRE frame -- now use every
-// core the trace does. This is what keeps the display refresh from pinning one
-// core while the other 31 sit idle.
-template <class F>
-void parallelFor(size_t n, F&& fn) {
-    if (n == 0) return;
-    unsigned hw = std::thread::hardware_concurrency();
-    if (hw == 0) hw = 4;
-    const size_t nThreads = std::min<size_t>(hw, n);
-    if (nThreads <= 1) { fn(size_t(0), n); return; }
-    std::vector<std::thread> pool;
-    pool.reserve(nThreads);
-    for (size_t t = 0; t < nThreads; ++t) {
-        const size_t i0 = t * n / nThreads;
-        const size_t i1 = (t + 1) * n / nThreads;
-        pool.emplace_back([&fn, i0, i1] { fn(i0, i1); });
-    }
-    for (std::thread& th : pool) th.join();
-}
 }  // namespace
 
-void CpuTracer::denoiseInto(std::vector<float>& colorOut) const {
-    const size_t n = static_cast<size_t>(width_) * height_;
-    const float inv = 1.0f / static_cast<float>(std::max(accumSamples_, 1));
+// Normalise + OIDN, from EXPLICIT buffers so the async worker can run this on
+// a snapshot while accumulation continues. `cnt` (when non-null) is the
+// per-pixel sample count from adaptive sampling; `globalSamples` covers the
+// uniform case. The static gate serialises the shared cached OIDN objects
+// between the worker and any synchronous caller (the headless CLI).
+void CpuTracer::denoiseBuffers(const float* colS, const float* albS,
+                               const float* norS, const uint16_t* cnt,
+                               int globalSamples, uint32_t w, uint32_t h,
+                               std::vector<float>& colorOut) const {
+    static std::mutex oidnGate;
+    std::lock_guard<std::mutex> gate(oidnGate);
+
+    const size_t n = static_cast<size_t>(w) * h;
+    const float invG = 1.0f / static_cast<float>(std::max(globalSamples, 1));
     std::vector<float> col(n * 3), alb(n * 3), nor(n * 3);
     parallelFor(n, [&](size_t a, size_t b) {
         for (size_t i = a; i < b; ++i) {
+            const float inv =
+                cnt ? 1.0f / static_cast<float>(std::max<uint16_t>(cnt[i], 1))
+                    : invG;
             for (int k = 0; k < 3; ++k) {
-                col[i * 3 + k] = accumColor_[i * 3 + k] * inv;
-                alb[i * 3 + k] =
-                    std::clamp(accumAlbedo_[i * 3 + k] * inv, 0.0f, 1.0f);
+                col[i * 3 + k] = colS[i * 3 + k] * inv;
+                alb[i * 3 + k] = std::clamp(albS[i * 3 + k] * inv, 0.0f, 1.0f);
             }
-            float nx = accumNormal_[i * 3] * inv,
-                  ny = accumNormal_[i * 3 + 1] * inv,
-                  nz = accumNormal_[i * 3 + 2] * inv;
+            float nx = norS[i * 3] * inv, ny = norS[i * 3 + 1] * inv,
+                  nz = norS[i * 3 + 2] * inv;
             const float l = std::sqrt(nx * nx + ny * ny + nz * nz);
             if (l > 1e-6f) { nx /= l; ny /= l; nz /= l; }
             nor[i * 3] = nx; nor[i * 3 + 1] = ny; nor[i * 3 + 2] = nz;
@@ -997,7 +1149,7 @@ void CpuTracer::denoiseInto(std::vector<float>& colorOut) const {
     }
     OIDNDevice dev = static_cast<OIDNDevice>(oidn_);
     const size_t bytes = n * 3 * sizeof(float);
-    if (oidnW_ != width_ || oidnH_ != height_ || !oidnFilter_) {
+    if (oidnW_ != w || oidnH_ != h || !oidnFilter_) {
         if (oidnFilter_) oidnReleaseFilter(static_cast<OIDNFilter>(oidnFilter_));
         if (oidnColor_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnColor_));
         if (oidnAlbedo_) oidnReleaseBuffer(static_cast<OIDNBuffer>(oidnAlbedo_));
@@ -1008,15 +1160,15 @@ void CpuTracer::denoiseInto(std::vector<float>& colorOut) const {
         OIDNBuffer bn = oidnNewBuffer(dev, bytes);
         OIDNBuffer bo = oidnNewBuffer(dev, bytes);
         OIDNFilter f = oidnNewFilter(dev, "RT");
-        const size_t px = 3 * sizeof(float), row = px * width_;
-        oidnSetFilterImage(f, "color", bc, OIDN_FORMAT_FLOAT3, width_, height_, 0, px, row);
-        oidnSetFilterImage(f, "albedo", ba, OIDN_FORMAT_FLOAT3, width_, height_, 0, px, row);
-        oidnSetFilterImage(f, "normal", bn, OIDN_FORMAT_FLOAT3, width_, height_, 0, px, row);
-        oidnSetFilterImage(f, "output", bo, OIDN_FORMAT_FLOAT3, width_, height_, 0, px, row);
+        const size_t px = 3 * sizeof(float), row = px * w;
+        oidnSetFilterImage(f, "color", bc, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterImage(f, "albedo", ba, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterImage(f, "normal", bn, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
+        oidnSetFilterImage(f, "output", bo, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterBool(f, "hdr", true);
         oidnCommitFilter(f);
         oidnColor_ = bc; oidnAlbedo_ = ba; oidnNormal_ = bn; oidnOut_ = bo;
-        oidnFilter_ = f; oidnW_ = width_; oidnH_ = height_;
+        oidnFilter_ = f; oidnW_ = w; oidnH_ = h;
     }
     oidnWriteBuffer(static_cast<OIDNBuffer>(oidnColor_), 0, bytes, col.data());
     oidnWriteBuffer(static_cast<OIDNBuffer>(oidnAlbedo_), 0, bytes, alb.data());
@@ -1026,12 +1178,30 @@ void CpuTracer::denoiseInto(std::vector<float>& colorOut) const {
     oidnReadBuffer(static_cast<OIDNBuffer>(oidnOut_), 0, bytes, colorOut.data());
 }
 
+void CpuTracer::denoiseInto(std::vector<float>& colorOut) const {
+    denoiseBuffers(accumColor_.data(), accumAlbedo_.data(), accumNormal_.data(),
+                   pixSamples_.empty() ? nullptr : pixSamples_.data(),
+                   accumSamples_, width_, height_, colorOut);
+}
+
 namespace {
+// Exact sRGB encode via a 4096-entry table. The pow() version cost a real
+// slice of every display resolve at 3 calls per pixel; 4096 entries is finer
+// than the 8-bit output can distinguish anywhere on the curve.
 inline uint8_t encodeSrgb(float c) {
+    static const std::array<uint8_t, 4097> lut = [] {
+        std::array<uint8_t, 4097> t{};
+        for (size_t i = 0; i < t.size(); ++i) {
+            const float v = static_cast<float>(i) / 4096.0f;
+            const float s = v <= 0.0031308f
+                                ? 12.92f * v
+                                : 1.055f * std::pow(v, 1.0f / 2.4f) - 0.055f;
+            t[i] = static_cast<uint8_t>(s * 255.0f + 0.5f);
+        }
+        return t;
+    }();
     c = std::clamp(c, 0.0f, 1.0f);
-    const float s = c <= 0.0031308f ? 12.92f * c
-                                    : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
-    return static_cast<uint8_t>(s * 255.0f + 0.5f);
+    return lut[static_cast<size_t>(c * 4096.0f + 0.5f)];
 }
 }  // namespace
 
@@ -1045,9 +1215,19 @@ void CpuTracer::resolveLinear(std::vector<float>& lin, bool denoise) const {
         denoiseInto(color);
     } else {
         color.resize(n * 3);
-        const float inv = 1.0f / static_cast<float>(std::max(accumSamples_, 1));
-        parallelFor(n * 3, [&](size_t a, size_t b) {
-            for (size_t i = a; i < b; ++i) color[i] = accumColor_[i] * inv;
+        // Adaptive sampling makes the sample count PER PIXEL.
+        const uint16_t* cnt = pixSamples_.size() == n ? pixSamples_.data() : nullptr;
+        const float invG = 1.0f / static_cast<float>(std::max(accumSamples_, 1));
+        parallelFor(n, [&](size_t a, size_t b) {
+            for (size_t i = a; i < b; ++i) {
+                const float inv =
+                    cnt ? 1.0f /
+                              static_cast<float>(std::max<uint16_t>(cnt[i], 1))
+                        : invG;
+                color[i * 3 + 0] = accumColor_[i * 3 + 0] * inv;
+                color[i * 3 + 1] = accumColor_[i * 3 + 1] * inv;
+                color[i * 3 + 2] = accumColor_[i * 3 + 2] * inv;
+            }
         });
     }
     lin.resize(n * 3);
@@ -1093,10 +1273,14 @@ void CpuTracer::setHighlight(std::vector<std::array<float, 4>> netColour,
     netOn_ = false;
     for (const std::array<float, 4>& c : netColour_)
         if (c[3] > 0.0f) { netOn_ = true; break; }
-    // The tag AOV describes the PREVIOUS highlight; drop it so a stale net
-    // cannot keep chasing after the selection changes. The caller restarts
-    // accumulation, which reallocates it.
+    // The tag AOV and patch list describe the PREVIOUS highlight; drop both
+    // so a stale net cannot keep chasing after the selection changes. The
+    // caller restarts accumulation, which reallocates the AOV, and any
+    // in-flight denoise belongs to the old selection.
     phaseAov_.clear();
+    chasePatchesValid_ = false;
+    chasePatchSamples_ = -1;
+    discardDenoise();
     rebuildNetLights();
 }
 
@@ -1165,25 +1349,26 @@ float netChase(float phase, uint32_t timeMs, bool animate) {
 }
 }  // namespace
 
-std::vector<uint8_t> CpuTracer::resolveDisplay(bool denoise, uint32_t chaseMs,
-                                               bool animate) const {
-    const size_t n = static_cast<size_t>(width_) * height_;
-    std::vector<uint8_t> out(n * 4, 0);
-    if (accumSamples_ <= 0) return out;
-    std::vector<float> lin;
-    resolveLinear(lin, denoise);
-    // The chase, applied at DISPLAY time so it costs no convergence -- the
-    // same trick as the GPU's tonemap pass.
-    if (animate && netOn_ && phaseAov_.size() == n * 2) {
-        parallelFor(n, [&](size_t a, size_t b) {
-            for (size_t i = a; i < b; ++i) {
-                if (phaseAov_[i * 2 + 1] <= 0.5f) continue;
-                const float k = netChase(phaseAov_[i * 2], chaseMs, true);
-                for (int cc = 0; cc < 3; ++cc)
-                    lin[i * 3 + cc] = std::clamp(lin[i * 3 + cc] * k, 0.0f, 1.0f);
-            }
-        });
+// Encode a tonemapped linear image to display BGRA. When `animate`, record
+// each tagged pixel's UNmodulated colour + phase into `patches`; the chase is
+// applied only by patchChase, so a base image and its patch list always agree.
+void CpuTracer::encodeDisplay(const std::vector<float>& lin,
+                              const std::vector<float>& aov, bool animate,
+                              std::vector<uint8_t>& out,
+                              std::vector<ChasePatch>& patches,
+                              bool& valid) const {
+    const size_t n = lin.size() / 3;
+    patches.clear();
+    valid = false;
+    if (animate && aov.size() == n * 2) {
+        for (size_t i = 0; i < n; ++i) {
+            if (aov[i * 2 + 1] <= 0.5f) continue;
+            patches.push_back({static_cast<uint32_t>(i), aov[i * 2],
+                               lin[i * 3], lin[i * 3 + 1], lin[i * 3 + 2]});
+        }
+        valid = true;
     }
+    out.resize(n * 4);
     parallelFor(n, [&](size_t a, size_t b) {
         for (size_t i = a; i < b; ++i) {
             // BGRA order for B8G8R8A8; store sRGB-encoded values so the SRGB
@@ -1194,7 +1379,142 @@ std::vector<uint8_t> CpuTracer::resolveDisplay(bool denoise, uint32_t chaseMs,
             out[i * 4 + 3] = 255;
         }
     });
+}
+
+std::vector<uint8_t> CpuTracer::resolveDisplay(bool denoise, uint32_t chaseMs,
+                                               bool animate) const {
+    (void)chaseMs;  // the chase is applied by patchChase, never baked here
+    const size_t n = static_cast<size_t>(width_) * height_;
+    std::vector<uint8_t> out(n * 4, 0);
+    if (accumSamples_ <= 0) return out;
+    std::vector<float> lin;
+    resolveLinear(lin, denoise);
+    encodeDisplay(lin, phaseAov_, animate && netOn_, out, chasePatches_,
+                  chasePatchesValid_);
+    chasePatchSamples_ = accumSamples_;
     return out;
+}
+
+bool CpuTracer::patchChase(std::vector<uint8_t>& bgra, uint32_t chaseMs,
+                           bool allowStale) const {
+    const size_t n = static_cast<size_t>(width_) * height_;
+    if (!chasePatchesValid_ || accumSamples_ <= 0 || bgra.size() != n * 4)
+        return false;
+    if (!allowStale && chasePatchSamples_ != accumSamples_) return false;
+    // A few percent of the pixels; cheaper single-threaded than a pool kick.
+    for (const ChasePatch& cp : chasePatches_) {
+        const float k = netChase(cp.phase, chaseMs, true);
+        uint8_t* px = &bgra[static_cast<size_t>(cp.px) * 4];
+        px[0] = encodeSrgb(cp.b * k);
+        px[1] = encodeSrgb(cp.g * k);
+        px[2] = encodeSrgb(cp.r * k);
+    }
+    return true;
+}
+
+void CpuTracer::kickDenoiseResolve(bool animate) {
+    if (accumSamples_ <= 0 || width_ == 0 || height_ == 0) return;
+    {
+        std::lock_guard<std::mutex> lk(dnMutex_);
+        if (dnBusy_ || dnKickedSamples_ == accumSamples_) return;
+        dnBusy_ = true;
+        dnKick_ = true;
+        dnKickedSamples_ = accumSamples_;
+        dnAnimate_ = animate && netOn_;
+        dnW_ = width_;
+        dnH_ = height_;
+        // Snapshot on THIS thread -- it is the only accumulator writer, so
+        // the copy is race-free; the worker then owns the copies.
+        dnCol_ = accumColor_;
+        dnAlb_ = accumAlbedo_;
+        dnNor_ = accumNormal_;
+        dnCnt_ = pixSamples_;
+        dnPhase_ = phaseAov_;
+        ++dnSeq_;
+        if (!dnThread_.joinable())
+            dnThread_ = std::thread([this] { denoiseWorker(); });
+    }
+    dnCv_.notify_one();
+}
+
+bool CpuTracer::fetchDenoiseResolve(std::vector<uint8_t>& bgra) {
+    std::lock_guard<std::mutex> lk(dnMutex_);
+    if (!dnReady_) return false;
+    bgra.swap(dnOut_);
+    chasePatches_ = std::move(dnPatches_);
+    chasePatchesValid_ = dnAnimate_;
+    chasePatchSamples_ = dnPatchSamples_;
+    dnReady_ = false;
+    return true;
+}
+
+void CpuTracer::discardDenoise() {
+    std::lock_guard<std::mutex> lk(dnMutex_);
+    dnReady_ = false;
+    dnKickedSamples_ = -1;
+    // An in-flight job carries a sequence below this floor; its completion
+    // is dropped in denoiseWorker rather than published.
+    dnMinSeq_ = dnSeq_ + 1;
+}
+
+void CpuTracer::denoiseWorker() {
+    for (;;) {
+        std::vector<float> col, alb, nor, phase;
+        std::vector<uint16_t> cnt;
+        uint32_t w = 0, h = 0;
+        bool animate = false;
+        int snapSamples = 0;
+        uint64_t seq = 0;
+        {
+            std::unique_lock<std::mutex> lk(dnMutex_);
+            dnCv_.wait(lk, [&] { return dnKick_ || dnStop_; });
+            if (dnStop_) return;
+            dnKick_ = false;
+            col.swap(dnCol_);
+            alb.swap(dnAlb_);
+            nor.swap(dnNor_);
+            cnt.swap(dnCnt_);
+            phase.swap(dnPhase_);
+            w = dnW_;
+            h = dnH_;
+            animate = dnAnimate_;
+            snapSamples = dnKickedSamples_;
+            seq = dnSeq_;
+        }
+
+        std::vector<float> den;
+        denoiseBuffers(col.data(), alb.data(), nor.data(),
+                       cnt.empty() ? nullptr : cnt.data(), snapSamples, w, h,
+                       den);
+        // Tonemap (denoise implies the PT integrator, never the preview).
+        const size_t n = static_cast<size_t>(w) * h;
+        std::vector<float> lin(n * 3);
+        const float kExposure = 0.85f;
+        parallelFor(n, [&](size_t a, size_t b) {
+            for (size_t i = a; i < b; ++i) {
+                const V3 t = shoulder(V3{den[i * 3], den[i * 3 + 1],
+                                         den[i * 3 + 2]} * kExposure);
+                lin[i * 3] = t.x;
+                lin[i * 3 + 1] = t.y;
+                lin[i * 3 + 2] = t.z;
+            }
+        });
+        std::vector<uint8_t> out;
+        std::vector<ChasePatch> patches;
+        bool valid = false;
+        encodeDisplay(lin, phase, animate, out, patches, valid);
+
+        {
+            std::lock_guard<std::mutex> lk(dnMutex_);
+            dnBusy_ = false;
+            if (seq < dnMinSeq_) continue;  // discarded mid-flight; drop it
+            dnOut_ = std::move(out);
+            dnPatches_ = std::move(patches);
+            dnAnimate_ = valid;
+            dnPatchSamples_ = snapSamples;
+            dnReady_ = true;
+        }
+    }
 }
 
 std::vector<uint8_t> CpuTracer::renderImage(const TraceCamera& cam,

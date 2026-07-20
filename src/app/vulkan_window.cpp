@@ -288,6 +288,14 @@ void VulkanWindow::createDeviceAndRenderer() {
     renderer_ = std::make_unique<vk::Renderer>(
         device_, surface_, static_cast<uint32_t>(width() * dpr),
         static_cast<uint32_t>(height() * dpr));
+    // On the software device, ray tracing defaults ON: llvmpipe raster costs
+    // ~130ms a frame (the full scene pass executes inside its synchronous
+    // present) while the Embree preview renders the same view in ~21ms WITH
+    // shadows and AO. Only the DEFAULT changes -- an explicit setting or a
+    // PCBVIEW_RT override still wins.
+    if (cpuRender() && !qEnvironmentVariableIsSet("PCBVIEW_RT") &&
+        !appSettings().contains("rayTracing"))
+        rtEnabled_ = true;
     renderer_->setRayTracing(rtEnabled_ && rtAvailable());
     if (qEnvironmentVariableIsSet("PCBVIEW_PT_SPP"))
         renderer_->setMaxSamples(qgetenv("PCBVIEW_PT_SPP").toInt());
@@ -297,15 +305,19 @@ void VulkanWindow::createDeviceAndRenderer() {
     if (qEnvironmentVariableIsSet("PCBVIEW_RENDER_SCALE"))
         renderer_->setRenderScale(qgetenv("PCBVIEW_RENDER_SCALE").toFloat());
 
-    // Fast-movement default is DEVICE-dependent: on for the CPU renderer (path
-    // tracing there is far too slow to orbit under), off for a GPU. Persisted
-    // per device class; an env override wins. A device swap re-evaluates it.
+    // Fast movement (raster while moving) defaults OFF everywhere now, still
+    // persisted per device class with an env override. It used to default ON
+    // for the CPU device on the assumption that raster is the cheap fallback
+    // there -- profiling showed the opposite: llvmpipe executes the full scene
+    // pass inside a synchronous present (~130ms), while the Embree preview's
+    // whole frame is ~21ms. Downgrading to raster during motion made moving
+    // SLOWER.
     if (qEnvironmentVariableIsSet("PCBVIEW_FAST_MOVE"))
         fastMove_ = qgetenv("PCBVIEW_FAST_MOVE").toInt() != 0;
     else
         fastMove_ = appSettings()
                         .value(cpuRender() ? "fastMovementCpu" : "fastMovementGpu",
-                               cpuRender())
+                               false)
                         .toBool();
     // A fresh renderer starts in whatever mode we set below; clear any stale
     // motion-downgrade latch from the previous device so the two agree.

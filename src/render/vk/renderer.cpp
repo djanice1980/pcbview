@@ -921,39 +921,50 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
     // (focus changes, overlays) must not burn CPU re-tracing a finished image.
     const int target = cpuTargetSamples();
     if (cpuTracer_->samples() < target || cpuPass_ == 0) {
-        const int batch = 4;
+        // The FIRST batch after a restart traces one sample: the image right
+        // after a camera move is what interactivity is judged by, and 1spp of
+        // the deterministic preview is already a complete picture. Later
+        // batches take 4 so the per-frame overhead is paid less often.
+        const int batch = cpuPass_ == 0 ? 1 : 4;
         cpuTracer_->accumulate(cam, sceneExtent_.width, sceneExtent_.height,
                                batch, cpuPass_);
         ++cpuPass_;
     }
 
-    // Denoising (OIDN, on this thread) is expensive, so run it at sample
-    // milestones -- powers of two early for fast cleanup, then every 32 so the
-    // late convergence still shows progress -- and at convergence. Between
-    // milestones keep showing the last denoised image and accumulate silently
-    // underneath. The RT preview skips OIDN entirely: its integrator is
-    // near-noise-free by 8 samples, so it just refreshes every frame.
+    // Denoising (OIDN) runs on a WORKER thread at sample milestones -- powers
+    // of two early for fast cleanup, then every 32 -- and swaps in whenever it
+    // finishes, so the frame loop never blocks on the ~0.5s filter. The RT
+    // preview skips OIDN entirely: its integrator is near-noise-free by 8
+    // samples, so it just refreshes every frame.
     const int s = cpuTracer_->samples();
     const bool milestone = s <= 32 ? (s & (s - 1)) == 0 : (s % 32) == 0;
     const bool converged = s >= target;
-    const bool wantDenoise = !preview && denoisingEnabled_ && s >= 4 &&
-                             (milestone || converged);
-    // While a net is chasing, the DISPLAY must refresh every frame even though
-    // the accumulation is finished -- the modulation lives in resolveDisplay,
-    // not in the traced radiance. Denoising still runs only on its milestones,
-    // so this costs a resolve, not an OIDN pass.
     const bool chasing = netAnimating();
-    const bool refresh = wantDenoise || preview || !denoisingEnabled_ ||
-                         cpuDisplayCache_.empty() || chasing;
-    if (refresh) {
-        const uint32_t chaseMs =
-            chasing ? static_cast<uint32_t>(
-                          std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - highlightStart_)
-                              .count())
-                    : 0u;
-        cpuDisplayCache_ =
-            cpuTracer_->resolveDisplay(wantDenoise, chaseMs, chasing);
+    const uint32_t chaseMs =
+        chasing ? static_cast<uint32_t>(
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - highlightStart_)
+                          .count())
+                : 0u;
+    const bool denoised = !preview && denoisingEnabled_;
+    if (denoised && s >= 4 && (milestone || converged))
+        cpuTracer_->kickDenoiseResolve(chasing);
+
+    // Display refresh, cheapest source first: a finished denoise swaps in; a
+    // chase on an unchanged base only re-touches the tagged pixels; otherwise
+    // the cheap paths (preview, denoise-off) resolve fresh every frame, and
+    // the denoised path keeps its last image while accumulating underneath.
+    if (denoised && cpuTracer_->fetchDenoiseResolve(cpuDisplayCache_)) {
+        if (chasing) cpuTracer_->patchChase(cpuDisplayCache_, chaseMs, true);
+    } else if (chasing &&
+               cpuTracer_->patchChase(cpuDisplayCache_, chaseMs,
+                                      /*allowStale=*/denoised)) {
+        // Patched in place -- a converged chase frame costs ~3% of the pixels
+        // instead of three full-image passes (and, with denoising on, no
+        // longer re-runs OIDN every frame).
+    } else if (preview || !denoisingEnabled_ || cpuDisplayCache_.empty()) {
+        cpuDisplayCache_ = cpuTracer_->resolveDisplay(false, 0, chasing);
+        if (chasing) cpuTracer_->patchChase(cpuDisplayCache_, chaseMs, true);
     }
     // This frame slot's fence was waited at the top of drawFrame, so ITS staging
     // buffer is idle; other slots may still be copying theirs.
