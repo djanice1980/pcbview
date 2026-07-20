@@ -41,6 +41,12 @@ const uint32_t kOverlayVert[] =
 const uint32_t kOverlayFrag[] =
 #include "shaders/overlay.frag.inc"
     ;
+const uint32_t kBloomExtract[] =
+#include "shaders/bloom_extract.frag.inc"
+    ;
+const uint32_t kBloomComposite[] =
+#include "shaders/bloom_composite.frag.inc"
+    ;
 
 constexpr uint32_t kFramesInFlight = 2;
 
@@ -123,6 +129,8 @@ Renderer::Renderer(Device& device, VkSurfaceKHR surface, uint32_t width,
     createDescriptors();
     createPipeline();
     createOverlayPipeline();
+    createBloomPipelines();
+    createBloomTargets();  // scene targets exist by now
     if (rtSupported_) createPathTracer();
     createSyncAndCommands();
 }
@@ -137,6 +145,9 @@ Renderer::~Renderer() {
     destroyBuffer(indexBuffer_);
     destroyBuffer(materialBuffer_);
     destroyBuffer(triMaterialBuffer_);
+    destroyBuffer(triNetBuffer_);
+    destroyBuffer(netColorBuffer_);
+    destroyBuffer(netLightBuffer_);
     destroyBuffer(tracedVertexBuffer_);
     destroySceneTargets();
 
@@ -147,6 +158,7 @@ Renderer::~Renderer() {
 
     if (pipelineOpaque_) vkDestroyPipeline(device_.handle, pipelineOpaque_, nullptr);
     if (pipelineBlend_) vkDestroyPipeline(device_.handle, pipelineBlend_, nullptr);
+    destroyBloom();
     if (overlayPipeline_) vkDestroyPipeline(device_.handle, overlayPipeline_, nullptr);
     if (overlayLayout_) vkDestroyPipelineLayout(device_.handle, overlayLayout_, nullptr);
     for (Buffer& b : overlayVb_) destroyBuffer(b);
@@ -1677,10 +1689,12 @@ void Renderer::createSceneTargets() {
         static_cast<uint32_t>(std::lround(extent_.height * renderScale_)), 1u,
         maxDim);
 
+    // SAMPLED so the bloom extract pass can read the finished scene.
     sceneColor_ = createImage(sceneExtent_, colorFormat_,
                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                  VK_IMAGE_USAGE_SAMPLED_BIT,
                               VK_IMAGE_ASPECT_COLOR_BIT);
     sceneDepth_ = createImage(sceneExtent_, depthFormat_,
                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
@@ -1737,6 +1751,7 @@ void Renderer::createSceneTargets() {
 void Renderer::destroySceneTargets() {
     destroyImage(sceneColor_);
     destroyImage(sceneDepth_);
+    destroyImage(bloomTex_);  // sized from sceneExtent_, so it dies with it
     for (Buffer& b : cpuStaging_) destroyBuffer(b);
     cpuStaging_.clear();
 }
@@ -1748,6 +1763,7 @@ void Renderer::setRenderScale(float scale) {
     renderScale_ = scale;
     destroySceneTargets();
     createSceneTargets();
+    createBloomTargets();
     // Every accumulated image is sized to the OLD scene extent, so the new
     // resolution has to start over. Without this the raster path followed the
     // slider but the traced paths did not: a converged CPU trace skips
@@ -2124,6 +2140,277 @@ void Renderer::recordOverlay(VkCommandBuffer cmd, VkExtent2D drawArea) {
     VkDeviceSize zero = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vb.handle, &zero);
     vkCmdDraw(cmd, static_cast<uint32_t>(overlayTris_.size() / 6), 1, 0, 0);
+}
+
+void Renderer::createBloomPipelines() {
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+    // CLAMP_TO_EDGE, or the halo wraps around the opposite edge of the image.
+    si.addressModeU = si.addressModeV = si.addressModeW =
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    check(vkCreateSampler(device_.handle, &si, nullptr, &bloomSampler_),
+          "bloom sampler");
+
+    VkDescriptorSetLayoutBinding b{};
+    b.binding = 0;
+    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b.descriptorCount = 1;
+    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo li{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = 1;
+    li.pBindings = &b;
+    check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr,
+                                      &bloomSetLayout_),
+          "bloom set layout");
+
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 2;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &ps;
+    check(vkCreateDescriptorPool(device_.handle, &pi, nullptr, &bloomPool_),
+          "bloom pool");
+
+    VkDescriptorSetLayout layouts[2] = {bloomSetLayout_, bloomSetLayout_};
+    VkDescriptorSetAllocateInfo ai{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = bloomPool_;
+    ai.descriptorSetCount = 2;
+    ai.pSetLayouts = layouts;
+    VkDescriptorSet sets[2]{};
+    check(vkAllocateDescriptorSets(device_.handle, &ai, sets), "bloom sets");
+    bloomSrcSet_ = sets[0];
+    bloomTexSet_ = sets[1];
+
+    VkPushConstantRange pcr{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4 * sizeof(float)};
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &bloomSetLayout_;
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
+    check(vkCreatePipelineLayout(device_.handle, &pl, nullptr, &bloomLayout_),
+          "bloom pipeline layout");
+
+    // Two pipelines over the same fullscreen vertex shader: extract writes a
+    // fresh target (no blend), composite adds onto the scene (ONE/ONE).
+    VkShaderModule vs = makeModule(device_.handle, kFullscreenVert,
+                                   sizeof(kFullscreenVert));
+    const auto build = [&](const uint32_t* code, size_t bytes, bool additive) {
+        VkShaderModule fs = makeModule(device_.handle, code, bytes);
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vs;
+        stages[0].pName = "main";
+        stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = fs;
+        stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo vin{
+            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia{
+            VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        VkPipelineViewportStateCreateInfo vp{
+            VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        vp.viewportCount = vp.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.cullMode = VK_CULL_MODE_NONE;
+        rs.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms{
+            VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        if (additive) {
+            cba.blendEnable = VK_TRUE;
+            cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            cba.colorBlendOp = VK_BLEND_OP_ADD;
+            cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            cba.alphaBlendOp = VK_BLEND_OP_ADD;
+        }
+        VkPipelineColorBlendStateCreateInfo cb{
+            VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        cb.attachmentCount = 1;
+        cb.pAttachments = &cba;
+        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo ds{
+            VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        ds.dynamicStateCount = 2;
+        ds.pDynamicStates = dyn;
+        VkPipelineRenderingCreateInfo rend{
+            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rend.colorAttachmentCount = 1;
+        rend.pColorAttachmentFormats = &colorFormat_;
+
+        VkGraphicsPipelineCreateInfo gpi{
+            VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        gpi.pNext = &rend;
+        gpi.stageCount = 2;
+        gpi.pStages = stages;
+        gpi.pVertexInputState = &vin;
+        gpi.pInputAssemblyState = &ia;
+        gpi.pViewportState = &vp;
+        gpi.pRasterizationState = &rs;
+        gpi.pMultisampleState = &ms;
+        gpi.pColorBlendState = &cb;
+        gpi.pDynamicState = &ds;
+        gpi.layout = bloomLayout_;
+        VkPipeline p = VK_NULL_HANDLE;
+        check(vkCreateGraphicsPipelines(device_.handle, VK_NULL_HANDLE, 1, &gpi,
+                                        nullptr, &p),
+              "bloom pipeline");
+        vkDestroyShaderModule(device_.handle, fs, nullptr);
+        return p;
+    };
+    bloomExtractPipeline_ = build(kBloomExtract, sizeof(kBloomExtract), false);
+    bloomCompositePipeline_ =
+        build(kBloomComposite, sizeof(kBloomComposite), true);
+    vkDestroyShaderModule(device_.handle, vs, nullptr);
+}
+
+// Quarter-resolution bloom target, plus the two descriptor writes. Called
+// whenever the scene targets are (re)created, since both depend on the size.
+void Renderer::createBloomTargets() {
+    if (bloomSetLayout_ == VK_NULL_HANDLE) return;
+    // HALF resolution, not quarter: a highlighted trace is only a pixel or two
+    // wide, and a quarter-res downsample attenuates it almost to nothing
+    // before it can bleed.
+    bloomExtent_ = {std::max(1u, sceneExtent_.width / 2),
+                    std::max(1u, sceneExtent_.height / 2)};
+    bloomTex_ = createImage(bloomExtent_, colorFormat_,
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                VK_IMAGE_USAGE_SAMPLED_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+
+    VkDescriptorImageInfo src{bloomSampler_, sceneColor_.view,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo tex{bloomSampler_, bloomTex_.view,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w[2]{};
+    for (int i = 0; i < 2; ++i) {
+        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstBinding = 0;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    }
+    w[0].dstSet = bloomSrcSet_;
+    w[0].pImageInfo = &src;
+    w[1].dstSet = bloomTexSet_;
+    w[1].pImageInfo = &tex;
+    vkUpdateDescriptorSets(device_.handle, 2, w, 0, nullptr);
+}
+
+void Renderer::destroyBloom() {
+    if (bloomExtractPipeline_)
+        vkDestroyPipeline(device_.handle, bloomExtractPipeline_, nullptr);
+    if (bloomCompositePipeline_)
+        vkDestroyPipeline(device_.handle, bloomCompositePipeline_, nullptr);
+    if (bloomLayout_)
+        vkDestroyPipelineLayout(device_.handle, bloomLayout_, nullptr);
+    if (bloomPool_) vkDestroyDescriptorPool(device_.handle, bloomPool_, nullptr);
+    if (bloomSetLayout_)
+        vkDestroyDescriptorSetLayout(device_.handle, bloomSetLayout_, nullptr);
+    if (bloomSampler_) vkDestroySampler(device_.handle, bloomSampler_, nullptr);
+    bloomExtractPipeline_ = bloomCompositePipeline_ = VK_NULL_HANDLE;
+    bloomLayout_ = VK_NULL_HANDLE;
+    bloomPool_ = VK_NULL_HANDLE;
+    bloomSetLayout_ = VK_NULL_HANDLE;
+    bloomSampler_ = VK_NULL_HANDLE;
+}
+
+// Threshold+downsample the finished scene, then add the result back over it.
+// Runs only while a net is highlighted: that is the one case with pixels
+// deliberately pushed past white, and it keeps ordinary renders untouched.
+void Renderer::recordBloom(VkCommandBuffer cmd) {
+    if (!bloomEnabled_ || highlightNets_.empty() ||
+        bloomExtractPipeline_ == VK_NULL_HANDLE)
+        return;
+
+    const auto barrier = [&](VkImage image, VkImageLayout from,
+                             VkImageLayout to) {
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT |
+                          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.image = image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.imageMemoryBarrierCount = 1;
+        d.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &d);
+    };
+
+    const auto pass = [&](VkImageView target, VkExtent2D extent,
+                          VkPipeline pipeline, VkDescriptorSet set,
+                          const float push[4], bool load) {
+        VkRenderingAttachmentInfo c{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        c.imageView = target;
+        c.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        c.loadOp = load ? VK_ATTACHMENT_LOAD_OP_LOAD
+                        : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        c.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        VkRenderingInfo r{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        r.renderArea = {{0, 0}, extent};
+        r.layerCount = 1;
+        r.colorAttachmentCount = 1;
+        r.pColorAttachments = &c;
+        vkCmdBeginRendering(cmd, &r);
+        VkViewport vp{0.0f, 0.0f, static_cast<float>(extent.width),
+                      static_cast<float>(extent.height), 0.0f, 1.0f};
+        VkRect2D sc{{0, 0}, extent};
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                bloomLayout_, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cmd, bloomLayout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           4 * sizeof(float), push);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRendering(cmd);
+    };
+
+    // 1: scene -> bloom target, thresholded and downsampled.
+    //
+    // UNDEFINED as the old layout: legal from any state and it discards the
+    // contents, which is what we want since the pass does not load them. It
+    // also covers the first frame after (re)creation, when the image really
+    // is UNDEFINED.
+    barrier(bloomTex_.handle, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    barrier(sceneColor_.handle, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    const float ex[4] = {1.0f / static_cast<float>(bloomExtent_.width),
+                         1.0f / static_cast<float>(bloomExtent_.height),
+                         0.45f,  // threshold: the glow clips well past this,
+                                 // ordinary lit copper does not reach it
+                         0.0f};
+    pass(bloomTex_.view, bloomExtent_, bloomExtractPipeline_, bloomSrcSet_, ex,
+         false);
+
+    // 2: add it back over the scene.
+    barrier(bloomTex_.handle, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    barrier(sceneColor_.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    const float co[4] = {1.0f / static_cast<float>(sceneExtent_.width),
+                         1.0f / static_cast<float>(sceneExtent_.height),
+                         2.6f,  // intensity
+                         0.0f};
+    pass(sceneColor_.view, sceneExtent_, bloomCompositePipeline_, bloomTexSet_,
+         co, true);
 }
 
 void Renderer::createSyncAndCommands() {
@@ -2646,6 +2933,9 @@ void Renderer::uploadNetColors(
         table[n * 4 + 3] = 1.0f;  // highlighted
     }
 
+    // Descriptor sets still reference the old buffer; the GPU must be done
+    // with them before it can be freed.
+    vkDeviceWaitIdle(device_.handle);
     destroyBuffer(netColorBuffer_);
     const VkDeviceSize size = table.size() * sizeof(float);
     netColorBuffer_ = createBuffer(
@@ -2710,6 +3000,7 @@ void Renderer::buildNetLights() {
         (void)0;
     }
 
+    vkDeviceWaitIdle(device_.handle);  // still bound in the PT descriptor set
     destroyBuffer(netLightBuffer_);
     if (lights.empty()) lights.assign(12, 0.0f);  // never leave the binding null
     const VkDeviceSize size = lights.size() * sizeof(float);
@@ -3040,6 +3331,10 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     vkCmdEndRendering(cmd);
   }  // end raster-vs-pathtrace branch
 
+    // Bloom runs on the finished scene, before the blit -- so it works for
+    // raster, RT and path tracing alike, and lands in high-res exports too.
+    recordBloom(cmd);
+
     // On an export frame the overlay goes into the SCENE image as well, at the
     // export resolution -- otherwise a high-res screenshot would silently drop
     // the measurements and dimension callouts the user is looking at. The
@@ -3193,6 +3488,7 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     destroySwapchain();
     createSwapchain(width, height);
     createSceneTargets();
+    createBloomTargets();
 
     VkSemaphoreCreateInfo sem{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     renderFinished_.resize(images_.size());

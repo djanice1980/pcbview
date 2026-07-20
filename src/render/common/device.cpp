@@ -323,6 +323,12 @@ Device createDevice(const GpuInfo& gpu,
     features.pNext = &v12;
     features.features.samplerAnisotropy = VK_TRUE;
     features.features.fillModeNonSolid = VK_TRUE;
+    // gl_PrimitiveID in a FRAGMENT shader (net highlighting looks the
+    // triangle's net up with it) declares the SPIR-V Geometry capability,
+    // which requires this feature even though no geometry shader exists.
+    // NVIDIA tolerated it without; the validation layer does not, and a
+    // stricter driver would fail to create the module.
+    features.features.geometryShader = VK_TRUE;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};

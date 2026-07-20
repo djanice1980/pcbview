@@ -1327,6 +1327,22 @@ readout can never disagree.
   struct had to change in **all four** shaders that read the material SSBO --
   board.vert, board.frag, board_rt.frag AND pathtrace.comp -- or they read at
   the wrong stride.
+- **Bloom** (`recordBloom`) gives the glow its aura. It runs on the FINISHED
+  scene image, before the blit, so one implementation covers raster, RT, path
+  tracing and high-resolution exports alike. Two passes: threshold+downsample
+  into a half-resolution target, then add it back with additive blending
+  (sampling a different image than it writes, which is what keeps it legal).
+  **Half resolution, not quarter** — a highlighted trace is a pixel or two
+  wide and a quarter-res downsample attenuates it to nothing before it can
+  bleed. It runs only while a net is highlighted, since that is the only case
+  with pixels deliberately pushed past white.
+  - Two validation-layer findings worth keeping: `gl_PrimitiveID` in a
+    FRAGMENT shader declares the SPIR-V **Geometry** capability, so the
+    device must enable `geometryShader` even though no geometry shader
+    exists (NVIDIA tolerated it without; a stricter driver would fail to
+    create the module). And the net colour/light buffers are referenced by
+    live descriptor sets, so they need a `vkDeviceWaitIdle` before being
+    freed on a highlight change.
 - **The highlight is EMISSIVE, in every mode.** The net is red — copper is
   gold and laminate green, so red is the one hue that cannot be mistaken for
   either — and it is emitted rather than shaded:

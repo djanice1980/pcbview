@@ -176,6 +176,8 @@ pcbview_add_shader(fullscreen.vert)
 pcbview_add_shader(tonemap.frag)
 pcbview_add_shader(overlay.vert)
 pcbview_add_shader(overlay.frag)
+pcbview_add_shader(bloom_extract.frag)
+pcbview_add_shader(bloom_composite.frag)
 
 add_executable(pcbview WIN32
     src/main.cpp

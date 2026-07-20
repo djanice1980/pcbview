@@ -297,6 +297,26 @@ private:
     void createSceneTargets();
     void destroySceneTargets();
     void createPipeline();
+    // Bloom: threshold+downsample the scene into a quarter-res target, then
+    // add it back with additive blending. One level is enough for a halo
+    // around a glowing net, and it works for every render mode because it
+    // operates on the finished scene image rather than on shading.
+    void createBloomPipelines();
+    void destroyBloom();
+    void createBloomTargets();
+    void recordBloom(VkCommandBuffer cmd);
+    VkPipelineLayout bloomLayout_ = VK_NULL_HANDLE;
+    VkPipeline bloomExtractPipeline_ = VK_NULL_HANDLE;
+    VkPipeline bloomCompositePipeline_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout bloomSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool bloomPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet bloomSrcSet_ = VK_NULL_HANDLE;   // reads sceneColor_
+    VkDescriptorSet bloomTexSet_ = VK_NULL_HANDLE;   // reads bloomTex_
+    VkSampler bloomSampler_ = VK_NULL_HANDLE;
+    Image bloomTex_;
+    VkExtent2D bloomExtent_{};
+    bool bloomEnabled_ = true;
+
     void createOverlayPipeline();
     // `drawArea` is the target being rendered into. Overlay vertices are in
     // WINDOW pixels, so the push constant always describes the window and the
