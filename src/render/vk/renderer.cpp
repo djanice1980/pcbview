@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <vector>
 #include <cstring>
 #include <fstream>
@@ -2776,13 +2777,71 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         uploadViaStaging(triMaterialBuffer_, triMaterial.data(), tsize);
     }
 
-    // Per-triangle net, for highlighting. Always allocated (a one-entry dummy
-    // when the board has no nets) so the descriptor is never left dangling --
-    // the raster shaders read it unconditionally.
+    // Per-triangle net AND position along that net, for highlighting and the
+    // chase animation. Always allocated (a one-entry dummy when the board has
+    // no nets) so the descriptor is never left dangling -- the raster shaders
+    // read it unconditionally.
+    //
+    // The phase is how far along its net a triangle sits, 0 at one end and 1
+    // at the other, so a shader can sweep a head down the run without knowing
+    // anything about the geometry. Measured as straight-line distance from
+    // the net's most extreme triangle: a graph walk would be truer to the
+    // copper, but for a travelling highlight the eye only needs a consistent
+    // ordering from one end to the other.
     {
+        struct TriInfo {
+            int32_t net;
+            float phase;
+        };
+        std::vector<TriInfo> info(triNet.size());
+        for (size_t i = 0; i < triNet.size(); ++i) info[i] = {triNet[i], 0.0f};
+
+        // Centroids once, then per net: farthest-from-mean is one end.
+        std::map<int, std::vector<size_t>> byNet;
+        for (size_t t = 0; t < triNet.size(); ++t)
+            if (triNet[t] >= 0) byNet[triNet[t]].push_back(t);
+
+        const auto centroid = [&](size_t t) {
+            const geom::Vertex& a = vertices[indices[t * 3 + 0]];
+            const geom::Vertex& b = vertices[indices[t * 3 + 1]];
+            const geom::Vertex& c = vertices[indices[t * 3 + 2]];
+            return std::array<float, 3>{
+                (a.position[0] + b.position[0] + c.position[0]) / 3.0f,
+                (a.position[1] + b.position[1] + c.position[1]) / 3.0f,
+                (a.position[2] + b.position[2] + c.position[2]) / 3.0f};
+        };
+        const auto dist = [](const std::array<float, 3>& p,
+                             const std::array<float, 3>& q) {
+            const float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        };
+
+        for (const auto& [net, tris] : byNet) {
+            std::vector<std::array<float, 3>> cs;
+            cs.reserve(tris.size());
+            std::array<float, 3> mean{0, 0, 0};
+            for (size_t t : tris) {
+                cs.push_back(centroid(t));
+                for (int k = 0; k < 3; ++k) mean[k] += cs.back()[k];
+            }
+            for (int k = 0; k < 3; ++k) mean[k] /= static_cast<float>(cs.size());
+
+            size_t endIdx = 0;
+            float best = -1.0f;
+            for (size_t i = 0; i < cs.size(); ++i) {
+                const float d = dist(cs[i], mean);
+                if (d > best) { best = d; endIdx = i; }
+            }
+            const std::array<float, 3> endPt = cs[endIdx];
+            float span = 1e-6f;
+            for (const auto& c : cs) span = std::max(span, dist(c, endPt));
+            for (size_t i = 0; i < tris.size(); ++i)
+                info[tris[i]].phase = dist(cs[i], endPt) / span;
+        }
+
         destroyBuffer(triNetBuffer_);
-        if (triNet.empty()) triNet.push_back(-1);
-        const VkDeviceSize nsize = triNet.size() * sizeof(int32_t);
+        if (info.empty()) info.push_back({-1, 0.0f});
+        const VkDeviceSize nsize = info.size() * sizeof(TriInfo);
         triNetBuffer_ = createBuffer(
             nsize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -2906,6 +2965,7 @@ void Renderer::setHighlightNets(
     const std::vector<std::array<float, 3>>& colours) {
     if (nets == highlightNets_) return;
     highlightNets_ = nets;
+    highlightStart_ = std::chrono::steady_clock::now();
     uploadNetColors(nets, colours);
     buildNetLights();
     // The path tracer treats the highlighted net as an emitter, so the
@@ -3236,6 +3296,17 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // Glow as hundredths, to avoid growing the push block past its 128-byte
     // budget for one float.
     push.highlight[1] = static_cast<int32_t>(netGlow_ * 100.0f);
+    // Chase clock, milliseconds since the current selection was made -- it
+    // restarts on every selection change so the wipe always plays from the
+    // end of the net, rather than dropping you into the middle of a cycle.
+    push.highlight[2] =
+        (netAnimate_ && !highlightNets_.empty())
+            ? static_cast<int32_t>(
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - highlightStart_)
+                      .count())
+            : 0;
+    push.highlight[3] = netAnimate_ ? 1 : 0;
     vkCmdPushConstants(cmd, layout_,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(push), &push);

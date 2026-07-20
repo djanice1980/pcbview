@@ -24,8 +24,16 @@ layout(std430, set = 0, binding = 0) readonly buffer Materials {
 
 // Per-triangle net index, -1 for none. Indexed globally, hence the material's
 // triangle base added to gl_PrimitiveID (which restarts every draw).
+// Alongside the net, how far along it this triangle sits: 0 at one end of the
+// run, 1 at the other. That ordering is what lets the chase animation sweep a
+// head down the trace without the shader knowing any geometry.
+struct TriInfo {
+    int net;
+    float phase;
+};
+
 layout(std430, set = 0, binding = 2) readonly buffer TriNets {
-    int nets[];
+    TriInfo tris[];
 } triNetTable;
 
 // Per-NET glow colour: rgb, with a = 1 when that net is highlighted. Looking
@@ -61,13 +69,45 @@ const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
 // highlighted net, a = 0 otherwise. The raster stage only gets
 // gl_PrimitiveID, which restarts every draw, so the material's triangle base
 // rebases it into the global per-triangle net table.
+// The chase. Time arrives in milliseconds in highlight.z, and highlight.w is
+// non-zero when the animation is on.
+//
+// Two acts, which is what makes a net readable rather than merely visible.
+// First a WIPE: the net starts dark and a bright head travels from one end to
+// the other, so you see which way the signal runs and where it terminates --
+// a static glow can't tell you that. Once the head arrives, it hands over to
+// a gradient cycling along the same axis forever, which keeps the direction
+// legible without the eye having to re-find the net.
+//
+// Returns a multiplier on the net's colour, so an un-animated highlight is
+// just this function returning 1.
+float netChase(float phase) {
+    if (push.highlight.w == 0) return 1.0;
+    const float t = float(push.highlight.z) * 0.001;
+
+    const float kWipe = 1.1;   // seconds for the head to run the net
+    if (t < kWipe) {
+        const float head = t / kWipe;
+        if (phase > head) return 0.0;               // not reached yet
+        // Bright at the head, settling to full behind it.
+        return mix(2.4, 1.0, clamp((head - phase) * 5.0, 0.0, 1.0));
+    }
+
+    // Travelling gradient. 1.5 cycles across the net reads as motion without
+    // turning into a barber pole on a long run.
+    const float g = fract(phase * 1.5 - (t - kWipe) * 0.55);
+    return 0.55 + 0.95 * (0.5 + 0.5 * cos(6.2831853 * g));
+}
+
 vec4 netHighlight() {
     if (push.highlight.x < 0) return vec4(0.0);
     const uint tri = materialTable.materials[inMaterial].extra.x +
                      uint(gl_PrimitiveID);
-    const int net = triNetTable.nets[tri];
-    if (net < 0) return vec4(0.0);
-    return netColourTable.colours[net];
+    const TriInfo info = triNetTable.tris[tri];
+    if (info.net < 0) return vec4(0.0);
+    vec4 c = netColourTable.colours[info.net];
+    c.rgb *= netChase(info.phase);
+    return c;
 }
 
 // Everything NOT on the highlighted net desaturates and drops well below it,
@@ -109,8 +149,11 @@ void main() {
     // put the trace back in shadow under a component -- the opposite of what
     // "follow this signal" needs. Matches the path tracer, which adds the
     // same colour as radiance.
+    // Zero rgb means the chase hasn't reached this stretch yet; fall through
+    // so it shades like the rest of the dimmed board rather than reading as a
+    // black gap cut out of the copper.
     const vec4 hl = netHighlight();
-    if (hl.a > 0.0) {
+    if (hl.a > 0.0 && any(greaterThan(hl.rgb, vec3(0.002)))) {
         // Glow strength arrives in hundredths; scaled down relative to the
         // path tracer because raster has no exposure to soak it up -- past a
         // point it just clips to flat white and loses the hue.

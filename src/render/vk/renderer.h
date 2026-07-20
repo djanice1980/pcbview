@@ -16,6 +16,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -159,6 +160,12 @@ public:
     // only drives how far past white the trace clips. Restarts accumulation.
     void setNetGlow(float strength);
     float netGlow() const { return netGlow_; }
+
+    // Chase animation on/off. Raster and RT only; see netAnimate_.
+    void setNetAnimate(bool on) { netAnimate_ = on; }
+    bool netAnimate() const { return netAnimate_; }
+    // True when the view must keep repainting to advance the animation.
+    bool netAnimating() const { return netAnimate_ && !highlightNets_.empty(); }
 
     // Exploded view, peeled outside-in.
     //
@@ -369,6 +376,13 @@ private:
     void uploadNetColors(const std::vector<int>& nets,
                          const std::vector<std::array<float, 3>>& colours);
     float netGlow_ = 3.2f;
+    // Chase animation: a wipe from one end of the net, then a cycling
+    // gradient. Raster and RT only -- the path tracer re-converges from
+    // scratch every frame, so an animated highlight there would never be
+    // anything but noise.
+    bool netAnimate_ = true;
+    std::chrono::steady_clock::time_point highlightStart_ =
+        std::chrono::steady_clock::now();
     float explodeStep_ = 0.0f;
     float explodeProgress_ = 0.0f;
     float maxRank_ = 0.0f;

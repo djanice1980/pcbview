@@ -38,9 +38,15 @@ layout(push_constant) uniform Push {
     ivec4 highlight;
 } push;
 
-// Per-triangle net index, -1 for none. Keep in step with board.frag.
+// Per-triangle net index and position along that net. Keep in step with
+// board.frag, including netChase below.
+struct TriInfo {
+    int net;
+    float phase;
+};
+
 layout(std430, set = 0, binding = 2) readonly buffer TriNets {
-    int nets[];
+    TriInfo tris[];
 } triNetTable;
 
 // Per-net glow colour; a = 1 when highlighted. See board.frag.
@@ -51,13 +57,30 @@ layout(std430, set = 0, binding = 3) readonly buffer NetColours {
 // Keep in step with board.frag and pathtrace.comp.
 const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
 
+// Wipe then cycling gradient -- see board.frag for the reasoning.
+float netChase(float phase) {
+    if (push.highlight.w == 0) return 1.0;
+    const float t = float(push.highlight.z) * 0.001;
+
+    const float kWipe = 1.1;
+    if (t < kWipe) {
+        const float head = t / kWipe;
+        if (phase > head) return 0.0;
+        return mix(2.4, 1.0, clamp((head - phase) * 5.0, 0.0, 1.0));
+    }
+    const float g = fract(phase * 1.5 - (t - kWipe) * 0.55);
+    return 0.55 + 0.95 * (0.5 + 0.5 * cos(6.2831853 * g));
+}
+
 vec4 netHighlight() {
     if (push.highlight.x < 0) return vec4(0.0);
     const uint tri = materialTable.materials[inMaterial].extra.x +
                      uint(gl_PrimitiveID);
-    const int net = triNetTable.nets[tri];
-    if (net < 0) return vec4(0.0);
-    return netColourTable.colours[net];
+    const TriInfo info = triNetTable.tris[tri];
+    if (info.net < 0) return vec4(0.0);
+    vec4 c = netColourTable.colours[info.net];
+    c.rgb *= netChase(info.phase);
+    return c;
 }
 
 vec3 applyNetHighlight(vec3 albedo) {
@@ -123,7 +146,7 @@ void main() {
     // the shadow and AO rays for these fragments, so highlighting is if
     // anything slightly cheaper.
     const vec4 hl = netHighlight();
-    if (hl.a > 0.0) {
+    if (hl.a > 0.0 && any(greaterThan(hl.rgb, vec3(0.002)))) {
         outColor = vec4(hl.rgb * (float(push.highlight.y) * 0.01) * 0.8, 1.0);
         return;
     }

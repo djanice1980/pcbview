@@ -1329,6 +1329,24 @@ void MainWindow::buildMenus() {
         viewport_->requestUpdate();
     });
 
+    // The chase, on by default -- it is the fastest way to see which way a
+    // signal runs, but it is motion, so it needs an off switch.
+    {
+        auto* chase = view->addAction("Animate net highlight");
+        chase->setCheckable(true);
+        chase->setChecked(appSettings().value("fxNetChase", true).toBool());
+        chase->setStatusTip(
+            "Sweep a highlight along the net, then cycle a gradient "
+            "(raster and ray-traced modes)");
+        connect(chase, &QAction::toggled, this, [this](bool on) {
+            appSettings().setValue("fxNetChase", on);
+            if (viewport_->renderer()) viewport_->renderer()->setNetAnimate(on);
+            viewport_->requestUpdate();
+        });
+        if (viewport_->renderer())
+            viewport_->renderer()->setNetAnimate(chase->isChecked());
+    }
+
     QMenu* help = menuBar()->addMenu("&Help");
     // The Ko-fi badge as an actual graphic in the menu -- a plain text entry
     // was too easy to overlook. Clicking opens the page and closes the menu.
