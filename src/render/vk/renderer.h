@@ -375,6 +375,9 @@ private:
     uint32_t netCount_ = 0;
     void uploadNetColors(const std::vector<int>& nets,
                          const std::vector<std::array<float, 3>>& colours);
+    // Surface finish reported by the board, empty when unknown. Drives the
+    // exposed-copper material; see classifyFinish.
+    std::string copperFinish_;
     float netGlow_ = 3.2f;
     // Chase animation: a wipe from one end of the net, then a cycling
     // gradient. Raster and RT only -- the path tracer re-converges from

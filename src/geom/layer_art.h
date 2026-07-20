@@ -112,6 +112,12 @@ struct LayerArt {
     double thickness = 1.6;
     double copperThickness = 0.035;
     double maskThickness = 0.010;
+
+    // Surface finish on exposed copper, from KiCad's `(copper_finish ...)`.
+    // Empty when unknown (every Gerber package -- a .gbrjob does not record
+    // it), in which case the renderer keeps its gold default rather than
+    // guessing something duller and being wrong more often.
+    std::string copperFinish;
     double silkThickness = 0.010;
 
     // Board profile, closed loops. Drills are NOT yet subtracted; assemble()

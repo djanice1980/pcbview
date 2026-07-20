@@ -1211,18 +1211,29 @@ where the gap is a *missing test board* rather than missing code.
 
 Things we currently render differently from what the plant would produce:
 
-1. **Explicit `(setup (stackup ...))` is not read on the KiCad path.** We derive
-   instead. Correct on every board here (none has the block) and exact against
-   KiCad's job file. NOTE the Gerber path DOES read real thicknesses from the
-   .gbrjob, so importing a board's gerbers is currently more stackup-accurate
-   than importing its .kicad_pcb for an asymmetric stack.
+1. ~~Explicit `(setup (stackup ...))` is not read on the KiCad path.~~ **FIXED
+   2026-07-20.** `buildLayerStackFromBlock` walks the block top-down and places
+   every film at its own thickness; the derivation remains as the fallback for
+   boards with no block. This mattered because a single derived dielectric
+   height spreads an asymmetric stack evenly and puts every inner foil where
+   the fab will not: on a 0.1/1.0/0.1 test stack the derived In1.Cu landed at
+   z=0.880 against a true 1.180. The block is authoritative for POSITION; if
+   its films disagree with `(general (thickness))` the stackup wins and the
+   difference is warned about rather than silently reconciled.
 2. **Oval drills are approximated as round** (larger axis). Warned, not silent.
    Real slots need proper geometry.
 3. **Custom / trapezoid pads fall back to the bounding rect.** Warned. Over-
    reports copper rather than under-reporting it.
-4. **No silkscreen.** KiCad uses Newstroke stroke fonts; text becomes geometry.
-5. **No surface finish distinction.** Exposed copper is rendered as bare copper;
-   real boards are ENIG/HASL, which is why KiCad's pads read yellower.
+4. ~~No surface finish distinction.~~ **FIXED 2026-07-20.** Exposed copper was
+   never "bare" -- it was hardcoded gold, so a HASL board rendered as ENIG.
+   `(copper_finish ...)` now drives colour AND roughness (`classifyFinish`):
+   bare/OSP salmon and matte, HAL neutral solder and visibly rougher (it is a
+   dipped finish), immersion silver/tin bright, ENIG and anything unrecognised
+   gold. Gerber packages have no finish to read -- a .gbrjob does not record
+   one -- so they keep the gold default rather than guessing.
+
+(The old entry 4, "No silkscreen", was stale: silkscreen with Newstroke stroke
+text has been rendered since phase 1.5.)
 
 ### Not yet verified — TO FIX (needs a test board, not just code)
 

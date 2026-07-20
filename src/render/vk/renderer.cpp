@@ -76,6 +76,32 @@ struct TonemapPush {
     uint32_t timeMs;   // milliseconds since the selection, for the chase
 };
 
+// Exposed-copper appearance by surface finish. The strings are KiCad's own
+// `(copper_finish ...)` values; matching is loose (substring, case-folded)
+// because the field is free text and fabs spell it half a dozen ways.
+struct CopperFinish {
+    float r, g, b;
+    float roughness;
+};
+
+inline CopperFinish classifyFinish(const std::string& raw) {
+    std::string f;
+    for (char c : raw) f += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const auto has = [&](const char* k) { return f.find(k) != std::string::npos; };
+
+    // Bare copper. "None" means genuinely unfinished -- the salmon-pink of raw
+    // foil, oxidising and matte. OSP is a microns-thin clear organic coat, so
+    // it looks like bare copper too.
+    if (has("none") || has("osp")) return {0.72f, 0.45f, 0.20f, 0.30f};
+    // Hot air levelled solder: tin-lead or lead-free. A DIPPED finish, so it
+    // is domed and visibly uneven -- much rougher than plated finishes.
+    if (has("hal") || has("hasl")) return {0.78f, 0.78f, 0.80f, 0.22f};
+    if (has("silver")) return {0.87f, 0.87f, 0.86f, 0.08f};
+    if (has("tin")) return {0.80f, 0.81f, 0.83f, 0.14f};
+    // ENIG, immersion/hard gold, and anything unrecognised.
+    return {0.94f, 0.70f, 0.28f, 0.05f};
+}
+
 // Round `v` up to a multiple of `a` (a power of two).
 inline VkDeviceSize alignUp(VkDeviceSize v, VkDeviceSize a) {
     return (v + a - 1) & ~(a - 1);
@@ -2496,6 +2522,9 @@ void Renderer::createSyncAndCommands() {
 }
 
 void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
+    // Read before materials are built below: the finish decides how exposed
+    // copper is shaded.
+    copperFinish_ = mesh.copperFinish;
     // Feed the Embree tracer the same mesh (CPU device only). Its own BVH is
     // separate from the Vulkan buffers built below for raster.
     if (cpuMode_ && cpuTracer_) {
@@ -2597,13 +2626,19 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
                 m = {{part.color[0], part.color[1], part.color[2], part.color[3]},
                      {0.55f, 0.1f, 0.0f, 0.0f}};
                 break;
-            default:
-                // Copper / exposed pads: gold ENIG finish, near-mirror roughness
-                // so pads read as polished plate -- a tight sharp highlight in
-                // raster, a near-specular reflection + sun glint in the path
-                // tracer (user request: pads more mirror than the chip sides).
-                m = {{0.94f, 0.70f, 0.28f, 1.0f}, {0.05f, 1.0f, 0.0f, 0.0f}};
+            default: {
+                // Copper / exposed pads, shaded as the plant will PLATE them.
+                // The finish is read from KiCad's (copper_finish ...); an
+                // unknown finish keeps the gold ENIG default rather than
+                // guessing something duller, because gold is both the most
+                // common finish on the boards this renders and the one users
+                // recognise. Roughness carries as much of the difference as
+                // colour: HASL is a dipped, visibly uneven surface, while ENIG
+                // and immersion silver are near-mirror plate.
+                const CopperFinish cf = classifyFinish(copperFinish_);
+                m = {{cf.r, cf.g, cf.b, 1.0f}, {cf.roughness, 1.0f, 0.0f, 0.0f}};
                 break;
+            }
         }
         materials.push_back(m);
 

@@ -97,6 +97,10 @@ struct BoardMesh {
     // Net table for the measure tool (from KiCad, or from Gerber X2 %TO.N%
     // attributes when the package carries them), plus
     // every track segment with its net -- the graph netPathLength() walks.
+    // Surface finish on exposed copper, carried through so the renderer can
+    // shade pads as the plant will actually plate them. Empty = unknown.
+    std::string copperFinish;
+
     std::vector<LayerArt::NetInfo> nets;
     std::vector<LayerArt::NetSeg> netSegments;
     // Board-outline bounding box (mm, components excluded) for the

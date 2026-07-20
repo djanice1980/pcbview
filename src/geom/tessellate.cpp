@@ -425,6 +425,7 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
     art.thickness = board.thickness;
     art.copperThickness = board.copperThickness;
     art.maskThickness = board.maskThickness;
+    art.copperFinish = board.copperFinish;
     art.silkThickness = board.silkThickness;
     art.warnings = board.warnings;
     art.drills = drillPaths(board, opts.circleSegments);
@@ -1094,6 +1095,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
     // centre, every outline vertex. Free clicks fall back to the board-top
     // plane, recorded here too.
     out.boardTopZ = art.thickness;
+    out.copperFinish = art.copperFinish;
     out.nets = art.nets;
     out.netSegments = art.netSegments;
     {

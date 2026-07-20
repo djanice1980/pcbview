@@ -160,6 +160,26 @@ struct BoardModel {
     // KiCad defaults; dielectric is derived in buildLayerStack().
     double copperThickness = 0.035;
     double maskThickness = 0.010;
+
+    // The explicit stackup, when the board carries `(setup (stackup ...))`.
+    // KiCad lists it TOP-DOWN and gives each film its own thickness, so an
+    // asymmetric stack (thin prepreg between signal layers, thick core in the
+    // middle) is only reproducible from this block -- deriving one dielectric
+    // height for the whole board spreads that asymmetry evenly and puts every
+    // inner foil in the wrong place. Empty when the board has no block, in
+    // which case buildLayerStack derives as before.
+    struct StackupEntry {
+        std::string name;   // "F.Cu", "dielectric 1", "F.Mask", "F.SilkS"
+        std::string type;   // "copper", "core", "prepreg", "Top Solder Mask"
+        double thickness = 0.0;
+        bool hasThickness = false;
+    };
+    std::vector<StackupEntry> stackup;
+
+    // `(copper_finish "ENIG")` and friends. Drives how exposed copper is
+    // shaded: bare copper is what an unfinished board looks like, and almost
+    // no real board ships that way.
+    std::string copperFinish;
     double dielectricThickness = 0.0;
     // Silkscreen ink sits ON the mask, outside the finished thickness -- KiCad's
     // gerber job file lists it in the stackup with no thickness at all.

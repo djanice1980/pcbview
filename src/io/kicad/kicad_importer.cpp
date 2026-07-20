@@ -60,7 +60,99 @@ int copperStackRank(std::string_view name) {
 // reports 0.1857 for all seven dielectrics. This reproduces KiCad's arithmetic
 // exactly, so an even split of the full thickness (the old placeholder) was
 // wrong twice over: wrong spacing, and a board 0.07mm too thick.
+// Place every film from an EXPLICIT (setup (stackup ...)) block.
+//
+// Returns false when the board has no usable block, leaving the caller to
+// derive. Walks the entries top-down accumulating z, which is the only way to
+// reproduce an asymmetric stack: a single derived dielectric height spreads
+// the asymmetry evenly and puts every inner foil somewhere the fab will not.
+//
+// The block is authoritative for POSITION. `(general (thickness ...))` still
+// names the finished thickness, and the two should agree -- when they do not,
+// the stackup wins (it is the per-film truth) and the disagreement is warned
+// about rather than silently reconciled.
+bool buildLayerStackFromBlock(BoardModel& board) {
+    if (board.stackup.empty()) return false;
+
+    // Total height of everything INSIDE the finished board. Silkscreen carries
+    // no thickness in KiCad's block and sits on top of the mask, so it is
+    // excluded here exactly as it is from (general (thickness ...)).
+    double total = 0.0;
+    int copperSeen = 0;
+    for (const auto& e : board.stackup) {
+        if (!e.hasThickness) continue;
+        if (e.type.find("Silk") != std::string::npos) continue;
+        total += e.thickness;
+        if (e.type == "copper") ++copperSeen;
+    }
+    if (copperSeen == 0 || total <= 0.0) return false;
+
+    if (std::abs(total - board.thickness) > 0.005) {
+        board.warnings.push_back(
+            "stackup films sum to " + std::to_string(total) +
+            " mm but (general (thickness)) says " +
+            std::to_string(board.thickness) +
+            " mm; using the stackup, which is the per-film truth");
+    }
+    board.thickness = total;
+
+    // Top-down: z starts at the finished surface and walks down.
+    double top = total;
+    int stackIndex = 0;
+    double firstCopper = -1.0, lastCopper = -1.0;
+    for (const auto& e : board.stackup) {
+        if (e.type.find("Silk") != std::string::npos) continue;
+        if (!e.hasThickness) continue;
+        const double bottom = top - e.thickness;
+
+        // Entries name a real layer only for copper and the masks; dielectric
+        // entries ("dielectric 1", core/prepreg) exist to consume height, and
+        // consuming it here is precisely what places the foils around them.
+        for (Layer& layer : board.layers) {
+            if (layer.name != e.name) continue;
+            layer.z = bottom;
+            layer.thickness = e.thickness;
+            if (layer.kind == LayerKind::Copper) layer.stackIndex = stackIndex;
+        }
+        if (e.type == "copper") {
+            if (firstCopper < 0.0) firstCopper = bottom;
+            lastCopper = bottom;
+            ++stackIndex;
+            board.copperThickness = e.thickness;
+        } else if (e.type.find("Solder Mask") != std::string::npos ||
+                   e.type.find("solder mask") != std::string::npos) {
+            board.maskThickness = e.thickness;
+        }
+        top = bottom;
+    }
+
+    // A representative dielectric height for the few consumers that still want
+    // one scalar. Derived from the copper span so it stays meaningful on an
+    // asymmetric stack rather than reporting whichever dielectric came last.
+    if (stackIndex > 1 && firstCopper > lastCopper) {
+        const double span = firstCopper - lastCopper;
+        board.dielectricThickness =
+            (span - (stackIndex - 1) * board.copperThickness) /
+            static_cast<double>(stackIndex - 1);
+    }
+
+    // Silkscreen sits ON the mask, outside the finished thickness.
+    for (Layer& layer : board.layers) {
+        if (layer.kind != LayerKind::Silkscreen) continue;
+        layer.thickness = board.silkThickness;
+        layer.z = (layer.name.rfind("F.", 0) == 0) ? board.thickness
+                                                   : -board.silkThickness;
+    }
+    return true;
+}
+
 void buildLayerStack(BoardModel& board) {
+    // An explicit block beats any derivation. This is the whole point: the
+    // Gerber path already reads real thicknesses from the .gbrjob, so until
+    // now importing a board's gerbers was MORE stackup-accurate than importing
+    // its .kicad_pcb.
+    if (buildLayerStackFromBlock(board)) return;
+
     std::vector<int> copper = board.copperLayers();
     std::sort(copper.begin(), copper.end(), [&](int a, int b) {
         return copperStackRank(board.layers[a].name) <
@@ -593,6 +685,22 @@ BoardModel importPcb(const std::string& path) {
         // Note: (setup (tenting ...)) needs no handling. Tenting is expressed by
         // vias simply carrying no mask layer, so a tented via contributes no
         // opening and the mask closes over it for free.
+
+        // The explicit stackup, when present. Read VERBATIM and in order --
+        // KiCad lists it top-down, and the order is what places every film.
+        if (const Node* stack = setup->child("stackup")) {
+            for (const Node* l : stack->childList("layer")) {
+                BoardModel::StackupEntry e;
+                e.name = std::string(l->str(1));
+                e.type = std::string(l->childStr("type", ""));
+                if (const Node* t = l->child("thickness")) {
+                    e.thickness = t->num(1, 0.0);
+                    e.hasThickness = true;
+                }
+                board.stackup.push_back(std::move(e));
+            }
+            board.copperFinish = std::string(stack->childStr("copper_finish", ""));
+        }
     }
 
     readLayers(root, board);

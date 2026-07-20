@@ -239,8 +239,19 @@ int dumpBoard(const std::string& path) {
                 board.thickness);
     std::printf("  copper foil    %.4f mm\n", board.copperThickness);
     std::printf("  mask film      %.4f mm\n", board.maskThickness);
-    std::printf("  dielectric     %.4f mm  (derived)\n\n",
-                board.dielectricThickness);
+    // Say WHERE the numbers came from. With an explicit block the per-film
+    // thicknesses are read and the single dielectric figure is only a mean
+    // over an asymmetric stack; without one, everything below is derived.
+    std::printf("  dielectric     %.4f mm  (%s)\n",
+                board.dielectricThickness,
+                board.stackup.empty() ? "derived"
+                                      : "mean; per-film from (setup (stackup))");
+    if (!board.stackup.empty())
+        std::printf("  stackup        explicit, %zu entries%s%s\n",
+                    board.stackup.size(),
+                    board.copperFinish.empty() ? "" : "; finish ",
+                    board.copperFinish.c_str());
+    std::printf("\n");
 
     std::printf("  Stackup (physical order, top to bottom; z = bottom of film):\n");
     for (const pcbview::Layer& layer : board.layers) {
