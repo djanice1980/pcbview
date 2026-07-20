@@ -1681,6 +1681,16 @@ output from it — a far stronger correctness check than eyeballing renders.
   `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe`. Build the installer with
   `ISCC.exe installer\pcbview.iss` after the `deploy` target has staged
   `build\Release`; output lands in `installer\Output\`.
+  - **Releases are built by CI now** (`.github/workflows/build.yml`), and the
+    published asset should come from there rather than a local build. A local
+    build and a published asset drifted apart TWICE in one day -- same
+    filename, same version, different bytes -- caught only by re-downloading
+    the asset and comparing hashes. That matters beyond tidiness: winget pins
+    `InstallerSha256`, so a silently-rebuilt artifact breaks the package.
+    Cutting a release is now `git tag vX.Y.Z && git push --tags`; CI builds,
+    checks the tag against the binary's own version resource, and attaches the
+    packages to a DRAFT release for a human to publish. It refuses to touch an
+    already-published release.
 - Visual Studio 18 Community — bundles CMake and Ninja at
   `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\`
 - KiCad 10.0.4 **is** installed, per-user, at
