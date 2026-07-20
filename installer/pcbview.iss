@@ -3,7 +3,7 @@
 ;   ISCC.exe installer\pcbview.iss
 ; Output: installer\Output\pcbview-<version>-setup.exe
 
-#define AppVersion "1.15.1"
+#define AppVersion "1.16.0"
 
 [Setup]
 AppId={{7E1F7A2C-9B7D-4A63-B7B1-52D1C0B4D6E1}
