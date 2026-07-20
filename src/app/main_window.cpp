@@ -668,6 +668,7 @@ void MainWindow::applyAppearance() {
     viewport_->renderer()->setComponentShine(fxComponentShine_ / 100.0f);
     viewport_->renderer()->setPadShine(fxPadShine_ / 100.0f);
     viewport_->renderer()->setShadowSoftness(fxShadowSoftness_ / 100.0f);
+    viewport_->renderer()->setNetGlow(fxNetGlow_ * 0.16f);
     viewport_->requestUpdate();
 }
 
@@ -1247,6 +1248,9 @@ void MainWindow::buildMenus() {
     fxComponentShine_ = appSettings().value("fxComponentShine", 0).toInt();
     fxPadShine_ = appSettings().value("fxPadShine", 94).toInt();
     fxShadowSoftness_ = appSettings().value("fxShadowSoftness", 15).toInt();
+    fxNetGlow_ = appSettings().value("fxNetGlow", 20).toInt();
+    if (qEnvironmentVariableIsSet("PCBVIEW_FX_GLOW"))
+        fxNetGlow_ = qEnvironmentVariable("PCBVIEW_FX_GLOW").toInt();
     if (qEnvironmentVariableIsSet("PCBVIEW_FX_COMPONENT"))
         fxComponentShine_ = qEnvironmentVariable("PCBVIEW_FX_COMPONENT").toInt();
     if (qEnvironmentVariableIsSet("PCBVIEW_FX_PADS"))
@@ -1304,6 +1308,17 @@ void MainWindow::buildMenus() {
                         viewport_->renderer()->setShadowSoftness(v / 100.0f);
                     viewport_->requestUpdate();
                 });
+    // 0-100 maps to 0-16x emission. In the path tracer this is real
+    // radiosity: the highlighted net throws that much more light onto its
+    // surroundings, which is what makes a hot setting read as plasma rather
+    // than paint.
+    addFxSlider("Net glow (highlight brightness)", fxNetGlow_, [this](int v) {
+        fxNetGlow_ = v;
+        appSettings().setValue("fxNetGlow", v);
+        if (viewport_->renderer())
+            viewport_->renderer()->setNetGlow(v * 0.16f);
+        viewport_->requestUpdate();
+    });
 
     QMenu* help = menuBar()->addMenu("&Help");
     // The Ko-fi badge as an actual graphic in the menu -- a plain text entry

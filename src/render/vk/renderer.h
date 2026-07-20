@@ -146,6 +146,13 @@ public:
     void setHighlightNet(int net);
     int highlightNet() const { return highlightNet_; }
 
+    // How hard the highlighted net emits. In the PATH TRACER this is literal
+    // radiosity -- the net is an emitter, so raising this genuinely throws
+    // more red light onto the copper and laminate around it. In raster/RT it
+    // only drives how far past white the trace clips. Restarts accumulation.
+    void setNetGlow(float strength);
+    float netGlow() const { return netGlow_; }
+
     // Exploded view, peeled outside-in.
     //
     // `mmPerStage` is how far a ring travels per stage of progress.
@@ -328,6 +335,7 @@ private:
     float camFwd_[3] = {0.0f, 0.0f, -1.0f};
     float camOrthoDistance_ = 0.0f;
     int highlightNet_ = -1;
+    float netGlow_ = 3.2f;
     float explodeStep_ = 0.0f;
     float explodeProgress_ = 0.0f;
     float maxRank_ = 0.0f;

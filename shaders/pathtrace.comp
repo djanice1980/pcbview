@@ -116,7 +116,6 @@ const float kSubstratePeelAlpha = 0.42;
 // The strength is what makes it read as a glowing filament rather than red
 // paint -- it is added as radiance, so it also spills onto its surroundings.
 const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
-const float kNetGlowStrength = 3.2;
 
 // the substrate (params.w > 0.5) is opaque at rest and fades toward
 // kSubstratePeelAlpha as the board peels (pc.misc.x).
@@ -289,7 +288,7 @@ void main() {
         // geometry desaturates and darkens so the glow dominates.
         if (int(pc.counts.y) >= 0) {
             if (triNet[prim] == int(pc.counts.y)) {
-                radiance += throughput * kNetGlow * kNetGlowStrength;
+                radiance += throughput * kNetGlow * (float(pc.counts.z) * 0.01);
                 albedo = mix(albedo, kNetGlow, 0.85);
                 metallic = 0.0;  // an emitter should not also mirror the sky
             } else {

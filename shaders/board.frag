@@ -100,7 +100,10 @@ void main() {
     // "follow this signal" needs. Matches the path tracer, which adds the
     // same colour as radiance.
     if (onHighlightedNet()) {
-        outColor = vec4(kNetGlow * 2.6, 1.0);
+        // Glow strength arrives in hundredths; scaled down relative to the
+        // path tracer because raster has no exposure to soak it up -- past a
+        // point it just clips to flat white and loses the red.
+        outColor = vec4(kNetGlow * (float(push.highlight.y) * 0.01) * 0.8, 1.0);
         return;
     }
 

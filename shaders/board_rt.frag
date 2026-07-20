@@ -116,7 +116,7 @@ void main() {
     // the shadow and AO rays for these fragments, so highlighting is if
     // anything slightly cheaper.
     if (onHighlightedNet()) {
-        outColor = vec4(kNetGlow * 2.6, 1.0);
+        outColor = vec4(kNetGlow * (float(push.highlight.y) * 0.01) * 0.8, 1.0);
         return;
     }
 

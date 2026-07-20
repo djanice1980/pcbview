@@ -125,6 +125,7 @@ private:
     int fxComponentShine_ = 0;
     int fxPadShine_ = 94;
     int fxShadowSoftness_ = 15;  // sun radius = v% of 8 deg; 15 = 1.2 deg
+    int fxNetGlow_ = 20;         // net highlight emission; v * 0.16 = strength
     void applyAppearance();  // push colours/opacity if the renderer exists
 
     // Create viewport_ + its container and wire every viewport signal. Called at

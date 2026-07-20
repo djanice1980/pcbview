@@ -984,8 +984,10 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             p.misc[1] = std::cos(shadowSoftness_ * 8.0f * 3.14159265f / 180.0f);
             p.misc[2] = rayOrtho_ ? 1.0f : 0.0f;
             p.counts[0] = opaqueTriCount_;
-            // Highlighted net, as int bits (-1 = none).
+            // Highlighted net, as int bits (-1 = none), and its emission
+            // strength in hundredths.
             p.counts[1] = static_cast<uint32_t>(highlightNet_);
+            p.counts[2] = static_cast<uint32_t>(netGlow_ * 100.0f);
             vkCmdPushConstants(cmd, ptLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(p), &p);
             vkCmdDispatch(cmd, (sceneExtent_.width + 7) / 8,
@@ -2589,6 +2591,14 @@ void Renderer::setHighlightNet(int net) {
     ptDenoisedValid_ = false;
 }
 
+void Renderer::setNetGlow(float strength) {
+    strength = std::clamp(strength, 0.0f, 40.0f);
+    if (std::abs(strength - netGlow_) < 1e-3f) return;
+    netGlow_ = strength;
+    resetAccumulation();  // the emitter changed, so the converged image is stale
+    ptDenoisedValid_ = false;
+}
+
 void Renderer::setCameraAxis(const float fwd[3], float orthoDistance) {
     camFwd_[0] = fwd[0];
     camFwd_[1] = fwd[1];
@@ -2801,6 +2811,9 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     push.camAxis[2] = camFwd_[2];
     push.camAxis[3] = camOrthoDistance_;  // > 0 only in orthographic
     push.highlight[0] = highlightNet_;
+    // Glow as hundredths, to avoid growing the push block past its 128-byte
+    // budget for one float.
+    push.highlight[1] = static_cast<int32_t>(netGlow_ * 100.0f);
     vkCmdPushConstants(cmd, layout_,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(push), &push);
