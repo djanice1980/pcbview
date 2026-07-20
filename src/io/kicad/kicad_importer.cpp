@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <map>
 #include <numbers>
 #include <sstream>
@@ -144,6 +145,79 @@ bool buildLayerStackFromBlock(BoardModel& board) {
                                                    : -board.silkThickness;
     }
     return true;
+}
+
+// Warn about top-level node types we do not read.
+//
+// This exists because `(arc ...)` -- curved copper tracks, which KiCad 6+ emits
+// routinely -- went unread for the whole life of the importer. Nothing flagged
+// it: the board simply rendered without that copper, every area check agreed
+// with itself, and it only surfaced when a human looked at a board and asked
+// why a trace was missing. Geometry that is silently absent is the worst
+// failure mode this importer has, so anything unrecognised now says so.
+//
+// The known-and-deliberately-ignored list is explicit rather than a silent
+// default: adding a node here is a decision, and reading this list tells you
+// exactly what the importer chooses not to draw.
+void auditUnhandledNodes(const Node& root, BoardModel& board) {
+    static const std::set<std::string_view> kHandled = {
+        // Geometry we read.
+        "footprint", "zone", "segment", "arc", "via", "gr_line", "gr_rect",
+        "gr_circle", "gr_arc", "gr_poly", "gr_curve", "gr_text", "dimension",
+        // Structure and metadata: no geometry to lose.
+        "version", "generator", "generator_version", "general", "paper",
+        "title_block", "layers", "setup", "net", "net_class", "property",
+        "embedded_fonts", "page", "host", "uuid", "tenting",
+        // Deliberately not drawn.
+        "group",       // a selection aid, not copper
+        "image",       // bitmap decoration
+        "target",      // fab alignment marks, not part of the board
+        "gr_bbox",     // a bounding hint
+    };
+
+    // Inside a footprint is where most geometry lives, so the same audit runs
+    // there. fp_* mirrors the gr_* set.
+    static const std::set<std::string_view> kHandledFp = {
+        "pad", "fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly",
+        "fp_curve", "fp_text", "property", "at", "layer", "uuid", "tstamp",
+        "descr", "tags", "attr", "path", "model", "sheetname", "sheetfile",
+        "autoplace_cost90", "autoplace_cost180", "solder_mask_margin",
+        "solder_paste_margin", "solder_paste_ratio", "clearance",
+        "zone_connect", "thermal_width", "thermal_gap", "net_tie_pad_groups",
+        "private_layers", "embedded_fonts", "generator", "version", "locked",
+        "placed", "group", "zone", "image", "fp_text_box",
+        // Metadata and DRC flags -- no geometry, so warning about them would
+        // be crying wolf on every real board. Enumerated deliberately: the
+        // point of this audit is that an unlisted node is a DECISION nobody
+        // made, and a silent default would defeat it.
+        "duplicate_pad_numbers_are_jumpers", "jumper_pad_groups",
+        "allow_soldermask_bridges_in_footprints", "allow_missing_courtyard",
+        "exclude_from_bom", "dnp", "component_classes", "tenting", "covering",
+        "plugging", "capping", "filling", "legacy_teardrops", "teardrops",
+        "generator_version", "sheetname", "sheetfile", "zone_layer_connections",
+    };
+
+    std::map<std::string, int> unknown;
+    const auto scan = [&](const Node& parent,
+                          const std::set<std::string_view>& known,
+                          const char* prefix) {
+        for (const Node& kid : parent.kids) {
+            if (!kid.isList) continue;
+            const std::string_view head = kid.head();
+            if (head.empty() || known.count(head)) continue;
+            ++unknown[prefix + std::string(head)];
+        }
+    };
+    scan(root, kHandled, "");
+    for (const Node* fp : root.childList("footprint"))
+        scan(*fp, kHandledFp, "footprint > ");
+
+    for (const auto& [name, count] : unknown) {
+        board.warnings.push_back(
+            "board contains " + std::to_string(count) + " (" + name +
+            " ...) node(s) the importer does not read -- any geometry they "
+            "carry is MISSING from the render");
+    }
 }
 
 void buildLayerStack(BoardModel& board) {
@@ -896,6 +970,7 @@ BoardModel importPcb(const std::string& path) {
     for (const Node* txt : root.childList("gr_text")) readText(*txt, 1, nullptr, board);
     readOutline(root, board);
 
+    auditUnhandledNodes(root, board);
     return board;
 }
 
