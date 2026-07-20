@@ -749,7 +749,9 @@ void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
                 bool snapped = false;
                 int net = -1;
                 screenToBoard(e->position(), p, snapped, net);
-                emit netPicked(snapped ? net : -1);
+                // Ctrl adds to the selection instead of replacing it.
+                emit netPicked(snapped ? net : -1,
+                               (e->modifiers() & Qt::ControlModifier) != 0);
             }
         }
     }

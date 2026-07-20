@@ -246,15 +246,21 @@ MainWindow::MainWindow(const QString& path) {
     // Headless net-highlight hook: highlight a net BY NAME (the UI picker
     // cannot be driven by synthetic input).
     if (qEnvironmentVariableIsSet("PCBVIEW_NET")) {
-        const QString want = qEnvironmentVariable("PCBVIEW_NET");
+        // Comma-separated for multi-net highlighting, mirroring Ctrl+click.
+        const QStringList want =
+            qEnvironmentVariable("PCBVIEW_NET").split(',', Qt::SkipEmptyParts);
         QTimer::singleShot(400, this, [this, want] {
-            for (size_t i = 0; i < mesh_.nets.size(); ++i) {
-                if (QString::fromStdString(mesh_.nets[i].name) == want) {
-                    highlightNet(static_cast<int>(i));
-                    return;
+            highlightedNets_.clear();
+            for (const QString& w : want) {
+                for (size_t i = 0; i < mesh_.nets.size(); ++i) {
+                    if (QString::fromStdString(mesh_.nets[i].name) ==
+                        w.trimmed()) {
+                        highlightedNets_.push_back(static_cast<int>(i));
+                        break;
+                    }
                 }
             }
-            statusBar()->showMessage("No net named " + want, 4000);
+            applyNetHighlights();
         });
     }
 
@@ -438,7 +444,10 @@ void MainWindow::buildViewport() {
             });
     // Clicking the board picks the net under the cursor.
     connect(viewport_, &VulkanWindow::netPicked, this,
-            [this](int net) { highlightNet(net); });
+            [this](int net, bool add) {
+                if (add) toggleHighlightNet(net);
+                else highlightNet(net);
+            });
     // A rebuilt viewport (device switch) starts with no highlight.
     if (highlightedNet_ >= 0 && viewport_->renderer())
         viewport_->renderer()->setHighlightNet(highlightedNet_);
@@ -1554,10 +1563,23 @@ void MainWindow::buildNetDock() {
 
     // Selecting a row highlights that net; the same call drives the renderer
     // and the status line, so board clicks and the headless hook land here too.
+    netList_->setSelectionMode(QAbstractItemView::ExtendedSelection);
     connect(netList_, &QTreeWidget::itemSelectionChanged, this, [this] {
-        const auto sel = netList_->selectedItems();
-        if (sel.isEmpty()) return;
-        highlightNet(sel.first()->data(0, Qt::UserRole).toInt());
+        // Selection order is not preserved by Qt, so keep nets already
+        // highlighted in their existing slots -- otherwise adding a net would
+        // reshuffle every colour.
+        std::vector<int> picked;
+        for (QTreeWidgetItem* it : netList_->selectedItems())
+            picked.push_back(it->data(0, Qt::UserRole).toInt());
+        std::vector<int> ordered;
+        for (int n : highlightedNets_)
+            if (std::find(picked.begin(), picked.end(), n) != picked.end())
+                ordered.push_back(n);
+        for (int n : picked)
+            if (std::find(ordered.begin(), ordered.end(), n) == ordered.end())
+                ordered.push_back(n);
+        highlightedNets_ = ordered;
+        applyNetHighlights();
     });
     connect(netFilter_, &QLineEdit::textChanged, this, [this](const QString& t) {
         for (int i = 0; i < netList_->topLevelItemCount(); ++i) {
@@ -1599,11 +1621,92 @@ void MainWindow::populateNets() {
     netList_->sortItems(0, Qt::AscendingOrder);
 }
 
+// A distinct, high-contrast palette. Red first because a single highlight
+// should look the way it always has; the rest are chosen to stay separable
+// against gold copper, green laminate and each other.
+static const std::array<std::array<float, 3>, 8> kNetPalette = {{
+    {{1.00f, 0.09f, 0.06f}},  // red
+    {{0.05f, 0.85f, 1.00f}},  // cyan
+    {{0.25f, 1.00f, 0.20f}},  // green
+    {{1.00f, 0.10f, 0.85f}},  // magenta
+    {{1.00f, 0.62f, 0.05f}},  // amber
+    {{0.55f, 0.35f, 1.00f}},  // violet
+    {{1.00f, 1.00f, 0.30f}},  // yellow
+    {{0.15f, 0.45f, 1.00f}},  // blue
+}};
+
+void MainWindow::toggleHighlightNet(int net) {
+    if (net < 0) return;
+    const auto it = std::find(highlightedNets_.begin(), highlightedNets_.end(),
+                              net);
+    if (it != highlightedNets_.end()) highlightedNets_.erase(it);
+    else highlightedNets_.push_back(net);
+    applyNetHighlights();
+}
+
+// Push the current selection to the renderer, colour the list rows to match,
+// and summarise in the status bar. Every entry point routes through here so
+// the list, the board and the readout cannot disagree.
+void MainWindow::applyNetHighlights() {
+    std::vector<std::array<float, 3>> colours;
+    for (size_t i = 0; i < highlightedNets_.size(); ++i)
+        colours.push_back(kNetPalette[i % kNetPalette.size()]);
+
+    highlightedNet_ = highlightedNets_.empty() ? -1 : highlightedNets_.front();
+    if (viewport_->renderer()) {
+        viewport_->renderer()->setHighlightNets(highlightedNets_, colours);
+        viewport_->requestUpdate();
+    }
+
+    // Row colours mirror the glow, so the list doubles as the legend.
+    if (netList_) {
+        const QSignalBlocker block(netList_);
+        for (int i = 0; i < netList_->topLevelItemCount(); ++i) {
+            QTreeWidgetItem* it = netList_->topLevelItem(i);
+            const int n = it->data(0, Qt::UserRole).toInt();
+            const auto f = std::find(highlightedNets_.begin(),
+                                     highlightedNets_.end(), n);
+            if (f == highlightedNets_.end()) {
+                it->setForeground(0, QColor(theme::kText));
+                it->setSelected(false);
+            } else {
+                const auto& c =
+                    kNetPalette[(f - highlightedNets_.begin()) %
+                                kNetPalette.size()];
+                it->setForeground(0, QColor::fromRgbF(c[0], c[1], c[2]));
+                it->setSelected(true);
+            }
+        }
+    }
+
+    if (highlightedNets_.empty()) {
+        statusBar()->clearMessage();
+        return;
+    }
+    if (highlightedNets_.size() > 1) {
+        QStringList names;
+        double total = 0.0;
+        for (int n : highlightedNets_) {
+            if (n < 0 || n >= static_cast<int>(mesh_.nets.size())) continue;
+            names << QString::fromStdString(mesh_.nets[n].name);
+            total += mesh_.nets[n].routedMm;
+        }
+        statusBar()->showMessage(QString("%1 nets: %2  ·  %3 mm routed total")
+                                     .arg(names.size())
+                                     .arg(names.join(", "))
+                                     .arg(total, 0, 'f', 1));
+        return;
+    }
+    highlightNet(highlightedNets_.front());
+}
+
 void MainWindow::highlightNet(int net) {
     highlightedNet_ = net;
-    if (viewport_->renderer()) {
-        viewport_->renderer()->setHighlightNet(net);
-        viewport_->requestUpdate();
+    if (highlightedNets_.size() != 1 || highlightedNets_.front() != net) {
+        highlightedNets_.clear();
+        if (net >= 0) highlightedNets_.push_back(net);
+        applyNetHighlights();
+        if (highlightedNets_.size() > 1) return;
     }
     if (net < 0 || net >= static_cast<int>(mesh_.nets.size())) {
         statusBar()->clearMessage();

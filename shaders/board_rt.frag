@@ -43,14 +43,21 @@ layout(std430, set = 0, binding = 2) readonly buffer TriNets {
     int nets[];
 } triNetTable;
 
+// Per-net glow colour; a = 1 when highlighted. See board.frag.
+layout(std430, set = 0, binding = 3) readonly buffer NetColours {
+    vec4 colours[];
+} netColourTable;
+
 // Keep in step with board.frag and pathtrace.comp.
 const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
 
-bool onHighlightedNet() {
-    if (push.highlight.x < 0) return false;
+vec4 netHighlight() {
+    if (push.highlight.x < 0) return vec4(0.0);
     const uint tri = materialTable.materials[inMaterial].extra.x +
                      uint(gl_PrimitiveID);
-    return triNetTable.nets[tri] == push.highlight.x;
+    const int net = triNetTable.nets[tri];
+    if (net < 0) return vec4(0.0);
+    return netColourTable.colours[net];
 }
 
 vec3 applyNetHighlight(vec3 albedo) {
@@ -115,8 +122,9 @@ void main() {
     // Emissive highlight, before any shading -- see board.frag. Also skips
     // the shadow and AO rays for these fragments, so highlighting is if
     // anything slightly cheaper.
-    if (onHighlightedNet()) {
-        outColor = vec4(kNetGlow * (float(push.highlight.y) * 0.01) * 0.8, 1.0);
+    const vec4 hl = netHighlight();
+    if (hl.a > 0.0) {
+        outColor = vec4(hl.rgb * (float(push.highlight.y) * 0.01) * 0.8, 1.0);
         return;
     }
 

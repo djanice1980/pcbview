@@ -18,6 +18,8 @@ layout(std430, set = 0, binding = 3) readonly buffer TriMat { uint triMat[]; };
 layout(std430, set = 0, binding = 8) readonly buffer TriNet { int triNet[]; };
 // The highlighted net as an area light: 3 corners per triangle, v0.w = area.
 layout(std430, set = 0, binding = 9) readonly buffer NetLights { vec4 netLit[]; };
+// Per-net glow colour; a = 1 when highlighted. Indexed by net id.
+layout(std430, set = 0, binding = 10) readonly buffer NetColours { vec4 netCol[]; };
 // params: x roughness, y metallic, z explode rank, w = 1 if it fades on peel.
 // `extra` is fragment-stage data (the raster net-highlight triangle base);
 // declared so this SSBO's stride matches MaterialGpu exactly.
@@ -299,14 +301,16 @@ void main() {
         // path tracer already carries that light everywhere for free. Other
         // geometry desaturates and darkens so the glow dominates.
         if (int(pc.counts.y) >= 0) {
-            if (triNet[prim] == int(pc.counts.y)) {
+            const int hnet = triNet[prim];
+            const vec4 hcol = hnet >= 0 ? netCol[hnet] : vec4(0.0);
+            if (hcol.a > 0.0) {
                 // Emission only on the CAMERA ray. Indirect light from the net
                 // arrives through next-event estimation below, so adding it
                 // here as well on a bounce would count the same light twice.
                 if (depth == 0)
-                    radiance += throughput * kNetGlow *
+                    radiance += throughput * hcol.rgb *
                                 (float(pc.counts.z) * 0.01);
-                albedo = mix(albedo, kNetGlow, 0.85);
+                albedo = mix(albedo, hcol.rgb, 0.85);
                 metallic = 0.0;  // an emitter should not also mirror the sky
             } else {
                 albedo = mix(albedo,
@@ -376,6 +380,10 @@ void main() {
             const vec3 b = netLit[li * 3u + 1u].xyz;
             const vec3 c = netLit[li * 3u + 2u].xyz;
             const float area = netLit[li * 3u + 0u].w;
+            // v1.w is the emitting net, so a multi-net selection lights the
+            // board in each net's own colour.
+            const int lnet = int(netLit[li * 3u + 1u].w);
+            const vec3 lcol = netCol[lnet].rgb;
 
             // Uniform barycentric point on the triangle.
             float u = rnd(), v = rnd();
@@ -398,7 +406,7 @@ void main() {
                     const float weight = float(pc.counts.w) * area * lndl /
                                          dist2;
                     radiance += throughput * albedo * (1.0 / PI) * ndl2 *
-                                kNetGlow * (float(pc.counts.z) * 0.01) * weight;
+                                lcol * (float(pc.counts.z) * 0.01) * weight;
                 }
             }
         }

@@ -143,8 +143,15 @@ public:
     // In the path tracer the net becomes an EMITTER, so it spills red light
     // onto its surroundings and appears in reflections. That changes the
     // image, hence the accumulation restart.
+    // Highlight one net, or several at once each in its own colour. The
+    // shaders look the colour up per net rather than comparing against a
+    // single index, so the count is not fixed. Empty clears.
+    void setHighlightNets(const std::vector<int>& nets,
+                          const std::vector<std::array<float, 3>>& colours);
     void setHighlightNet(int net);
-    int highlightNet() const { return highlightNet_; }
+    int highlightNet() const {
+        return highlightNets_.empty() ? -1 : highlightNets_.front();
+    }
 
     // How hard the highlighted net emits. In the PATH TRACER this is literal
     // radiosity -- the net is an emitter, so raising this genuinely throws
@@ -334,7 +341,13 @@ private:
     // shaders; see setCameraAxis.
     float camFwd_[3] = {0.0f, 0.0f, -1.0f};
     float camOrthoDistance_ = 0.0f;
-    int highlightNet_ = -1;
+    std::vector<int> highlightNets_;
+    // One RGBA per net: rgb = glow colour, a = 1 when highlighted. Indexed by
+    // the per-triangle net id, so any number of nets can glow at once.
+    Buffer netColorBuffer_;
+    uint32_t netCount_ = 0;
+    void uploadNetColors(const std::vector<int>& nets,
+                         const std::vector<std::array<float, 3>>& colours);
     float netGlow_ = 3.2f;
     float explodeStep_ = 0.0f;
     float explodeProgress_ = 0.0f;

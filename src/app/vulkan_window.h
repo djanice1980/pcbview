@@ -159,7 +159,7 @@ signals:
     // A click on the board picked this net (index into BoardMesh::nets), or
     // -1 for a click that hit no net-carrying feature. Only outside measure
     // mode, where a click places measurement points instead.
-    void netPicked(int net);
+    void netPicked(int net, bool add);
 
     void frameRendered();
     void statusMessage(const QString& text);

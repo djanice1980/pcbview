@@ -48,6 +48,8 @@ constexpr uint32_t kFramesInFlight = 2;
 // RT device and unused otherwise, so 2 is free either way and the fragment
 // shaders can hard-code it.
 constexpr uint32_t kNetBinding = 2;
+// Per-net glow colour (rgb + highlighted flag), indexed by the triangle's net.
+constexpr uint32_t kNetColorBinding = 3;
 
 struct PtPush {
     float eye[4];    // xyz, w = sampleIndex
@@ -537,8 +539,8 @@ void Renderer::createPathTracer() {
     // 8 = per-triangle net, for the highlight glow.
     // 9 = the highlighted net as a sampleable area light (next-event
     // estimation), so it actually illuminates its surroundings.
-    VkDescriptorSetLayoutBinding b[10]{};
-    for (uint32_t i = 0; i < 10; ++i) {
+    VkDescriptorSetLayoutBinding b[11]{};
+    for (uint32_t i = 0; i < 11; ++i) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -548,9 +550,10 @@ void Renderer::createPathTracer() {
     for (int i = 5; i <= 7; ++i) b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     VkDescriptorSetLayoutCreateInfo li{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 10;
+    li.bindingCount = 11;
     li.pBindings = b;
     check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr, &ptSetLayout_),
           "pt set layout");
@@ -574,7 +577,7 @@ void Renderer::createPathTracer() {
 
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6},  // vtx, idx, triMat, mats, triNet, netLights
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},  // + netColour
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5}};  // 3 pt + 2 tonemap
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 2;
@@ -770,8 +773,8 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    VkWriteDescriptorSet w[10]{};
-    for (int i = 0; i < 10; ++i) {
+    VkWriteDescriptorSet w[11]{};
+    for (int i = 0; i < 11; ++i) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = ptSet_;
         w[i].dstBinding = i;
@@ -795,7 +798,9 @@ void Renderer::updatePathTraceDescriptors() {
                                                  : triNetBuffer_.handle,
         0, VK_WHOLE_SIZE};
     w[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[9].pBufferInfo = &lights;
-    vkUpdateDescriptorSets(device_.handle, 10, w, 0, nullptr);
+    VkDescriptorBufferInfo ncol{netColorBuffer_.handle != VK_NULL_HANDLE ? netColorBuffer_.handle : triNetBuffer_.handle, 0, VK_WHOLE_SIZE};
+    w[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[10].pBufferInfo = &ncol;
+    vkUpdateDescriptorSets(device_.handle, 11, w, 0, nullptr);
 
     VkDescriptorImageInfo den{VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet tw[2]{};
@@ -997,7 +1002,7 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             p.counts[0] = opaqueTriCount_;
             // Highlighted net, as int bits (-1 = none), and its emission
             // strength in hundredths.
-            p.counts[1] = static_cast<uint32_t>(highlightNet_);
+            p.counts[1] = static_cast<uint32_t>(highlightNets_.empty() ? -1 : 1);
             p.counts[2] = static_cast<uint32_t>(netGlow_ * 100.0f);
             p.counts[3] = netLightCount_;  // sampleable net triangles
             vkCmdPushConstants(cmd, ptLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
@@ -1786,6 +1791,8 @@ void Renderer::createDescriptors() {
         net.descriptorCount = 1;
         net.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         bindings.push_back(net);
+        net.binding = kNetColorBinding;
+        bindings.push_back(net);
     }
 
     VkDescriptorSetLayoutCreateInfo info{
@@ -1796,7 +1803,7 @@ void Renderer::createDescriptors() {
           "vkCreateDescriptorSetLayout");
 
     std::vector<VkDescriptorPoolSize> sizes{
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};  // materials + per-triangle net
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}};  // materials, triNet, netColour
     if (rtSupported_)
         sizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1});
     VkDescriptorPoolCreateInfo pool{
@@ -2450,6 +2457,9 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     restVertices_ = vertices;
     restIndices_ = indices;
     triNetCpu_ = triNet;
+    netCount_ = static_cast<uint32_t>(mesh.nets.size());
+    highlightNets_.clear();
+    uploadNetColors({}, {});  // sized to this board, all nets off
     vertexRank_.resize(vertexMat.size());
     for (size_t i = 0; i < vertexMat.size(); ++i)
         vertexRank_[i] = materials[vertexMat[i]].params[2];
@@ -2597,8 +2607,19 @@ void Renderer::setShadowSoftness(float s01) {
 }
 
 void Renderer::setHighlightNet(int net) {
-    if (net == highlightNet_) return;
-    highlightNet_ = net;
+    if (net < 0) {
+        setHighlightNets({}, {});
+    } else {
+        setHighlightNets({net}, {{{1.0f, 0.09f, 0.06f}}});
+    }
+}
+
+void Renderer::setHighlightNets(
+    const std::vector<int>& nets,
+    const std::vector<std::array<float, 3>>& colours) {
+    if (nets == highlightNets_) return;
+    highlightNets_ = nets;
+    uploadNetColors(nets, colours);
     buildNetLights();
     // The path tracer treats the highlighted net as an emitter, so the
     // converged image is no longer valid.
@@ -2606,18 +2627,61 @@ void Renderer::setHighlightNet(int net) {
     ptDenoisedValid_ = false;
 }
 
-// Collect the highlighted net's triangles into a buffer the path tracer can
-// sample as an area light. Each entry is three corners plus the triangle's
-// area, which is the sampling weight.
+// One RGBA per net: the glow colour, with alpha marking it highlighted. The
+// shaders index this by the triangle's net id, which is what lets any number
+// of nets glow at once in different colours.
+void Renderer::uploadNetColors(
+    const std::vector<int>& nets,
+    const std::vector<std::array<float, 3>>& colours) {
+    std::vector<float> table(std::max<uint32_t>(netCount_, 1u) * 4, 0.0f);
+    for (size_t i = 0; i < nets.size(); ++i) {
+        const int n = nets[i];
+        if (n < 0 || static_cast<uint32_t>(n) >= netCount_) continue;
+        const std::array<float, 3> c =
+            i < colours.size() ? colours[i]
+                               : std::array<float, 3>{1.0f, 0.09f, 0.06f};
+        table[n * 4 + 0] = c[0];
+        table[n * 4 + 1] = c[1];
+        table[n * 4 + 2] = c[2];
+        table[n * 4 + 3] = 1.0f;  // highlighted
+    }
+
+    destroyBuffer(netColorBuffer_);
+    const VkDeviceSize size = table.size() * sizeof(float);
+    netColorBuffer_ = createBuffer(
+        size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    uploadViaStaging(netColorBuffer_, table.data(), size);
+
+    // Rebind: the raster set reads it every frame, and a stale handle here is
+    // a device-lost rather than a wrong colour.
+    VkDescriptorBufferInfo info{netColorBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = materialSet_;
+    w.dstBinding = kNetColorBinding;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w.pBufferInfo = &info;
+    vkUpdateDescriptorSets(device_.handle, 1, &w, 0, nullptr);
+}
+
+// Collect the highlighted nets' triangles into a buffer the path tracer can
+// sample as area lights. Each entry is three corners, the triangle's area
+// (the sampling weight) and its net id (so the estimator uses that net's
+// colour).
 void Renderer::buildNetLights() {
     netLightCount_ = 0;
-    if (highlightNet_ < 0 || restIndices_.empty() || triNetCpu_.empty()) return;
+    if (highlightNets_.empty() || restIndices_.empty() || triNetCpu_.empty())
+        return;
 
     std::vector<float> lights;  // 12 floats per triangle: v0,v1,v2 (+area in w)
     const size_t triangles =
         std::min(triNetCpu_.size(), restIndices_.size() / 3);
     for (size_t t = 0; t < triangles; ++t) {
-        if (triNetCpu_[t] != highlightNet_) continue;
+        const int tn = triNetCpu_[t];
+        if (std::find(highlightNets_.begin(), highlightNets_.end(), tn) ==
+            highlightNets_.end())
+            continue;
         const geom::Vertex& a = restVertices_[restIndices_[t * 3 + 0]];
         const geom::Vertex& b = restVertices_[restIndices_[t * 3 + 1]];
         const geom::Vertex& c = restVertices_[restIndices_[t * 3 + 2]];
@@ -2637,11 +2701,13 @@ void Renderer::buildNetLights() {
 
         lights.insert(lights.end(), {a.position[0], a.position[1],
                                      a.position[2], area});
-        lights.insert(lights.end(),
-                      {b.position[0], b.position[1], b.position[2], 0.0f});
+        // v1.w carries the net id so the estimator can look up its colour.
+        lights.insert(lights.end(), {b.position[0], b.position[1],
+                                     b.position[2], static_cast<float>(tn)});
         lights.insert(lights.end(),
                       {c.position[0], c.position[1], c.position[2], 0.0f});
         ++netLightCount_;
+        (void)0;
     }
 
     destroyBuffer(netLightBuffer_);
@@ -2873,7 +2939,9 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     push.camAxis[1] = camFwd_[1];
     push.camAxis[2] = camFwd_[2];
     push.camAxis[3] = camOrthoDistance_;  // > 0 only in orthographic
-    push.highlight[0] = highlightNet_;
+    // Now just a flag: the colour (and which nets) live in the net-colour
+    // table, so any number can glow at once.
+    push.highlight[0] = highlightNets_.empty() ? -1 : 1;
     // Glow as hundredths, to avoid growing the push block past its 128-byte
     // budget for one float.
     push.highlight[1] = static_cast<int32_t>(netGlow_ * 100.0f);

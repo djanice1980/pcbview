@@ -28,6 +28,13 @@ layout(std430, set = 0, binding = 2) readonly buffer TriNets {
     int nets[];
 } triNetTable;
 
+// Per-NET glow colour: rgb, with a = 1 when that net is highlighted. Looking
+// the colour up per net (rather than comparing against one index) is what
+// lets several nets glow at once, each in its own colour.
+layout(std430, set = 0, binding = 3) readonly buffer NetColours {
+    vec4 colours[];
+} netColourTable;
+
 // Must match board.vert byte for byte -- one push block spans both stages.
 layout(push_constant) uniform Push {
     mat4 viewProj;
@@ -50,14 +57,17 @@ layout(push_constant) uniform Push {
 // step with pathtrace.comp, which uses the same colour as an EMITTER.
 const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
 
-// True when this fragment belongs to the highlighted net. The raster stage
-// only gets gl_PrimitiveID, which restarts every draw, so the material's
-// triangle base rebases it into the global per-triangle net table.
-bool onHighlightedNet() {
-    if (push.highlight.x < 0) return false;
+// This fragment's highlight colour: rgb with a = 1 when it belongs to a
+// highlighted net, a = 0 otherwise. The raster stage only gets
+// gl_PrimitiveID, which restarts every draw, so the material's triangle base
+// rebases it into the global per-triangle net table.
+vec4 netHighlight() {
+    if (push.highlight.x < 0) return vec4(0.0);
     const uint tri = materialTable.materials[inMaterial].extra.x +
                      uint(gl_PrimitiveID);
-    return triNetTable.nets[tri] == push.highlight.x;
+    const int net = triNetTable.nets[tri];
+    if (net < 0) return vec4(0.0);
+    return netColourTable.colours[net];
 }
 
 // Everything NOT on the highlighted net desaturates and drops well below it,
@@ -99,11 +109,12 @@ void main() {
     // put the trace back in shadow under a component -- the opposite of what
     // "follow this signal" needs. Matches the path tracer, which adds the
     // same colour as radiance.
-    if (onHighlightedNet()) {
+    const vec4 hl = netHighlight();
+    if (hl.a > 0.0) {
         // Glow strength arrives in hundredths; scaled down relative to the
         // path tracer because raster has no exposure to soak it up -- past a
-        // point it just clips to flat white and loses the red.
-        outColor = vec4(kNetGlow * (float(push.highlight.y) * 0.01) * 0.8, 1.0);
+        // point it just clips to flat white and loses the hue.
+        outColor = vec4(hl.rgb * (float(push.highlight.y) * 0.01) * 0.8, 1.0);
         return;
     }
 

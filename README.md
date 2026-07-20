@@ -57,10 +57,12 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
 - **Net highlighting (KiCad).** Pick a net from the searchable **Nets** panel
   or just click a pad or via on the board: that signal **glows red** across
   every layer while the rest of the board mutes to grey, so a run can be
-  followed through the stack and into the exploded view. In path-traced mode
-  the net is a genuine emitter — it casts red light onto the copper around it
-  and appears in reflections. The status bar reports the net's routed length
-  and via count.
+  followed through the stack and into the exploded view. **Ctrl+click (or
+  Ctrl+click in the list) adds more nets, each in its own colour**, and the
+  list rows are tinted to match so the panel doubles as the legend. In
+  path-traced mode the nets are genuine emitters — they light the copper
+  around them in their own colours and appear in reflections. The status bar
+  reports routed length and via count.
 - **Layer control.** Per-layer visibility, a one-click components toggle, and
   auto-hiding side panels (pin, or peek-on-hover).
 - **Print & export.** Print as-shown, flat (overhead orthographic), or **flat at

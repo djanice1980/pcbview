@@ -69,6 +69,11 @@ private:
     // renderer, the net list selection and the status readout together, so
     // every entry point (list click, board click, headless hook) agrees.
     void highlightNet(int net);
+    // Ctrl+click adds to (or removes from) the selection instead of replacing
+    // it, so several nets can be followed at once in different colours.
+    void toggleHighlightNet(int net);
+    void applyNetHighlights();
+    std::vector<int> highlightedNets_;
     void buildNetDock();
     void populateNets();
     void onSaveScreenshot();
