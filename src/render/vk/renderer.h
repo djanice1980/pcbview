@@ -372,6 +372,9 @@ private:
     // One RGBA per net: rgb = glow colour, a = 1 when highlighted. Indexed by
     // the per-triangle net id, so any number of nets can glow at once.
     Buffer netColorBuffer_;
+    // Per-net origin (xyz) and inverse span (w). The chase reads this per
+    // FRAGMENT so the sweep follows the copper rather than the triangulation.
+    Buffer netSpanBuffer_;
     uint32_t netCount_ = 0;
     void uploadNetColors(const std::vector<int>& nets,
                          const std::vector<std::array<float, 3>>& colours);

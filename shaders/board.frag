@@ -27,13 +27,8 @@ layout(std430, set = 0, binding = 0) readonly buffer Materials {
 // Alongside the net, how far along it this triangle sits: 0 at one end of the
 // run, 1 at the other. That ordering is what lets the chase animation sweep a
 // head down the trace without the shader knowing any geometry.
-struct TriInfo {
-    int net;
-    float phase;
-};
-
 layout(std430, set = 0, binding = 2) readonly buffer TriNets {
-    TriInfo tris[];
+    int nets[];
 } triNetTable;
 
 // Per-NET glow colour: rgb, with a = 1 when that net is highlighted. Looking
@@ -42,6 +37,15 @@ layout(std430, set = 0, binding = 2) readonly buffer TriNets {
 layout(std430, set = 0, binding = 3) readonly buffer NetColours {
     vec4 colours[];
 } netColourTable;
+
+// Per-net ORIGIN (xyz) and inverse span (w): one end of the run, and the
+// reciprocal of its length. Phase is derived from this PER FRAGMENT rather
+// than stored per triangle -- a per-triangle value is constant across each
+// triangle, so the highlight rendered the triangulation instead of the shape,
+// and a round pad lit up as a visible fan of facets.
+layout(std430, set = 0, binding = 4) readonly buffer NetSpans {
+    vec4 spans[];
+} netSpanTable;
 
 // Must match board.vert byte for byte -- one push block spans both stages.
 layout(push_constant) uniform Push {
@@ -122,10 +126,14 @@ vec4 netHighlight() {
     if (push.highlight.x < 0) return vec4(0.0);
     const uint tri = materialTable.materials[inMaterial].extra.x +
                      uint(gl_PrimitiveID);
-    const TriInfo info = triNetTable.tris[tri];
-    if (info.net < 0) return vec4(0.0);
-    vec4 c = netColourTable.colours[info.net];
-    c.rgb *= netChase(info.phase);
+    const int net = triNetTable.nets[tri];
+    if (net < 0) return vec4(0.0);
+    // Distance along the net from its far end, normalised -- smooth across a
+    // triangle because it depends on the fragment's position, not its face.
+    const vec4 span = netSpanTable.spans[net];
+    const float phase = clamp(length(inWorldPos - span.xyz) * span.w, 0.0, 1.0);
+    vec4 c = netColourTable.colours[net];
+    c.rgb *= netChase(phase);
     return c;
 }
 

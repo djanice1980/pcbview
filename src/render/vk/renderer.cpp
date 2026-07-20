@@ -57,6 +57,8 @@ constexpr uint32_t kFramesInFlight = 2;
 constexpr uint32_t kNetBinding = 2;
 // Per-net glow colour (rgb + highlighted flag), indexed by the triangle's net.
 constexpr uint32_t kNetColorBinding = 3;
+// Per-net origin + inverse span, so the chase is evaluated per fragment.
+constexpr uint32_t kNetSpanBinding = 4;
 
 struct PtPush {
     float eye[4];    // xyz, w = sampleIndex
@@ -175,6 +177,7 @@ Renderer::~Renderer() {
     destroyBuffer(triMaterialBuffer_);
     destroyBuffer(triNetBuffer_);
     destroyBuffer(netColorBuffer_);
+    destroyBuffer(netSpanBuffer_);
     destroyBuffer(netLightBuffer_);
     destroyBuffer(tracedVertexBuffer_);
     destroySceneTargets();
@@ -593,8 +596,8 @@ void Renderer::createPathTracer() {
     // estimation), so it actually illuminates its surroundings.
     // 11 = first-hit net phase, written as an AOV so the chase animation can
     // run as a display-time modulation without disturbing accumulation.
-    VkDescriptorSetLayoutBinding b[12]{};
-    for (uint32_t i = 0; i < 12; ++i) {
+    VkDescriptorSetLayoutBinding b[13]{};
+    for (uint32_t i = 0; i < 13; ++i) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -606,9 +609,11 @@ void Renderer::createPathTracer() {
     b[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    // 12 = per-net origin + inverse span, for the per-fragment chase phase.
+    b[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     VkDescriptorSetLayoutCreateInfo li{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 12;
+    li.bindingCount = 13;
     li.pBindings = b;
     check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr, &ptSetLayout_),
           "pt set layout");
@@ -632,7 +637,7 @@ void Renderer::createPathTracer() {
 
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7},  // + netColour
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},  // + netColour, netSpan
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7}};  // 4 pt + 3 tonemap
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 2;
@@ -829,8 +834,8 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    VkWriteDescriptorSet w[12]{};
-    for (int i = 0; i < 12; ++i) {
+    VkWriteDescriptorSet w[13]{};
+    for (int i = 0; i < 13; ++i) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = ptSet_;
         w[i].dstBinding = i;
@@ -859,7 +864,12 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorImageInfo phase{VK_NULL_HANDLE, ptNetPhase_.view,
                                 VK_IMAGE_LAYOUT_GENERAL};
     w[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[11].pImageInfo = &phase;
-    vkUpdateDescriptorSets(device_.handle, 12, w, 0, nullptr);
+    VkDescriptorBufferInfo nspan{
+        netSpanBuffer_.handle != VK_NULL_HANDLE ? netSpanBuffer_.handle
+                                                : triNetBuffer_.handle,
+        0, VK_WHOLE_SIZE};
+    w[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[12].pBufferInfo = &nspan;
+    vkUpdateDescriptorSets(device_.handle, 13, w, 0, nullptr);
 
     VkDescriptorImageInfo den{VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet tw[3]{};
@@ -1878,6 +1888,8 @@ void Renderer::createDescriptors() {
         bindings.push_back(net);
         net.binding = kNetColorBinding;
         bindings.push_back(net);
+        net.binding = kNetSpanBinding;
+        bindings.push_back(net);
     }
 
     VkDescriptorSetLayoutCreateInfo info{
@@ -1888,7 +1900,7 @@ void Renderer::createDescriptors() {
           "vkCreateDescriptorSetLayout");
 
     std::vector<VkDescriptorPoolSize> sizes{
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3}};  // materials, triNet, netColour
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};  // materials, triNet, colour, span
     if (rtSupported_)
         sizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1});
     VkDescriptorPoolCreateInfo pool{
@@ -2866,14 +2878,20 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     // copper, but for a travelling highlight the eye only needs a consistent
     // ordering from one end to the other.
     {
-        struct TriInfo {
-            int32_t net;
-            float phase;
-        };
-        std::vector<TriInfo> info(triNet.size());
-        for (size_t i = 0; i < triNet.size(); ++i) info[i] = {triNet[i], 0.0f};
-
-        // Centroids once, then per net: farthest-from-mean is one end.
+        // Per-net ORIGIN and inverse span, so the chase animation can be
+        // evaluated PER FRAGMENT from world position rather than stored per
+        // triangle.
+        //
+        // A per-triangle phase is constant across each triangle, so the
+        // highlight showed the triangulation -- a round pad lit up as a visible
+        // fan of facets instead of sweeping smoothly across the copper. Phase
+        // is a property of WHERE a point is on the net, not of which triangle
+        // happens to cover it, and computing it from position makes it
+        // independent of how finely anything is tessellated.
+        //
+        // The origin is the net's most extreme triangle centroid (farthest from
+        // its mean), so the sweep starts at one end of the run; the span
+        // normalises the far end to 1.
         std::map<int, std::vector<size_t>> byNet;
         for (size_t t = 0; t < triNet.size(); ++t)
             if (triNet[t] >= 0) byNet[triNet[t]].push_back(t);
@@ -2893,7 +2911,9 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
             return std::sqrt(dx * dx + dy * dy + dz * dz);
         };
 
+        std::vector<float> spans(std::max<uint32_t>(netCount_, 1u) * 4, 0.0f);
         for (const auto& [net, tris] : byNet) {
+            if (net < 0 || static_cast<uint32_t>(net) >= netCount_) continue;
             std::vector<std::array<float, 3>> cs;
             cs.reserve(tris.size());
             std::array<float, 3> mean{0, 0, 0};
@@ -2912,21 +2932,35 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
             const std::array<float, 3> endPt = cs[endIdx];
             float span = 1e-6f;
             for (const auto& c : cs) span = std::max(span, dist(c, endPt));
-            for (size_t i = 0; i < tris.size(); ++i)
-                info[tris[i]].phase = dist(cs[i], endPt) / span;
+
+            float* e = &spans[static_cast<size_t>(net) * 4];
+            e[0] = endPt[0];
+            e[1] = endPt[1];
+            e[2] = endPt[2];
+            e[3] = 1.0f / span;
         }
 
+        destroyBuffer(netSpanBuffer_);
+        const VkDeviceSize ssize = spans.size() * sizeof(float);
+        netSpanBuffer_ = createBuffer(
+            ssize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        uploadViaStaging(netSpanBuffer_, spans.data(), ssize);
+
+        // Back to a tight array of ints. It carried a per-triangle phase
+        // alongside the net id until the phase moved to the fragment shader;
+        // that 8-byte stride caused two separate bugs (a heap overrun staging
+        // it, and the path tracer reading it as 4-byte ints), so collapsing it
+        // is a simplification worth having.
         destroyBuffer(triNetBuffer_);
-        if (info.empty()) info.push_back({-1, 0.0f});
-        const VkDeviceSize nsize = info.size() * sizeof(TriInfo);
+        if (triNet.empty()) triNet.push_back(-1);
+        const VkDeviceSize nsize = triNet.size() * sizeof(int32_t);
         triNetBuffer_ = createBuffer(
             nsize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        // From info, NOT triNet: nsize counts 8-byte TriInfo entries, so
-        // staging from the 4-byte-per-triangle net array reads twice its
-        // length and walks off the end of the heap block.
-        uploadViaStaging(triNetBuffer_, info.data(), nsize);
+        uploadViaStaging(triNetBuffer_, triNet.data(), nsize);
     }
 
     const VkDeviceSize msize = materials.size() * sizeof(MaterialGpu);
@@ -2939,7 +2973,8 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
 
     VkDescriptorBufferInfo bufferInfo{materialBuffer_.handle, 0, msize};
     VkDescriptorBufferInfo netInfo{triNetBuffer_.handle, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet writes[2]{};
+    VkDescriptorBufferInfo spanInfo{netSpanBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet writes[3]{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = materialSet_;
     writes[0].dstBinding = 0;
@@ -2952,7 +2987,13 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     writes[1].descriptorCount = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[1].pBufferInfo = &netInfo;
-    vkUpdateDescriptorSets(device_.handle, 2, writes, 0, nullptr);
+    writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[2].dstSet = materialSet_;
+    writes[2].dstBinding = kNetSpanBinding;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[2].pBufferInfo = &spanInfo;
+    vkUpdateDescriptorSets(device_.handle, 3, writes, 0, nullptr);
 
     // Build the RT acceleration structure over this geometry and point binding 1
     // at it. Rebuilt every upload -- a new board / thickness changes the buffers.
@@ -3077,6 +3118,12 @@ void Renderer::uploadNetColors(
     // with them before it can be freed.
     vkDeviceWaitIdle(device_.handle);
     destroyBuffer(netColorBuffer_);
+    // NOT netSpanBuffer_: it holds per-net geometry (origin + inverse span)
+    // built in uploadBoard, and a colour change cannot invalidate it. Freeing
+    // it here left the raster set reading freed memory, and once the PT set
+    // was rebuilt its null-handle fallback bound the triangle-net buffer
+    // instead -- ints reinterpreted as floats are denormals, so every phase
+    // read back 0 and the chase froze at one point in its cycle.
     const VkDeviceSize size = table.size() * sizeof(float);
     netColorBuffer_ = createBuffer(
         size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,

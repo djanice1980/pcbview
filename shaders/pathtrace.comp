@@ -20,15 +20,15 @@ layout(std430, set = 0, binding = 3) readonly buffer TriMat { uint triMat[]; };
 // tight array of ints (as it was before the phase was added) makes every
 // other triangle report a float's bit pattern as its net index -- which
 // lights up unrelated copper all over the board.
-struct TriInfo {
-    int net;
-    float phase;
-};
-layout(std430, set = 0, binding = 8) readonly buffer TriNet { TriInfo triNet[]; };
+layout(std430, set = 0, binding = 8) readonly buffer TriNet { int triNet[]; };
 // The highlighted net as an area light: 3 corners per triangle, v0.w = area.
 layout(std430, set = 0, binding = 9) readonly buffer NetLights { vec4 netLit[]; };
 // Per-net glow colour; a = 1 when highlighted. Indexed by net id.
 layout(std430, set = 0, binding = 10) readonly buffer NetColours { vec4 netCol[]; };
+// Per-net origin (xyz) + inverse span (w); see board.frag. The phase written
+// to the AOV is derived from the HIT POSITION, so the chase follows the copper
+// rather than the triangulation.
+layout(std430, set = 0, binding = 12) readonly buffer NetSpans { vec4 netSpan[]; };
 
 // First-hit net phase AOV. .r = how far along its net this pixel's copper sits,
 // .g = 1 when the pixel directly shows highlighted copper. Written on the
@@ -329,14 +329,17 @@ void main() {
         // path tracer already carries that light everywhere for free. Other
         // geometry desaturates and darkens so the glow dominates.
         if (int(pc.counts.y) >= 0) {
-            const int hnet = triNet[prim].net;
+            const int hnet = triNet[prim];
             const vec4 hcol = hnet >= 0 ? netCol[hnet] : vec4(0.0);
             // Positive tags only -- never write a zero here. A film hit or a
             // non-highlighted triangle must leave any existing tag alone, or
             // it reintroduces the lottery this AOV exists to avoid.
-            if (depth == 0 && hcol.a > 0.0)
+            if (depth == 0 && hcol.a > 0.0) {
+                const vec4 sp = netSpan[hnet];
+                const float ph = clamp(length(p - sp.xyz) * sp.w, 0.0, 1.0);
                 imageStore(netPhaseImg, ivec2(gl_GlobalInvocationID.xy),
-                           vec4(triNet[prim].phase, 1.0, 0.0, 1.0));
+                           vec4(ph, 1.0, 0.0, 1.0));
+            }
             if (hcol.a > 0.0) {
                 // Emission only on the CAMERA ray. Indirect light from the net
                 // arrives through next-event estimation below, so adding it
