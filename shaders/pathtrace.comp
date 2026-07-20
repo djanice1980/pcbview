@@ -186,10 +186,17 @@ void main() {
 
     uint sampleIndex = uint(pc.eye.w);
 
-    // Clear the phase AOV first: a camera ray that hits nothing (or hits
-    // non-copper) never reaches the write below, and a stale value from a
-    // previous camera position would animate background pixels.
-    imageStore(netPhaseImg, ivec2(px), vec4(0.0, 0.0, 0.0, 1.0));
+    // Clear the phase AOV only when accumulation RESTARTS, not every sample.
+    // The films are resolved by stochastic alpha, so a sample whose die roll
+    // commits the soldermask never reaches the copper underneath; clearing
+    // every sample let that roll erase the tag, and whichever way the last
+    // sample landed was what the converged image kept. Masked copper
+    // therefore stopped animating while bare copper was fine. Clearing once
+    // per accumulation and only ever writing a POSITIVE tag below makes this
+    // "did any sample see highlighted copper here", which is the question the
+    // chase actually needs answered.
+    if (sampleIndex == 0u)
+        imageStore(netPhaseImg, ivec2(px), vec4(0.0, 0.0, 0.0, 1.0));
     // XOR-chained hash stages, NOT additive mixing: `hashu(px.x + hashu(px.y +
     // ...))` builds correlation planes (an additive lattice), which showed up as
     // faint screen-anchored lines/squares of biased stochastic-alpha outcomes
@@ -324,10 +331,12 @@ void main() {
         if (int(pc.counts.y) >= 0) {
             const int hnet = triNet[prim].net;
             const vec4 hcol = hnet >= 0 ? netCol[hnet] : vec4(0.0);
-            if (depth == 0)
+            // Positive tags only -- never write a zero here. A film hit or a
+            // non-highlighted triangle must leave any existing tag alone, or
+            // it reintroduces the lottery this AOV exists to avoid.
+            if (depth == 0 && hcol.a > 0.0)
                 imageStore(netPhaseImg, ivec2(gl_GlobalInvocationID.xy),
-                           vec4(triNet[prim].phase, hcol.a > 0.0 ? 1.0 : 0.0,
-                                0.0, 1.0));
+                           vec4(triNet[prim].phase, 1.0, 0.0, 1.0));
             if (hcol.a > 0.0) {
                 // Emission only on the CAMERA ray. Indirect light from the net
                 // arrives through next-event estimation below, so adding it
