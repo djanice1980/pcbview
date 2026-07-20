@@ -535,8 +535,10 @@ void Renderer::createPathTracer() {
     // Compute set: 0 TLAS, 1 vtx, 2 idx, 3 triMat, 4 mats, 5 accum, 6 albedo,
     // 7 normal.
     // 8 = per-triangle net, for the highlight glow.
-    VkDescriptorSetLayoutBinding b[9]{};
-    for (uint32_t i = 0; i < 9; ++i) {
+    // 9 = the highlighted net as a sampleable area light (next-event
+    // estimation), so it actually illuminates its surroundings.
+    VkDescriptorSetLayoutBinding b[10]{};
+    for (uint32_t i = 0; i < 10; ++i) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -545,9 +547,10 @@ void Renderer::createPathTracer() {
     for (int i = 1; i <= 4; ++i) b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     for (int i = 5; i <= 7; ++i) b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     VkDescriptorSetLayoutCreateInfo li{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 9;
+    li.bindingCount = 10;
     li.pBindings = b;
     check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr, &ptSetLayout_),
           "pt set layout");
@@ -571,7 +574,7 @@ void Renderer::createPathTracer() {
 
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5},  // vtx, idx, triMat, mats, triNet
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6},  // vtx, idx, triMat, mats, triNet, netLights
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 5}};  // 3 pt + 2 tonemap
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 2;
@@ -767,8 +770,8 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    VkWriteDescriptorSet w[9]{};
-    for (int i = 0; i < 9; ++i) {
+    VkWriteDescriptorSet w[10]{};
+    for (int i = 0; i < 10; ++i) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = ptSet_;
         w[i].dstBinding = i;
@@ -784,7 +787,15 @@ void Renderer::updatePathTraceDescriptors() {
     w[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[6].pImageInfo = &alb;
     w[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[7].pImageInfo = &nrm;
     w[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[8].pBufferInfo = &net;
-    vkUpdateDescriptorSets(device_.handle, 9, w, 0, nullptr);
+    // The net light list only exists while a net is highlighted; point the
+    // binding at the triangle-net buffer as a harmless stand-in otherwise, so
+    // the descriptor is never null.
+    VkDescriptorBufferInfo lights{
+        netLightBuffer_.handle != VK_NULL_HANDLE ? netLightBuffer_.handle
+                                                 : triNetBuffer_.handle,
+        0, VK_WHOLE_SIZE};
+    w[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[9].pBufferInfo = &lights;
+    vkUpdateDescriptorSets(device_.handle, 10, w, 0, nullptr);
 
     VkDescriptorImageInfo den{VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet tw[2]{};
@@ -988,6 +999,7 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             // strength in hundredths.
             p.counts[1] = static_cast<uint32_t>(highlightNet_);
             p.counts[2] = static_cast<uint32_t>(netGlow_ * 100.0f);
+            p.counts[3] = netLightCount_;  // sampleable net triangles
             vkCmdPushConstants(cmd, ptLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(p), &p);
             vkCmdDispatch(cmd, (sceneExtent_.width + 7) / 8,
@@ -2436,6 +2448,8 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     // holds each vertex's material index (== part index); resolve rank now that
     // ranks are known, and keep the part index for the visibility bake.
     restVertices_ = vertices;
+    restIndices_ = indices;
+    triNetCpu_ = triNet;
     vertexRank_.resize(vertexMat.size());
     for (size_t i = 0; i < vertexMat.size(); ++i)
         vertexRank_[i] = materials[vertexMat[i]].params[2];
@@ -2585,10 +2599,59 @@ void Renderer::setShadowSoftness(float s01) {
 void Renderer::setHighlightNet(int net) {
     if (net == highlightNet_) return;
     highlightNet_ = net;
+    buildNetLights();
     // The path tracer treats the highlighted net as an emitter, so the
     // converged image is no longer valid.
     resetAccumulation();
     ptDenoisedValid_ = false;
+}
+
+// Collect the highlighted net's triangles into a buffer the path tracer can
+// sample as an area light. Each entry is three corners plus the triangle's
+// area, which is the sampling weight.
+void Renderer::buildNetLights() {
+    netLightCount_ = 0;
+    if (highlightNet_ < 0 || restIndices_.empty() || triNetCpu_.empty()) return;
+
+    std::vector<float> lights;  // 12 floats per triangle: v0,v1,v2 (+area in w)
+    const size_t triangles =
+        std::min(triNetCpu_.size(), restIndices_.size() / 3);
+    for (size_t t = 0; t < triangles; ++t) {
+        if (triNetCpu_[t] != highlightNet_) continue;
+        const geom::Vertex& a = restVertices_[restIndices_[t * 3 + 0]];
+        const geom::Vertex& b = restVertices_[restIndices_[t * 3 + 1]];
+        const geom::Vertex& c = restVertices_[restIndices_[t * 3 + 2]];
+        // Area via the cross product of two edges.
+        const float e1[3] = {b.position[0] - a.position[0],
+                             b.position[1] - a.position[1],
+                             b.position[2] - a.position[2]};
+        const float e2[3] = {c.position[0] - a.position[0],
+                             c.position[1] - a.position[1],
+                             c.position[2] - a.position[2]};
+        const float cx = e1[1] * e2[2] - e1[2] * e2[1];
+        const float cy = e1[2] * e2[0] - e1[0] * e2[2];
+        const float cz = e1[0] * e2[1] - e1[1] * e2[0];
+        const float area = 0.5f * std::sqrt(cx * cx + cy * cy + cz * cz);
+        if (area <= 0.0f) continue;  // degenerate, and a zero-area light is a
+                                     // division by zero in the estimator
+
+        lights.insert(lights.end(), {a.position[0], a.position[1],
+                                     a.position[2], area});
+        lights.insert(lights.end(),
+                      {b.position[0], b.position[1], b.position[2], 0.0f});
+        lights.insert(lights.end(),
+                      {c.position[0], c.position[1], c.position[2], 0.0f});
+        ++netLightCount_;
+    }
+
+    destroyBuffer(netLightBuffer_);
+    if (lights.empty()) lights.assign(12, 0.0f);  // never leave the binding null
+    const VkDeviceSize size = lights.size() * sizeof(float);
+    netLightBuffer_ = createBuffer(
+        size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    uploadViaStaging(netLightBuffer_, lights.data(), size);
+    updatePathTraceDescriptors();
 }
 
 void Renderer::setNetGlow(float strength) {

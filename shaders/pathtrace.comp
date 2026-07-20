@@ -16,6 +16,8 @@ layout(std430, set = 0, binding = 2) readonly buffer Idx { uint idx[]; };
 layout(std430, set = 0, binding = 3) readonly buffer TriMat { uint triMat[]; };
 // Per-triangle net, for highlighting. Same global order as the index buffer.
 layout(std430, set = 0, binding = 8) readonly buffer TriNet { int triNet[]; };
+// The highlighted net as an area light: 3 corners per triangle, v0.w = area.
+layout(std430, set = 0, binding = 9) readonly buffer NetLights { vec4 netLit[]; };
 // params: x roughness, y metallic, z explode rank, w = 1 if it fades on peel.
 // `extra` is fragment-stage data (the raster net-highlight triangle base);
 // declared so this SSBO's stride matches MaterialGpu exactly.
@@ -66,12 +68,22 @@ vec3 vnrm(uint i) { return vec3(vtx[6u*i+3u], vtx[6u*i+4u], vtx[6u*i+5u]); }
 // deliberately dim so the physically-accumulated board reads rich and matte
 // rather than washed out (path tracing blows out fast under a bright dome).
 const vec3 kSunDir = normalize(vec3(0.35, 0.25, 1.0));
-const vec3 kSunColor = vec3(1.0, 0.95, 0.88) * 2.6;
+const vec3 kSunColorBase = vec3(1.0, 0.95, 0.88) * 2.6;
+
+// Highlighting a net turns the lights down. This is the difference between a
+// candle at noon and a candle at night: the net's emission is physically
+// small next to the sun, so however hard it emits, its light never shows.
+// Dimming the sun and sky while a net is highlighted lets the net become the
+// dominant source, and its red spill onto the surrounding copper -- the
+// actual point of tracing it as a light -- finally reads.
+float sceneDim() { return int(pc.counts.y) >= 0 ? 0.18 : 1.0; }
+#define kSunColor (kSunColorBase * sceneDim())
+
 vec3 sky(vec3 d) {
     float t = clamp(d.z * 0.5 + 0.5, 0.0, 1.0);
     vec3 env = mix(vec3(0.11, 0.12, 0.15), vec3(0.42, 0.44, 0.49), t);
     float sun = pow(max(dot(d, kSunDir), 0.0), 350.0);
-    return env + kSunColor * sun;
+    return (env + kSunColorBase * sun) * sceneDim();
 }
 
 // The sun has ANGULAR SIZE, user-adjustable via Effects -> Shadow softness
@@ -288,7 +300,12 @@ void main() {
         // geometry desaturates and darkens so the glow dominates.
         if (int(pc.counts.y) >= 0) {
             if (triNet[prim] == int(pc.counts.y)) {
-                radiance += throughput * kNetGlow * (float(pc.counts.z) * 0.01);
+                // Emission only on the CAMERA ray. Indirect light from the net
+                // arrives through next-event estimation below, so adding it
+                // here as well on a bounce would count the same light twice.
+                if (depth == 0)
+                    radiance += throughput * kNetGlow *
+                                (float(pc.counts.z) * 0.01);
                 albedo = mix(albedo, kNetGlow, 0.85);
                 metallic = 0.0;  // an emitter should not also mirror the sky
             } else {
@@ -342,6 +359,48 @@ void main() {
             const vec3 specCol = mix(vec3(0.04), albedo, metallic);
             radiance += throughput *
                         (albedo * (1.0 / PI) + specCol * spec) * kSunColor * ndl;
+        }
+
+        // --- Next-event estimation toward the highlighted net --------------
+        //
+        // The net is a 0.25mm filament: a diffuse bounce essentially never
+        // lands on it, so emission alone lit the trace and nothing else.
+        // Sampling it explicitly as an area light is what turns the highlight
+        // into actual illumination on the surrounding copper and laminate.
+        // Uniform over triangles, weighted by area -- traces tessellate into
+        // similar-sized triangles, so a full area CDF buys little here.
+        if (pc.counts.w > 0u && int(pc.counts.y) >= 0) {
+            const uint li = min(uint(rnd() * float(pc.counts.w)),
+                                pc.counts.w - 1u);
+            const vec3 a = netLit[li * 3u + 0u].xyz;
+            const vec3 b = netLit[li * 3u + 1u].xyz;
+            const vec3 c = netLit[li * 3u + 2u].xyz;
+            const float area = netLit[li * 3u + 0u].w;
+
+            // Uniform barycentric point on the triangle.
+            float u = rnd(), v = rnd();
+            if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
+            const vec3 lp = a + (b - a) * u + (c - a) * v;
+
+            vec3 toL = lp - p;
+            const float dist2 = max(dot(toL, toL), 1e-6);
+            const float dist = sqrt(dist2);
+            toL /= dist;
+
+            const float ndl2 = dot(n, toL);
+            if (ndl2 > 0.0) {
+                vec3 ln = normalize(cross(b - a, c - a));
+                const float lndl = abs(dot(ln, -toL));  // two-sided emitter
+                if (lndl > 0.0 &&
+                    !occluded(p + gn * 0.03, toL, dist - 0.05)) {
+                    // pdf = 1 / (count * area); the estimator's area-to-solid
+                    // -angle Jacobian is lndl / dist^2.
+                    const float weight = float(pc.counts.w) * area * lndl /
+                                         dist2;
+                    radiance += throughput * albedo * (1.0 / PI) * ndl2 *
+                                kNetGlow * (float(pc.counts.z) * 0.01) * weight;
+                }
+            }
         }
 
         // Next direction: metallic -> glossy reflection tinted by the metal's

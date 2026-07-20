@@ -376,6 +376,18 @@ private:
     // triangle order as the index buffer; the raster fragment shader reaches
     // it via MaterialGpu::extra[0] + gl_PrimitiveID.
     Buffer triNetBuffer_;
+    // The highlighted net as a SAMPLEABLE light: one entry per triangle on
+    // that net (three corners + its area), rebuilt whenever the highlight
+    // changes. Next-event estimation samples these directly instead of hoping
+    // a diffuse bounce stumbles onto a 0.25mm trace -- which it essentially
+    // never does, so emission alone lit nothing around it.
+    Buffer netLightBuffer_;
+    uint32_t netLightCount_ = 0;
+    void buildNetLights();
+    // CPU copies kept only so buildNetLights can walk the triangles without
+    // reading back from the GPU.
+    std::vector<uint32_t> restIndices_;
+    std::vector<int32_t> triNetCpu_;
     // The BLAS is built from these EXPLODED positions rather than vertexBuffer_
     // (the rest geometry the raster path holds). At rest it is a copy of the rest
     // vertices; in path-traced mode it is re-baked whenever the peel changes so the
