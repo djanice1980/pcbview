@@ -279,8 +279,22 @@ FileFunction parseFileFunction(std::string_view v) {
     if (k == "copper") f.kind = FileFunction::Kind::Copper;
     else if (k == "soldermask") f.kind = FileFunction::Kind::Soldermask;
     else if (k == "legend") f.kind = FileFunction::Kind::Silkscreen;
-    else if (k == "paste") f.kind = FileFunction::Kind::Paste;
+    // "Paste" in a file's own X2 attribute, "SolderPaste" in a .gbrjob
+    // manifest -- the same inconsistency as Soldermask/SolderMask, which only
+    // passes because case-folding happens to collapse it. The manifest wins
+    // when present, so a package with a .gbrjob reported its paste layers as
+    // unidentified until both spellings were accepted.
+    else if (k == "paste" || k == "solderpaste")
+        f.kind = FileFunction::Kind::Paste;
     else if (k == "profile") f.kind = FileFunction::Kind::Profile;
+    // Documentation: drawings ABOUT the board rather than layers OF it. All
+    // of these are real X2 FileFunction values, so a file carrying one has
+    // told us exactly what it is -- reporting it as unidentified would be
+    // simply untrue.
+    else if (k == "drillmap" || k == "fabricationdrawing" ||
+             k == "vcutmap" || k == "assemblydrawing" ||
+             k == "arraydrawing" || k == "otherdrawing")
+        f.kind = FileFunction::Kind::Documentation;
 
     for (const std::string& part : parts) {
         if (part == "Top") f.top = true;

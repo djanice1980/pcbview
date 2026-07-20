@@ -1348,6 +1348,22 @@ readout can never disagree.
     create the module). And the net colour/light buffers are referenced by
     live descriptor sets, so they need a `vkDeviceWaitIdle` before being
     freed on a highlight change.
+- **`LayerArt::warnings` vs `LayerArt::notes` mean opposite things.** A
+  WARNING is something that may make the render disagree with the board (a
+  file we could not identify, a thickness we had to guess). A NOTE is a file we
+  identified correctly and deliberately did not draw: solder paste is a stencil
+  aperture, a drill map documents the board rather than being part of it. Both
+  are shown under View > Import report and both go to stderr, but only warnings
+  raise the status line. A viewer that announces five warnings on a healthy
+  package teaches the user to ignore it, and then the one warning that matters
+  goes unread.
+  - Layer kinds must be honest about this too. `Kind::Documentation` exists so
+    a drill map -- which declares itself with `TF.FileFunction,Drillmap` -- is
+    not reported as unidentified. It told us exactly what it was.
+  - **Manifest and in-file spellings differ.** A `.gbrjob` says `SolderPaste`
+    and `SolderMask`; a file's own X2 attribute says `Paste` and `Soldermask`.
+    Case-folding hides the mask case by accident; paste needed both spellings
+    listed, and any NEW kind must be checked against both sources.
 - **Pseudo-nets (`geom/connectivity.cpp`) recover connectivity from copper
   alone**, for packages with no net data. Per layer, the copper is unioned
   through a `PolyTree64` so nesting is explicit -- each top-level outer contour

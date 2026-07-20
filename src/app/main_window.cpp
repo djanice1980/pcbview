@@ -655,19 +655,35 @@ bool MainWindow::loadBoard(const QString& path) {
     // transient one-of-five with no way to see the rest tells the user a
     // problem exists while withholding what it is.
     importWarnings_ = warnings;
-    // Also to stdout. On a windowed build this goes nowhere unless someone
+    importNotes_.clear();
+    for (const std::string& n : baseArt_.notes)
+        importNotes_ << QString::fromStdString(n);
+    importNotes_.removeDuplicates();
+
+    // Also to stderr. On a windowed build this goes nowhere unless someone
     // redirects it, so it costs a normal user nothing -- but it makes the
-    // warning list retrievable from a headless run, and "paste me the output"
-    // is a far better support question than "what did the status bar say".
+    // list retrievable from a headless run, and "paste me the output" is a
+    // far better support question than "what did the status bar say".
     for (const QString& w : warnings)
         std::fprintf(stderr, "[import warning] %s\n", w.toUtf8().constData());
+    for (const QString& n : importNotes_)
+        std::fprintf(stderr, "[import note] %s\n", n.toUtf8().constData());
     std::fflush(stderr);
+
+    // Lead with warnings. A package where everything was understood must not
+    // look like it has problems -- notes get a count, not an alarm.
     if (!warnings.isEmpty()) {
         statusBar()->showMessage(
-            QString("%1 import warning(s): %2  —  View ▸ Import warnings…")
+            QString("%1 import warning(s): %2  —  View ▸ Import report…")
                 .arg(warnings.size())
                 .arg(warnings.first()),
             10000);
+    } else if (!importNotes_.isEmpty()) {
+        statusBar()->showMessage(
+            QString("Imported cleanly — %1 file(s) recognised but not "
+                    "rendered.  View ▸ Import report…")
+                .arg(importNotes_.size()),
+            8000);
     } else if (!componentMsg.isEmpty()) {
         statusBar()->showMessage(componentMsg, 10000);
     }
@@ -1357,7 +1373,7 @@ void MainWindow::buildMenus() {
     });
 
     {
-        auto* warn = view->addAction("Import warnings…");
+        auto* warn = view->addAction("Import report…");
         warn->setStatusTip(
             "Everything the importer could not use from this package");
         connect(warn, &QAction::triggered, this, &MainWindow::showImportWarnings);
@@ -1673,20 +1689,34 @@ void MainWindow::buildNetDock() {
 
 void MainWindow::showImportWarnings() {
     QDialog dlg(this);
-    dlg.setWindowTitle("Import warnings");
+    dlg.setWindowTitle("Import report");
     auto* lay = new QVBoxLayout(&dlg);
-    if (importWarnings_.isEmpty()) {
-        lay->addWidget(new QLabel("No warnings — everything in the package "
-                                  "was recognised and used.",
+    if (importWarnings_.isEmpty() && importNotes_.isEmpty()) {
+        lay->addWidget(new QLabel("Nothing to report — every file in the "
+                                  "package was recognised and used.",
                                   &dlg));
     } else {
-        lay->addWidget(new QLabel(
-            QString("%1 warning(s) from the last import:").arg(importWarnings_.size()),
-            &dlg));
+        // Two sections, because they mean opposite things. A warning may make
+        // the render disagree with the board; a note is the importer saying it
+        // understood a file and chose not to draw it.
+        QString body;
+        if (!importWarnings_.isEmpty()) {
+            body += QString("WARNINGS (%1) — these may make the render "
+                            "disagree with the board:\n")
+                        .arg(importWarnings_.size());
+            for (const QString& w : importWarnings_) body += "  - " + w + "\n";
+        }
+        if (!importNotes_.isEmpty()) {
+            if (!body.isEmpty()) body += "\n";
+            body += QString("NOTES (%1) — recognised and deliberately not "
+                            "rendered. Nothing is wrong:\n")
+                        .arg(importNotes_.size());
+            for (const QString& n : importNotes_) body += "  - " + n + "\n";
+        }
         auto* list = new QPlainTextEdit(&dlg);
         list->setReadOnly(true);
-        list->setPlainText(importWarnings_.join("\n"));
-        list->setMinimumSize(720, 260);
+        list->setPlainText(body);
+        list->setMinimumSize(780, 300);
         lay->addWidget(list);
     }
     auto* close = new QPushButton("Close", &dlg);

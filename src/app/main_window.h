@@ -103,6 +103,7 @@ private:
     // first, so this is the only way to see the rest.
     void showImportWarnings();
     QStringList importWarnings_;
+    QStringList importNotes_;
 
     // Append the cached component parts onto mesh_ (fresh copies, so repeated
     // reassembles don't accumulate), shifting top-mounted parts to sit on the

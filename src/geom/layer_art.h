@@ -140,7 +140,16 @@ struct LayerArt {
     std::vector<PartialBore> partialBores;
 
     std::vector<ArtLayer> layers;
+    // WARNINGS are things that may make the render disagree with the board:
+    // a file we could not identify, a thickness we had to guess. NOTES are
+    // things we identified correctly and deliberately did not use.
+    //
+    // Keeping them apart is not cosmetic. A package where everything was
+    // understood should not announce five warnings -- a viewer that cries
+    // wolf on a healthy import teaches the user to ignore it, and then the
+    // one warning that actually matters goes unread.
     std::vector<std::string> warnings;
+    std::vector<std::string> notes;
 
     // Net table: name plus the routed copper length (sum of that net's track
     // segments) and via count, for the measure tool's net panel. Filled from

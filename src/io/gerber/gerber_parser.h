@@ -19,7 +19,20 @@ namespace pcbview::gerber {
 // The %TF.FileFunction attribute, when present. This is what identifies a layer
 // without filename heuristics -- copper (with stack position), mask, silk, etc.
 struct FileFunction {
-    enum class Kind { Unknown, Copper, Soldermask, Silkscreen, Paste, Profile };
+    // Documentation kinds are recognised and deliberately NOT rendered: a
+    // drill map or fab drawing describes the board for a human, it is not
+    // anything that exists on the finished board. Distinguishing them from
+    // Unknown matters -- "we do not use this" and "we could not identify
+    // this" are different statements, and only one of them is a problem.
+    enum class Kind {
+        Unknown,
+        Copper,
+        Soldermask,
+        Silkscreen,
+        Paste,
+        Profile,
+        Documentation,
+    };
     Kind kind = Kind::Unknown;
     int copperIndex = 0;      // 1-based stack position for copper (L1 = top)
     bool top = false;

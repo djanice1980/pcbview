@@ -693,17 +693,25 @@ geom::LayerArt importPackage(const std::string& path) {
                 break;
             case FileFunction::Kind::Paste:
                 // Recognised, deliberately unused: solder paste is a stencil
-                // aperture, not something on the finished board. Calling it
-                // "unclassified" implied the importer failed to understand it.
-                art.warnings.push_back("solder paste layer not rendered (it is "
-                                       "a stencil, not board copper): " +
-                                       f.name);
+                // aperture, not something on the finished board.
+                art.notes.push_back("solder paste layer not rendered (it is "
+                                    "a stencil, not board copper): " +
+                                    f.name);
+                break;
+            case FileFunction::Kind::Documentation:
+                // Also recognised and deliberately unused. These files declare
+                // themselves via TF.FileFunction, so they are identified, not
+                // mysterious -- they simply describe the board rather than
+                // being part of it.
+                art.notes.push_back(
+                    "drill map / fab drawing not rendered (it documents the "
+                    "board, it is not a layer of it): " + f.name);
                 break;
             default:
                 art.warnings.push_back(
-                    "unrecognised gerber ignored (no TF.FileFunction, and the "
-                    "name matches no known layer -- drill maps and fab "
-                    "drawings land here): " + f.name);
+                    "gerber not identified, ignored (no usable "
+                    "TF.FileFunction and the filename matches no known "
+                    "layer): " + f.name);
                 break;
         }
     }
@@ -801,7 +809,7 @@ geom::LayerArt importPackage(const std::string& path) {
         }
     }
     if (!art.nets.empty())
-        art.warnings.push_back(
+        art.notes.push_back(
             "Gerber X2 net attributes found: " + std::to_string(art.nets.size()) +
             " nets (net highlighting and routed length available)");
 
