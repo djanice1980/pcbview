@@ -85,7 +85,7 @@ float netChase(float phase) {
     if (push.highlight.w == 0) return 1.0;
     const float t = float(push.highlight.z) * 0.001;
 
-    const float kWipe = 1.1;   // seconds for the head to run the net
+    const float kWipe = 2.2;   // seconds for the head to run the net
     if (t < kWipe) {
         const float head = t / kWipe;
         if (phase > head) return 0.0;               // not reached yet
@@ -101,7 +101,7 @@ float netChase(float phase) {
     // trough above ~0.4 still clips past white and the whole cycle renders as
     // one flat saturated colour -- measurably identical frames. 0.12 at the
     // trough is what makes the band actually read as moving.
-    const float g = fract(phase * 1.5 - (t - kWipe) * 0.55);
+    const float g = fract(phase * 1.5 - (t - kWipe) * 0.275);
     return 0.12 + 0.88 * (0.5 + 0.5 * cos(6.2831853 * g));
 }
 

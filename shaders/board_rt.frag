@@ -62,7 +62,7 @@ float netChase(float phase) {
     if (push.highlight.w == 0) return 1.0;
     const float t = float(push.highlight.z) * 0.001;
 
-    const float kWipe = 1.1;
+    const float kWipe = 2.2;
     if (t < kWipe) {
         const float head = t / kWipe;
         if (phase > head) return 0.0;
@@ -70,7 +70,7 @@ float netChase(float phase) {
     }
     // Trough well below 1 so the band clears the glow multiplier's clipping
     // point -- see board.frag.
-    const float g = fract(phase * 1.5 - (t - kWipe) * 0.55);
+    const float g = fract(phase * 1.5 - (t - kWipe) * 0.275);
     return 0.12 + 0.88 * (0.5 + 0.5 * cos(6.2831853 * g));
 }
 

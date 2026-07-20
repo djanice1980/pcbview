@@ -422,7 +422,19 @@ void Renderer::bakeExplode(float progress) {
     // shadows in lockstep with what raster actually draws.
     std::vector<uint8_t> vis(parts_.size(), 1);
     const bool peeling = progress > 0.0f;
-    const bool substrateOpaque = substrateOpacity_ >= 0.999f;
+    // "Opaque" has to mean actually-occluding, which is opacity AND being
+    // drawn at all. Testing the opacity alone meant hiding the substrate with
+    // its visibility checkbox left this believing the laminate was still
+    // burying the inner copper -- so hiding the substrate REMOVED inner
+    // layers instead of revealing them, which is the opposite of why anyone
+    // hides it.
+    bool substrateShown = false;
+    for (size_t si = 0; si < parts_.size(); ++si) {
+        if (parts_[si].name != "substrate") continue;
+        substrateShown = parts_[si].visible;
+        break;
+    }
+    const bool substrateOpaque = substrateOpacity_ >= 0.999f && substrateShown;
     for (const DrawItem& item : draws_) {
         bool v = item.part < parts_.size() ? parts_[item.part].visible : true;
         if (item.hideWhenCollapsed && !peeling && substrateOpaque) v = false;
@@ -3335,7 +3347,19 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // reads as one solid block, and reveal it the moment it peels. A translucent
     // substrate is the exception: there the whole point is to see through to the
     // inner layers, so keep them shown even when collapsed.
-    const bool substrateOpaque = substrateOpacity_ >= 0.999f;
+    // "Opaque" has to mean actually-occluding, which is opacity AND being
+    // drawn at all. Testing the opacity alone meant hiding the substrate with
+    // its visibility checkbox left this believing the laminate was still
+    // burying the inner copper -- so hiding the substrate REMOVED inner
+    // layers instead of revealing them, which is the opposite of why anyone
+    // hides it.
+    bool substrateShown = false;
+    for (size_t si = 0; si < parts_.size(); ++si) {
+        if (parts_[si].name != "substrate") continue;
+        substrateShown = parts_[si].visible;
+        break;
+    }
+    const bool substrateOpaque = substrateOpacity_ >= 0.999f && substrateShown;
     const auto visible = [&](const DrawItem& i) {
         if (i.part < parts_.size() && !parts_[i.part].visible) return false;
         if (i.hideWhenCollapsed && !peeling && substrateOpaque) return false;
