@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: DavidJanice.pcbview
+PackageVersion: 1.17.1
+MinimumOSVersion: 10.0.0.0
+InstallerType: inno
+# winget supplies the Inno silent switches itself
+# (/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-); they are verified against
+# this installer rather than assumed.
+Scope: machine
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+UpgradeBehavior: install
+ReleaseDate: 2026-07-20
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/djanice1980/pcbview/releases/download/v1.17.1/pcbview-1.17.1-setup.exe
+    InstallerSha256: 310DD9D6660FE4156D9328C357C6F671E3675CBAEC24D9ED5580442FF9CB9360
+    # Verified by installing this exact asset and reading the registry key it
+    # creates. Deliberately the ONLY detection hint given: an UpgradeCode is an
+    # MSI concept that Inno does not write, and the Add/Remove DisplayName
+    # differs between scopes ("pcbview" per-machine, "pcbview (Current user)"
+    # per-user), so asserting either would be claiming something unverified.
+    ProductCode: '{7E1F7A2C-9B7D-4A63-B7B1-52D1C0B4D6E1}_is1'
+ManifestType: installer
+ManifestVersion: 1.6.0

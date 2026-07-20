@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: DavidJanice.pcbview
+PackageVersion: 1.17.1
+PackageLocale: en-US
+Publisher: David Janice
+PublisherUrl: https://github.com/djanice1980
+PublisherSupportUrl: https://github.com/djanice1980/pcbview/issues
+PackageName: pcbview
+PackageUrl: https://github.com/djanice1980/pcbview
+License: GPL-3.0-only
+LicenseUrl: https://github.com/djanice1980/pcbview/blob/main/LICENSE
+Copyright: Copyright (c) David Janice
+ShortDescription: Ray-traced 3D viewer for KiCad boards and Gerber packages.
+Description: |-
+  pcbview renders a printed circuit board in 3D from either a KiCad project or a
+  Gerber package, with the stated goal of showing what the fab will actually
+  build rather than a stylised approximation.
+
+  It offers rasterised, ray-traced (contact shadows and ambient occlusion) and
+  fully path-traced rendering with Intel Open Image Denoise, and runs entirely
+  on the CPU when no suitable GPU is present. Copper, soldermask, silkscreen,
+  plated barrels, blind and buried vias, routed slots and 3D component bodies
+  are all modelled, and an exploded view separates the stack.
+
+  Nets can be highlighted and followed through the board, taken from KiCad
+  connectivity, from Gerber X2 attributes, or derived from the copper itself
+  when a package carries no netlist at all. Measurement tools report fab-exact
+  distances and routed net lengths, and the board can be printed or exported at
+  up to four times the window resolution.
+Moniker: pcbview
+Tags:
+  - 3d
+  - cad
+  - eda
+  - electronics
+  - gerber
+  - kicad
+  - path-tracing
+  - pcb
+  - ray-tracing
+  - viewer
+ReleaseNotesUrl: https://github.com/djanice1980/pcbview/releases/tag/v1.17.1
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
