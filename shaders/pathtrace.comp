@@ -15,7 +15,16 @@ layout(std430, set = 0, binding = 1) readonly buffer Verts { float vtx[]; };
 layout(std430, set = 0, binding = 2) readonly buffer Idx { uint idx[]; };
 layout(std430, set = 0, binding = 3) readonly buffer TriMat { uint triMat[]; };
 // Per-triangle net, for highlighting. Same global order as the index buffer.
-layout(std430, set = 0, binding = 8) readonly buffer TriNet { int triNet[]; };
+// Per-triangle net id and position along that net. MUST match the layout in
+// board.frag / board_rt.frag: this is the same buffer, and reading it as a
+// tight array of ints (as it was before the phase was added) makes every
+// other triangle report a float's bit pattern as its net index -- which
+// lights up unrelated copper all over the board.
+struct TriInfo {
+    int net;
+    float phase;
+};
+layout(std430, set = 0, binding = 8) readonly buffer TriNet { TriInfo triNet[]; };
 // The highlighted net as an area light: 3 corners per triangle, v0.w = area.
 layout(std430, set = 0, binding = 9) readonly buffer NetLights { vec4 netLit[]; };
 // Per-net glow colour; a = 1 when highlighted. Indexed by net id.
@@ -301,7 +310,7 @@ void main() {
         // path tracer already carries that light everywhere for free. Other
         // geometry desaturates and darkens so the glow dominates.
         if (int(pc.counts.y) >= 0) {
-            const int hnet = triNet[prim];
+            const int hnet = triNet[prim].net;
             const vec4 hcol = hnet >= 0 ? netCol[hnet] : vec4(0.0);
             if (hcol.a > 0.0) {
                 // Emission only on the CAMERA ray. Indirect light from the net
