@@ -95,21 +95,27 @@ jobs:
           $v = (Get-Item $exe).VersionInfo.FileVersion.Trim()
           Write-Host "built pcbview $v"
           # --gpu-info exits without opening a window, so it proves the binary
-          # LOADS: that every Qt and Vulkan dependency resolved and the app got
-          # as far as probing devices. That is the deploy correctness CI can
+          # LOADS: that every Qt and Vulkan dependency resolved and the app ran
+          # far enough to probe devices. That is the deploy correctness CI can
           # actually assert.
           #
-          # It deliberately does not require a device to be found. A runner has
-          # no GPU; a bundled CPU driver (lavapipe) usually answers, but that is
-          # not something to fail a build over. What IS fatal is the 0xC0000000
-          # range -- STATUS_DLL_NOT_FOUND and friends -- which is exactly what a
-          # missing runtime DLL produces, and is the failure this step exists to
-          # catch.
-          & $exe --gpu-info
-          $code = $LASTEXITCODE
+          # Start-Process -Wait, NOT the & call operator: pcbview is a
+          # windowed-subsystem app, so & returns immediately and never sets
+          # $LASTEXITCODE. (This is documented in ARCHITECTURE.md and it still
+          # caught this workflow on its first run.)
+          $p = Start-Process $exe -ArgumentList '--gpu-info' -PassThru -Wait `
+                 -NoNewWindow -RedirectStandardOutput gpu.txt -RedirectStandardError gpuerr.txt
+          $code = $p.ExitCode
+          Get-Content gpu.txt, gpuerr.txt -ErrorAction SilentlyContinue | Write-Host
           Write-Host "--gpu-info exit code: $code"
-          if ($code -lt 0) {
-            throw "pcbview crashed or failed to load (0x{0:X8}) -- a runtime DLL is probably missing from the deploy" -f $code
+
+          # A runner has no Vulkan driver, so "no device" is the NORMAL result
+          # here and must not fail the build. What is fatal is the NT status
+          # range -- 0xC0000135 STATUS_DLL_NOT_FOUND, 0xC000007B bad image and
+          # friends -- which is exactly what a missing or mismatched runtime
+          # DLL produces, and is the failure this step exists to catch.
+          if ($code -lt -1073741000) {
+            throw ("pcbview failed to LOAD (0x{0:X8}) -- a runtime DLL is missing or mismatched in the deploy" -f $code)
           }
 
       - name: Check the tag matches the built version
