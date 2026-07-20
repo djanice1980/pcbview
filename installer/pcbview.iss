@@ -26,6 +26,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; Per-user install works too; let the user pick (admin -> Program Files).
 PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
+; Stable name in Add/Remove Programs. Inno's default folds the version into
+; DisplayName ("pcbview version 1.17.0"), which changes every release and so
+; cannot be matched on by a deployment tool; the version is already published
+; separately as DisplayVersion.
+UninstallDisplayName=pcbview
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked

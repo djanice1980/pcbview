@@ -243,6 +243,55 @@ Grab the latest release from the
 Both are self-contained — Qt, the CPU Vulkan driver, Embree, and the denoiser
 are all bundled. No prerequisites.
 
+
+### Unattended / scripted install
+
+The installer is [Inno Setup](https://jrsoftware.org/isinfo.php), so it takes
+the standard switches. Every command below is exercised on each release —
+install, upgrade-over-running and uninstall are how the packages get verified
+before they are published.
+
+```bat
+:: per-machine (needs an elevated context: SYSTEM, an RMM agent, or admin)
+pcbview-1.17.0-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ALLUSERS
+
+:: per-user, no elevation, custom location
+pcbview-1.17.0-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /DIR="%LOCALAPPDATA%\pcbview"
+
+:: also drop a desktop shortcut (off by default)
+pcbview-1.17.0-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /TASKS="desktopicon"
+
+:: write an install log for diagnosis
+pcbview-1.17.0-setup.exe /VERYSILENT /LOG="%TEMP%\pcbview-install.log"
+```
+
+**Upgrading needs neither the old version removed nor pcbview closed.** The
+installer uses Restart Manager to shut a running instance down, replaces it and
+returns exit code 0, rather than failing on a locked file or leaving a
+half-updated install behind.
+
+**Detection and removal.** The usual values are published under
+`...\CurrentVersion\Uninstall\` (HKLM for a per-machine install, HKCU for
+per-user):
+
+| value | use |
+|---|---|
+| `DisplayName` | `pcbview` (a per-user install appends ` (Current user)`) — no version in it, so it is stable across releases and safe to match on |
+| `DisplayVersion` | the version, e.g. `1.17.0` |
+| `InstallLocation` | install directory |
+| `QuietUninstallString` | ready-made silent uninstall command |
+
+```bat
+:: silent uninstall
+"C:\Program Files\pcbview\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+```
+
+Check the exit code rather than assuming success: 0 is success, and a silent
+installer that hits an elevation prompt returns **2** having installed nothing.
+
+For an install-free rollout, ship the portable zip instead — it writes nothing
+outside its own folder except `~/.pcbview/settings.xml`.
+
 ## Building from source
 
 pcbview is currently a **Windows / MSVC** build. You need:
