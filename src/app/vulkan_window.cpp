@@ -534,7 +534,12 @@ void VulkanWindow::setViewTop() {
 
 void VulkanWindow::setViewBottom() {
     Camera dest = camera_;
-    dest.yaw = 0.0f;
+    // yaw pi: the industry "flip board" is LEFT-RIGHT (about the vertical
+    // axis), not top-over-bottom. Reaching the underside with yaw 0 shows a
+    // view rotated 180 degrees from what Altium/KiCad (and a board in your
+    // hands) present -- bottom silk reads upside down and gets reported as
+    // "mirrored".
+    dest.yaw = 3.14159265f;
     dest.pitch = -1.57079633f;  // -pi/2
     dest.roll = 0.0f;
     setViewTarget(dest, false);
