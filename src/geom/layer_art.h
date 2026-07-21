@@ -191,6 +191,11 @@ struct LayerArt {
     // unrouted net appears as several of them, and two shorted nets appear as
     // one -- so every surface that shows them must say where they came from.
     bool netsArePseudo = false;
+    // The net table came from an IPC-D-356 netlist: REAL names at test-point
+    // positions (kept in netPoints), but no name->copper mapping yet.
+    // extractPseudoNets recognises this and names its derived groups from the
+    // contained test points instead of refusing to run.
+    bool netsFromTestPoints = false;
 
     // Every track segment with its net (mm, Y flip applied) -- the graph the
     // measure tool walks to report the routed distance BETWEEN two points on

@@ -186,6 +186,7 @@ add_executable(pcbview WIN32
     src/io/kicad/kicad_importer.cpp
     src/io/gerber/gerber_parser.cpp
     src/io/gerber/gerber_project.cpp
+    src/io/ipc356/ipc356.cpp
     src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     ${MINIZ_SOURCES}
@@ -257,6 +258,7 @@ add_executable(pcbview_tests
     tests/pcbview_tests.cpp
     src/io/gerber/gerber_parser.cpp
     src/io/gerber/gerber_project.cpp
+    src/io/ipc356/ipc356.cpp
     src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     src/text/stroke_text.cpp

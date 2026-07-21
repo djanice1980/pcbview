@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -113,8 +114,10 @@ PseudoNetStats extractPseudoNets(LayerArt& art, const ProgressFn& progress) {
     const auto report = [&](const std::string& stage, int pct) {
         return progress ? progress(stage, pct) : true;
     };
-    // Never overwrite a real netlist.
-    if (!art.nets.empty()) return {};
+    // Never overwrite a real netlist -- EXCEPT a 356 test-point table, which
+    // is names without geometry: binding those names to the copper is exactly
+    // what this function exists to finish.
+    if (!art.nets.empty() && !art.netsFromTestPoints) return {};
 
     std::vector<ArtLayer*> copper;
     for (ArtLayer& al : art.layers)
@@ -206,26 +209,125 @@ PseudoNetStats extractPseudoNets(LayerArt& art, const ProgressFn& progress) {
     // Publish. The "~" prefix is the signal that these are derived; the UI
     // says so too, but a name that travels with the data cannot be lost.
     report("Publishing nets", 98);
+
+    // 356 test points, snapshotted BEFORE the net table is replaced: each is
+    // a (name, position) pair, and a point inside an island names its whole
+    // group. Disagreements are findings, not errors: one name across several
+    // groups is an OPEN, several names in one group is a SHORT.
+    struct NamedPoint {
+        std::string name;
+        Point64 at;
+        size_t pointIdx;  // back-reference into art.netPoints
+    };
+    std::vector<NamedPoint> testPoints;
+    if (art.netsFromTestPoints) {
+        for (size_t pi = 0; pi < art.netPoints.size(); ++pi) {
+            const LayerArt::NetPoint& np = art.netPoints[pi];
+            if (np.net < 0 || np.net >= static_cast<int>(art.nets.size()))
+                continue;
+            testPoints.push_back(
+                {art.nets[np.net].name,
+                 Point64{static_cast<int64_t>(std::llround(np.pos[0] * kScale)),
+                         static_cast<int64_t>(std::llround(np.pos[1] * kScale))},
+                 pi});
+        }
+    }
+
     art.nets.clear();
     for (ArtLayer* al : copper) al->netArt.clear();
-    // (layer, island) -> published net index, for the segment assignment below.
+    // (layer, island) -> published net index, for the assignments below.
     std::vector<std::vector<int>> islandNet(perLayer.size());
     for (size_t li = 0; li < perLayer.size(); ++li)
         islandNet[li].assign(perLayer[li].size(), -1);
+    for (size_t g = 0; g < groups.size(); ++g)
+        for (const auto& [li, ii] : groups[g].members)
+            islandNet[li][ii] = static_cast<int>(g);
+
+    // Vote: which names' test points land inside which group's copper. A
+    // through-hole point is present on every layer, so testing all layers is
+    // correct for it and harmless for SMD (only its own layer contains it).
+    std::vector<std::map<std::string, int>> votes(groups.size());
+    std::vector<int> pointGroup(testPoints.size(), -1);
+    std::map<std::string, std::vector<int>> nameGroups;
+    for (size_t ti = 0; ti < testPoints.size(); ++ti) {
+        for (size_t li = 0; li < perLayer.size() && pointGroup[ti] < 0; ++li) {
+            const int hit = islandAt(perLayer[li], testPoints[ti].at);
+            if (hit < 0) continue;
+            pointGroup[ti] = islandNet[li][hit];
+        }
+        if (pointGroup[ti] >= 0) {
+            ++votes[pointGroup[ti]][testPoints[ti].name];
+            auto& gs = nameGroups[testPoints[ti].name];
+            if (std::find(gs.begin(), gs.end(), pointGroup[ti]) == gs.end())
+                gs.push_back(pointGroup[ti]);
+        }
+    }
+
+    // Name the groups. Majority name wins; a second distinct name in the same
+    // group is a short finding. A name spanning groups gets #2, #3 suffixes on
+    // the smaller pieces -- an open finding.
+    std::vector<std::string> groupName(groups.size());
+    for (size_t g = 0; g < groups.size(); ++g) {
+        std::string best;
+        int bestVotes = 0;
+        for (const auto& [name, n] : votes[g]) {
+            if (n > bestVotes) {
+                bestVotes = n;
+                best = name;
+            }
+        }
+        groupName[g] = best;  // empty = unnamed, resolved to "~k" below
+        if (votes[g].size() > 1) {
+            std::string all;
+            for (const auto& [name, n] : votes[g])
+                all += (all.empty() ? "" : ", ") + name;
+            art.warnings.push_back("copper group joins nets " + all +
+                                   " -- short?");
+        }
+    }
+    for (auto& [name, gs] : nameGroups) {
+        if (gs.size() <= 1) continue;
+        art.warnings.push_back(
+            "net '" + name + "' spans " + std::to_string(gs.size()) +
+            " unconnected copper groups -- open?");
+        int k = 1;
+        for (const int g : gs) {
+            if (groupName[g] != name) continue;  // a short vote lost here
+            if (k > 1)
+                groupName[g] = name + "#" + std::to_string(k);
+            ++k;
+        }
+    }
+
     for (size_t g = 0; g < groups.size(); ++g) {
         LayerArt::NetInfo info;
-        info.name = "~" + std::to_string(g + 1);
+        info.name = groupName[g].empty() ? "~" + std::to_string(g + 1)
+                                         : groupName[g];
         // Clipper works in integer units; kScale converts back, squared for
         // an area.
         info.copperMm2 = groups[g].area / (kScale * kScale);
         art.nets.push_back(std::move(info));
         for (const auto& [li, ii] : groups[g].members) {
-            islandNet[li][ii] = static_cast<int>(g);
             ArtLayer::NetRegion nr;
             nr.net = static_cast<int>(g);
             nr.paths = perLayer[li][ii].paths;
             copper[li]->netArt.push_back(std::move(nr));
         }
+    }
+
+    // Point the 356 test points at their groups' published nets, so pad
+    // snapping and click naming carry the REAL names. A point that landed on
+    // no copper keeps no net (and says so).
+    if (art.netsFromTestPoints) {
+        int unplaced = 0;
+        for (size_t ti = 0; ti < testPoints.size(); ++ti) {
+            art.netPoints[testPoints[ti].pointIdx].net = pointGroup[ti];
+            if (pointGroup[ti] < 0) ++unplaced;
+        }
+        if (unplaced > 0)
+            art.warnings.push_back(
+                std::to_string(unplaced) +
+                " netlist test point(s) sit on no copper");
     }
 
     // Give the pseudo-nets their SEGMENT GRAPH: every untagged stroke the

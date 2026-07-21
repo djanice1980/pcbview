@@ -20,11 +20,14 @@
 
 #include <clipper2/clipper.h>
 
+#include <set>
+
 #include "geom/connectivity.h"
 #include "geom/layer_art.h"
 #include "geom/tessellate.h"
 #include "io/gerber/gerber_parser.h"
 #include "io/gerber/gerber_project.h"
+#include "io/ipc356/ipc356.h"
 
 namespace fs = std::filesystem;
 using namespace pcbview;
@@ -330,6 +333,165 @@ static void testInference() {
     CHECK(netlessSnap);
 }
 
+// ---- IPC-D-356 -------------------------------------------------------------
+//
+// A netlist for the SAME fixture board, netless flavour: real names at test
+// points sitting on the fixture's known copper. Metric (CUST 1 = 0.001mm),
+// so (1,1)mm is X+0001000. The N/C record must be dropped; the 317 record is
+// a through-hole point (the plated (1,1) pad).
+
+static const char* k356 =
+    "C  IPC-D-356 fixture netlist\n"
+    "P  UNITS CUST 1\n"
+    "317NETA          TP1   D0400PA00X+0001000Y+0001000X0600Y0600\n"
+    "327NETA          TP2        A01X+0005000Y+0003000X1000Y1000\n"
+    "327NETB          TP3        A01X+0008000Y+0004000X0300Y0300\n"
+    "327NETC          TP4        A01X+0006700Y+0002700X0600Y0600\n"
+    "317N/C           TP5   D0400PA00X+0002000Y+0004500X0600Y0600\n"
+    "999\n";
+
+static void test356Parser() {
+    CHECK(ipc356::looksLike(k356));
+    CHECK(!ipc356::looksLike(kFCu));  // a gerber must not sniff as a netlist
+
+    const ipc356::File f = ipc356::parse(k356);
+    CHECK(f.ok);
+    CHECK(f.warnings.empty());
+    CHECK(f.records.size() == 4);  // N/C filtered out
+    if (f.records.size() != 4) return;
+    CHECK(f.records[0].net == "NETA");
+    CHECK(f.records[0].through);
+    CHECK_NEAR(f.records[0].x, 1.0, 1e-9);
+    CHECK_NEAR(f.records[0].y, 1.0, 1e-9);
+    CHECK(!f.records[1].through);
+    CHECK_NEAR(f.records[1].x, 5.0, 1e-9);
+    CHECK_NEAR(f.records[1].y, 3.0, 1e-9);
+    CHECK(f.records[3].net == "NETC");
+    CHECK_NEAR(f.records[3].x, 6.7, 1e-9);
+    CHECK_NEAR(f.records[3].y, 2.7, 1e-9);
+
+    // Inch flavour: CUST 0 = 0.0001 inch, and negative coordinates.
+    const ipc356::File in = ipc356::parse(
+        "P  UNITS CUST 0\n"
+        "327INCHNET       TP1        A01X+0010000Y-0005000\n");
+    CHECK(in.ok);
+    if (in.ok && !in.records.empty()) {
+        // 10000 units x 0.0001" = 1.0" = 25.4mm.
+        CHECK_NEAR(in.records[0].x, 25.4, 1e-9);
+        CHECK_NEAR(in.records[0].y, -12.7, 1e-9);
+    }
+}
+
+static fs::path write356Fixture() {
+    const fs::path dir = fs::temp_directory_path() / "pcbview_fix_356";
+    fs::create_directories(dir);
+    const auto put = [&](const char* name, const std::string& text) {
+        std::ofstream f(dir / name, std::ios::binary);
+        f << text;
+    };
+    put("l1.gbr", stripNets(kFCu));
+    put("l2.gbr", stripNets(kBCu));
+    put("edge.gbr", kProfile);
+    put("holes.drl", kDrill);
+    put("board.ipc", k356);
+    return dir;
+}
+
+// The marriage: a netless package plus a 356 file arrives as REAL names at
+// test points (netsFromTestPoints), and extractPseudoNets then names its
+// copper groups from the contained points instead of inventing "~1".
+static void test356Package() {
+    geom::LayerArt art = gerber::importPackage(write356Fixture().string());
+    CHECK(art.netsFromTestPoints);
+    CHECK(!art.netsArePseudo);  // names are real, just unbound
+    CHECK(art.nets.size() == 3);
+    int named = 0;
+    for (const auto& np : art.netPoints)
+        if (np.net >= 0) ++named;
+    CHECK(named == 5);  // 4 records; the through-hole point at both faces
+
+    const size_t warningsBefore = art.warnings.size();
+    const geom::PseudoNetStats stats = geom::extractPseudoNets(art);
+    CHECK(stats.groups == 3);
+    CHECK(art.netsArePseudo);  // connectivity is still derived...
+    CHECK(art.nets.size() == 3);
+    std::set<std::string> names;
+    for (const auto& n : art.nets) names.insert(n.name);
+    // ...but every group carries its netlist name, no "~k" placeholders.
+    CHECK(names == std::set<std::string>({"NETA", "NETB", "NETC"}));
+    // The marriage itself raised no findings: no opens, no shorts, no orphan
+    // test points on this board. (The import may warn about other things.)
+    CHECK(art.warnings.size() == warningsBefore);
+    for (size_t i = warningsBefore; i < art.warnings.size(); ++i)
+        std::printf("  marriage warning: %s\n", art.warnings[i].c_str());
+
+    // Routed lengths still accumulate from the assigned strokes.
+    double routedSum = 0.0;
+    for (const auto& n : art.nets) routedSum += n.routedMm;
+    CHECK_NEAR(routedSum, 11.0, 1e-6);
+
+    // Test points now index the published table under their own names.
+    for (const auto& np : art.netPoints)
+        if (np.net >= 0)
+            CHECK(art.nets[np.net].name[0] != '~');
+
+    // And the path solver walks the REAL-named net.
+    const geom::BoardMesh mesh = geom::assemble(art, {});
+    const geom::LayerArt::NetSeg* four = findSeg(mesh, 4.0);
+    CHECK(four != nullptr);
+    if (!four) return;
+    CHECK(art.nets[four->net].name == "NETA");
+    double ax, ay, bx, by;
+    lerp(*four, 0.25, ax, ay);
+    lerp(*four, 0.75, bx, by);
+    CHECK_NEAR(geom::netPathLength(mesh, four->net, ax, ay, bx, by), 2.0,
+               1e-3);
+}
+
+// The findings the marriage exists to raise: the same board with a DEFECTIVE
+// netlist. NETA is claimed at (1,1) and also on the (8,x) stroke -- two
+// unconnected groups, an OPEN. NETB and NETC both land on the plane island --
+// one group, a SHORT. Every group still gets a name (opens suffix #2).
+static void test356Findings() {
+    static const char* kBad =
+        "P  UNITS CUST 1\n"
+        "317NETA          TP1   D0400PA00X+0001000Y+0001000X0600Y0600\n"
+        "327NETA          TP2        A01X+0008000Y+0004000X0300Y0300\n"
+        "327NETC          TP3        A01X+0006700Y+0002700X0600Y0600\n"
+        "327NETB          TP4        A01X+0007300Y+0004300X0600Y0600\n"
+        "999\n";
+    const fs::path dir = fs::temp_directory_path() / "pcbview_fix_356b";
+    fs::create_directories(dir);
+    const auto put = [&](const char* name, const std::string& text) {
+        std::ofstream f(dir / name, std::ios::binary);
+        f << text;
+    };
+    put("l1.gbr", stripNets(kFCu));
+    put("l2.gbr", stripNets(kBCu));
+    put("edge.gbr", kProfile);
+    put("holes.drl", kDrill);
+    put("board.ipc", kBad);
+
+    geom::LayerArt art = gerber::importPackage(dir.string());
+    CHECK(art.netsFromTestPoints);
+    const size_t before = art.warnings.size();
+    const geom::PseudoNetStats stats = geom::extractPseudoNets(art);
+    CHECK(stats.groups == 3);
+
+    bool open = false, shorted = false;
+    for (size_t i = before; i < art.warnings.size(); ++i) {
+        if (art.warnings[i].find("open?") != std::string::npos) open = true;
+        if (art.warnings[i].find("short?") != std::string::npos)
+            shorted = true;
+    }
+    CHECK(open);
+    CHECK(shorted);
+    std::set<std::string> names;
+    for (const auto& n : art.nets) names.insert(n.name);
+    CHECK(names.count("NETA") == 1);    // first group claimed keeps the name
+    CHECK(names.count("NETA#2") == 1);  // the open's second piece is visible
+}
+
 // Arc interpolation, both quadrant modes, strokes and regions -- exact
 // analytic ground truth (chord-vs-arc error at the parser's segment count is
 // well under the tolerances used).
@@ -476,6 +638,9 @@ int main() {
     testParserTagged();
     testPackageTagged();
     testInference();
+    test356Parser();
+    test356Package();
+    test356Findings();
     testArcs();
     testStepRepeat();
     testCorpus();

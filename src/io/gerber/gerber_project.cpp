@@ -16,6 +16,7 @@
 #include <cstdlib>
 
 #include "io/gerber/gerber_parser.h"
+#include "io/ipc356/ipc356.h"
 
 namespace pcbview::gerber {
 namespace {
@@ -661,9 +662,19 @@ geom::LayerArt importPackage(const std::string& path) {
     Paths64 profileDark;
     bool haveProfile = false;
 
+    // An IPC-D-356 netlist riding with the package: names at positions. Only
+    // consulted when the gerbers themselves carry no X2 nets -- a real tag is
+    // authoritative over a sidecar file.
+    const NamedFile* netlist356 = nullptr;
+
     for (const NamedFile& f : files) {
         if (endsWithNoCase(f.name, ".gbrjob")) continue;
         if (looksLikeDrill(f.name)) continue;
+        if (endsWithNoCase(f.name, ".ipc") || endsWithNoCase(f.name, ".356") ||
+            endsWithNoCase(f.name, ".d356") || ipc356::looksLike(f.text)) {
+            if (!netlist356) netlist356 = &f;
+            continue;
+        }
         // Cheap sniff: gerber files start with attribute/format commands.
         if (f.text.find('%') == std::string::npos &&
             f.text.find("G04") == std::string::npos) {
@@ -816,6 +827,39 @@ geom::LayerArt importPackage(const std::string& path) {
         art.notes.push_back(
             "Gerber X2 net attributes found: " + std::to_string(art.nets.size()) +
             " nets (net highlighting and routed length available)");
+
+    // No X2 nets, but a 356 netlist rode along: take the NAMES. Each record
+    // becomes a net-carrying snap point immediately; the geometry mapping
+    // (which copper belongs to which name) comes from running "Infer nets",
+    // which recognises this flag and names its derived groups from the test
+    // points instead of inventing "~1" style placeholders.
+    if (art.nets.empty() && netlist356) {
+        const ipc356::File nl = ipc356::parse(netlist356->text);
+        for (const std::string& w : nl.warnings) art.warnings.push_back(w);
+        if (nl.ok) {
+            for (const ipc356::Record& r : nl.records) {
+                auto [it, inserted] = netIndex.emplace(
+                    r.net, static_cast<int>(art.nets.size()));
+                if (inserted) art.nets.push_back({r.net, 0.0, 0});
+                geom::LayerArt::NetPoint np;
+                np.pos[0] = r.x;
+                np.pos[1] = r.y;
+                np.pos[2] = art.thickness;
+                np.net = it->second;
+                art.netPoints.push_back(np);
+                if (r.through) {
+                    np.pos[2] = 0.0;  // reachable from the bottom face too
+                    art.netPoints.push_back(np);
+                }
+            }
+            art.netsFromTestPoints = true;
+            art.notes.push_back(
+                "IPC-D-356 netlist found (" + netlist356->name + "): " +
+                std::to_string(art.nets.size()) +
+                " net names at " + std::to_string(nl.records.size()) +
+                " test points. Run Infer nets to bind them to the copper.");
+        }
+    }
 
     for (int i = 0; i < nCopper; ++i) {
         geom::ArtLayer al;

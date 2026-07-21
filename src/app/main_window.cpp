@@ -1987,12 +1987,28 @@ void MainWindow::populateNets() {
     // nets (X2 %TO.N% object attributes, which pcbview reads); this particular
     // package simply has none, which for a KiCad export means it was written
     // without "Include advanced X2 features".
-    // Offer inference only when there is no netlist to overwrite, and say so
-    // whenever the list is showing derived data.
+    // Offer inference when there is no netlist to overwrite -- or when the
+    // nets are 356 test-point names that still need binding to the copper.
+    // Say what the list is showing either way.
     if (inferNetsBtn_)
-        inferNetsBtn_->setVisible(loaded_ && mesh_.nets.empty());
-    if (pseudoNetNote_)
-        pseudoNetNote_->setVisible(baseArt_.netsArePseudo && !mesh_.nets.empty());
+        inferNetsBtn_->setVisible(loaded_ &&
+                                  (mesh_.nets.empty() ||
+                                   (baseArt_.netsFromTestPoints &&
+                                    !baseArt_.netsArePseudo)));
+    if (pseudoNetNote_) {
+        pseudoNetNote_->setText(
+            baseArt_.netsFromTestPoints
+                ? (baseArt_.netsArePseudo
+                       ? "Net names from the IPC-D-356 netlist; connectivity "
+                         "derived from copper geometry."
+                       : "Net names from the IPC-D-356 netlist — run Infer "
+                         "nets to bind them to the copper.")
+                : "Derived from copper geometry — not a netlist. Names are "
+                  "arbitrary.");
+        pseudoNetNote_->setVisible(
+            !mesh_.nets.empty() &&
+            (baseArt_.netsArePseudo || baseArt_.netsFromTestPoints));
+    }
 
     if (mesh_.nets.empty()) {
         auto* none = new QTreeWidgetItem(
