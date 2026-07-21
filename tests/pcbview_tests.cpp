@@ -435,12 +435,50 @@ static void testStepRepeat() {
     for (const auto& fl : sr.flashes) CHECK(fl.net == "NETS");
 }
 
+// Corpus: every package committed under tests/corpus/<name>/ is imported and
+// held to survival invariants -- no throw, a real outline, copper present,
+// and a successful assemble. This is deliberately weaker than the fixture
+// assertions above: the corpus exists to feed the parser the WILD, where the
+// ground truth is unknown but "imports sane geometry without crashing" is
+// still a strong regression net. Growing coverage = dropping a folder in.
+static void testCorpus() {
+    const fs::path corpus = fs::path(__FILE__).parent_path() / "corpus";
+    if (!fs::exists(corpus)) return;
+    int packages = 0;
+    for (const auto& entry : fs::directory_iterator(corpus)) {
+        if (!entry.is_directory()) continue;
+        ++packages;
+        const std::string name = entry.path().filename().string();
+        try {
+            const geom::LayerArt art =
+                gerber::importPackage(entry.path().string());
+            CHECK(!art.outline.empty());
+            bool copper = false;
+            for (const auto& al : art.layers)
+                if (al.kind == LayerKind::Copper && !al.art.empty())
+                    copper = true;
+            CHECK(copper);
+            const geom::BoardMesh mesh = geom::assemble(art, {});
+            bool tris = false;
+            for (const auto& part : mesh.parts)
+                if (!part.mesh.indices.empty()) tris = true;
+            CHECK(tris);
+        } catch (const std::exception& e) {
+            ++g_failures;
+            std::printf("FAIL corpus package '%s' threw: %s\n", name.c_str(),
+                        e.what());
+        }
+    }
+    std::printf("corpus: %d package(s) imported\n", packages);
+}
+
 int main() {
     testParserTagged();
     testPackageTagged();
     testInference();
     testArcs();
     testStepRepeat();
+    testCorpus();
     if (g_failures == 0) {
         std::printf("OK: all checks passed\n");
         return 0;
