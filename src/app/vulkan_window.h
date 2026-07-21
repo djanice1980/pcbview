@@ -110,13 +110,20 @@ public:
     void setExplodeProgress(float progress, bool snap = false);
     float explodeProgress() const { return explodeProgress_; }
 
-    // True while any view animation (camera glide, zoom, peel) is still
-    // easing toward its target -- the showcase engine waits on this before
-    // starting a step's hold time.
+    // True while any view animation (camera glide, zoom, peel, spin) is
+    // still easing toward its target -- the showcase engine waits on this
+    // before starting a step's hold time.
     bool viewAnimating() const {
         const float d = explodeProgress_ - explodeTarget_;
-        return cameraAnimating_ || zoomAnimating_ || d > 1e-4f || d < -1e-4f;
+        return cameraAnimating_ || zoomAnimating_ || spinActive_ ||
+               d > 1e-4f || d < -1e-4f;
     }
+
+    // Constant-rate camera spin: sweep `degrees` about one axis (0 = yaw /
+    // turntable, 1 = pitch / tumble, 2 = roll / twist) over `seconds`.
+    // The eased view glide cannot express this -- setViewTarget normalises
+    // to the shortest way round, which a 360 by definition is not.
+    void startSpin(int axis, float degrees, float seconds);
 
     // How far a ring travels per stage, scaled to the board's size.
     float explodeStepMm() const;
@@ -232,6 +239,12 @@ private:
     // View presets and Fit set a target and let this glide there.
     void setViewTarget(const Camera& dest, bool snap);
     bool stepCameraAnimation();
+    bool stepSpinAnimation();
+    bool spinActive_ = false;
+    int spinAxis_ = 0;          // 0 yaw, 1 pitch, 2 roll
+    float spinRemaining_ = 0;   // radians still to sweep (signed)
+    float spinRate_ = 0;        // radians per second (signed)
+    QElapsedTimer spinClock_;
 
     // Tear down everything that depends on the VkSurfaceKHR. Must run BEFORE Qt
     // destroys the platform window, or the surface outlives its swapchain and

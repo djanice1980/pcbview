@@ -548,6 +548,42 @@ void VulkanWindow::setViewIso() {
     setViewTarget(dest, false);
 }
 
+void VulkanWindow::startSpin(int axis, float degrees, float seconds) {
+    if (seconds <= 0.01f || degrees == 0.0f) return;
+    spinAxis_ = axis;
+    spinRemaining_ = glm::radians(degrees);
+    spinRate_ = spinRemaining_ / seconds;
+    spinActive_ = true;
+    // The spin owns the camera; a leftover glide would fight it.
+    cameraAnimating_ = false;
+    zoomAnimating_ = false;
+    spinClock_.restart();
+    requestUpdate();
+}
+
+bool VulkanWindow::stepSpinAnimation() {
+    if (!spinActive_) return false;
+    const double dt =
+        std::min(static_cast<double>(spinClock_.restart()) / 1000.0, 0.1);
+    float d = static_cast<float>(spinRate_ * dt);
+    if (std::abs(d) >= std::abs(spinRemaining_)) {
+        d = spinRemaining_;
+        spinActive_ = false;
+    }
+    spinRemaining_ -= d;
+    float* angle = spinAxis_ == 1   ? &camera_.pitch
+                   : spinAxis_ == 2 ? &camera_.roll
+                                    : &camera_.yaw;
+    *angle += d;
+    if (!spinActive_) {
+        // Land on the canonical wrap so the next preset takes the short way.
+        constexpr float kPi = 3.14159265f, kTwoPi = 6.28318531f;
+        while (*angle > kPi) *angle -= kTwoPi;
+        while (*angle < -kPi) *angle += kTwoPi;
+    }
+    return spinActive_;
+}
+
 void VulkanWindow::render() {
     if (!initialised_ || !renderer_) return;
 
@@ -557,7 +593,8 @@ void VulkanWindow::render() {
     const bool exploding = stepExplodeAnimation();
     const bool gliding = stepCameraAnimation();
     const bool zooming = stepZoomAnimation();
-    const bool stillAnimating = exploding || gliding || zooming;
+    const bool spinning = stepSpinAnimation();
+    const bool stillAnimating = exploding || gliding || zooming || spinning;
 
     // Fast-movement: a drag, pan, or any in-flight animation counts as motion.
     // While moving, render plain raster; restore the requested mode when it

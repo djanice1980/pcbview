@@ -1970,6 +1970,17 @@ constexpr ShowcaseKindDef kShowcaseKinds[] = {
     {"Top view", "view", "top"},
     {"Bottom view", "view", "bottom"},
     {"Isometric view", "view", "iso"},
+    {"Explode 25%", "explode", "25"},
+    {"Explode 50%", "explode", "50"},
+    {"Explode 75%", "explode", "75"},
+    {"Explode 100%", "explode", "100"},
+    {"Collapse (explode 0%)", "explode", "0"},
+    // For spins the seconds box is the SWEEP duration, not a hold.
+    {"Spin 360° (turntable)", "spin", "yaw,360"},
+    {"Spin 180° (turntable)", "spin", "yaw,180"},
+    {"Tumble 360° (pitch)", "spin", "pitch,360"},
+    {"Tumble 180° (pitch)", "spin", "pitch,180"},
+    {"Twist 360° (roll)", "spin", "roll,360"},
 };
 }  // namespace
 
@@ -1992,7 +2003,9 @@ void MainWindow::buildShowcaseDock() {
     showcaseHold_->setValue(3.0);
     showcaseHold_->setDecimals(1);
     showcaseHold_->setSuffix(" s");
-    showcaseHold_->setToolTip("How long to hold this view once it settles");
+    showcaseHold_->setToolTip(
+        "How long to hold this step once it settles.\n"
+        "For spins this is the sweep duration instead.");
     addRow->addWidget(showcaseHold_);
     auto* addBtn = new QPushButton("Add");
     connect(addBtn, &QPushButton::clicked, this, [this] {
@@ -2096,8 +2109,24 @@ void MainWindow::applyShowcaseStep(const ShowcaseStep& step) {
         if (step.param == "top") viewport_->setViewTop();
         else if (step.param == "bottom") viewport_->setViewBottom();
         else viewport_->setViewIso();
+    } else if (step.kind == "explode") {
+        // param = percent of the full peel; the renderer owns what "full"
+        // means for this board.
+        const float frac = step.param.toFloat() / 100.0f;
+        const float full =
+            viewport_->renderer() ? viewport_->renderer()->maxRank() : 0.0f;
+        viewport_->setExplodeProgress(frac * full);
+    } else if (step.kind == "spin") {
+        // param = "axis,degrees"; the step's seconds are the sweep time.
+        const QStringList f = step.param.split(',');
+        const int axis = f.value(0) == "pitch" ? 1
+                         : f.value(0) == "roll" ? 2
+                                                : 0;
+        const float deg = f.size() > 1 ? f[1].toFloat() : 360.0f;
+        viewport_->startSpin(axis, deg,
+                             static_cast<float>(std::max(step.holdSec, 0.5)));
     }
-    // Future kinds ("spin", "explode", "layers", "net") dispatch here.
+    // Future kinds ("layers", "net") dispatch here.
 }
 
 void MainWindow::startShowcase() {
@@ -2152,13 +2181,16 @@ void MainWindow::showcaseAdvance() {
             showcaseTimer_->start(100);
             return;
         }
-        // Phase 2: the hold, then the next step.
+        // Phase 2: the hold, then the next step. A spin's seconds WERE the
+        // sweep just completed, so it advances immediately.
         showcaseTimer_->disconnect();
         connect(showcaseTimer_, &QTimer::timeout, this, [this] {
             ++showcaseIndex_;
             showcaseAdvance();
         });
-        showcaseTimer_->start(static_cast<int>(step.holdSec * 1000.0));
+        const double holdMs =
+            step.kind == "spin" ? 0.0 : step.holdSec * 1000.0;
+        showcaseTimer_->start(static_cast<int>(holdMs));
     });
     showcaseTimer_->start(100);
 }
