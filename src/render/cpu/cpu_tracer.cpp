@@ -42,7 +42,7 @@ inline float maxc(V3 a) { return std::max(a.x, std::max(a.y, a.z)); }
 constexpr float PI = 3.14159265359f;
 const V3 kSunDir = normalize({0.35f, 0.25f, 1.0f});
 const V3 kSunColor = {1.0f * 2.6f, 0.95f * 2.6f, 0.88f * 2.6f};
-constexpr float kSubstratePeelAlpha = 0.42f;
+constexpr float kSubstratePeelAlpha = 0.25f;
 
 // ---- RNG, matching pathtrace.comp --------------------------------------
 inline uint32_t hashu(uint32_t x) {
@@ -632,7 +632,8 @@ bool occluded(const Ctx& c, V3 o, V3 d, float tmax) {
 
 // One full path. Returns radiance; fills guides on the primary hit.
 V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
-         V3& firstNormal, int maxDepth, float* outPhase = nullptr) {
+         V3& firstNormal, int maxDepth, float* outPhase = nullptr,
+         uint32_t pixelHash = 0, uint32_t sampleIndex = 0) {
     V3 radiance{0, 0, 0};
     V3 throughput{1, 1, 1};
     firstAlbedo = {1, 1, 1};
@@ -721,7 +722,26 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
         // stand-in for FR4 subsurface scattering. Does not consume path depth.
         if (!c.preview && m.fade > 0.5f) {
             const float ea = effAlpha(c, prim);
-            if (ea < 0.99f && rng.next() >= ea && transmits < 8u) {
+            // Camera-segment slab dice is STRATIFIED per pixel (golden-ratio
+            // sequence over the sample index): an emissive net behind a
+            // translucent slab is a binary bright/dark signal whose white-
+            // noise mottle only shrinks as 1/sqrt(N) and survives
+            // convergence. Stratification makes each pixel's pass/commit
+            // ratio near-exact instead. Bounce segments keep white noise.
+            // KEEP IN STEP with the same dice in pathtrace.comp.
+            float xi;
+            if (depth == 0) {
+                const float off =
+                    static_cast<float>(hashu(
+                        pixelHash ^ (transmits * 0x9E3779B9u))) *
+                    (1.0f / 4294967296.0f);
+                const float t2 =
+                    off + static_cast<float>(sampleIndex) * 0.6180339887f;
+                xi = t2 - std::floor(t2);
+            } else {
+                xi = rng.next();
+            }
+            if (ea < 0.99f && xi >= ea && transmits < 8u) {
                 ++transmits;
                 origin = p + dir * 0.02f;
                 dir = sampleCone(dir, kTransmitCos, rng);
@@ -1134,7 +1154,7 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
                     V3 ga, gn;
                     float ph[2] = {0.0f, 0.0f};
                     const V3 rad =
-                        trace(c, origin, dir, rng, ga, gn, maxDepth, ph);
+                        trace(c, origin, dir, rng, ga, gn, maxDepth, ph, hh, gs);
                     if (ph[1] > 0.0f) {
                         aov[p * 2] = ph[0];
                         aov[p * 2 + 1] = 1.0f;

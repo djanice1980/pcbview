@@ -165,7 +165,7 @@ float viewScale(vec3 worldPos) {
 // How transparent the substrate goes at a full peel. The laminate is what hides
 // the copper, so fading it is what makes an exploded view legible -- but it must
 // stay more solid than the mask (0.72) or the board reads as glass.
-const float kSubstratePeelAlpha = 0.42;
+const float kSubstratePeelAlpha = 0.25;
 
 void main() {
     Material m = materialTable.materials[inMaterial];

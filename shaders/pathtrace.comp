@@ -138,7 +138,7 @@ vec3 cosineHemisphere(vec3 n) {
 
 // The substrate's translucency at a full peel (matches the raster shader), so the
 // laminate fades to reveal inner copper as the stack explodes.
-const float kSubstratePeelAlpha = 0.42;
+const float kSubstratePeelAlpha = 0.25;
 
 // Effective opacity of a hit. The soldermask is a fixed translucent coating;
 // Net highlight colour. Deliberately a saturated red: copper is gold and the
@@ -205,6 +205,9 @@ void main() {
     // stages decorrelates the pixel grid properly.
     uint h = hashu(px.x);
     h = hashu(h ^ px.y);
+    // Kept for the stratified camera-ray slab dice below: it needs a pixel
+    // identity that does NOT change per sample.
+    const uint pixelHash = h;
     g_rng = hashu(h ^ (pc.dim.w + sampleIndex));
 
     // Jittered primary ray through the pixel.
@@ -363,7 +366,25 @@ void main() {
         // Does not consume path depth (the counter guards runaway).
         if (m.params.w > 0.5) {
             float ea = effAlpha(prim);
-            if (ea < 0.99 && rnd() >= ea && transmits < 8u) {
+            // The CAMERA segment dices the slab with a per-pixel STRATIFIED
+            // sequence rather than white noise. An emissive highlighted net
+            // behind a translucent slab is a binary bright/dark signal; with
+            // white noise its mottle only shrinks as 1/sqrt(N) and survives
+            // convergence (the denoiser then smears it into blobs). A
+            // golden-ratio sequence makes each pixel's pass/commit ratio
+            // near-exact as samples accumulate, so the converged image is
+            // smooth. Bounce segments keep white noise -- stratification
+            // there would correlate GI paths.
+            float xi;
+            if (depth == 0) {
+                const float off =
+                    float(hashu(pixelHash ^ (transmits * 0x9E3779B9u))) *
+                    (1.0 / 4294967296.0);
+                xi = fract(off + float(sampleIndex) * 0.6180339887);
+            } else {
+                xi = rnd();
+            }
+            if (ea < 0.99 && xi >= ea && transmits < 8u) {
                 ++transmits;
                 origin = p + dir * 0.02;
                 dir = sampleCone(dir, kTransmitCos);

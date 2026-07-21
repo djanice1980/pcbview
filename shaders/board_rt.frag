@@ -124,7 +124,7 @@ float viewScale(vec3 worldPos) {
     return length(push.cameraPos.xyz - worldPos);
 }
 
-const float kSubstratePeelAlpha = 0.42;
+const float kSubstratePeelAlpha = 0.25;
 
 // True if anything opaque lies between `origin` and `origin + dir*tmax`.
 bool occluded(vec3 origin, vec3 dir, float tmax) {
