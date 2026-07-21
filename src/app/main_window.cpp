@@ -2024,7 +2024,26 @@ void MainWindow::buildShowcaseDock() {
     // The playlist. Drag to reorder; the model follows the widget order.
     showcaseList_ = new QListWidget;
     showcaseList_->setDragDropMode(QAbstractItemView::InternalMove);
-    showcaseList_->setToolTip("Drag to reorder; Delete removes");
+    showcaseList_->setToolTip(
+        "Drag to reorder; Delete removes; double-click to change the "
+        "seconds");
+    connect(showcaseList_, &QListWidget::itemDoubleClicked, this,
+            [this](QListWidgetItem* item) {
+                const int row = showcaseList_->row(item);
+                if (row < 0 || row >= static_cast<int>(showcaseSteps_.size()))
+                    return;
+                ShowcaseStep& s = showcaseSteps_[row];
+                bool ok = false;
+                const double v = QInputDialog::getDouble(
+                    this, "Step duration",
+                    s.kind == "spin" ? "Sweep duration (seconds):"
+                                     : "Hold time (seconds):",
+                    s.holdSec, 0.0, 600.0, 1, &ok);
+                if (!ok) return;
+                s.holdSec = v;
+                refreshShowcaseList();
+                saveShowcase();
+            });
     connect(showcaseList_->model(), &QAbstractItemModel::rowsMoved, this,
             [this] {
                 std::vector<ShowcaseStep> reordered;
