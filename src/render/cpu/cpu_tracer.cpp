@@ -745,7 +745,13 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
             if (ea < 0.99f && xi >= ea && transmits < 8u) {
                 ++transmits;
                 origin = p + dir * 0.02f;
-                dir = sampleCone(dir, kTransmitCos, rng);
+                // The CAMERA segment passes through STRAIGHT: the frosted
+                // cone blurred everything behind a peeled slab, so however
+                // low the opacity slider went the exploded view stayed milky
+                // -- inspection needs window glass, not shower glass. Bounce
+                // segments keep the scatter, so transmitted LIGHT still
+                // diffuses like resin. KEEP IN STEP with pathtrace.comp.
+                if (depth != 0) dir = sampleCone(dir, kTransmitCos, rng);
                 throughput = throughput * mix({1, 1, 1}, albedo, 0.35f);
                 --depth;
                 continue;

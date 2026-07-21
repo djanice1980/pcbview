@@ -388,7 +388,13 @@ void main() {
             if (ea < 0.99 && xi >= ea && transmits < 8u) {
                 ++transmits;
                 origin = p + dir * 0.02;
-                dir = sampleCone(dir, kTransmitCos);
+                // The CAMERA segment passes through STRAIGHT: the frosted
+                // cone blurred everything behind a peeled slab, so however
+                // low the opacity slider went the exploded view stayed milky
+                // -- inspection needs window glass, not shower glass. Bounce
+                // segments keep the scatter, so transmitted LIGHT still
+                // diffuses like resin. KEEP IN STEP with cpu_tracer.cpp.
+                if (depth != 0) dir = sampleCone(dir, kTransmitCos);
                 throughput *= mix(vec3(1.0), albedo, 0.35);
                 --depth;
                 continue;
