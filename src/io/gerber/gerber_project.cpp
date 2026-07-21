@@ -655,6 +655,7 @@ geom::LayerArt importPackage(const std::string& path) {
         FileFunction fn;
         Paths64 dark;
         std::vector<NetArea> nets;  // from %TO.N%, empty when absent
+        std::vector<GerberImage::Flash> flashes;  // D03 centres (pads)
     };
     std::vector<ParsedLayer> copper, masks, silks;
     Paths64 profileDark;
@@ -679,7 +680,8 @@ geom::LayerArt importPackage(const std::string& path) {
 
         switch (fn.kind) {
             case FileFunction::Kind::Copper:
-                copper.push_back({fn, std::move(img.dark), std::move(img.nets)});
+                copper.push_back({fn, std::move(img.dark), std::move(img.nets),
+                                  std::move(img.flashes)});
                 break;
             case FileFunction::Kind::Soldermask:
                 masks.push_back({fn, std::move(img.dark), {}});
@@ -830,6 +832,20 @@ geom::LayerArt importPackage(const std::string& path) {
             if (!na.name.empty()) continue;
             for (const NetArea::Seg& sg : na.segments)
                 al.looseSegments.push_back({sg.ax, sg.ay, sg.bx, sg.by});
+        }
+        // Every pad flash is a measurement snap target -- the magnetic pad
+        // clicking KiCad boards get from their pad table, which a Gerber
+        // otherwise lacks entirely. The marker sits on the layer's outward
+        // face; the net comes from the flash's X2 tag when present.
+        for (const GerberImage::Flash& fl : copper[i].flashes) {
+            geom::LayerArt::NetPoint np;
+            np.pos[0] = fl.x;
+            np.pos[1] = fl.y;
+            np.pos[2] = copper[i].fn.bottom ? al.z : al.z + al.thickness;
+            const auto nit = netIndex.find(fl.net);
+            np.net = (fl.net.empty() || nit == netIndex.end()) ? -1
+                                                               : nit->second;
+            art.netPoints.push_back(np);
         }
         // Per-net split of this layer's copper, so the mesh keeps net identity
         // per triangle. Anything with no TO.N stays in the -1 bucket and

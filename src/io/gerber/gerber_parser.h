@@ -67,6 +67,15 @@ struct GerberImage {
     // Per-net copper, empty when the file carries no TO.N attributes.
     std::vector<NetArea> nets;
 
+    // Every D03 flash centre (mm, same space as NetArea::Seg), with the net
+    // name active at the flash ("" when untagged). On copper layers these are
+    // the pads -- the snap targets a Gerber board otherwise lacks entirely.
+    struct Flash {
+        double x = 0, y = 0;
+        std::string net;
+    };
+    std::vector<Flash> flashes;
+
     std::vector<std::string> warnings;
     bool ok = false;  // false if a fatal parse error left the image unusable
 };

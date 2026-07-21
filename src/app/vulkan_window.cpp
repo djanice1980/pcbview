@@ -1056,7 +1056,9 @@ int VulkanWindow::netAtWorld(const glm::vec3& p) const {
     if (!mesh_) return -1;
     for (const geom::SnapPoint& sp : mesh_->snapPoints) {
         const glm::vec3 w(sp.pos[0], sp.pos[1], sp.pos[2]);
-        if (glm::length(w - p) < 0.05f) return sp.net;
+        // Only a NET-CARRYING snap answers here; a netless one (untagged pad
+        // flash, bare drill) must not block the segment lookup below.
+        if (sp.net >= 0 && glm::length(w - p) < 0.05f) return sp.net;
     }
     int net = -1;
     double bestD = 0.6;  // mm
@@ -1150,30 +1152,42 @@ bool VulkanWindow::screenToBoard(const QPointF& posDip, glm::vec3& out,
             found = true;
         }
     }
-    if (found) {
+    if (found && bestNet >= 0) {
         out = bestP;
         snapped = true;
         net = bestNet;
         return true;
     }
+    if (found) {
+        // Snapped to a NETLESS point (a Gerber pad flash without X2 tags, a
+        // bare drill). Keep the magnetic position, but fall through to the
+        // segment/triangle net lookups below -- returning here made snapping
+        // to a pad WORSE at naming nets than clicking beside it.
+        out = bestP;
+        snapped = true;
+    }
 
-    // Free point: unproject the cursor through the SAME matrix the frame
-    // rendered with and intersect the board-top plane. Reversed-Z: NDC depth
-    // 1 is the near plane, 0.25 just a second point along the ray.
-    const float u = px / static_cast<float>(width() * dpr) * 2.0f - 1.0f;
-    const float v = py / static_cast<float>(height() * dpr) * 2.0f - 1.0f;
-    const glm::mat4 inv = glm::inverse(lastViewProj_);
-    const glm::vec4 h0 = inv * glm::vec4(u, v, 1.0f, 1.0f);
-    const glm::vec4 h1 = inv * glm::vec4(u, v, 0.25f, 1.0f);
-    if (std::abs(h0.w) < 1e-12f || std::abs(h1.w) < 1e-12f) return false;
-    const glm::vec3 a = glm::vec3(h0) / h0.w;
-    const glm::vec3 b = glm::vec3(h1) / h1.w;
-    const glm::vec3 dir = glm::normalize(b - a);
-    if (std::abs(dir.z) < 1e-6f) return false;
-    const float topZ = static_cast<float>(mesh_->boardTopZ);
-    const float t = (topZ - a.z) / dir.z;
-    if (t < 0.0f) return false;
-    out = a + dir * t;
+    // Free point (no snap): unproject the cursor through the SAME matrix the
+    // frame rendered with and intersect the board-top plane. Reversed-Z: NDC
+    // depth 1 is the near plane, 0.25 just a second point along the ray. A
+    // netless SNAP skips this -- its position is already exact -- and goes
+    // straight to the net lookups below.
+    if (!snapped) {
+        const float u = px / static_cast<float>(width() * dpr) * 2.0f - 1.0f;
+        const float v = py / static_cast<float>(height() * dpr) * 2.0f - 1.0f;
+        const glm::mat4 inv = glm::inverse(lastViewProj_);
+        const glm::vec4 h0 = inv * glm::vec4(u, v, 1.0f, 1.0f);
+        const glm::vec4 h1 = inv * glm::vec4(u, v, 0.25f, 1.0f);
+        if (std::abs(h0.w) < 1e-12f || std::abs(h1.w) < 1e-12f) return false;
+        const glm::vec3 a = glm::vec3(h0) / h0.w;
+        const glm::vec3 b = glm::vec3(h1) / h1.w;
+        const glm::vec3 dir = glm::normalize(b - a);
+        if (std::abs(dir.z) < 1e-6f) return false;
+        const float topZ = static_cast<float>(mesh_->boardTopZ);
+        const float t = (topZ - a.z) / dir.z;
+        if (t < 0.0f) return false;
+        out = a + dir * t;
+    }
     // A free point can still sit ON a track. Naming its net from the nearest
     // segment is what makes "length along the trace between these two points"
     // work for clicks in the MIDDLE of a run -- the usual gesture -- where no

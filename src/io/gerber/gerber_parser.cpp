@@ -381,6 +381,7 @@ public:
 
         GerberImage img;
         img.dark = std::move(image_);
+        img.flashes = std::move(flashes_);
         // Union each net's own geometry: the objects overlap heavily (every
         // trace corner is two draws sharing a stroke cap), and the consumer
         // wants one region per net, not thousands of stamped shapes.
@@ -432,6 +433,7 @@ private:
     Paths64 pending_;
     std::string currentNet_;                       // active %TO.N%, "" if none
     std::map<std::string, Paths64> netPaths_;
+    std::vector<GerberImage::Flash> flashes_;
     std::map<std::string, double> netLen_;
     std::map<std::string, std::vector<NetArea::Seg>> netSegs_;
     bool pendingDark_ = true;
@@ -860,6 +862,7 @@ private:
 
     void operationFlash(double x, double y) {
         auto it = apertures_.find(currentAperture_);
+        flashes_.push_back({x, y, currentNet_});
         if (it != apertures_.end()) addDark(flashAperture(it->second, x, y));
         curX_ = x; curY_ = y;
     }
