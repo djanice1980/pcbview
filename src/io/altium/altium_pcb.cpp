@@ -413,6 +413,7 @@ geom::LayerArt importPcbDoc(const std::string& path) {
     };
     std::vector<StackLayer> copperStack;
     std::vector<Vertex> boardVerts;
+    std::map<int, std::string> layerName;  // ALL layer ids, for skip reports
     {
         const std::string data = findData("Board6");
         if (data.empty())
@@ -420,6 +421,10 @@ geom::LayerArt importPcbDoc(const std::string& path) {
         Reader r(data.data(), data.size());
         const auto kv = r.readProperties();
         boardVerts = verticesFromProps(kv);
+        for (int i = 1; i <= 82; ++i) {
+            const std::string n = prop(kv, "LAYER" + std::to_string(i) + "NAME");
+            if (!n.empty()) layerName[i] = n;
+        }
 
         // The stackup is a linked list over LAYER<n> records, TOP (id 1) to
         // BOTTOM (id 32). The chain routinely passes through INTERNAL PLANE
@@ -842,6 +847,13 @@ geom::LayerArt importPcbDoc(const std::string& path) {
 
     const double maskExpand = 0.1016;  // Altium's default 4mil rule
 
+    // Primitives on layers we render nowhere are counted, not dropped in
+    // silence: copper-family layers outside the stackup chain get a WARNING
+    // (the render disagrees with the board), everything else (mechanical,
+    // keepout, documentation...) one summary NOTE.
+    std::map<int, int> skippedOn;
+    const auto skip = [&](int layerId) { ++skippedOn[layerId]; };
+
     // Which polygons got real pour geometry from Regions6.
     std::set<uint16_t> pouredPolygons;
     for (const Region& rg : regions)
@@ -873,6 +885,8 @@ geom::LayerArt importPcbDoc(const std::string& path) {
             }
         } else if (io::DarkClearAcc* acc = simpleTarget(t.layer)) {
             acc->dark(polys);
+        } else {
+            skip(t.layer);
         }
     }
     for (const Arc& a : arcs) {
@@ -900,6 +914,8 @@ geom::LayerArt importPcbDoc(const std::string& path) {
             addCopper(si, netOf(a.net), polys);
         } else if (io::DarkClearAcc* acc = simpleTarget(a.layer)) {
             acc->dark(polys);
+        } else {
+            skip(a.layer);
         }
     }
     for (const Fill& f : fills) {
@@ -912,6 +928,7 @@ geom::LayerArt importPcbDoc(const std::string& path) {
         const int si = stackIndexOf(f.layer);
         if (si >= 0) addCopper(si, netOf(f.net), polys);
         else if (io::DarkClearAcc* acc = simpleTarget(f.layer)) acc->dark(polys);
+        else skip(f.layer);
     }
     for (const Region& rg : regions) {
         if (rg.keepout || rg.outline.empty()) continue;
@@ -926,6 +943,8 @@ geom::LayerArt importPcbDoc(const std::string& path) {
                 if (net >= 0) art.nets[net].hasPlane = true;
             } else if (io::DarkClearAcc* acc = simpleTarget(rg.layer)) {
                 acc->dark(rg.outline);
+            } else {
+                skip(rg.layer);
             }
         }
     }
@@ -987,6 +1006,12 @@ geom::LayerArt importPcbDoc(const std::string& path) {
             }
         } else if (const int si = stackIndexOf(p.layer); si >= 0) {
             flash(si, p.topShape, p.topW, p.topH, p.roundRadiusTop);
+        } else if (io::DarkClearAcc* acc = simpleTarget(p.layer)) {
+            acc->dark(io::placed(
+                padShape(p.topShape, p.topW, p.topH, p.roundRadiusTop), p.x,
+                p.y, -p.rotation, false));
+        } else {
+            skip(p.layer);
         }
         // Mask openings from the pad's own faces.
         if (p.layer == kMultiLayer || p.layer == kTopLayer) {
@@ -1134,6 +1159,40 @@ geom::LayerArt importPcbDoc(const std::string& path) {
                 "no board outline in Board6; using the copper bounding box");
         }
         art.outline = std::move(board);
+    }
+
+    // ONE line each for the two kinds of skipped content, not a popup per
+    // layer: copper that will visibly be missing is a warning; deliberately
+    // undrawn documentation layers are a note.
+    {
+        const auto nameOf = [&](int id) {
+            const auto it = layerName.find(id);
+            return it != layerName.end() ? it->second
+                                         : "layer " + std::to_string(id);
+        };
+        std::string copperMsg, otherMsg;
+        int otherCount = 0;
+        for (const auto& [id, count] : skippedOn) {
+            const bool copperFamily =
+                (id >= kTopLayer && id <= kBottomLayer) ||
+                (id >= 39 && id <= 54);
+            if (copperFamily) {
+                copperMsg += (copperMsg.empty() ? "" : ", ") + nameOf(id) +
+                             " (" + std::to_string(count) + ")";
+            } else {
+                otherCount += count;
+                if (otherMsg.size() < 120)
+                    otherMsg += (otherMsg.empty() ? "" : ", ") + nameOf(id);
+            }
+        }
+        if (!copperMsg.empty())
+            art.warnings.push_back(
+                "copper outside the stackup chain was skipped: " + copperMsg);
+        if (otherCount > 0)
+            art.notes.push_back(
+                std::to_string(otherCount) +
+                " primitive(s) on non-board layers not rendered (" + otherMsg +
+                ")");
     }
 
     if (textCount > 0)
