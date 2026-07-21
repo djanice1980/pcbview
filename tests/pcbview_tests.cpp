@@ -1248,9 +1248,12 @@ static void testAltiumPcbDoc() {
         put32(rec, static_cast<uint32_t>(body.size()));
         return rec + body;
     };
+    // The last two tracks sit on layers OUTSIDE the 2-layer stackup: one on
+    // an unused mid (copper family -> warning), one on Mechanical 1 (note).
     const std::string tracks6 =
         track(1, 0, 1, 1, 5, 1, 0.3) + track(1, 0, 5, 1, 5, 3, 0.3) +
-        track(1, 1, 8, 1, 8, 4, 0.3) + track(32, 0, 1, 1, 3, 1, 0.3);
+        track(1, 1, 8, 1, 8, 4, 0.3) + track(32, 0, 1, 1, 3, 1, 0.3) +
+        track(5, 0, 2, 2, 3, 2, 0.2) + track(57, 0xFFFF, 2, 3, 3, 3, 0.2);
 
     // Pads: NETA at (1,1) multilayer plated 0.4mm hole, NETA at (5,3) top,
     // NETC at (6.7,2.7) and (7.3,4.3) top. Subrecord5 is the 110-byte form.
@@ -1350,7 +1353,17 @@ static void testAltiumPcbDoc() {
     CHECK_NEAR(art.nets[0].routedMm, 8.0, 1e-4);
     CHECK_NEAR(art.nets[1].routedMm, 3.0, 1e-4);
     CHECK(art.nets[2].hasPlane);  // fallback-filled polygon
-    CHECK(art.netSegments.size() == 4);
+    CHECK(art.netSegments.size() == 4);  // stray-layer tracks don't route
+
+    // Skipped content is REPORTED, split by consequence: the unused-mid
+    // track is missing copper (warning), the mechanical track a note.
+    bool copperWarn = false, mechNote = false;
+    for (const auto& w : art.warnings)
+        if (w.find("outside the stackup") != std::string::npos) copperWarn = true;
+    for (const auto& n : art.notes)
+        if (n.find("non-board layers") != std::string::npos) mechNote = true;
+    CHECK(copperWarn);
+    CHECK(mechNote);
 
     CHECK_NEAR(std::abs(Clipper2Lib::Area(art.outline)) /
                    (geom::kScale * geom::kScale),
