@@ -892,13 +892,19 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
     // Restart accumulation when the view changed (resetAccumulation bumps
     // ptGeneration_ on any camera move, exactly like the GPU path), or when the
     // integrator switched between full path tracing and the RT preview.
-    if (cpuTracerGen_ != ptGeneration_ || cpuPreviewActive_ != preview) {
+    // Flat = raster mode with the RT toggle off: primary rays, no shadow/AO.
+    // A change in EITHER flag switches integrator, so both restart
+    // accumulation (mixed integrators in one accumulation would be wrong).
+    const bool flat = preview && !rtRequested_;
+    if (cpuTracerGen_ != ptGeneration_ || cpuPreviewActive_ != preview ||
+        cpuFlatActive_ != flat) {
         cpuTracerGen_ = ptGeneration_;
         cpuPreviewActive_ = preview;
+        cpuFlatActive_ = flat;
         cpuPass_ = 0;
         cpuDisplayCache_.clear();  // the old view is stale
     }
-    cpuTracer_->setPreview(preview);
+    cpuTracer_->setPreview(preview, flat);
 
     // Re-bake the exploded geometry (rebuilds the Embree BVH) when the peel
     // moved; that restarts accumulation just like a camera change.
@@ -3382,11 +3388,17 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
   // mode at rest (same at-rest gate as the GPU's RT shadows). The result is
   // copied into sceneColor_ (left COLOR_ATTACHMENT_OPTIMAL) and presented by
   // the shared blit.
+  // The software device never rasterises a scene: llvmpipe executes the whole
+  // 968K-triangle pass inside a synchronous present (~130ms measured), while
+  // Embree answers the same visibility question at one primary ray per pixel
+  // an order of magnitude faster. Raster mode on the CPU device is therefore
+  // the preview integrator -- with shadow/AO rays when RT is on, without them
+  // ("flat") when it is off. The raster pipeline below remains for real GPUs
+  // and as the not-yet-ready fallback while a board uploads.
   const bool cpuPt = cpuMode_ && mode_ == RenderMode::PathTraced;
-  const bool cpuRt = cpuMode_ && mode_ == RenderMode::Raster && rtRequested_ &&
-                     explodeProgress_ < 0.01f;
-  if ((cpuPt || cpuRt) && cpuTracer_ && cpuTracer_->ready()) {
-    recordCpuPathTrace(cmd, /*preview=*/cpuRt);
+  const bool cpuPreview = cpuMode_ && mode_ == RenderMode::Raster;
+  if ((cpuPt || cpuPreview) && cpuTracer_ && cpuTracer_->ready()) {
+    recordCpuPathTrace(cmd, /*preview=*/cpuPreview);
   } else if (mode_ == RenderMode::PathTraced && rtSupported_ &&
       tlas_ != VK_NULL_HANDLE) {
     // Path-trace + tonemap into sceneColor_ (left COLOR_ATTACHMENT_OPTIMAL), so

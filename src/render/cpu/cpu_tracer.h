@@ -73,7 +73,16 @@ public:
     // exactly as it does in raster + RT on a GPU, not like the path tracer.
     // Converges in a handful of samples. The caller resets accumulation when
     // switching (mixed integrators in one accumulation would be wrong).
-    void setPreview(bool on) { preview_ = on; }
+    //
+    // `flat` skips the shadow ray and the AO kernel: primary visibility only,
+    // shaded with the raster formula -- the software device's replacement for
+    // rasterisation. llvmpipe rasterises this board in ~130ms; one primary ray
+    // per pixel through Embree beats that by an order of magnitude, which is
+    // why the CPU device no longer rasterises scenes at all.
+    void setPreview(bool on, bool flat) {
+        preview_ = on;
+        flat_ = on && flat;
+    }
 
     // Appearance parity with the Vulkan renderer's material edits. Same
     // formulas as Renderer::setMaskColor / setSubstrateAppearance /
@@ -185,6 +194,7 @@ private:
     void rebuildScene(bool fastBuild);
 
     bool preview_ = false;
+    bool flat_ = false;  // preview minus shadow/AO rays: the "raster" look
     float sunCosMax_ = 0.99978f;  // cos(1.2 deg): slider default 15
 
     void* device_ = nullptr;  // RTCDevice

@@ -1309,13 +1309,11 @@ void MainWindow::buildMenus() {
                       &MainWindow::showAppearanceDialog);
     render->addSeparator();
 
-    QAction* rt = render->addAction("&Ray-traced shadows + AO");
-    rt->setCheckable(true);
-    connect(rt, &QAction::toggled, this, [this](bool on) {
-        viewport_->setRayTracing(on);
-        applyInternalResForMode();  // traced modes carry their own scale
-    });
-
+    // Ray-traced shadows + AO used to be a toggle here. It is now always on:
+    // the CPU device renders everything through Embree (where RT-on measured
+    // FASTER-converging and better-looking than the flat preview), and on a
+    // GPU the ray-query cost only applies at rest. PCBVIEW_RT=0 remains as a
+    // headless hook for the flat preview.
     QAction* pt = render->addAction("&Path tracing (full-scene lighting)");
     pt->setCheckable(true);
     connect(pt, &QAction::toggled, this, [this](bool on) {
@@ -1344,28 +1342,12 @@ void MainWindow::buildMenus() {
     // The GPU list and RT capability are known only after the renderer exists
     // (first expose), so fill these in each time the menu opens.
     connect(render, &QMenu::aboutToShow, this,
-            [this, rt, pt, oidn, fastMove, gpuMenu] {
+            [this, pt, oidn, fastMove, gpuMenu] {
         const bool haveRenderer = viewport_->renderer() != nullptr;
-        const bool rtAvail = haveRenderer && viewport_->rtAvailable();
         const bool ptAvail = haveRenderer && viewport_->ptAvailable();
         const bool ptOn = viewport_->pathTracing();
-        // RT shadows are a RASTER enhancement, GPU-only (Vulkan ray query). While
-        // path tracing owns the frame the toggle has no effect at all, so grey it
-        // out -- otherwise both read "on" at once and imply they compose. The
-        // checked state is kept, so it comes back when path tracing is off.
-        rt->setEnabled(rtAvail && !ptOn);
         pt->setEnabled(ptAvail);
         oidn->setEnabled(ptAvail && ptOn);
-        rt->setToolTip(!rtAvail
-                           ? "This device cannot ray trace"
-                       : ptOn
-                           ? "Not applicable while path tracing is on -- the "
-                             "path tracer computes full-scene lighting itself"
-                       : viewport_->cpuRender()
-                           ? "Contact shadows + ambient occlusion via Intel "
-                             "Embree on the CPU (assembled board only)"
-                           : "Contact shadows + ambient occlusion, ray-traced "
-                             "(shown on the assembled board, not while exploded)");
         pt->setToolTip(ptAvail
                            ? (viewport_->cpuRender()
                                   ? "Full path tracing on the CPU via Intel Embree; "
@@ -1376,8 +1358,7 @@ void MainWindow::buildMenus() {
         oidn->setToolTip("Intel Open Image Denoise — clean the path-traced image "
                          "in a fraction of the samples");
         {
-            const QSignalBlocker b1(rt), b2(pt), b3(oidn), b4(fastMove);
-            rt->setChecked(viewport_->rayTracing());
+            const QSignalBlocker b2(pt), b3(oidn), b4(fastMove);
             pt->setChecked(viewport_->pathTracing());
             oidn->setChecked(viewport_->denoising());
             fastMove->setChecked(viewport_->fastMovement());

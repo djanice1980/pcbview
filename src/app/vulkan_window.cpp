@@ -235,11 +235,16 @@ void VulkanWindow::initialise() {
     const QByteArray envGpu = qgetenv("PCBVIEW_GPU");
     preferredGpu_ = !envGpu.isEmpty() ? QString::fromLocal8Bit(envGpu)
                                       : appSettings().value("gpuName").toString();
-    // PCBVIEW_RT=1/0 forces the ray-traced path for a headless capture; otherwise
-    // the persisted setting decides.
+    // Ray-traced shadows + AO are ALWAYS ON -- no longer a user toggle. The
+    // CPU device renders everything through Embree, where RT-on measured both
+    // faster-converging and better-looking than the flat preview; on a GPU the
+    // ray-query cost applies only at rest. Any previously persisted
+    // "rayTracing" setting is deliberately ignored (users who turned it off
+    // could otherwise never get it back once the menu item was removed).
+    // PCBVIEW_RT=0 stays as a headless hook: it exercises the flat preview.
     rtEnabled_ = qEnvironmentVariableIsSet("PCBVIEW_RT")
                      ? qgetenv("PCBVIEW_RT").toInt() != 0
-                     : appSettings().value("rayTracing", false).toBool();
+                     : true;
     ptEnabled_ = qEnvironmentVariableIsSet("PCBVIEW_PT")
                      ? qgetenv("PCBVIEW_PT").toInt() != 0
                      : appSettings().value("pathTracing", false).toBool();
@@ -288,14 +293,6 @@ void VulkanWindow::createDeviceAndRenderer() {
     renderer_ = std::make_unique<vk::Renderer>(
         device_, surface_, static_cast<uint32_t>(width() * dpr),
         static_cast<uint32_t>(height() * dpr));
-    // On the software device, ray tracing defaults ON: llvmpipe raster costs
-    // ~130ms a frame (the full scene pass executes inside its synchronous
-    // present) while the Embree preview renders the same view in ~21ms WITH
-    // shadows and AO. Only the DEFAULT changes -- an explicit setting or a
-    // PCBVIEW_RT override still wins.
-    if (cpuRender() && !qEnvironmentVariableIsSet("PCBVIEW_RT") &&
-        !appSettings().contains("rayTracing"))
-        rtEnabled_ = true;
     renderer_->setRayTracing(rtEnabled_ && rtAvailable());
     if (qEnvironmentVariableIsSet("PCBVIEW_PT_SPP"))
         renderer_->setMaxSamples(qgetenv("PCBVIEW_PT_SPP").toInt());
@@ -333,7 +330,7 @@ void VulkanWindow::createDeviceAndRenderer() {
     emit statusMessage(
         QString("%1  |  ray tracing: %2  |  %3 triangles")
             .arg(QString::fromStdString(device_.gpu.name))
-            .arg(isCpu                   ? "RT + path tracing via Embree (CPU)"
+            .arg(isCpu ? "all rendering via Embree (CPU)"
                  : !device_.rayQueryEnabled ? "unsupported"
                  : rtEnabled_             ? "ON"
                                           : "available (off)")
@@ -404,18 +401,6 @@ void VulkanWindow::setPreferredGpu(const QString& nameSubstring) {
     createDeviceAndRenderer();
     setExplodeProgress(explodeTarget_, /*snap=*/true);
     emit boardUploaded();
-    requestUpdate();
-}
-
-void VulkanWindow::setRayTracing(bool on) {
-    rtEnabled_ = on;
-    appSettings().setValue("rayTracing", on);
-    if (renderer_) renderer_->setRayTracing(on && rtAvailable());
-    emit statusMessage(QString("Ray tracing %1")
-                           .arg(!rtAvailable() ? "unsupported on this device"
-                                : on ? (cpuRender() ? "ON — CPU (Embree preview)"
-                                                    : "ON")
-                                     : "off"));
     requestUpdate();
 }
 
@@ -623,11 +608,11 @@ void VulkanWindow::render() {
     const glm::mat4 viewProj = proj * view;
 
     // Tracers need the camera as a ray basis (eye + pixel-plane spans), not a
-    // matrix. Setting it resets accumulation whenever the view changed. The CPU
-    // RT preview traces from this basis too, so feed it in raster mode when the
-    // RT toggle is live on the CPU device.
-    if (renderer_->renderMode() == vk::RenderMode::PathTraced ||
-        (cpuRender() && rtEnabled_)) {
+    // matrix. Setting it resets accumulation whenever the view changed. The
+    // software device renders EVERY mode through the Embree tracer (its raster
+    // mode is the flat preview), so it always needs the basis -- gating it on
+    // the RT toggle left the flat view frozen mid-orbit.
+    if (renderer_->renderMode() == vk::RenderMode::PathTraced || cpuRender()) {
         const glm::vec3 fwd = glm::normalize(basis.forward);
         glm::vec3 rayEye = eye;
         glm::vec3 right, up;

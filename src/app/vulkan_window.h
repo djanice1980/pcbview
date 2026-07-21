@@ -66,9 +66,9 @@ public:
     bool ptAvailable() const;   // path tracing available (Vulkan RT on a GPU, Embree on CPU)
     void setPreferredGpu(const QString& nameSubstring);
 
-    // Ray-traced shadows/AO on top of the raster shading. No-op if the device
-    // has no ray-query support. Persisted.
-    void setRayTracing(bool on);
+    // Ray-traced shadows/AO on top of the raster shading. ALWAYS ON (no user
+    // toggle; PCBVIEW_RT=0 is a headless hook for the flat preview); silently
+    // absent when the device has no ray-query support.
     bool rayTracing() const { return rtEnabled_; }
 
     // Full path-tracing mode. Progressive: accumulates while the camera is still.

@@ -494,6 +494,7 @@ private:
     // lands on a power of two, and an exact test silently never denoised.
     int cpuNextDenoise_ = 4;
     bool cpuPreviewActive_ = false;        // last pass was the RT preview
+    bool cpuFlatActive_ = false;           // ...and whether it was flat-shaded
     // Last DENOISED display image, shown between denoise milestones so the
     // render thread is not blocked on OIDN every frame (the GPU path does the
     // same asynchronously).
@@ -505,14 +506,12 @@ private:
     void recordCpuPathTrace(VkCommandBuffer cmd, bool preview);
 
 public:
-    // True while a progressive tracer (GPU PT, CPU PT, or the CPU RT preview)
-    // still has samples to add -- the caller keeps frames coming while so.
+    // True while a progressive tracer (GPU PT, or any CPU-device mode -- the
+    // software device renders EVERYTHING through the Embree tracer now) still
+    // has samples to add -- the caller keeps frames coming while so.
     bool accumulating() const {
         if (cpuMode_) {
-            if (!cpuTracer_) return false;
-            const bool tracing = mode_ == RenderMode::PathTraced ||
-                                 (rtRequested_ && explodeProgress_ < 0.01f);
-            return tracing && cpuTracer_->samples() < cpuTargetSamples();
+            return cpuTracer_ && cpuTracer_->samples() < cpuTargetSamples();
         }
         return mode_ == RenderMode::PathTraced && ptSampleCount_ < ptMaxSamples_;
     }

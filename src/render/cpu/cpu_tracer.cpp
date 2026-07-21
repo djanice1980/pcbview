@@ -398,6 +398,7 @@ struct Ctx {
     const uint32_t* triMat;
     float peel;       // substrate fade amount (0 at rest)
     bool preview;     // RT preview: sun shadow + AO, no GI bounces
+    bool flat;        // preview minus shadow/AO: primary visibility only
     float sunCosMax;  // cos(sun angular radius); 1 = point sun
     // Net highlighting (mirrors pathtrace.comp's triNet/netCol/netSpan).
     const int32_t* triNet = nullptr;
@@ -501,10 +502,15 @@ void intersectFilter(const RTCFilterFunctionNArguments* a) {
         a->valid[0] = 0;
         return;
     }
-    // The peeling laminate ALWAYS commits its entering face; the shading code
-    // decides between surface shading and scattered transmission (mirrors the
-    // GPU -- a direction change cannot happen mid-traversal).
-    if (c.mats[c.triMat[prim]].fade > 0.5f) return;  // accept
+    // The peeling laminate ALWAYS commits its entering face in the PT
+    // integrator; its shading loop decides between surface shading and
+    // scattered transmission (mirrors the GPU). The PREVIEW has no
+    // transmission loop, so a PEELED slab (non-opaque -- an at-rest opaque
+    // one was accepted above) falls through to be recorded as a film in the
+    // analytic coat and passed over: a translucent ghost, like the raster
+    // fade. Committing it opaque would hide exactly the inner copper the
+    // exploded view exists to show.
+    if (c.mats[c.triMat[prim]].fade > 0.5f && !c.preview) return;  // accept
     if (rc->recordCoat) {
         const float t = RTCRayN_tfar(a->ray, 1, 0);
         if (t < rc->coatT) {
@@ -721,11 +727,15 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
             const V3 fillDir =
                 normalize(viewDir - camRight * 0.5f - camUp * 0.25f);
             const V3 kp = keyPos - p;
+            // Flat: skip the shadow and AO rays entirely -- primary visibility
+            // shaded with the raster formula IS the raster look, at one ray
+            // per pixel instead of a software-rasterised scene pass.
             const float shadow =
-                occluded(c, p + n * 0.05f, keyDir, std::sqrt(dot(kp, kp)))
+                c.flat ? 1.0f
+                : occluded(c, p + n * 0.05f, keyDir, std::sqrt(dot(kp, kp)))
                     ? 0.0f
                     : 1.0f;
-            const float ao = ambientOcclusionRt(c, p, n);
+            const float ao = c.flat ? 1.0f : ambientOcclusionRt(c, p, n);
             radiance = rasterShade(albedo, m.roughness, metallicOverride, n, viewDir,
                                    keyDir, fillDir, shadow, ao);
             if (hcol[3] > 0.0f) {
@@ -987,6 +997,7 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
     c.triMat = triMat_.data();
     c.peel = peel_;  // substrate fade while exploded
     c.preview = preview_;
+    c.flat = flat_;
     c.sunCosMax = sunCosMax_;
     c.triNet = triNet_.empty() ? nullptr : triNet_.data();
     c.netCol = netColour_.empty() ? nullptr : &netColour_[0][0];
