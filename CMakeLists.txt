@@ -60,7 +60,19 @@ set(MINIZ_SOURCES
     ${miniz_SOURCE_DIR}/miniz.c
     ${miniz_SOURCE_DIR}/miniz_tdef.c
     ${miniz_SOURCE_DIR}/miniz_tinfl.c
-    ${miniz_SOURCE_DIR}/miniz_zip.c
+    ${miniz_SOURCE_DIR}/miniz_zip.c)
+
+# pugixml: small MIT XML parser, for the IPC-2581 importer. Same
+# compile-straight-in trick as miniz -- its own CMake would build a lib and
+# an install step we don't want.
+FetchContent_Declare(pugixml
+    GIT_REPOSITORY https://github.com/zeux/pugixml.git
+    GIT_TAG v1.15
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR no-cmake-here
+)
+FetchContent_MakeAvailable(pugixml)
+set(PUGIXML_SOURCES ${pugixml_SOURCE_DIR}/src/pugixml.cpp
 )
 
 # cgltf: single-header glTF/GLB reader (MIT), for loading the component bodies
@@ -192,9 +204,11 @@ add_executable(pcbview WIN32
     src/io/odb/odb_features.cpp
     src/io/odb/odb_eda.cpp
     src/io/odb/odb_project.cpp
+    src/io/ipc2581/ipc2581.cpp
     src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     ${MINIZ_SOURCES}
+    ${PUGIXML_SOURCES}
     src/text/stroke_text.cpp
     src/model/board.cpp
     src/model/validate.cpp
@@ -218,6 +232,7 @@ target_include_directories(pcbview PRIVATE
     ${earcut_SOURCE_DIR}/include
     ${glm_SOURCE_DIR}
     ${miniz_SOURCE_DIR}
+    ${pugixml_SOURCE_DIR}/src
     ${cgltf_SOURCE_DIR}
     ${OIDN_DIR}/include
     ${EMBREE_DIR}/include
@@ -269,17 +284,20 @@ add_executable(pcbview_tests
     src/io/odb/odb_features.cpp
     src/io/odb/odb_eda.cpp
     src/io/odb/odb_project.cpp
+    src/io/ipc2581/ipc2581.cpp
     src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     src/text/stroke_text.cpp
     src/model/board.cpp
     ${MINIZ_SOURCES}
+    ${PUGIXML_SOURCES}
 )
 target_include_directories(pcbview_tests PRIVATE
     src
     ${earcut_SOURCE_DIR}/include
     ${glm_SOURCE_DIR}
     ${miniz_SOURCE_DIR}
+    ${pugixml_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 target_compile_definitions(pcbview_tests PRIVATE MINIZ_EXPORT=)

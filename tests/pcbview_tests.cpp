@@ -32,6 +32,7 @@
 #include "geom/tessellate.h"
 #include "io/gerber/gerber_parser.h"
 #include "io/gerber/gerber_project.h"
+#include "io/ipc2581/ipc2581.h"
 #include "io/ipc356/ipc356.h"
 #include "io/odb/odb_features.h"
 #include "io/odb/odb_fs.h"
@@ -893,6 +894,161 @@ static void testOdbTgz() {
     checkOdbArt(art, "tgz");
 }
 
+// ---- IPC-2581 --------------------------------------------------------------
+//
+// The fixture board once more, as IPC-2581 XML: same NETA/NETB/NETC ground
+// truth, plus the one thing only this format carries -- a real stackup with
+// thicknesses.
+
+static void testIpc2581() {
+    static const char* kXml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<IPC-2581 revision=\"C\">\n"
+        " <Content>\n"
+        "  <DictionaryLineDesc units=\"MILLIMETER\">\n"
+        "   <EntryLineDesc id=\"LINE_1\">\n"
+        "    <LineDesc lineWidth=\"0.3\" lineEnd=\"ROUND\"/>\n"
+        "   </EntryLineDesc>\n"
+        "  </DictionaryLineDesc>\n"
+        "  <DictionaryStandard units=\"MILLIMETER\">\n"
+        "   <EntryStandard id=\"CIRCLE_1\">\n"
+        "    <Circle diameter=\"1.0\"/>\n"
+        "   </EntryStandard>\n"
+        "   <EntryStandard id=\"CIRCLE_M\">\n"
+        "    <Circle diameter=\"1.2\"/>\n"
+        "   </EntryStandard>\n"
+        "  </DictionaryStandard>\n"
+        " </Content>\n"
+        " <Ecad>\n"
+        "  <CadHeader units=\"MILLIMETER\"/>\n"
+        "  <CadData>\n"
+        "   <Layer name=\"F.Mask\" layerFunction=\"SOLDERMASK\" side=\"TOP\"/>\n"
+        "   <Layer name=\"top\" layerFunction=\"CONDUCTOR\" side=\"TOP\"/>\n"
+        "   <Layer name=\"DIEL_1\" layerFunction=\"DIELCORE\" side=\"INTERNAL\"/>\n"
+        "   <Layer name=\"bottom\" layerFunction=\"CONDUCTOR\" side=\"BOTTOM\"/>\n"
+        "   <Layer name=\"drill_all\" layerFunction=\"DRILL\">\n"
+        "    <Span fromLayer=\"top\" toLayer=\"bottom\"/>\n"
+        "   </Layer>\n"
+        "   <Stackup>\n"
+        "    <StackupGroup>\n"
+        "     <StackupLayer layerOrGroupRef=\"F.Mask\" thickness=\"0.010\" sequence=\"0\"/>\n"
+        "     <StackupLayer layerOrGroupRef=\"top\" thickness=\"0.035\" sequence=\"1\"/>\n"
+        "     <StackupLayer layerOrGroupRef=\"DIEL_1\" thickness=\"1.510\" sequence=\"2\"/>\n"
+        "     <StackupLayer layerOrGroupRef=\"bottom\" thickness=\"0.035\" sequence=\"3\"/>\n"
+        "     <StackupLayer layerOrGroupRef=\"B.Mask\" thickness=\"0.010\" sequence=\"4\"/>\n"
+        "    </StackupGroup>\n"
+        "   </Stackup>\n"
+        "   <Step name=\"fixture\">\n"
+        "    <Profile>\n"
+        "     <Polygon>\n"
+        "      <PolyBegin x=\"0\" y=\"0\"/>\n"
+        "      <PolyStepSegment x=\"9\" y=\"0\"/>\n"
+        "      <PolyStepSegment x=\"9\" y=\"5\"/>\n"
+        "      <PolyStepSegment x=\"0\" y=\"5\"/>\n"
+        "      <PolyStepSegment x=\"0\" y=\"0\"/>\n"
+        "     </Polygon>\n"
+        "    </Profile>\n"
+        "    <LayerFeature layerRef=\"top\">\n"
+        "     <Set net=\"NETA\">\n"
+        "      <Features>\n"
+        "       <Line startX=\"1\" startY=\"1\" endX=\"5\" endY=\"1\">\n"
+        "        <LineDescRef id=\"LINE_1\"/>\n"
+        "       </Line>\n"
+        "       <Line startX=\"5\" startY=\"1\" endX=\"5\" endY=\"3\">\n"
+        "        <LineDescRef id=\"LINE_1\"/>\n"
+        "       </Line>\n"
+        "      </Features>\n"
+        "      <Pad>\n"
+        "       <Location x=\"1\" y=\"1\"/>\n"
+        "       <StandardPrimitiveRef id=\"CIRCLE_1\"/>\n"
+        "      </Pad>\n"
+        "      <Pad>\n"
+        "       <Location x=\"5\" y=\"3\"/>\n"
+        "       <StandardPrimitiveRef id=\"CIRCLE_1\"/>\n"
+        "      </Pad>\n"
+        "     </Set>\n"
+        "     <Set net=\"NETB\">\n"
+        "      <Features>\n"
+        "       <Line startX=\"8\" startY=\"1\" endX=\"8\" endY=\"4\">\n"
+        "        <LineDescRef id=\"LINE_1\"/>\n"
+        "       </Line>\n"
+        "      </Features>\n"
+        "     </Set>\n"
+        "     <Set net=\"NETC\">\n"
+        "      <Features>\n"
+        "       <Contour>\n"
+        "        <Polygon>\n"
+        "         <PolyBegin x=\"6.5\" y=\"2.5\"/>\n"
+        "         <PolyStepSegment x=\"7.5\" y=\"2.5\"/>\n"
+        "         <PolyStepSegment x=\"7.5\" y=\"4.5\"/>\n"
+        "         <PolyStepSegment x=\"6.5\" y=\"4.5\"/>\n"
+        "         <PolyStepSegment x=\"6.5\" y=\"2.5\"/>\n"
+        "        </Polygon>\n"
+        "       </Contour>\n"
+        "      </Features>\n"
+        "      <Pad>\n"
+        "       <Location x=\"6.7\" y=\"2.7\"/>\n"
+        "       <StandardPrimitiveRef id=\"CIRCLE_1\"/>\n"
+        "      </Pad>\n"
+        "      <Pad>\n"
+        "       <Location x=\"7.3\" y=\"4.3\"/>\n"
+        "       <StandardPrimitiveRef id=\"CIRCLE_1\"/>\n"
+        "      </Pad>\n"
+        "     </Set>\n"
+        "    </LayerFeature>\n"
+        "    <LayerFeature layerRef=\"bottom\">\n"
+        "     <Set net=\"NETA\">\n"
+        "      <Features>\n"
+        "       <Line startX=\"1\" startY=\"1\" endX=\"3\" endY=\"1\">\n"
+        "        <LineDescRef id=\"LINE_1\"/>\n"
+        "       </Line>\n"
+        "      </Features>\n"
+        "      <Pad>\n"
+        "       <Location x=\"1\" y=\"1\"/>\n"
+        "       <StandardPrimitiveRef id=\"CIRCLE_1\"/>\n"
+        "      </Pad>\n"
+        "     </Set>\n"
+        "    </LayerFeature>\n"
+        "    <LayerFeature layerRef=\"F.Mask\">\n"
+        "     <Set>\n"
+        "      <Pad>\n"
+        "       <Location x=\"1\" y=\"1\"/>\n"
+        "       <StandardPrimitiveRef id=\"CIRCLE_M\"/>\n"
+        "      </Pad>\n"
+        "     </Set>\n"
+        "    </LayerFeature>\n"
+        "    <LayerFeature layerRef=\"drill_all\">\n"
+        "     <Set net=\"NETA\">\n"
+        "      <Hole diameter=\"0.4\" platingStatus=\"VIA\" x=\"1\" y=\"1\"/>\n"
+        "     </Set>\n"
+        "    </LayerFeature>\n"
+        "   </Step>\n"
+        "  </CadData>\n"
+        " </Ecad>\n"
+        "</IPC-2581>\n";
+
+    const fs::path xml = fs::temp_directory_path() / "pcbview_fix_2581.xml";
+    {
+        std::ofstream f(xml, std::ios::binary);
+        f << kXml;
+    }
+    CHECK(ipc2581::isIpc2581(xml.string()));
+    geom::LayerArt art = ipc2581::importFile(xml.string());
+
+    // NETA pad appears on both faces (top pad + bottom pad), so counts match
+    // the ODB++ fixture exactly and the shared checker applies as-is.
+    checkOdbArt(art, "2581");
+
+    // What only IPC-2581 carries: the real stackup.
+    CHECK_NEAR(art.thickness, 1.6, 1e-9);
+    for (const auto& al : art.layers)
+        if (al.name == "top") CHECK_NEAR(al.z, 1.555, 1e-9);
+    bool stackNote = false;
+    for (const auto& n : art.notes)
+        if (n.find("stackup") != std::string::npos) stackNote = true;
+    CHECK(stackNote);
+}
+
 // LZW (.Z) decoder sanity: round-trip against a minimal single-width
 // compressor (data short enough that no code-width bump occurs).
 static void testOdbLzw() {
@@ -944,6 +1100,7 @@ int main() {
     testOdbDirectory();
     testOdbTgz();
     testOdbLzw();
+    testIpc2581();
     testCorpus();
     if (g_failures == 0) {
         std::printf("OK: all checks passed\n");

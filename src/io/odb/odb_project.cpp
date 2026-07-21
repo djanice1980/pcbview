@@ -12,6 +12,7 @@
 #include <stdexcept>
 
 #include "io/gerber/gerber_project.h"
+#include "io/shapes.h"
 #include "io/odb/odb_eda.h"
 #include "io/odb/odb_features.h"
 #include "io/odb/odb_fs.h"
@@ -78,35 +79,7 @@ std::string chooseStep(const OdbFs& fsys, const Matrix& m,
     return steps.front();
 }
 
-// Sequential dark/clear compositor, batching consecutive darks into one
-// union -- the same accumulation discipline the Gerber parser uses, because
-// per-feature booleans on a 100k-feature layer would take minutes.
-struct DarkClearAcc {
-    Paths64 acc;
-    Paths64 pending;
-    bool sawClear = false;
-
-    void dark(const Paths64& p) {
-        pending.insert(pending.end(), p.begin(), p.end());
-    }
-    void flush() {
-        if (pending.empty()) return;
-        if (!acc.empty())
-            pending.insert(pending.end(), acc.begin(), acc.end());
-        acc = Union(pending, FillRule::NonZero);
-        pending.clear();
-    }
-    void clear(const Paths64& p) {
-        if (p.empty()) return;
-        flush();
-        acc = Difference(acc, p, FillRule::NonZero);
-        sawClear = true;
-    }
-    Paths64 take() {
-        flush();
-        return std::move(acc);
-    }
-};
+using io::DarkClearAcc;
 
 }  // namespace
 

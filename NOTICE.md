@@ -27,6 +27,7 @@ mutually compatible at GPL-3:
 | earcut.hpp | ISC | permissive |
 | glm | MIT | permissive |
 | cgltf | MIT | permissive |
+| pugixml | MIT | permissive |
 | Intel Open Image Denoise | Apache-2.0 | compatible with GPL-3; **incompatible with GPL-2** |
 | Intel Embree | Apache-2.0 | compatible with GPL-3; **incompatible with GPL-2** |
 
@@ -116,6 +117,7 @@ here.
 | glm | MIT |
 | miniz | MIT |
 | cgltf | MIT |
+| pugixml | MIT |
 | Intel Open Image Denoise | Apache-2.0 |
 | Intel Embree | Apache-2.0 |
 | Mesa (lavapipe) | MIT |
