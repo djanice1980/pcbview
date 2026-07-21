@@ -660,12 +660,13 @@ void readTextBox(const Node& node, const Component* comp, BoardModel& board) {
                 else if (v == "right") cx = hi.x - w * 0.5;
                 else if (v == "top") cy = lo.y + h * 0.5;
                 else if (v == "bottom") cy = hi.y - h * 0.5;
+                // Absolute, same as readText.
+                else if (v == "mirror") t.mirror = true;
             }
         }
     }
     const Vec2 local{cx, cy};
     t.at = comp ? applyTransform(local, comp->at, comp->rotation) : local;
-    if (comp) t.mirror = comp->bottom;
 
     // Rough wrap check: warn only when the content genuinely overflows.
     if (w > (hi.x - lo.x) * 1.02) {
@@ -698,8 +699,6 @@ void readText(const Node& node, size_t contentIndex, const Component* comp,
         t.at = comp ? applyTransform(local, comp->at, comp->rotation) : local;
         t.rotation = at->num(3, 0.0);
     }
-    if (comp) t.mirror = comp->bottom;
-
     if (const Node* effects = node.child("effects")) {
         if (const Node* font = effects->child("font")) {
             if (const Node* size = font->child("size")) {
@@ -712,8 +711,12 @@ void readText(const Node& node, size_t contentIndex, const Component* comp,
                         font->child("italic")->str(1) == "yes");
         }
         if (const Node* justify = effects->child("justify")) {
-            // `mirror` here flips the text independently of the board side.
-            if (justify->hasAtom("mirror")) t.mirror = !t.mirror;
+            // `(justify mirror)` is the ABSOLUTE mirror state -- KiCad writes
+            // it on every back-side text it flips. Seeding from the
+            // footprint's side and toggling here double-flipped: bottom
+            // designators rendered unmirrored and read mirror-imaged from
+            // below.
+            if (justify->hasAtom("mirror")) t.mirror = true;
         }
     }
     board.texts.push_back(std::move(t));
