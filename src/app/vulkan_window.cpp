@@ -1377,6 +1377,24 @@ void VulkanWindow::buildOverlay() {
                 std::snprintf(buf, sizeof(buf), "%.3f mm", glm::length(d));
                 drawText(buf, (ax + bx) * 0.5f, (ay + by) * 0.5f - 14.0f * dpr,
                          14.0f * dpr, kWhite);
+                // When both ends sit on the same net, the number people came
+                // for -- the length ALONG the copper -- goes right under the
+                // straight-line figure, at the measurement, not only in the
+                // corner panel where nobody is looking.
+                const int endNet = (measureStage_ >= 2)
+                                       ? measureBNet_
+                                       : (haveHover_ ? hoverNet_ : -1);
+                if (mesh_ && measureANet_ >= 0 && endNet == measureANet_) {
+                    const double path = geom::netPathLength(
+                        *mesh_, measureANet_, measureA_.x, measureA_.y, end.x,
+                        end.y);
+                    if (path >= 0.0) {
+                        std::snprintf(buf, sizeof(buf), "route %.3f mm", path);
+                        drawText(buf, (ax + bx) * 0.5f,
+                                 (ay + by) * 0.5f + 14.0f * dpr, 13.0f * dpr,
+                                 kAmber);
+                    }
+                }
             }
         }
     }
