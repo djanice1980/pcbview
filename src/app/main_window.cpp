@@ -24,7 +24,11 @@
 #include <QPlainTextEdit>
 #include <QProgressDialog>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QShortcut>
+#include <QSpinBox>
+#include <QCheckBox>
+#include <QToolButton>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
@@ -206,6 +210,7 @@ MainWindow::MainWindow(const QString& path) {
     buildStackupDock();
     buildPropertiesDock();
     buildNetDock();
+    buildShowcaseDock();
     buildStatusBar();
 
     rebuildRecentMenu();
@@ -304,6 +309,35 @@ MainWindow::MainWindow(const QString& path) {
                 }
             }
             applyNetHighlights();
+        });
+    }
+
+    // Headless/demo showcase hook: "top:2;iso:3;bottom:2" (kind defaults to
+    // "view" when a step has two fields) loads that playlist and starts it
+    // on repeat. Deferred like PCBVIEW_NET so the board is loaded first.
+    if (qEnvironmentVariableIsSet("PCBVIEW_SHOWCASE")) {
+        const QString packed = qEnvironmentVariable("PCBVIEW_SHOWCASE");
+        QTimer::singleShot(900, this, [this, packed] {
+            showcaseSteps_.clear();
+            for (const QString& part :
+                 packed.split(';', Qt::SkipEmptyParts)) {
+                const QStringList f = part.split(':');
+                ShowcaseStep st;
+                if (f.size() == 3) {
+                    st.kind = f[0];
+                    st.param = f[1];
+                    st.holdSec = f[2].toDouble();
+                } else if (f.size() == 2) {
+                    st.param = f[0];
+                    st.holdSec = f[1].toDouble();
+                } else {
+                    continue;
+                }
+                showcaseSteps_.push_back(st);
+            }
+            refreshShowcaseList();
+            if (showcaseForever_) showcaseForever_->setChecked(true);
+            startShowcase();
         });
     }
 
@@ -587,6 +621,9 @@ void MainWindow::rebuildViewport() {
 }
 
 bool MainWindow::loadBoard(const QString& path) {
+    // A running showcase must not keep driving the camera across a board
+    // swap.
+    stopShowcase();
     QApplication::setOverrideCursor(Qt::WaitCursor);
 
     // A .kicad_pcb has full semantics; an ODB++ job resolves to LayerArt with
@@ -1912,6 +1949,250 @@ void MainWindow::buildNetDock() {
     dock->setMinimumWidth(230);
     addDockWidget(Qt::RightDockWidgetArea, dock);
     netDock_ = dock;
+}
+
+// ---- showcase --------------------------------------------------------------
+//
+// A playlist of views played on a timer: each step animates to its view,
+// waits for the glide to settle, holds, then advances; the list loops N
+// times or forever. The step model is deliberately a (kind, param, hold)
+// triple so richer kinds -- explode levels, 180/360 spins, layer hiding,
+// trace highlights -- can be added without touching the engine.
+
+namespace {
+// The step kinds offered today. label is UI text; kind/param feed the engine.
+struct ShowcaseKindDef {
+    const char* label;
+    const char* kind;
+    const char* param;
+};
+constexpr ShowcaseKindDef kShowcaseKinds[] = {
+    {"Top view", "view", "top"},
+    {"Bottom view", "view", "bottom"},
+    {"Isometric view", "view", "iso"},
+};
+}  // namespace
+
+void MainWindow::buildShowcaseDock() {
+    auto* dock = new CollapsibleDock("SHOWCASE", Qt::RightDockWidgetArea, this);
+
+    auto* panel = new QWidget;
+    auto* layout = new QVBoxLayout(panel);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(4);
+
+    // Add-step row: what + how long.
+    auto* addRow = new QHBoxLayout;
+    addRow->setSpacing(4);
+    showcaseKind_ = new QComboBox;
+    for (const auto& k : kShowcaseKinds) showcaseKind_->addItem(k.label);
+    addRow->addWidget(showcaseKind_, 1);
+    showcaseHold_ = new QDoubleSpinBox;
+    showcaseHold_->setRange(0.0, 600.0);
+    showcaseHold_->setValue(3.0);
+    showcaseHold_->setDecimals(1);
+    showcaseHold_->setSuffix(" s");
+    showcaseHold_->setToolTip("How long to hold this view once it settles");
+    addRow->addWidget(showcaseHold_);
+    auto* addBtn = new QPushButton("Add");
+    connect(addBtn, &QPushButton::clicked, this, [this] {
+        const auto& k = kShowcaseKinds[showcaseKind_->currentIndex()];
+        ShowcaseStep s;
+        s.kind = k.kind;
+        s.param = k.param;
+        s.holdSec = showcaseHold_->value();
+        showcaseSteps_.push_back(s);
+        refreshShowcaseList();
+        saveShowcase();
+    });
+    addRow->addWidget(addBtn);
+    layout->addLayout(addRow);
+
+    // The playlist. Drag to reorder; the model follows the widget order.
+    showcaseList_ = new QListWidget;
+    showcaseList_->setDragDropMode(QAbstractItemView::InternalMove);
+    showcaseList_->setToolTip("Drag to reorder; Delete removes");
+    connect(showcaseList_->model(), &QAbstractItemModel::rowsMoved, this,
+            [this] {
+                std::vector<ShowcaseStep> reordered;
+                for (int i = 0; i < showcaseList_->count(); ++i) {
+                    const int from =
+                        showcaseList_->item(i)->data(Qt::UserRole).toInt();
+                    if (from >= 0 &&
+                        from < static_cast<int>(showcaseSteps_.size()))
+                        reordered.push_back(showcaseSteps_[from]);
+                }
+                showcaseSteps_ = std::move(reordered);
+                refreshShowcaseList();
+                saveShowcase();
+            });
+    auto* delSc = new QShortcut(QKeySequence::Delete, showcaseList_);
+    delSc->setContext(Qt::WidgetShortcut);
+    connect(delSc, &QShortcut::activated, this, [this] {
+        const int row = showcaseList_->currentRow();
+        if (row < 0 || row >= static_cast<int>(showcaseSteps_.size())) return;
+        showcaseSteps_.erase(showcaseSteps_.begin() + row);
+        refreshShowcaseList();
+        saveShowcase();
+    });
+    layout->addWidget(showcaseList_);
+
+    // Loop controls + transport.
+    auto* playRow = new QHBoxLayout;
+    playRow->setSpacing(4);
+    playRow->addWidget(new QLabel("Loops:"));
+    showcaseLoops_ = new QSpinBox;
+    showcaseLoops_->setRange(1, 999);
+    showcaseLoops_->setValue(1);
+    playRow->addWidget(showcaseLoops_);
+    showcaseForever_ = new QCheckBox("Repeat");
+    showcaseForever_->setToolTip("Loop until stopped");
+    connect(showcaseForever_, &QCheckBox::toggled, this,
+            [this](bool on) { showcaseLoops_->setEnabled(!on); });
+    playRow->addWidget(showcaseForever_);
+    playRow->addStretch(1);
+    showcasePlay_ = new QPushButton("Play");
+    connect(showcasePlay_, &QPushButton::clicked, this, [this] {
+        if (showcaseIndex_ >= 0) stopShowcase("stopped");
+        else startShowcase();
+    });
+    playRow->addWidget(showcasePlay_);
+    layout->addLayout(playRow);
+
+    connect(showcaseLoops_, &QSpinBox::valueChanged, this,
+            [this] { saveShowcase(); });
+    connect(showcaseForever_, &QCheckBox::toggled, this,
+            [this] { saveShowcase(); });
+
+    showcaseTimer_ = new QTimer(this);
+    showcaseTimer_->setSingleShot(true);
+
+    dock->setContent(panel);
+    dock->setMinimumWidth(230);
+    addDockWidget(Qt::RightDockWidgetArea, dock);
+    showcaseDock_ = dock;
+
+    loadShowcase();
+}
+
+void MainWindow::refreshShowcaseList() {
+    if (!showcaseList_) return;
+    const QSignalBlocker block(showcaseList_);
+    showcaseList_->clear();
+    for (size_t i = 0; i < showcaseSteps_.size(); ++i) {
+        const ShowcaseStep& s = showcaseSteps_[i];
+        QString label = s.param;
+        for (const auto& k : kShowcaseKinds)
+            if (s.kind == k.kind && s.param == k.param) label = k.label;
+        auto* item = new QListWidgetItem(
+            QString("%1  —  %2s").arg(label).arg(s.holdSec, 0, 'f', 1));
+        item->setData(Qt::UserRole, static_cast<int>(i));
+        showcaseList_->addItem(item);
+    }
+}
+
+void MainWindow::applyShowcaseStep(const ShowcaseStep& step) {
+    if (step.kind == "view") {
+        if (step.param == "top") viewport_->setViewTop();
+        else if (step.param == "bottom") viewport_->setViewBottom();
+        else viewport_->setViewIso();
+    }
+    // Future kinds ("spin", "explode", "layers", "net") dispatch here.
+}
+
+void MainWindow::startShowcase() {
+    if (showcaseSteps_.empty() || !loaded_) return;
+    showcaseIndex_ = 0;
+    showcaseLoopsDone_ = 0;
+    showcasePlay_->setText("Stop");
+    showcaseAdvance();
+}
+
+void MainWindow::stopShowcase(const QString& reason) {
+    if (showcaseIndex_ < 0) return;
+    showcaseIndex_ = -1;
+    showcaseTimer_->stop();
+    showcaseTimer_->disconnect();
+    if (showcasePlay_) showcasePlay_->setText("Play");
+    if (!reason.isEmpty())
+        statusBar()->showMessage("Showcase " + reason, 3000);
+}
+
+// Apply the current step, poll until its animation settles, hold, advance.
+// One QTimer serves both phases; each connect replaces the last.
+void MainWindow::showcaseAdvance() {
+    if (showcaseIndex_ < 0 ||
+        showcaseIndex_ >= static_cast<int>(showcaseSteps_.size())) {
+        // End of the list: loop or finish.
+        ++showcaseLoopsDone_;
+        const bool repeatOn = showcaseForever_ && showcaseForever_->isChecked();
+        if (!repeatOn && showcaseLoopsDone_ >= showcaseLoops_->value()) {
+            stopShowcase("finished");
+            return;
+        }
+        showcaseIndex_ = 0;
+    }
+
+    const ShowcaseStep step = showcaseSteps_[showcaseIndex_];
+    const bool repeatOn = showcaseForever_ && showcaseForever_->isChecked();
+    statusBar()->showMessage(
+        QString("Showcase %1/%2%3")
+            .arg(showcaseIndex_ + 1)
+            .arg(showcaseSteps_.size())
+            .arg(repeatOn ? QString("  ·  repeat")
+                         : QString("  ·  loop %1/%2")
+                               .arg(showcaseLoopsDone_ + 1)
+                               .arg(showcaseLoops_->value())));
+    applyShowcaseStep(step);
+
+    // Phase 1: wait for the glide to settle, checking a few times a second.
+    showcaseTimer_->disconnect();
+    connect(showcaseTimer_, &QTimer::timeout, this, [this, step] {
+        if (viewport_->viewAnimating()) {
+            showcaseTimer_->start(100);
+            return;
+        }
+        // Phase 2: the hold, then the next step.
+        showcaseTimer_->disconnect();
+        connect(showcaseTimer_, &QTimer::timeout, this, [this] {
+            ++showcaseIndex_;
+            showcaseAdvance();
+        });
+        showcaseTimer_->start(static_cast<int>(step.holdSec * 1000.0));
+    });
+    showcaseTimer_->start(100);
+}
+
+void MainWindow::saveShowcase() {
+    QStringList parts;
+    for (const ShowcaseStep& s : showcaseSteps_)
+        parts << QString("%1:%2:%3").arg(s.kind, s.param).arg(s.holdSec);
+    QSettings s = appSettings();
+    s.setValue("showcaseSteps", parts.join(";"));
+    if (showcaseLoops_) s.setValue("showcaseLoops", showcaseLoops_->value());
+    if (showcaseForever_)
+        s.setValue("showcaseRepeat", showcaseForever_->isChecked());
+}
+
+void MainWindow::loadShowcase() {
+    QSettings s = appSettings();
+    showcaseSteps_.clear();
+    const QString packed = s.value("showcaseSteps").toString();
+    for (const QString& part :
+         packed.split(';', Qt::SkipEmptyParts)) {
+        const QStringList f = part.split(':');
+        if (f.size() != 3) continue;
+        ShowcaseStep st;
+        st.kind = f[0];
+        st.param = f[1];
+        st.holdSec = f[2].toDouble();
+        showcaseSteps_.push_back(st);
+    }
+    if (showcaseLoops_)
+        showcaseLoops_->setValue(s.value("showcaseLoops", 1).toInt());
+    if (showcaseForever_)
+        showcaseForever_->setChecked(s.value("showcaseRepeat", false).toBool());
+    refreshShowcaseList();
 }
 
 // Tick off any stackup row whose part was hidden from the environment, so the

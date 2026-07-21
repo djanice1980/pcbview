@@ -110,6 +110,14 @@ public:
     void setExplodeProgress(float progress, bool snap = false);
     float explodeProgress() const { return explodeProgress_; }
 
+    // True while any view animation (camera glide, zoom, peel) is still
+    // easing toward its target -- the showcase engine waits on this before
+    // starting a step's hold time.
+    bool viewAnimating() const {
+        const float d = explodeProgress_ - explodeTarget_;
+        return cameraAnimating_ || zoomAnimating_ || d > 1e-4f || d < -1e-4f;
+    }
+
     // How far a ring travels per stage, scaled to the board's size.
     float explodeStepMm() const;
 

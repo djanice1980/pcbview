@@ -11,10 +11,16 @@
 #include <functional>
 #include <memory>
 
+class QCheckBox;
+class QComboBox;
 class QDockWidget;
+class QDoubleSpinBox;
 class QImage;
 class QLineEdit;
+class QListWidget;
 class QSlider;
+class QSpinBox;
+class QTimer;
 
 #include "app/vulkan_window.h"
 #include "geom/tessellate.h"
@@ -80,6 +86,25 @@ private:
     std::vector<int> highlightedNets_;
     void buildNetDock();
     void populateNets();
+
+    // ---- showcase: a playlist of views played on a timer -------------------
+    // One step of the show. `kind` dispatches ("view" today; spins, explode
+    // levels, layer hiding and trace highlights are designed to slot in as
+    // new kinds later), `param` is the kind's argument, `holdSec` is how long
+    // to sit at the step AFTER its transition settles.
+    struct ShowcaseStep {
+        QString kind = "view";
+        QString param = "iso";
+        double holdSec = 3.0;
+    };
+    void buildShowcaseDock();
+    void applyShowcaseStep(const ShowcaseStep& step);
+    void showcaseAdvance();
+    void startShowcase();
+    void stopShowcase(const QString& reason = {});
+    void refreshShowcaseList();
+    void saveShowcase();
+    void loadShowcase();
     void onSaveScreenshot();
     // mode: 0 = as shown on screen, 1 = flat overhead (top orthographic),
     // 2 = flat overhead printed at the board's true physical size (1:1).
@@ -175,6 +200,17 @@ private:
     QDockWidget* stackupDock_ = nullptr;
     QDockWidget* propertiesDock_ = nullptr;
     QDockWidget* netDock_ = nullptr;
+    QDockWidget* showcaseDock_ = nullptr;
+    QListWidget* showcaseList_ = nullptr;
+    QComboBox* showcaseKind_ = nullptr;
+    QDoubleSpinBox* showcaseHold_ = nullptr;
+    QSpinBox* showcaseLoops_ = nullptr;
+    QCheckBox* showcaseForever_ = nullptr;
+    QPushButton* showcasePlay_ = nullptr;
+    std::vector<ShowcaseStep> showcaseSteps_;
+    int showcaseIndex_ = -1;   // -1 = idle; else the step being shown
+    int showcaseLoopsDone_ = 0;
+    QTimer* showcaseTimer_ = nullptr;  // drives settle-poll and holds
     QTreeWidget* netList_ = nullptr;
     QLineEdit* netFilter_ = nullptr;
     QPushButton* inferNetsBtn_ = nullptr;
