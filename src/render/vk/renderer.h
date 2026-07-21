@@ -447,6 +447,11 @@ private:
     // reading back from the GPU.
     std::vector<uint32_t> restIndices_;
     std::vector<int32_t> triNetCpu_;
+    // The traced-geometry bake (exploded Z travel + NaN'd hidden parts), kept
+    // CPU-side so the net-light emitter list can be rebuilt in the SAME space
+    // the rays traverse. Building emitters from rest positions left the
+    // exploded view's next-event estimation sampling a collapsed board.
+    std::vector<geom::Vertex> bakedVertices_;
     // Per-net chase origin + inverse span, kept CPU-side so the Embree tracer
     // can be handed the same table the GPU paths read from netSpanBuffer_.
     std::vector<std::array<float, 4>> netSpanCpu_;

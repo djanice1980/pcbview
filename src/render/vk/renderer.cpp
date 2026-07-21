@@ -493,6 +493,8 @@ void Renderer::bakeExplode(float progress) {
     }
     uploadViaStaging(tracedVertexBuffer_, exploded.data(),
                      exploded.size() * sizeof(geom::Vertex));
+    // Keep the baked copy: the net-light emitters must live in THIS space.
+    bakedVertices_ = std::move(exploded);
 }
 
 void Renderer::setPartVisible(const std::string& name, bool visible) {
@@ -528,6 +530,10 @@ void Renderer::rebuildTracedGeometry(float progress) {
     bakeExplode(progress);
     buildAccelerationStructures(asVertexCount_, asIndexCount_);
     tracedExplode_ = progress;
+    // The emitter list samples points ON the net's triangles; those triangles
+    // just moved (or were NaN'd away), so rebuild it in the new space.
+    // No-op when nothing is highlighted.
+    buildNetLights();
 
     // Rebind the new TLAS handle everywhere it is referenced: the raster RT
     // fragment shader (material set, binding 1) and the path tracer.
@@ -2857,13 +2863,19 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         }
     }
 
-    // Rule 2: these usage flags cost nothing today and mean phase 4 builds its
+    // Rule 2: these usage flags cost nothing and mean the RT path builds its
     // acceleration structures over these very buffers. STORAGE too, so the path
-    // tracer can read vertices/indices as SSBOs to shade a ray hit.
+    // tracer can read vertices/indices as SSBOs to shade a ray hit. But ONLY
+    // when the acceleration-structure extension is actually enabled: the
+    // software device deliberately skips it (Embree traces there, not Vulkan),
+    // and requesting the flag without the extension is the spec violation the
+    // validation layer flagged on every llvmpipe board upload.
+    const bool asEnabled = device_.rayQueryEnabled || device_.rayTracingEnabled;
     const VkBufferUsageFlags rtReady =
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        asEnabled ? (VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
+                  : VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 
     destroyBuffer(vertexBuffer_);
     destroyBuffer(indexBuffer_);
@@ -3232,9 +3244,20 @@ void Renderer::buildNetLights() {
         if (std::find(highlightNets_.begin(), highlightNets_.end(), tn) ==
             highlightNets_.end())
             continue;
-        const geom::Vertex& a = restVertices_[restIndices_[t * 3 + 0]];
-        const geom::Vertex& b = restVertices_[restIndices_[t * 3 + 1]];
-        const geom::Vertex& c = restVertices_[restIndices_[t * 3 + 2]];
+        // Baked positions when a bake exists (exploded stack, hidden parts),
+        // rest positions otherwise -- the emitters must be where the rays are.
+        const std::vector<geom::Vertex>& verts =
+            bakedVertices_.size() == restVertices_.size() ? bakedVertices_
+                                                          : restVertices_;
+        const geom::Vertex& a = verts[restIndices_[t * 3 + 0]];
+        const geom::Vertex& b = verts[restIndices_[t * 3 + 1]];
+        const geom::Vertex& c = verts[restIndices_[t * 3 + 2]];
+        // A NaN-baked (hidden) triangle is not in the traced scene; it must
+        // not emit either. NaN != NaN.
+        if (a.position[0] != a.position[0] ||
+            b.position[0] != b.position[0] ||
+            c.position[0] != c.position[0])
+            continue;
         // Area via the cross product of two edges.
         const float e1[3] = {b.position[0] - a.position[0],
                              b.position[1] - a.position[1],
