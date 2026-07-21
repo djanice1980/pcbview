@@ -1083,8 +1083,6 @@ void VulkanWindow::setMeasurement(float ax, float ay, float az, float bx,
     measureANet_ = netAt(measureA_);
     measureBNet_ = netAt(measureB_);
     measureStage_ = 2;
-    fprintf(stderr, "[meas] set A=(%.2f,%.2f,%.2f) net=%d  B net=%d  mesh=%d\n",
-            ax, ay, az, measureANet_, measureBNet_, mesh_ ? 1 : 0);  // TEMP
     emit measureModeChanged(true);
     updateReadout();
     requestUpdate();
@@ -1392,10 +1390,6 @@ void VulkanWindow::buildOverlay() {
     // Net panel: when both measurement endpoints sit on the SAME net, show
     // that net's routed length in the corner -- the measured straight line is
     // the crow-flies distance, this is the copper the signal actually takes.
-    { static int n=0; if ((n++ % 32)==0) fprintf(stderr,
-        "[meas] overlay mode=%d stage=%d mesh=%d aNet=%d bNet=%d\n",
-        (int)measureMode_, measureStage_, mesh_ ? 1 : 0, measureANet_,
-        measureBNet_); }  // TEMP
     if (measureMode_ && measureStage_ >= 1 && mesh_ && measureANet_ >= 0) {
         const int endNet =
             (measureStage_ >= 2) ? measureBNet_ : (haveHover_ ? hoverNet_ : -1);
