@@ -667,8 +667,48 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
 
         if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) {
             // Preview matches the raster clear colour, not the PT sky dome.
-            const V3 bg = c.preview ? V3{0.118f, 0.118f, 0.118f}
-                                    : sky(dir) * sceneDim(c);
+            V3 bg = c.preview ? V3{0.118f, 0.118f, 0.118f}
+                              : sky(dir) * sceneDim(c);
+            // Films recorded along a ray that then MISSES still cover the
+            // background. Without this fold a peeled slab was simply absent
+            // wherever the sky showed through behind it -- which in an
+            // exploded view is most of the slab -- so the substrate read as
+            // missing at every opacity below fully opaque.
+            if (c.preview && rc.filmCount > 0) {
+                const V3 viewDir = dir * -1.0f;
+                V3 camRight = cross(viewDir, {0.0f, 0.0f, 1.0f});
+                camRight = dot(camRight, camRight) < 1e-4f
+                               ? V3{1, 0, 0}
+                               : normalize(camRight);
+                const V3 camUp = cross(camRight, viewDir);
+                // The light rig scales with distance; the nearest film is the
+                // only depth this ray has.
+                float tRef = 1e30f;
+                for (int i = 0; i < rc.filmCount; ++i)
+                    tRef = std::min(tRef, rc.films[i].t);
+                const V3 keyDir = normalize(camRight * 0.55f + camUp * 0.55f +
+                                            viewDir);
+                const V3 fillDir =
+                    normalize(viewDir - camRight * 0.5f - camUp * 0.25f);
+                int idx[RayCtx::kMaxFilms];
+                for (int i = 0; i < rc.filmCount; ++i) idx[i] = i;
+                for (int i = 1; i < rc.filmCount; ++i) {  // t DESCENDING
+                    const int v = idx[i];
+                    int j = i - 1;
+                    while (j >= 0 && rc.films[idx[j]].t < rc.films[v].t) {
+                        idx[j + 1] = idx[j];
+                        --j;
+                    }
+                    idx[j + 1] = v;
+                }
+                for (int i = 0; i < rc.filmCount; ++i) {
+                    const RayCtx::FilmHit& f = rc.films[idx[i]];
+                    const V3 filmLit =
+                        rasterShade(f.albedo, f.rough, 0.0f, f.n, viewDir,
+                                    keyDir, fillDir, 1.0f, 1.0f);
+                    bg = mix(bg, filmLit, f.alpha);
+                }
+            }
             radiance = radiance + throughput * bg;
             if (depth == 0) { firstAlbedo = bg; firstNormal = dir * -1.0f; }
             break;
