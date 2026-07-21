@@ -482,6 +482,22 @@ struct RayCtx {
     V3 coatAlbedo{0, 0, 0};
     float coatAlpha = 0.0f;
     float coatRough = 0.2f;  // film roughness, for the preview's raster blend
+
+    // Preview only: EVERY translucent surface the primary ray crosses (mask
+    // films and peeled laminate slabs), for a deterministic front-to-back
+    // composite -- the ray-traced equivalent of the GPU raster's sorted
+    // blend. One nearest coat cannot represent an exploded stack, and dicing
+    // the slabs put Monte Carlo noise into the one integrator whose whole
+    // point is being clean at a single sample. 16 slots cover an edge-on ray
+    // through a 7-slab stack with both masks; overflow drops the extras,
+    // whose contribution is behind that much film anyway.
+    struct FilmHit {
+        float t, alpha, rough;
+        V3 albedo, n;
+    };
+    static constexpr int kMaxFilms = 16;
+    FilmHit films[kMaxFilms];
+    int filmCount = 0;
 };
 
 // Intersect filter: opaque accepts (commits), film exit faces pass through,
@@ -502,24 +518,12 @@ void intersectFilter(const RTCFilterFunctionNArguments* a) {
         a->valid[0] = 0;
         return;
     }
-    // The peeling laminate. In the PT integrator its entering face ALWAYS
+    // The peeling laminate in the PT integrator: its entering face ALWAYS
     // commits; the shading loop decides between surface shading and scattered
-    // transmission (mirrors the GPU). The PREVIEW has no transmission loop --
-    // and the analytic coat cannot stand in, because it holds only the
-    // NEAREST film: seven stacked peeled slabs collapsed into one full-frame
-    // wash with no slab geometry, which read as "the substrate is gone". So
-    // the preview DICES the slab per sample instead, exactly like the PT
-    // transmission: each AA sample commits with the slab's effective opacity,
-    // and since the preview accumulates samples anyway, the image converges
-    // to properly layered translucency -- visible slabs, inner copper through
-    // them -- within a handful of samples at rest.
-    if (c.mats[c.triMat[prim]].fade > 0.5f) {
-        if (!c.preview) return;  // accept; the PT loop transmits
-        const float xi =
-            hashu(rc->diceSeed ^ prim) * (1.0f / 4294967296.0f);
-        if (xi >= effAlpha(c, prim)) a->valid[0] = 0;  // pass through
-        return;
-    }
+    // transmission (mirrors the GPU).
+    const bool laminate = c.mats[c.triMat[prim]].fade > 0.5f;
+    if (laminate && !c.preview) return;  // accept; the PT loop transmits
+
     if (rc->recordCoat) {
         const float t = RTCRayN_tfar(a->ray, 1, 0);
         if (t < rc->coatT) {
@@ -530,7 +534,23 @@ void intersectFilter(const RTCFilterFunctionNArguments* a) {
             rc->coatRough = fm.roughness;
         }
     }
-    if (c.preview) {  // analytic composite instead of stochastic commit
+    if (c.preview) {
+        // Deterministic layered transparency: record EVERY translucent
+        // surface (mask film or peeled slab) the ray crosses and pass over
+        // it; shading composites them front-to-back over the committed hit,
+        // exactly like the GPU raster's sorted blend. No dice, no noise --
+        // clean at ONE sample, which is the preview's whole contract. (A
+        // single nearest coat collapsed an exploded stack into one wash;
+        // dicing traded that for Monte Carlo speckle. Both wrong tools.)
+        if (rc->filmCount < RayCtx::kMaxFilms) {
+            const Material& fm = c.mats[c.triMat[prim]];
+            RayCtx::FilmHit& f = rc->films[rc->filmCount++];
+            f.t = RTCRayN_tfar(a->ray, 1, 0);
+            f.alpha = effAlpha(c, prim);
+            f.rough = fm.roughness;
+            f.albedo = {fm.albedo[0], fm.albedo[1], fm.albedo[2]};
+            f.n = normalize(ng);  // entering face: already facing the ray
+        }
         a->valid[0] = 0;
         return;
     }
@@ -750,17 +770,37 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
             if (hcol[3] > 0.0f) {
                 // board.frag/board_rt.frag return the highlight directly at
                 // 0.8x glow -- raster has no exposure to soak up more before
-                // it clips to flat white and loses the hue.
+                // it clips to flat white and loses the hue. Films still fold
+                // over it below, so a highlighted net BEHIND a peeled slab
+                // shows through it tinted, as the GPU blend pass does.
                 radiance = V3{hcol[0], hcol[1], hcol[2]} * (c.netGlow * 0.8f);
-                break;
             }
-            if (coatAlpha > 0.0f && coatT < tHit) {
-                V3 fn{0, 0, 1};
-                if (dot(fn, viewDir) < 0.0f) fn = fn * -1.0f;  // two-sided
-                const V3 filmLit = rasterShade(coatAlbedo, coatRough, 0.0f, fn,
-                                               viewDir, keyDir, fillDir, shadow,
-                                               1.0f);
-                radiance = mix(radiance, filmLit, coatAlpha);
+            // Fold every recorded translucent surface over the base, far to
+            // near -- the deterministic equivalent of the raster sorted
+            // blend. Traversal order is arbitrary and a candidate can lie
+            // BEYOND the committed hit (a nearer opaque hit superseded it),
+            // so sort and skip those.
+            if (rc.filmCount > 0) {
+                int idx[RayCtx::kMaxFilms];
+                int nf = 0;
+                for (int i = 0; i < rc.filmCount; ++i)
+                    if (rc.films[i].t < tHit - 1e-4f) idx[nf++] = i;
+                for (int i = 1; i < nf; ++i) {  // insertion sort, t DESCENDING
+                    const int v = idx[i];
+                    int j = i - 1;
+                    while (j >= 0 && rc.films[idx[j]].t < rc.films[v].t) {
+                        idx[j + 1] = idx[j];
+                        --j;
+                    }
+                    idx[j + 1] = v;
+                }
+                for (int i = 0; i < nf; ++i) {
+                    const RayCtx::FilmHit& f = rc.films[idx[i]];
+                    const V3 filmLit =
+                        rasterShade(f.albedo, f.rough, 0.0f, f.n, viewDir,
+                                    keyDir, fillDir, shadow, 1.0f);
+                    radiance = mix(radiance, filmLit, f.alpha);
+                }
             }
             break;
         }
