@@ -622,12 +622,22 @@ static void testCorpus() {
         ++packages;
         const std::string name = entry.path().filename().string();
         try {
-            // A corpus folder holding matrix/matrix is an ODB++ job; anything
-            // else is a Gerber package.
+            // Dispatch by content: matrix/matrix = ODB++ job; a lone
+            // IPC-2581 .xml = that; anything else = a Gerber package.
+            std::string xml2581;
+            for (const auto& f : fs::directory_iterator(entry.path())) {
+                if (f.is_regular_file() &&
+                    ipc2581::isIpc2581(f.path().string())) {
+                    xml2581 = f.path().string();
+                    break;
+                }
+            }
             const geom::LayerArt art =
                 odb::isOdbJob(entry.path().string())
                     ? odb::importJob(entry.path().string())
-                    : gerber::importPackage(entry.path().string());
+                    : !xml2581.empty()
+                          ? ipc2581::importFile(xml2581)
+                          : gerber::importPackage(entry.path().string());
             CHECK(!art.outline.empty());
             bool copper = false;
             for (const auto& al : art.layers)
