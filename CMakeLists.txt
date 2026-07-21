@@ -249,6 +249,30 @@ target_link_libraries(pcbview PRIVATE
     ${EMBREE_DIR}/lib/embree4.lib
 )
 
+# Geometry/importer regression tests: a console target with NO Vulkan and NO
+# Qt, runnable on a bare CI runner. It compiles the shared geometry + Gerber
+# sources directly -- the same translation units the app builds -- so a change
+# that breaks the importer breaks this target's assertions, not just the GUI.
+add_executable(pcbview_tests
+    tests/pcbview_tests.cpp
+    src/io/gerber/gerber_parser.cpp
+    src/io/gerber/gerber_project.cpp
+    src/geom/connectivity.cpp
+    src/geom/tessellate.cpp
+    src/text/stroke_text.cpp
+    src/model/board.cpp
+    ${MINIZ_SOURCES}
+)
+target_include_directories(pcbview_tests PRIVATE
+    src
+    ${earcut_SOURCE_DIR}/include
+    ${glm_SOURCE_DIR}
+    ${miniz_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
+)
+target_compile_definitions(pcbview_tests PRIVATE MINIZ_EXPORT=)
+target_link_libraries(pcbview_tests PRIVATE Clipper2)
+
 # Stage the OIDN runtime beside the exe: the CPU device plus the CUDA (NVIDIA) and
 # HIP (AMD) GPU devices. OIDN picks the fastest present at runtime -- a GPU when
 # its driver is installed, else the CPU. The CUDA/HIP device DLLs need only the

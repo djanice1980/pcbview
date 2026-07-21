@@ -81,6 +81,18 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      # Geometry/importer regression suite: no Vulkan, no Qt, runs on the bare
+      # runner. Synthetic fixtures with hand-computed ground truth -- exact
+      # routed lengths, path-solver cases, pseudo-net inference, snap points.
+      # This is the net that catches importer regressions the smoke test
+      # (which only proves the exe LOADS) never could.
+      - name: Geometry tests
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target pcbview_tests
+          & build\Release\pcbview_tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "pcbview_tests failed" }
+
       # Stages the Qt runtime beside the exe. Everything shipped comes from
       # this directory, so the portable zip and the installer contain exactly
       # the same payload.
