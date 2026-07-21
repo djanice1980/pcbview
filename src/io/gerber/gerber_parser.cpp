@@ -378,6 +378,7 @@ public:
                 ++i;
             }
         }
+        flushStepRepeat();  // a file may end without a closing %SR*%
         flush();
 
         GerberImage img;
@@ -437,6 +438,66 @@ private:
     std::map<std::string, Paths64> netPaths_;
     std::vector<GerberImage::Flash> flashes_;
     std::set<std::string> regionNets_;  // nets that drew a G36 region
+
+    // %SR step-and-repeat. Objects drawn inside an open SR block are captured
+    // (shape + polarity + net for geometry; raw records for segments and
+    // flashes) and REPLAYED translated for every other cell of the grid when
+    // the block closes -- so nets, measurements and snap points replicate
+    // with the copper, not just the image. srReplaying_ keeps the replay
+    // from re-capturing itself.
+    bool srActive_ = false;
+    bool srReplaying_ = false;
+    int srNx_ = 1, srNy_ = 1;
+    double srDx_ = 0.0, srDy_ = 0.0;  // mm
+    struct SrShape {
+        Paths64 shape;
+        bool dark;
+        std::string net;
+    };
+    std::vector<SrShape> srShapes_;
+    struct SrSeg {
+        double ax, ay, bx, by;
+        std::string net;
+    };
+    std::vector<SrSeg> srSegs_;
+    std::vector<GerberImage::Flash> srFlashes_;
+
+    void flushStepRepeat() {
+        if (!srActive_) return;
+        srActive_ = false;
+        srReplaying_ = true;
+        const bool savedDark = polarityDark_;
+        const std::string savedNet = currentNet_;
+        for (int ix = 0; ix < srNx_; ++ix) {
+            for (int iy = 0; iy < srNy_; ++iy) {
+                if (ix == 0 && iy == 0) continue;  // the original
+                const double dx = ix * srDx_, dy = iy * srDy_;
+                const int64_t ox = geom::toInt(dx), oy = geom::toInt(dy);
+                for (const SrShape& c : srShapes_) {
+                    Paths64 moved = c.shape;
+                    for (Path64& path : moved)
+                        for (Point64& q : path) { q.x += ox; q.y += oy; }
+                    polarityDark_ = c.dark;
+                    currentNet_ = c.net;
+                    addDark(std::move(moved));
+                }
+                for (const SrSeg& sg : srSegs_) {
+                    netLen_[sg.net] +=
+                        std::hypot(sg.bx - sg.ax, sg.by - sg.ay);
+                    netSegs_[sg.net].push_back(
+                        {sg.ax + dx, sg.ay + dy, sg.bx + dx, sg.by + dy});
+                }
+                for (const GerberImage::Flash& fl : srFlashes_)
+                    flashes_.push_back({fl.x + dx, fl.y + dy, fl.net});
+            }
+        }
+        polarityDark_ = savedDark;
+        currentNet_ = savedNet;
+        srReplaying_ = false;
+        srShapes_.clear();
+        srSegs_.clear();
+        srFlashes_.clear();
+    }
     std::map<std::string, double> netLen_;
     std::map<std::string, std::vector<NetArea::Seg>> netSegs_;
     bool pendingDark_ = true;
@@ -457,6 +518,8 @@ private:
         pending_.clear();
     }
     void addDark(Paths64 shape) {
+        if (srActive_ && !srReplaying_)
+            srShapes_.push_back({shape, polarityDark_, currentNet_});
         if (!polarityDark_ != !pendingDark_ && !pending_.empty()) flush();
         pendingDark_ = polarityDark_;
         // Tag dark geometry with the current net BEFORE it is composited --
@@ -563,8 +626,31 @@ private:
                    cmd.rfind("IP", 0) == 0 || cmd.rfind("IN", 0) == 0 ||
                    cmd.rfind("LN", 0) == 0) {
             // other attributes / image name / polarity -- no geometry
-        } else if (cmd.rfind("SR", 0) == 0 || cmd.rfind("AB", 0) == 0) {
-            warn("step-and-repeat / aperture blocks not implemented (" + cmd + ")");
+        } else if (cmd.rfind("SR", 0) == 0) {
+            // %SRX3Y2I5.0J4.0*% opens a step-and-repeat grid; a bare %SR*%
+            // (or a new %SR...) closes the previous block. Offsets are in the
+            // file's current unit.
+            flushStepRepeat();
+            int nx = 1, ny = 1;
+            double di = 0.0, dj = 0.0;
+            const auto field = [&](char key, bool integer) -> double {
+                const size_t k = cmd.find(key, 2);
+                if (k == std::string::npos) return integer ? 1.0 : 0.0;
+                return std::atof(cmd.c_str() + k + 1);
+            };
+            nx = static_cast<int>(field('X', true));
+            ny = static_cast<int>(field('Y', true));
+            di = field('I', false) * unitScale_;
+            dj = field('J', false) * unitScale_;
+            if (nx > 1 || ny > 1) {
+                srActive_ = true;
+                srNx_ = std::max(nx, 1);
+                srNy_ = std::max(ny, 1);
+                srDx_ = di;
+                srDy_ = dj;
+            }
+        } else if (cmd.rfind("AB", 0) == 0) {
+            warn("aperture blocks not implemented (" + cmd + ")");
         } else if (cmd.rfind("MI", 0) == 0 || cmd.rfind("OF", 0) == 0 ||
                    cmd.rfind("SF", 0) == 0 || cmd.rfind("AS", 0) == 0) {
             warn("deprecated transform command ignored (" + cmd + ")");
@@ -736,6 +822,41 @@ private:
     //
     // Returns points k = 1..segs: the start is the caller's current point and
     // is deliberately excluded, the end point is included.
+    // Resolve the arc centre from the I/J offsets. G75 (multi-quadrant):
+    // signed offsets from the start point, directly. G74 (single-quadrant):
+    // the file gives UNSIGNED offsets, and the centre is whichever of the
+    // four sign combinations yields a consistent radius AND a sweep of at
+    // most 90 degrees in the commanded direction. Treating G74 like G75 --
+    // which this parser silently did until the arc fixtures caught it --
+    // put the centre on the wrong side and swept most of the wrong circle.
+    std::pair<double, double> arcCentre(double sx, double sy, double ex,
+                                        double ey, double i, double j,
+                                        bool cw) const {
+        if (multiQuadrant_) return {sx + i, sy + j};
+        const double ai = std::abs(i), aj = std::abs(j);
+        double bestCx = sx + ai, bestCy = sy + aj;
+        double bestErr = std::numeric_limits<double>::infinity();
+        for (int si = -1; si <= 1; si += 2) {
+            for (int sj = -1; sj <= 1; sj += 2) {
+                const double cx = sx + si * ai, cy = sy + sj * aj;
+                const double r0 = std::hypot(sx - cx, sy - cy);
+                const double r1 = std::hypot(ex - cx, ey - cy);
+                const double a0 = std::atan2(sy - cy, sx - cx);
+                const double a1 = std::atan2(ey - cy, ex - cx);
+                double sweep = cw ? a0 - a1 : a1 - a0;
+                while (sweep < 0) sweep += 2 * std::numbers::pi;
+                if (sweep > std::numbers::pi / 2 + 1e-3) continue;
+                const double err = std::abs(r0 - r1);
+                if (err < bestErr) {
+                    bestErr = err;
+                    bestCx = cx;
+                    bestCy = cy;
+                }
+            }
+        }
+        return {bestCx, bestCy};
+    }
+
     std::vector<std::pair<double, double>> arcPointsMm(double sx, double sy,
                                                        double ex, double ey,
                                                        double cx, double cy,
@@ -747,8 +868,11 @@ private:
         // Sweep direction. Gerber G02 is clockwise.
         if (cw) { if (a1 >= a0) a1 -= 2 * std::numbers::pi; }
         else { if (a1 <= a0) a1 += 2 * std::numbers::pi; }
-        // Full circle if start==end (common for isolated circular pours).
+        // Full circle if start==end -- but only in MULTI-quadrant mode
+        // (common for isolated circular pours). In G74 the spec makes a
+        // zero-displacement arc a zero-LENGTH arc, never a full turn.
         if (std::abs(ex - sx) < 1e-9 && std::abs(ey - sy) < 1e-9) {
+            if (!multiQuadrant_) return pts;
             a1 = a0 + (cw ? -2 : 2) * std::numbers::pi;
         }
         const int segs = std::max(2, static_cast<int>(
@@ -804,13 +928,17 @@ private:
                 if (len <= 1e-9) return;
                 netLen_[currentNet_] += len;
                 netSegs_[currentNet_].push_back({ax, ay, bx, by});
+                if (srActive_ && !srReplaying_)
+                    srSegs_.push_back({ax, ay, bx, by, currentNet_});
             };
             if (interp_ == 1) {
                 edge(curX_, curY_, x, y);
             } else if (hasIJ) {
                 double px = curX_, py = curY_;
+                const auto [acx, acy] =
+                    arcCentre(curX_, curY_, x, y, i, j, interp_ == 2);
                 for (const auto& [qx, qy] : arcPointsMm(curX_, curY_, x, y,
-                                                        curX_ + i, curY_ + j,
+                                                        acx, acy,
                                                         interp_ == 2)) {
                     edge(px, py, qx, qy);
                     px = qx; py = qy;
@@ -822,8 +950,10 @@ private:
             if (interp_ == 1) {
                 regionContour_.push_back(toClip(x, y));
             } else if (hasIJ) {
-                const auto pts = arcPoints(curX_, curY_, x, y, curX_ + i,
-                                           curY_ + j, interp_ == 2);
+                const auto [acx, acy] =
+                    arcCentre(curX_, curY_, x, y, i, j, interp_ == 2);
+                const auto pts =
+                    arcPoints(curX_, curY_, x, y, acx, acy, interp_ == 2);
                 for (const Point64& p : pts) regionContour_.push_back(p);
             }
             curX_ = x; curY_ = y;
@@ -848,8 +978,10 @@ private:
         if (interp_ == 1 || !hasIJ) {
             spine.push_back(toClip(x, y));
         } else {
-            const auto pts = arcPoints(curX_, curY_, x, y, curX_ + i, curY_ + j,
-                                       interp_ == 2);
+            const auto [acx, acy] =
+                arcCentre(curX_, curY_, x, y, i, j, interp_ == 2);
+            const auto pts =
+                arcPoints(curX_, curY_, x, y, acx, acy, interp_ == 2);
             for (const Point64& p : pts) spine.push_back(p);
         }
         if (width > 0.0 && spine.size() >= 2) {
@@ -866,6 +998,8 @@ private:
     void operationFlash(double x, double y) {
         auto it = apertures_.find(currentAperture_);
         flashes_.push_back({x, y, currentNet_});
+        if (srActive_ && !srReplaying_)
+            srFlashes_.push_back({x, y, currentNet_});
         if (it != apertures_.end()) addDark(flashAperture(it->second, x, y));
         curX_ = x; curY_ = y;
     }

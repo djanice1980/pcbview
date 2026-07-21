@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include <clipper2/clipper.h>
+
 #include "geom/connectivity.h"
 #include "geom/layer_art.h"
 #include "geom/tessellate.h"
@@ -328,10 +330,117 @@ static void testInference() {
     CHECK(netlessSnap);
 }
 
+// Arc interpolation, both quadrant modes, strokes and regions -- exact
+// analytic ground truth (chord-vs-arc error at the parser's segment count is
+// well under the tolerances used).
+static void testArcs() {
+    // G75 multi-quadrant: one D01 with start == end is a FULL circle.
+    // r = 2mm about (5,5): routed length 2*pi*2 = 12.566.
+    const char* fullCircle =
+        "%FSLAX46Y46*%\n%MOMM*%\n%ADD10C,0.200000*%\n"
+        "G01*\nD10*\nG75*\nG03*\n"
+        "%TO.N,ARC*%\n"
+        "X7000000Y5000000D02*\n"
+        "X7000000Y5000000I-2000000J0D01*\n"
+        "%TD*%\nM02*\n";
+    const gerber::GerberImage a = gerber::parseGerber(fullCircle, "arc75");
+    CHECK(a.ok);
+    double routed = -1;
+    for (const auto& na : a.nets)
+        if (na.name == "ARC") routed = na.routedMm;
+    CHECK_NEAR(routed, 2.0 * 3.14159265358979 * 2.0, 0.02);
+
+    // G74 single-quadrant: unsigned I/J, arc <= 90 degrees. Quarter circle,
+    // r = 2mm: routed pi = 3.1416.
+    const char* quarter =
+        "%FSLAX46Y46*%\n%MOMM*%\n%ADD10C,0.200000*%\n"
+        "G01*\nD10*\nG74*\nG03*\n"
+        "%TO.N,ARC*%\n"
+        "X7000000Y5000000D02*\n"
+        "X5000000Y7000000I2000000J0D01*\n"
+        "%TD*%\nM02*\n";
+    const gerber::GerberImage b = gerber::parseGerber(quarter, "arc74");
+    CHECK(b.ok);
+    routed = -1;
+    for (const auto& na : b.nets)
+        if (na.name == "ARC") routed = na.routedMm;
+    CHECK_NEAR(routed, 3.14159265358979, 0.01);
+
+    // A region with an arc edge: a semicircular pour, r = 2mm about (4,2).
+    // Area = pi * r^2 / 2 = 6.283 mm^2.
+    const char* halfDisc =
+        "%FSLAX46Y46*%\n%MOMM*%\n"
+        "G01*\nG75*\n"
+        "%TO.N,POUR*%\n"
+        "G36*\n"
+        "X2000000Y2000000D02*\n"
+        "G01*X6000000Y2000000D01*\n"
+        "G03*X2000000Y2000000I-2000000J0D01*\n"
+        "G37*\n"
+        "%TD*%\nM02*\n";
+    const gerber::GerberImage c = gerber::parseGerber(halfDisc, "arcRegion");
+    CHECK(c.ok);
+    double area = -1;
+    for (const auto& na : c.nets)
+        if (na.name == "POUR") {
+            area = 0.0;
+            for (const auto& p : na.area)
+                area += std::abs(Clipper2Lib::Area(p));
+            area /= geom::kScale * geom::kScale;
+        }
+    CHECK_NEAR(area, 3.14159265358979 * 2.0, 0.05);  // pi*r^2/2, r=2
+}
+
+// %SR step-and-repeat: the SAME content parsed plain and inside a 2x2 grid
+// must replicate exactly -- geometry, net segments, routed length and pad
+// flashes all x4, in non-overlapping cells.
+static void testStepRepeat() {
+    const std::string content =
+        "%TO.N,NETS*%\n"
+        "X1000000Y1000000D02*\n"
+        "X3000000Y1000000D01*\n"
+        "D11*\n"
+        "X1000000Y1000000D03*\n"
+        "%TD*%\n";
+    const std::string header =
+        "%FSLAX46Y46*%\n%MOMM*%\n%ADD10C,0.300000*%\n%ADD11C,1.000000*%\n"
+        "G01*\nD10*\n";
+    const gerber::GerberImage plain =
+        gerber::parseGerber(header + content + "M02*\n", "plain");
+    const gerber::GerberImage sr = gerber::parseGerber(
+        header + "%SRX2Y2I10.0J10.0*%\n" + content + "%SR*%\nM02*\n", "sr");
+    CHECK(plain.ok);
+    CHECK(sr.ok);
+
+    const auto routedOf = [](const gerber::GerberImage& img) {
+        for (const auto& na : img.nets)
+            if (na.name == "NETS") return na.routedMm;
+        return -1.0;
+    };
+    const auto segsOf = [](const gerber::GerberImage& img) {
+        for (const auto& na : img.nets)
+            if (na.name == "NETS") return na.segments.size();
+        return size_t(0);
+    };
+    const auto areaOf = [](const gerber::GerberImage& img) {
+        double a = 0.0;
+        for (const auto& p : img.dark) a += Clipper2Lib::Area(p);
+        return a / (geom::kScale * geom::kScale);
+    };
+    CHECK_NEAR(routedOf(sr), 4.0 * routedOf(plain), 1e-6);
+    CHECK(segsOf(sr) == 4 * segsOf(plain));
+    CHECK(sr.flashes.size() == 4 * plain.flashes.size());
+    CHECK_NEAR(areaOf(sr), 4.0 * areaOf(plain), 1e-3);  // cells don't overlap
+    // And the replicated flashes still carry the net.
+    for (const auto& fl : sr.flashes) CHECK(fl.net == "NETS");
+}
+
 int main() {
     testParserTagged();
     testPackageTagged();
     testInference();
+    testArcs();
+    testStepRepeat();
     if (g_failures == 0) {
         std::printf("OK: all checks passed\n");
         return 0;
