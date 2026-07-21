@@ -502,15 +502,24 @@ void intersectFilter(const RTCFilterFunctionNArguments* a) {
         a->valid[0] = 0;
         return;
     }
-    // The peeling laminate ALWAYS commits its entering face in the PT
-    // integrator; its shading loop decides between surface shading and
-    // scattered transmission (mirrors the GPU). The PREVIEW has no
-    // transmission loop, so a PEELED slab (non-opaque -- an at-rest opaque
-    // one was accepted above) falls through to be recorded as a film in the
-    // analytic coat and passed over: a translucent ghost, like the raster
-    // fade. Committing it opaque would hide exactly the inner copper the
-    // exploded view exists to show.
-    if (c.mats[c.triMat[prim]].fade > 0.5f && !c.preview) return;  // accept
+    // The peeling laminate. In the PT integrator its entering face ALWAYS
+    // commits; the shading loop decides between surface shading and scattered
+    // transmission (mirrors the GPU). The PREVIEW has no transmission loop --
+    // and the analytic coat cannot stand in, because it holds only the
+    // NEAREST film: seven stacked peeled slabs collapsed into one full-frame
+    // wash with no slab geometry, which read as "the substrate is gone". So
+    // the preview DICES the slab per sample instead, exactly like the PT
+    // transmission: each AA sample commits with the slab's effective opacity,
+    // and since the preview accumulates samples anyway, the image converges
+    // to properly layered translucency -- visible slabs, inner copper through
+    // them -- within a handful of samples at rest.
+    if (c.mats[c.triMat[prim]].fade > 0.5f) {
+        if (!c.preview) return;  // accept; the PT loop transmits
+        const float xi =
+            hashu(rc->diceSeed ^ prim) * (1.0f / 4294967296.0f);
+        if (xi >= effAlpha(c, prim)) a->valid[0] = 0;  // pass through
+        return;
+    }
     if (rc->recordCoat) {
         const float t = RTCRayN_tfar(a->ray, 1, 0);
         if (t < rc->coatT) {
