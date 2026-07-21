@@ -440,6 +440,17 @@ void MainWindow::buildViewport() {
         // device + mode. Idempotent (setRenderScale early-returns if unchanged),
         // so ordinary board loads never disturb a scale already dialled in.
         applyInternalResForMode();
+        // A rebuilt viewport (device switch) brings a renderer that has never
+        // heard of the current net selection -- the highlight and its chase
+        // just vanished from the board while the list still showed them
+        // selected. Re-push, gated on an explicit rebuild flag: this signal
+        // also fires on fresh board LOADS, where it arrives before
+        // populateNets() clears the old board's selection -- re-applying
+        // there would paint the previous board's net ids onto the new one.
+        if (reapplyNetsOnUpload_) {
+            reapplyNetsOnUpload_ = false;
+            if (!highlightedNets_.empty()) applyNetHighlights();
+        }
     });
     connect(viewport_, &VulkanWindow::explodeChanged, this,
             [this](float progress, float maxProgress) {
@@ -524,7 +535,10 @@ void MainWindow::rebuildViewport() {
     const float explode = viewport_->explodeProgress();
     // The internal-resolution scale is remembered per device + mode and
     // re-applied on the first board upload (applyInternalResForMode), so nothing
-    // needs to be carried across the rebuild here.
+    // needs to be carried across the rebuild here. The net selection DOES need
+    // a re-push -- it lives in this window but the renderer copy dies with the
+    // viewport -- and the flag keeps that re-push out of ordinary board loads.
+    reapplyNetsOnUpload_ = true;
 
     VulkanWindow* oldViewport = viewport_;
     QWidget* oldContainer = viewportContainer_;
@@ -1949,6 +1963,10 @@ void MainWindow::populateNets() {
     if (!netList_) return;
     netList_->clear();
     highlightedNet_ = -1;
+    // Clear the WHOLE selection, not just the primary: net ids belong to the
+    // board that just went away, and a stale vector here painted the wrong
+    // nets on the next board once boardUploaded started re-applying it.
+    highlightedNets_.clear();
     if (viewport_->renderer()) viewport_->renderer()->setHighlightNet(-1);
 
     // Say WHY the list is empty rather than showing a blank panel that looks

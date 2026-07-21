@@ -193,6 +193,11 @@ private:
     QLabel* scaleLabel_ = nullptr;
     QSlider* scaleSlider_ = nullptr;
     QLabel* explodeLabel_ = nullptr;
+    // Set by rebuildViewport (device switch): the fresh renderer must be told
+    // about the current net selection on its first board upload. Deliberately
+    // NOT set on ordinary loads -- boardUploaded fires there before
+    // populateNets() clears the OLD board's selection.
+    bool reapplyNetsOnUpload_ = false;
 
     int frameCounter_ = 0;
 };
