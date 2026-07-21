@@ -32,6 +32,7 @@
 #include "geom/tessellate.h"
 #include "io/gerber/gerber_parser.h"
 #include "io/gerber/gerber_project.h"
+#include "io/altium/altium_pcb.h"
 #include "io/ipc2581/ipc2581.h"
 #include "io/ipc356/ipc356.h"
 #include "io/odb/odb_features.h"
@@ -1049,6 +1050,338 @@ static void testIpc2581() {
     CHECK(stackNote);
 }
 
+// ---- Altium PcbDoc ---------------------------------------------------------
+//
+// The fixture board serialized as a synthetic PcbDoc: an in-test CFB writer
+// (regular sectors only -- the cutoff is set to 0 so the reader never touches
+// the mini-stream) around streams laid out to the record formats ported from
+// KiCad's importer. Round-trips OUR layout understanding, not real Altium
+// output -- a real-board cross-check still needs an actual .PcbDoc.
+
+namespace cfbw {
+
+static void put16(std::string& s, uint16_t v) {
+    s.push_back(static_cast<char>(v & 0xff));
+    s.push_back(static_cast<char>(v >> 8));
+}
+static void put32(std::string& s, uint32_t v) {
+    for (int i = 0; i < 4; ++i) s.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+}
+static void putI32(std::string& s, int32_t v) { put32(s, static_cast<uint32_t>(v)); }
+static void putF64(std::string& s, double v) {
+    uint64_t bits;
+    std::memcpy(&bits, &v, 8);
+    for (int i = 0; i < 8; ++i) s.push_back(static_cast<char>((bits >> (8 * i)) & 0xff));
+}
+// mm -> Altium 1/10000 mil units.
+static int32_t mm(double v) { return static_cast<int32_t>(std::llround(v / 2.54e-6)); }
+
+// A property list: u32 length + text + NUL.
+static std::string props(const std::string& text) {
+    std::string s;
+    put32(s, static_cast<uint32_t>(text.size() + 1));
+    s += text;
+    s.push_back('\0');
+    return s;
+}
+
+struct Entry {
+    std::string name;
+    uint8_t type;  // 1 storage, 2 stream, 5 root
+    uint32_t left = 0xFFFFFFFF, right = 0xFFFFFFFF, child = 0xFFFFFFFF;
+    uint32_t startSector = 0xFFFFFFFE;
+    uint32_t size = 0;
+};
+
+// Streams as {storage, content}; every stream lives in its own storage's
+// "Data", mirroring a PcbDoc.
+static std::string writeCfb(const std::vector<std::pair<std::string, std::string>>& streams) {
+    constexpr size_t kSector = 512;
+    std::vector<Entry> dir;
+    dir.push_back({"Root Entry", 5});
+    std::string content;  // all stream sectors, concatenated
+    std::vector<uint32_t> chains;  // FAT chain values for stream sectors
+
+    uint32_t prevStorage = 0xFFFFFFFF;
+    for (const auto& [storage, data] : streams) {
+        const uint32_t storageId = static_cast<uint32_t>(dir.size());
+        dir.push_back({storage, 1});
+        const uint32_t streamId = static_cast<uint32_t>(dir.size());
+        dir.push_back({"Data", 2});
+        dir[storageId].child = streamId;
+        if (prevStorage == 0xFFFFFFFF) dir[0].child = storageId;
+        else dir[prevStorage].right = storageId;
+        prevStorage = storageId;
+
+        const uint32_t firstSector = static_cast<uint32_t>(content.size() / kSector);
+        dir[streamId].startSector = firstSector;
+        dir[streamId].size = static_cast<uint32_t>(data.size());
+        content += data;
+        content.resize((content.size() + kSector - 1) / kSector * kSector, '\0');
+        const uint32_t nSect = static_cast<uint32_t>(content.size() / kSector) - firstSector;
+        for (uint32_t i = 0; i < nSect; ++i)
+            chains.push_back(i + 1 < nSect ? firstSector + i + 1 : 0xFFFFFFFE);
+    }
+
+    // Sector numbering: [FAT][dir sectors][stream sectors]. Stream start
+    // sectors were recorded content-relative; rebase them to absolute now
+    // that the directory size (and so the stream base) is known.
+    const uint32_t nDirSectPre = static_cast<uint32_t>(
+        (dir.size() * 128 + kSector - 1) / kSector);
+    const uint32_t streamBasePre = 1 + nDirSectPre;
+    for (Entry& e : dir)
+        if (e.type == 2) e.startSector += streamBasePre;
+
+    // Directory sectors.
+    std::string dirBytes;
+    for (const Entry& e : dir) {
+        std::string d(128, '\0');
+        size_t n = std::min<size_t>(e.name.size(), 31);
+        for (size_t i = 0; i < n; ++i) {
+            d[i * 2] = e.name[i];
+            d[i * 2 + 1] = 0;
+        }
+        const uint16_t nameLen = static_cast<uint16_t>((n + 1) * 2);
+        d[64] = static_cast<char>(nameLen & 0xff);
+        d[65] = static_cast<char>(nameLen >> 8);
+        d[66] = static_cast<char>(e.type);
+        d[67] = 1;  // black
+        std::string tail;
+        put32(tail, e.left);
+        put32(tail, e.right);
+        put32(tail, e.child);
+        tail.append(16, '\0');  // CLSID
+        tail.append(4, '\0');   // state
+        tail.append(8, '\0');   // times
+        tail.append(8, '\0');
+        put32(tail, e.startSector);
+        put32(tail, e.size);
+        put32(tail, 0);
+        std::memcpy(d.data() + 68, tail.data(), tail.size());
+        dirBytes += d;
+    }
+    dirBytes.resize((dirBytes.size() + kSector - 1) / kSector * kSector, '\0');
+    const uint32_t nDirSect = static_cast<uint32_t>(dirBytes.size() / kSector);
+    const uint32_t nStreamSect = static_cast<uint32_t>(content.size() / kSector);
+
+    // Sector layout: [FAT][dir sectors][stream sectors].
+    const uint32_t fatSector = 0;
+    const uint32_t dirStart = 1;
+    const uint32_t streamBase = dirStart + nDirSect;
+    const uint32_t totalSect = streamBase + nStreamSect;
+    if (totalSect > kSector / 4) throw std::runtime_error("fixture too big");
+
+    std::string fat;
+    put32(fat, 0xFFFFFFFD);  // the FAT sector itself
+    for (uint32_t i = 0; i < nDirSect; ++i)
+        put32(fat, i + 1 < nDirSect ? dirStart + i + 1 : 0xFFFFFFFE);
+    for (uint32_t v : chains)
+        put32(fat, v == 0xFFFFFFFE ? v : v + streamBase);
+    fat.resize(kSector, '\xFF');  // FREESECT
+
+    // Header.
+    std::string h;
+    h += std::string("\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1", 8);
+    h.append(16, '\0');       // CLSID
+    put16(h, 0x3E);           // minor
+    put16(h, 3);              // major (512-byte sectors)
+    put16(h, 0xFFFE);         // little endian
+    put16(h, 9);              // sector shift
+    put16(h, 6);              // mini shift
+    h.append(6, '\0');
+    put32(h, 0);              // numDirSectors (v3: 0)
+    put32(h, 1);              // numFatSectors
+    put32(h, dirStart);       // first dir sector
+    put32(h, 0);              // transaction
+    put32(h, 0);              // mini cutoff 0: everything via regular sectors
+    put32(h, 0xFFFFFFFE);     // first minifat
+    put32(h, 0);              // num minifat
+    put32(h, 0xFFFFFFFE);     // first DIFAT
+    put32(h, 0);              // num DIFAT
+    put32(h, fatSector);      // DIFAT[0]
+    while (h.size() < kSector) h += std::string("\xFF\xFF\xFF\xFF", 4);
+    h.resize(kSector);
+
+    return h + fat + dirBytes + content;
+}
+
+}  // namespace cfbw
+
+static void testAltiumPcbDoc() {
+    using namespace cfbw;
+
+    // Board6: TOP->BOTTOM stackup and the 9x5 outline.
+    const std::string board6 = props(
+        "|HEADER=Board|"
+        "LAYER1NAME=Top Layer|LAYER1NEXT=32|LAYER1PREV=0|"
+        "LAYER1COPTHICK=1.4mil|LAYER1DIELHEIGHT=60mil|"
+        "LAYER32NAME=Bottom Layer|LAYER32NEXT=0|LAYER32PREV=1|"
+        "LAYER32COPTHICK=1.4mil|LAYER32DIELHEIGHT=0mil|"
+        "VX0=0mil|VY0=0mil|VX1=354.331mil|VY1=0mil|"
+        "VX2=354.331mil|VY2=196.85mil|VX3=0mil|VY3=196.85mil");
+    // 9mm = 354.331mil, 5mm = 196.85mil (converted back exactly enough).
+
+    const std::string nets6 = props("|NAME=NETA") + props("|NAME=NETB") +
+                              props("|NAME=NETC");
+
+    // Tracks: layer, flags, net/polygon/component, coords. NETA 4+2 on top,
+    // NETB 3 on top, NETA 2 on bottom.
+    const auto track = [&](uint8_t layer, uint16_t net, double x1, double y1,
+                           double x2, double y2, double w) {
+        std::string body;
+        body.push_back(static_cast<char>(layer));
+        body.push_back(0x04);  // flags1: not locked, not polygonoutline
+        body.push_back(0);     // flags2
+        put16(body, net);
+        put16(body, 0xFFFF);  // polygon
+        put16(body, 0xFFFF);  // component
+        body.append(4, '\0');
+        putI32(body, mm(x1));
+        putI32(body, mm(y1));
+        putI32(body, mm(x2));
+        putI32(body, mm(y2));
+        putI32(body, mm(w));
+        put16(body, 0xFFFF);  // subpolyindex
+        body.push_back(0);
+        std::string rec;
+        rec.push_back(4);  // TRACK
+        put32(rec, static_cast<uint32_t>(body.size()));
+        return rec + body;
+    };
+    const std::string tracks6 =
+        track(1, 0, 1, 1, 5, 1, 0.3) + track(1, 0, 5, 1, 5, 3, 0.3) +
+        track(1, 1, 8, 1, 8, 4, 0.3) + track(32, 0, 1, 1, 3, 1, 0.3);
+
+    // Pads: NETA at (1,1) multilayer plated 0.4mm hole, NETA at (5,3) top,
+    // NETC at (6.7,2.7) and (7.3,4.3) top. Subrecord5 is the 110-byte form.
+    const auto pad = [&](uint8_t layer, uint16_t net, double x, double y,
+                         double w, double h, double hole) {
+        std::string rec;
+        rec.push_back(2);  // PAD
+        // 1: name
+        std::string name;
+        name.push_back(1);
+        name += "P";
+        put32(rec, static_cast<uint32_t>(name.size()));
+        rec += name;
+        // 2-4: empty
+        for (int i = 0; i < 3; ++i) put32(rec, 0);
+        // 5: geometry, 110 bytes
+        std::string g;
+        g.push_back(static_cast<char>(layer));
+        g.push_back(0x04);
+        g.push_back(0);
+        put16(g, net);
+        g.append(2, '\0');
+        put16(g, 0xFFFF);  // component
+        g.append(4, '\0');
+        putI32(g, mm(x));
+        putI32(g, mm(y));
+        putI32(g, mm(w));   // top
+        putI32(g, mm(h));
+        putI32(g, mm(w));   // mid
+        putI32(g, mm(h));
+        putI32(g, mm(w));   // bot
+        putI32(g, mm(h));
+        putI32(g, mm(hole));
+        g.push_back(1);  // top shape: circle
+        g.push_back(1);
+        g.push_back(1);
+        putF64(g, 0.0);  // rotation
+        g.push_back(1);  // plated
+        g.push_back(0);
+        g.push_back(0);  // padmode simple
+        g.append(23, '\0');
+        putI32(g, 0);  // paste expansion
+        putI32(g, 0);  // solder expansion
+        g.append(7, '\0');
+        g.push_back(1);
+        g.push_back(1);
+        g.append(3, '\0');
+        put32(g, 0);  // the always-zero tail of the 110-byte form
+        put32(rec, static_cast<uint32_t>(g.size()));
+        rec += g;
+        // 6: absent
+        put32(rec, 0);
+        return rec;
+    };
+    const std::string pads6 =
+        pad(74, 0, 1, 1, 1.0, 1.0, 0.4) + pad(1, 0, 5, 3, 1.0, 1.0, 0) +
+        pad(1, 2, 6.7, 2.7, 1.0, 1.0, 0) + pad(1, 2, 7.3, 4.3, 1.0, 1.0, 0);
+
+    // NETC plane: a polygon with no stored pour -> solid fallback fill.
+    const std::string polygons6 = props(
+        "|LAYER=TOP|NET=2|"
+        "VX0=255.906mil|VY0=98.4252mil|"
+        "VX1=295.276mil|VY1=98.4252mil|"
+        "VX2=295.276mil|VY2=177.165mil|"
+        "VX3=255.906mil|VY3=177.165mil");
+    // 6.5/2.5/7.5/4.5mm in mils.
+
+    const std::string fileHeader = props(
+        "|HEADER=Protel for Windows - PCB 6.0 Binary File Version 6.0");
+
+    const std::string doc = writeCfb({{"FileHeader", fileHeader},
+                                      {"Board6", board6},
+                                      {"Nets6", nets6},
+                                      {"Tracks6", tracks6},
+                                      {"Pads6", pads6},
+                                      {"Polygons6", polygons6}});
+
+    const fs::path file = fs::temp_directory_path() / "pcbview_fix.PcbDoc";
+    {
+        std::ofstream f(file, std::ios::binary);
+        f << doc;
+    }
+    CHECK(altium::isPcbDoc(file.string()));
+    geom::LayerArt art;
+    try {
+        art = altium::importPcbDoc(file.string());
+    } catch (const std::exception& e) {
+        ++g_failures;
+        std::printf("FAIL PcbDoc import threw: %s\n", e.what());
+        return;
+    }
+
+    CHECK(art.nets.size() == 3);
+    if (art.nets.size() != 3) return;
+    CHECK(art.nets[0].name == "NETA");
+    // Altium coordinates quantize to 2.54nm; micrometre tolerance.
+    CHECK_NEAR(art.nets[0].routedMm, 8.0, 1e-4);
+    CHECK_NEAR(art.nets[1].routedMm, 3.0, 1e-4);
+    CHECK(art.nets[2].hasPlane);  // fallback-filled polygon
+    CHECK(art.netSegments.size() == 4);
+
+    CHECK_NEAR(std::abs(Clipper2Lib::Area(art.outline)) /
+                   (geom::kScale * geom::kScale),
+               45.0, 0.05);  // mil-string round trip costs a little
+    CHECK(art.drills.size() == 1);
+    CHECK(art.barrels.size() == 1);
+
+    int copper = 0, mask = 0;
+    for (const auto& al : art.layers) {
+        if (al.kind == LayerKind::Copper) ++copper;
+        if (al.kind == LayerKind::Soldermask) ++mask;
+    }
+    CHECK(copper == 2);
+    CHECK(mask == 2);  // derived openings on both faces
+
+    // Real stackup thickness: 2x1.4mil copper + 60mil dielectric + 2 masks.
+    CHECK_NEAR(art.thickness, 2 * 0.03556 + 1.524 + 0.020, 1e-6);
+
+    // The path solver walks Altium nets like any others.
+    const geom::BoardMesh mesh = geom::assemble(art, {});
+    const geom::LayerArt::NetSeg* four = findSeg(mesh, 4.0);
+    CHECK(four != nullptr);
+    if (!four) return;
+    CHECK(art.nets[four->net].name == "NETA");
+    double ax, ay, bx, by;
+    lerp(*four, 0.25, ax, ay);
+    lerp(*four, 0.75, bx, by);
+    CHECK_NEAR(geom::netPathLength(mesh, four->net, ax, ay, bx, by), 2.0,
+               1e-3);
+}
+
 // LZW (.Z) decoder sanity: round-trip against a minimal single-width
 // compressor (data short enough that no code-width bump occurs).
 static void testOdbLzw() {
@@ -1101,6 +1434,7 @@ int main() {
     testOdbTgz();
     testOdbLzw();
     testIpc2581();
+    testAltiumPcbDoc();
     testCorpus();
     if (g_failures == 0) {
         std::printf("OK: all checks passed\n");

@@ -60,6 +60,7 @@
 #include "geom/connectivity.h"
 #include "app/component_import.h"
 #include "app/theme.h"
+#include "io/altium/altium_pcb.h"
 #include "io/gerber/gerber_project.h"
 #include "io/ipc2581/ipc2581.h"
 #include "io/kicad/kicad_importer.h"
@@ -613,6 +614,11 @@ bool MainWindow::loadBoard(const QString& path) {
             art = ipc2581::importFile(path.toStdString());
             for (const std::string& w : art.warnings)
                 warnings << QString::fromStdString(w);
+        } else if (altium::isPcbDoc(path.toStdString())) {
+            gerber = true;
+            art = altium::importPcbDoc(path.toStdString());
+            for (const std::string& w : art.warnings)
+                warnings << QString::fromStdString(w);
         } else {
             gerber = true;
             art = gerber::importPackage(path.toStdString());
@@ -852,10 +858,10 @@ void MainWindow::onOpen() {
     const QString path = QFileDialog::getOpenFileName(
         this, "Open board or gerbers", start,
         "All supported (*.kicad_pcb *.zip *.gbrjob *.tgz *.tar.gz *.tar "
-        "*.xml *.cvg);;"
+        "*.xml *.cvg *.PcbDoc);;"
         "KiCad PCB (*.kicad_pcb);;Gerber package (*.zip *.gbrjob);;"
         "ODB++ job (*.tgz *.tar.gz *.tar *.zip);;"
-        "IPC-2581 (*.xml *.cvg);;All files (*)");
+        "IPC-2581 (*.xml *.cvg);;Altium PCB (*.PcbDoc);;All files (*)");
     if (!path.isEmpty()) loadBoard(path);
 }
 
@@ -1176,6 +1182,7 @@ bool droppable(const QString& localPath) {
            localPath.endsWith(".tar", Qt::CaseInsensitive) ||
            localPath.endsWith(".xml", Qt::CaseInsensitive) ||
            localPath.endsWith(".cvg", Qt::CaseInsensitive) ||
+           localPath.endsWith(".pcbdoc", Qt::CaseInsensitive) ||
            QFileInfo(localPath).isDir();
 }
 }  // namespace

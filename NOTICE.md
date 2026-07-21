@@ -28,6 +28,8 @@ mutually compatible at GPL-3:
 | glm | MIT | permissive |
 | cgltf | MIT | permissive |
 | pugixml | MIT | permissive |
+| Microsoft compoundfilereader | MIT | permissive (vendored single header) |
+| KiCad Altium record layouts | GPL-3.0 | adapted from pcbnew/pcb_io/altium |
 | Intel Open Image Denoise | Apache-2.0 | compatible with GPL-3; **incompatible with GPL-2** |
 | Intel Embree | Apache-2.0 | compatible with GPL-3; **incompatible with GPL-2** |
 
@@ -118,6 +120,8 @@ here.
 | miniz | MIT |
 | cgltf | MIT |
 | pugixml | MIT |
+| Microsoft compoundfilereader | MIT |
+| KiCad (Altium importer record layouts) | GPL-3.0 |
 | Intel Open Image Denoise | Apache-2.0 |
 | Intel Embree | Apache-2.0 |
 | Mesa (lavapipe) | MIT |

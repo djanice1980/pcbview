@@ -205,6 +205,7 @@ add_executable(pcbview WIN32
     src/io/odb/odb_eda.cpp
     src/io/odb/odb_project.cpp
     src/io/ipc2581/ipc2581.cpp
+    src/io/altium/altium_pcb.cpp
     src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     ${MINIZ_SOURCES}
@@ -285,6 +286,7 @@ add_executable(pcbview_tests
     src/io/odb/odb_eda.cpp
     src/io/odb/odb_project.cpp
     src/io/ipc2581/ipc2581.cpp
+    src/io/altium/altium_pcb.cpp
     src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     src/text/stroke_text.cpp
