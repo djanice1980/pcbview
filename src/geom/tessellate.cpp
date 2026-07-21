@@ -1441,6 +1441,11 @@ double netPathLength(const BoardMesh& mesh, int net, double ax, double ay,
         return id;
     };
 
+    struct SegRef {
+        int na, nb;
+        double ax, ay, bx, by, len;
+    };
+    std::vector<SegRef> segs;
     for (const LayerArt::NetSeg& s : mesh.netSegments) {
         if (s.net != net) continue;
         const int na = nodeAt(s.ax, s.ay);
@@ -1448,27 +1453,72 @@ double netPathLength(const BoardMesh& mesh, int net, double ax, double ay,
         const double len = std::hypot(s.bx - s.ax, s.by - s.ay);
         nodes[na].edges.emplace_back(nb, len);
         nodes[nb].edges.emplace_back(na, len);
+        segs.push_back({na, nb, s.ax, s.ay, s.bx, s.by, len});
     }
     if (nodes.empty()) return -1.0;
 
-    // Attach the query points. Source gets a virtual node; the target keeps a
-    // per-node landing cost added at pop time.
+    // Attach each query point by PROJECTING it onto the nearest segment of
+    // the net -- interiors included, not just endpoints. A measurement click
+    // lands mid-trace far more often than on a junction, and the old
+    // endpoint-only attach reported "no route" for any point over 1mm from a
+    // segment END even when it sat dead-centre ON the copper. The projection
+    // splits its segment virtually: the point connects to both segment ends
+    // with the along-the-copper distances (plus the tiny perpendicular hop).
+    struct Attach {
+        int seg = -1;      // index into segs
+        double t = 0.0;    // param along the segment, 0..1
+        double perp = 0.0; // distance off the copper centreline
+    };
+    constexpr double kAttach = 1.0;  // mm
+    const auto attach = [&](double px, double py) {
+        Attach best;
+        double bestD = kAttach;
+        for (size_t i = 0; i < segs.size(); ++i) {
+            const SegRef& s = segs[i];
+            const double vx = s.bx - s.ax, vy = s.by - s.ay;
+            const double ll = vx * vx + vy * vy;
+            double t = ll > 1e-12
+                           ? ((px - s.ax) * vx + (py - s.ay) * vy) / ll
+                           : 0.0;
+            t = std::clamp(t, 0.0, 1.0);
+            const double cx = s.ax + vx * t, cy = s.ay + vy * t;
+            const double d = std::hypot(px - cx, py - cy);
+            if (d < bestD) {
+                bestD = d;
+                best = {static_cast<int>(i), t, d};
+            }
+        }
+        return best;
+    };
+    const Attach atA = attach(ax, ay);
+    const Attach atB = attach(bx, by);
+    if (atA.seg < 0 || atB.seg < 0) return -1.0;
+
+    // Both points on the SAME segment: the direct run along it, no junctions.
+    double direct = std::numeric_limits<double>::infinity();
+    if (atA.seg == atB.seg) {
+        direct = atA.perp + atB.perp +
+                 std::abs(atA.t - atB.t) * segs[atA.seg].len;
+    }
+
+    // Source: a virtual node joined to its segment's two ends by the
+    // along-the-copper distances. Target: landing costs on ITS segment's two
+    // ends, added at pop time.
     const int src = static_cast<int>(nodes.size());
     nodes.push_back({ax, ay, {}});
-    constexpr double kAttach = 1.0;  // mm
+    {
+        const SegRef& s = segs[atA.seg];
+        nodes[src].edges.emplace_back(s.na, atA.perp + atA.t * s.len);
+        nodes[src].edges.emplace_back(s.nb, atA.perp + (1.0 - atA.t) * s.len);
+    }
     std::vector<double> landing(nodes.size(),
                                 std::numeric_limits<double>::infinity());
-    bool anyLanding = false;
-    for (int i = 0; i < src; ++i) {
-        const double da = std::hypot(nodes[i].x - ax, nodes[i].y - ay);
-        if (da <= kAttach) nodes[src].edges.emplace_back(i, da);
-        const double db = std::hypot(nodes[i].x - bx, nodes[i].y - by);
-        if (db <= kAttach) {
-            landing[i] = db;
-            anyLanding = true;
-        }
+    {
+        const SegRef& s = segs[atB.seg];
+        landing[s.na] = std::min(landing[s.na], atB.perp + atB.t * s.len);
+        landing[s.nb] =
+            std::min(landing[s.nb], atB.perp + (1.0 - atB.t) * s.len);
     }
-    if (nodes[src].edges.empty() || !anyLanding) return -1.0;
 
     std::vector<double> dist(nodes.size(),
                              std::numeric_limits<double>::infinity());
@@ -1476,7 +1526,9 @@ double netPathLength(const BoardMesh& mesh, int net, double ax, double ay,
     std::priority_queue<QE, std::vector<QE>, std::greater<QE>> q;
     dist[src] = 0.0;
     q.push({0.0, src});
-    double best = std::numeric_limits<double>::infinity();
+    // Seed with the same-segment direct run (if any); the graph may still
+    // find something shorter through a loop, so both compete.
+    double best = direct;
     while (!q.empty()) {
         const auto [d, n] = q.top();
         q.pop();

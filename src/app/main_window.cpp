@@ -303,13 +303,17 @@ MainWindow::MainWindow(const QString& path) {
     }
 
     // Headless measurement hook: pin a measurement between two world points
-    // (x1,y1,z1,x2,y2,z2 in mm) -- mouse picks can't be synthesised.
+    // (x1,y1,z1,x2,y2,z2 in mm) -- mouse picks can't be synthesised. Deferred
+    // like PCBVIEW_NET: the nets it resolves against need the board loaded,
+    // and firing synchronously raced the load (mesh sometimes absent).
     if (qEnvironmentVariableIsSet("PCBVIEW_MEASURE")) {
         const QStringList p = qEnvironmentVariable("PCBVIEW_MEASURE").split(',');
         if (p.size() == 6) {
-            viewport_->setMeasurement(p[0].toFloat(), p[1].toFloat(),
-                                      p[2].toFloat(), p[3].toFloat(),
-                                      p[4].toFloat(), p[5].toFloat());
+            QTimer::singleShot(700, this, [this, p] {
+                viewport_->setMeasurement(p[0].toFloat(), p[1].toFloat(),
+                                          p[2].toFloat(), p[3].toFloat(),
+                                          p[4].toFloat(), p[5].toFloat());
+            });
         }
     }
 

@@ -1052,19 +1052,39 @@ void VulkanWindow::setMeasurement(float ax, float ay, float az, float bx,
     measureMode_ = true;
     measureA_ = {ax, ay, az};
     measureB_ = {bx, by, bz};
-    // Resolve nets like a snapped click would: the nearest snap point within
-    // a hair of the given position (net-carrying points are listed first).
+    // Resolve nets like a click would: a snap point within a hair of the
+    // position wins; failing that, the nearest track segment names the net --
+    // mid-trace points are the common case for measuring along a run.
     const auto netAt = [&](const glm::vec3& p) -> int {
         if (!mesh_) return -1;
         for (const geom::SnapPoint& sp : mesh_->snapPoints) {
             const glm::vec3 w(sp.pos[0], sp.pos[1], sp.pos[2]);
             if (glm::length(w - p) < 0.05f) return sp.net;
         }
-        return -1;
+        int net = -1;
+        double bestD = 0.6;  // mm
+        for (const geom::LayerArt::NetSeg& s : mesh_->netSegments) {
+            if (s.net < 0) continue;
+            const double vx = s.bx - s.ax, vy = s.by - s.ay;
+            const double ll = vx * vx + vy * vy;
+            double tt = ll > 1e-12
+                            ? ((p.x - s.ax) * vx + (p.y - s.ay) * vy) / ll
+                            : 0.0;
+            tt = std::clamp(tt, 0.0, 1.0);
+            const double d = std::hypot(p.x - (s.ax + vx * tt),
+                                        p.y - (s.ay + vy * tt));
+            if (d < bestD) {
+                bestD = d;
+                net = s.net;
+            }
+        }
+        return net;
     };
     measureANet_ = netAt(measureA_);
     measureBNet_ = netAt(measureB_);
     measureStage_ = 2;
+    fprintf(stderr, "[meas] set A=(%.2f,%.2f,%.2f) net=%d  B net=%d  mesh=%d\n",
+            ax, ay, az, measureANet_, measureBNet_, mesh_ ? 1 : 0);  // TEMP
     emit measureModeChanged(true);
     updateReadout();
     requestUpdate();
@@ -1142,6 +1162,27 @@ bool VulkanWindow::screenToBoard(const QPointF& posDip, glm::vec3& out,
     const float t = (topZ - a.z) / dir.z;
     if (t < 0.0f) return false;
     out = a + dir * t;
+    // A free point can still sit ON a track. Naming its net from the nearest
+    // segment is what makes "length along the trace between these two points"
+    // work for clicks in the MIDDLE of a run -- the usual gesture -- where no
+    // snap point exists to carry the net.
+    {
+        double bestD = 0.6;  // mm: about a trace width
+        for (const geom::LayerArt::NetSeg& s : mesh_->netSegments) {
+            if (s.net < 0) continue;
+            const double vx = s.bx - s.ax, vy = s.by - s.ay;
+            const double ll = vx * vx + vy * vy;
+            double tt = ll > 1e-12 ? ((out.x - s.ax) * vx + (out.y - s.ay) * vy) / ll
+                                   : 0.0;
+            tt = std::clamp(tt, 0.0, 1.0);
+            const double d = std::hypot(out.x - (s.ax + vx * tt),
+                                        out.y - (s.ay + vy * tt));
+            if (d < bestD) {
+                bestD = d;
+                net = s.net;
+            }
+        }
+    }
     return true;
 }
 
@@ -1351,6 +1392,10 @@ void VulkanWindow::buildOverlay() {
     // Net panel: when both measurement endpoints sit on the SAME net, show
     // that net's routed length in the corner -- the measured straight line is
     // the crow-flies distance, this is the copper the signal actually takes.
+    { static int n=0; if ((n++ % 32)==0) fprintf(stderr,
+        "[meas] overlay mode=%d stage=%d mesh=%d aNet=%d bNet=%d\n",
+        (int)measureMode_, measureStage_, mesh_ ? 1 : 0, measureANet_,
+        measureBNet_); }  // TEMP
     if (measureMode_ && measureStage_ >= 1 && mesh_ && measureANet_ >= 0) {
         const int endNet =
             (measureStage_ >= 2) ? measureBNet_ : (haveHover_ ? hoverNet_ : -1);
