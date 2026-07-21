@@ -116,7 +116,8 @@ bool isOdbJob(const std::string& path) {
     return false;
 }
 
-geom::LayerArt importJob(const std::string& path) {
+geom::LayerArt importJob(const std::string& path,
+                         const std::string& stepOverride) {
     geom::LayerArt art;
     art.sourcePath = path;
 
@@ -127,7 +128,21 @@ geom::LayerArt importJob(const std::string& path) {
             "no ODB++ job found (missing matrix/matrix): " + path);
 
     const Matrix matrix = parseMatrix(fsys.read("matrix/matrix"));
-    const std::string step = chooseStep(fsys, matrix, art.notes);
+    std::string step = chooseStep(fsys, matrix, art.notes);
+    if (!stepOverride.empty()) {
+        const bool exists =
+            fsys.exists("steps/" + stepOverride + "/stephdr") ||
+            fsys.exists("steps/" + stepOverride + "/profile") ||
+            !fsys.dirs("steps/" + stepOverride).empty();
+        if (!exists) {
+            art.warnings.push_back("requested ODB++ step '" + stepOverride +
+                                   "' not found; using '" + step + "'");
+        } else {
+            step = stepOverride;
+            art.notes.push_back("ODB++ step '" + step +
+                                "' selected via override");
+        }
+    }
     if (step.empty())
         throw std::runtime_error("ODB++ job has no steps: " + path);
     const std::string stepDir = "steps/" + step + "/";
@@ -188,6 +203,129 @@ geom::LayerArt importJob(const std::string& path) {
     };
     const int firstCopperRow = copperLayers.front()->row;
 
+    // ---- board area (profile), needed EARLY --------------------------------
+    // Negative layers prime their copper sheet from it, and the outline at
+    // the end reuses it.
+    Paths64 boardArea;
+    {
+        const FeaturesFile ff = parseFeatures(fsys.read(stepDir + "profile"));
+        FeatureRealizer real(ff, userSymbol, art.warnings);
+        Paths64 surfaces, strokes;
+        for (const Feature& f : ff.features) {
+            if (!f.dark) continue;
+            Paths64 polys = real.realize(f);
+            Paths64& dst =
+                f.kind == Feature::Kind::Surface ? surfaces : strokes;
+            dst.insert(dst.end(), polys.begin(), polys.end());
+        }
+        if (!surfaces.empty())
+            boardArea = Union(surfaces, FillRule::NonZero);
+        else if (!strokes.empty())
+            boardArea = gerber::boardFromProfile(strokes);
+    }
+
+    // ---- step-repeat expansion (panel steps) --------------------------------
+    // A step's stephdr STEP-REPEAT blocks place another step NX x NY times.
+    // Expanded geometry-only: the replicas' copper/mask/silk/drills merge
+    // into this step's layers; nets stay with the board step.
+    std::map<std::string, Paths64> srLayer;  // lower layer name -> geometry
+    Paths64 srDrills, srBarrels;
+    int srInstances = 0;
+    {
+        const std::string hdrText = fsys.read(stepDir + "stephdr");
+        const double hdrUnit =
+            hdrText.find("UNITS=MM") != std::string::npos ? 1.0 : 25.4;
+        for (const Block& b : parseStructured(hdrText)) {
+            if (b.name != "STEP-REPEAT") continue;
+            const std::string child = toLower(b.get("NAME"));
+            if (child.empty() || child == toLower(step)) continue;
+            const std::string childDir = "steps/" + child + "/";
+            const std::string childHdr = fsys.read(childDir + "stephdr");
+            const double childUnit =
+                childHdr.find("UNITS=MM") != std::string::npos ? 1.0 : 25.4;
+            double datumX = 0, datumY = 0;
+            for (const Block& h : parseStructured(childHdr)) {
+                if (!h.name.empty()) continue;
+                datumX = std::atof(h.get("X_DATUM").c_str()) * childUnit;
+                datumY = std::atof(h.get("Y_DATUM").c_str()) * childUnit;
+            }
+            const double X = std::atof(b.get("X").c_str()) * hdrUnit;
+            const double Y = std::atof(b.get("Y").c_str()) * hdrUnit;
+            const double DX = std::atof(b.get("DX").c_str()) * hdrUnit;
+            const double DY = std::atof(b.get("DY").c_str()) * hdrUnit;
+            const int NX = std::max(1, std::atoi(b.get("NX").c_str()));
+            const int NY = std::max(1, std::atoi(b.get("NY").c_str()));
+            const double angle = std::atof(b.get("ANGLE").c_str());  // CCW
+
+            // Realize each child layer ONCE (geometry-only), datum at the
+            // origin, then stamp the grid.
+            const auto childGeometry = [&](const std::string& layer) {
+                const FeaturesFile ff = parseFeatures(
+                    fsys.read(childDir + "layers/" + layer + "/features"));
+                FeatureRealizer real(ff, userSymbol, art.warnings);
+                DarkClearAcc comp;
+                for (const Feature& f : ff.features) {
+                    Paths64 polys = real.realize(f);
+                    if (polys.empty()) continue;
+                    if (f.dark) comp.dark(polys);
+                    else comp.clear(polys);
+                }
+                Paths64 base = comp.take();
+                if (!base.empty() && (datumX != 0 || datumY != 0))
+                    base = TranslatePaths(base, geom::toInt(-datumX),
+                                          geom::toInt(-datumY));
+                return base;
+            };
+            const auto stamp = [&](const Paths64& base, Paths64& dst) {
+                if (base.empty()) return;
+                for (int i = 0; i < NX; ++i)
+                    for (int j = 0; j < NY; ++j) {
+                        Paths64 inst = io::placed(base, X + i * DX,
+                                                  Y + j * DY, -angle, false);
+                        dst.insert(dst.end(), inst.begin(), inst.end());
+                    }
+            };
+            for (const MatrixLayer* ml : copperLayers)
+                stamp(childGeometry(ml->name), srLayer[toLower(ml->name)]);
+            for (const MatrixLayer* ml : maskLayers)
+                stamp(childGeometry(ml->name), srLayer[toLower(ml->name)]);
+            for (const MatrixLayer* ml : silkLayers)
+                stamp(childGeometry(ml->name), srLayer[toLower(ml->name)]);
+            for (const MatrixLayer* ml : drillLayers) {
+                // Holes only; plating from the layer name, like the main
+                // drill pass.
+                const FeaturesFile ff = parseFeatures(
+                    fsys.read(childDir + "layers/" + ml->name + "/features"));
+                FeatureRealizer real(ff, userSymbol, art.warnings);
+                std::string upper = ml->name;
+                std::transform(upper.begin(), upper.end(), upper.begin(),
+                               ::toupper);
+                const bool plated =
+                    upper.find("NON-PLATED") == std::string::npos &&
+                    upper.find("NON_PLATED") == std::string::npos;
+                Paths64 holes;
+                for (const Feature& f : ff.features) {
+                    if (!f.dark || (f.kind != Feature::Kind::Pad &&
+                                    f.kind != Feature::Kind::Line))
+                        continue;
+                    const Paths64 polys = real.realize(f);
+                    holes.insert(holes.end(), polys.begin(), polys.end());
+                }
+                if (!holes.empty() && (datumX != 0 || datumY != 0))
+                    holes = TranslatePaths(holes, geom::toInt(-datumX),
+                                           geom::toInt(-datumY));
+                stamp(holes, srDrills);
+                if (plated) stamp(holes, srBarrels);
+            }
+            srInstances += NX * NY;
+        }
+        if (srInstances > 0)
+            art.notes.push_back(
+                "step-repeat expanded: " + std::to_string(srInstances) +
+                " instance(s) merged (geometry only -- open the board step "
+                "for nets)");
+    }
+
     // ---- copper layers ----------------------------------------------------
     int textSkipped = 0;
     for (int ci = 0; ci < nCopper; ++ci) {
@@ -195,9 +333,10 @@ geom::LayerArt importJob(const std::string& path) {
         const std::string featPath = stepDir + "layers/" + ml.name + "/features";
         const FeaturesFile ff = parseFeatures(fsys.read(featPath));
         textSkipped += ff.textCount;
-        if (!ml.positive)
-            art.warnings.push_back("layer '" + ml.name +
-                                   "' is NEGATIVE; rendered as positive");
+        // A NEGATIVE layer (power/ground plane in classic jobs) inverts:
+        // the layer is a copper sheet over the board area and its features
+        // are the clearances.
+        const bool negative = !ml.positive;
 
         FeatureRealizer real(ff, userSymbol, art.warnings);
         const int lyrIdx = [&] {
@@ -209,17 +348,41 @@ geom::LayerArt importJob(const std::string& path) {
         std::map<int, Paths64> netDark;  // art net (-1 = none) -> raw darks
         const bool top = (ci == 0), bottom = (ci == nCopper - 1);
 
+        if (negative) {
+            if (boardArea.empty()) {
+                art.warnings.push_back(
+                    "layer '" + ml.name +
+                    "' is NEGATIVE but the step has no profile; rendered "
+                    "as positive");
+            } else {
+                comp.dark(boardArea);
+                Paths64& sheet = netDark[-1];
+                sheet.insert(sheet.end(), boardArea.begin(), boardArea.end());
+                art.notes.push_back("negative layer '" + ml.name +
+                                    "' rendered as a plane sheet with its "
+                                    "features as clearances");
+            }
+        }
+        // Panel replicas land as plain dark copper.
+        if (const auto sr = srLayer.find(toLower(ml.name));
+            sr != srLayer.end() && !sr->second.empty()) {
+            comp.dark(sr->second);
+            Paths64& bucket = netDark[-1];
+            bucket.insert(bucket.end(), sr->second.begin(), sr->second.end());
+        }
+
+        const bool invert = negative && !boardArea.empty();
         for (size_t fi = 0; fi < ff.features.size(); ++fi) {
             const Feature& f = ff.features[fi];
             Paths64 polys = real.realize(f);
             if (polys.empty()) continue;
-            if (!f.dark) {
+            if (f.dark == invert) {  // inverted on negative layers
                 comp.clear(polys);
                 continue;
             }
             comp.dark(polys);
             int net = -1;
-            if (lyrIdx >= 0) {
+            if (!invert && lyrIdx >= 0) {
                 const auto it =
                     eda.featureNet.find({lyrIdx, static_cast<int>(fi)});
                 if (it != eda.featureNet.end() &&
@@ -270,7 +433,9 @@ geom::LayerArt importJob(const std::string& path) {
             // No real netlist? Every stroke feeds pseudo-net inference.
             al.netArt.push_back(std::move(nr));
         }
-        if (art.nets.empty()) {
+        if (art.nets.empty() && !invert) {
+            // On a negative layer the strokes are clearances, not routes --
+            // feeding them to pseudo-net inference would invent tracks.
             for (const Feature& f : ff.features)
                 if (f.kind == Feature::Kind::Line && f.dark)
                     al.looseSegments.push_back({f.xs, f.ys, f.xe, f.ye});
@@ -287,6 +452,9 @@ geom::LayerArt importJob(const std::string& path) {
         textSkipped += ff.textCount;
         FeatureRealizer real(ff, userSymbol, art.warnings);
         DarkClearAcc comp;
+        if (const auto sr = srLayer.find(toLower(ml.name));
+            sr != srLayer.end())
+            comp.dark(sr->second);
         for (const Feature& f : ff.features) {
             Paths64 polys = real.realize(f);
             if (polys.empty()) continue;
@@ -383,41 +551,29 @@ geom::LayerArt importJob(const std::string& path) {
             }
         }
     }
+    art.drills.insert(art.drills.end(), srDrills.begin(), srDrills.end());
+    art.barrels.insert(art.barrels.end(), srBarrels.begin(), srBarrels.end());
     geom::normalizeWinding(art.drills);
     geom::normalizeWinding(art.barrels);
 
     // ---- outline -----------------------------------------------------------
-    {
-        const FeaturesFile ff = parseFeatures(fsys.read(stepDir + "profile"));
-        FeatureRealizer real(ff, userSymbol, art.warnings);
-        Paths64 surfaces, strokes;
-        for (const Feature& f : ff.features) {
-            if (!f.dark) continue;
-            Paths64 polys = real.realize(f);
-            Paths64& dst =
-                f.kind == Feature::Kind::Surface ? surfaces : strokes;
-            dst.insert(dst.end(), polys.begin(), polys.end());
-        }
-        if (!surfaces.empty()) {
-            // Filled profile: already the board area, holes and all. Do NOT
-            // normalize -- cutout winding is the data.
-            art.outline = Union(surfaces, FillRule::NonZero);
-        } else if (!strokes.empty()) {
-            art.outline = gerber::boardFromProfile(strokes);
-        } else {
-            // No profile: bound the copper, with a warning.
-            Paths64 all;
-            for (const geom::ArtLayer& al : art.layers)
-                if (al.kind == LayerKind::Copper)
-                    all.insert(all.end(), al.art.begin(), al.art.end());
-            const Rect64 bb = GetBounds(all);
-            if (bb.Width() <= 0)
-                throw std::runtime_error(
-                    "ODB++ step has no profile and no copper: " + path);
-            art.outline = {bb.AsPath()};
-            art.warnings.push_back(
-                "step has no profile; using the copper bounding box");
-        }
+    if (!boardArea.empty()) {
+        // Parsed early (negative layers primed from it). Winding preserved:
+        // cutouts are the data.
+        art.outline = std::move(boardArea);
+    } else {
+        // No profile: bound the copper, with a warning.
+        Paths64 all;
+        for (const geom::ArtLayer& al : art.layers)
+            if (al.kind == LayerKind::Copper)
+                all.insert(all.end(), al.art.begin(), al.art.end());
+        const Rect64 bb = GetBounds(all);
+        if (bb.Width() <= 0)
+            throw std::runtime_error(
+                "ODB++ step has no profile and no copper: " + path);
+        art.outline = {bb.AsPath()};
+        art.warnings.push_back(
+            "step has no profile; using the copper bounding box");
     }
 
     if (textSkipped > 0)

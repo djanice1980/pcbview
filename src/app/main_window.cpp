@@ -606,7 +606,11 @@ bool MainWindow::loadBoard(const QString& path) {
                 warnings << QString::fromStdString(w);
         } else if (odb::isOdbJob(path.toStdString())) {
             gerber = true;  // "no BoardModel" path, same as a Gerber package
-            art = odb::importJob(path.toStdString());
+            // PCBVIEW_ODB_STEP opens a specific step -- e.g. a panel step,
+            // whose step-repeats are expanded into the panel view.
+            art = odb::importJob(
+                path.toStdString(),
+                qEnvironmentVariable("PCBVIEW_ODB_STEP").toStdString());
             for (const std::string& w : art.warnings)
                 warnings << QString::fromStdString(w);
         } else if (ipc2581::isIpc2581(path.toStdString())) {

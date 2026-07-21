@@ -845,6 +845,93 @@ static void testOdbDirectory() {
     checkOdbArt(art, "dir");
 }
 
+// ODB++ NEGATIVE layer: the layer is a plane sheet over the profile and its
+// features are clearances -- assert the inversion actually inverts.
+static void testOdbNegative() {
+    const fs::path dir = fs::temp_directory_path() / "pcbview_fix_odb_neg";
+    auto files = odbFixtureFiles();  // copy
+    files["matrix/matrix"] =
+        "STEP {\n   COL=1\n   NAME=pcb\n}\n"
+        "LAYER {\n   ROW=1\n   CONTEXT=BOARD\n   TYPE=SIGNAL\n"
+        "   NAME=top\n   POLARITY=POSITIVE\n}\n"
+        "LAYER {\n   ROW=2\n   CONTEXT=BOARD\n   TYPE=POWER_GROUND\n"
+        "   NAME=plane\n   POLARITY=NEGATIVE\n}\n"
+        "LAYER {\n   ROW=3\n   CONTEXT=BOARD\n   TYPE=SIGNAL\n"
+        "   NAME=bottom\n   POLARITY=POSITIVE\n}\n";
+    // One 1mm-wide clearance stroke across the 9x5 sheet.
+    files["steps/pcb/layers/plane/features"] =
+        "UNITS=MM\n"
+        "$0 r1000\n"
+        "L 0 2.5 9 2.5 0 P 0\n";
+    for (const auto& [rel, text] : files) {
+        const fs::path p = dir / rel;
+        fs::create_directories(p.parent_path());
+        std::ofstream f(p, std::ios::binary);
+        f << text;
+    }
+    geom::LayerArt art = odb::importJob(dir.string());
+    double planeArea = -1;
+    for (const auto& al : art.layers)
+        if (al.name == "plane")
+            planeArea = Clipper2Lib::Area(al.art) /
+                        (geom::kScale * geom::kScale);
+    // 45mm^2 sheet minus a 9x1mm stroke (round caps hang off the edge):
+    // strictly between "not inverted" (~9mm^2 stroke) and the full sheet.
+    CHECK(planeArea > 34.0);
+    CHECK(planeArea < 37.0);
+}
+
+// ODB++ step-repeat: a panel step stamping the board 2x1 -- geometry
+// doubles, and the outline comes from the panel's own profile.
+static void testOdbPanel() {
+    const fs::path dir = fs::temp_directory_path() / "pcbview_fix_odb_panel";
+    auto files = odbFixtureFiles();  // the pcb step, unchanged
+    files["steps/panel/stephdr"] =
+        "UNITS=MM\n"
+        "STEP-REPEAT {\n"
+        "   NAME=pcb\n"
+        "   X=0\n   Y=0\n"
+        "   DX=10\n   DY=0\n"
+        "   NX=2\n   NY=1\n"
+        "   ANGLE=0\n"
+        "}\n";
+    files["steps/panel/profile"] =
+        "UNITS=MM\n"
+        "S P 0\n"
+        "OB 0 0 I\n"
+        "OS 19 0\n"
+        "OS 19 5\n"
+        "OS 0 5\n"
+        "OE\n"
+        "SE\n";
+    for (const auto& [rel, text] : files) {
+        const fs::path p = dir / rel;
+        fs::create_directories(p.parent_path());
+        std::ofstream f(p, std::ios::binary);
+        f << text;
+    }
+    geom::LayerArt single = odb::importJob(dir.string());  // auto: board step
+    geom::LayerArt panel = odb::importJob(dir.string(), "panel");
+
+    CHECK_NEAR(std::abs(Clipper2Lib::Area(panel.outline)) /
+                   (geom::kScale * geom::kScale),
+               95.0, 1e-3);  // 19x5 rail-less panel
+    CHECK(panel.drills.size() == 2 * single.drills.size());
+    CHECK(panel.barrels.size() == 2 * single.barrels.size());
+    const auto copperArea = [](const geom::LayerArt& a, const char* name) {
+        for (const auto& al : a.layers)
+            if (al.name == name)
+                return Clipper2Lib::Area(al.art) /
+                       (geom::kScale * geom::kScale);
+        return 0.0;
+    };
+    CHECK_NEAR(copperArea(panel, "top"), 2 * copperArea(single, "top"), 1e-2);
+    bool srNote = false;
+    for (const auto& n : panel.notes)
+        if (n.find("step-repeat expanded") != std::string::npos) srNote = true;
+    CHECK(srNote);
+}
+
 // ODB++ text: tokenization (multi-word string, trailing version token) and
 // stroke realization through the shared Newstroke path.
 static void testOdbText() {
@@ -1510,6 +1597,8 @@ int main() {
     testArcs();
     testStepRepeat();
     testOdbDirectory();
+    testOdbNegative();
+    testOdbPanel();
     testOdbText();
     testOdbTgz();
     testOdbLzw();
