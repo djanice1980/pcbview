@@ -20,7 +20,12 @@
 
 #include <clipper2/clipper.h>
 
+#include <cstdint>
+#include <cstring>
+#include <map>
 #include <set>
+
+#include <miniz.h>
 
 #include "geom/connectivity.h"
 #include "geom/layer_art.h"
@@ -28,6 +33,9 @@
 #include "io/gerber/gerber_parser.h"
 #include "io/gerber/gerber_project.h"
 #include "io/ipc356/ipc356.h"
+#include "io/odb/odb_features.h"
+#include "io/odb/odb_fs.h"
+#include "io/odb/odb_project.h"
 
 namespace fs = std::filesystem;
 using namespace pcbview;
@@ -634,6 +642,290 @@ static void testCorpus() {
     std::printf("corpus: %d package(s) imported\n", packages);
 }
 
+// ---- ODB++ -----------------------------------------------------------------
+//
+// The same 9x5 fixture board expressed as an ODB++ product model: matrix,
+// profile surface, two signal layers, a plated drill, and an eda/data netlist
+// carrying the same NETA/NETB/NETC ground truth as the Gerber fixture --
+// including feature-index-addressed net membership (FID), the part most worth
+// pinning down.
+
+static const std::map<std::string, std::string>& odbFixtureFiles() {
+    static const std::map<std::string, std::string> files = {
+        {"matrix/matrix",
+         "STEP {\n"
+         "   COL=1\n"
+         "   NAME=pcb\n"
+         "}\n"
+         "LAYER {\n"
+         "   ROW=1\n"
+         "   CONTEXT=BOARD\n"
+         "   TYPE=SOLDER_MASK\n"
+         "   NAME=mask_top\n"
+         "   POLARITY=POSITIVE\n"
+         "}\n"
+         "LAYER {\n"
+         "   ROW=2\n"
+         "   CONTEXT=BOARD\n"
+         "   TYPE=SIGNAL\n"
+         "   NAME=top\n"
+         "   POLARITY=POSITIVE\n"
+         "}\n"
+         "LAYER {\n"
+         "   ROW=3\n"
+         "   CONTEXT=BOARD\n"
+         "   TYPE=SIGNAL\n"
+         "   NAME=bottom\n"
+         "   POLARITY=POSITIVE\n"
+         "}\n"
+         "LAYER {\n"
+         "   ROW=4\n"
+         "   CONTEXT=BOARD\n"
+         "   TYPE=DRILL\n"
+         "   NAME=drill\n"
+         "   POLARITY=POSITIVE\n"
+         "   START_NAME=\n"
+         "   END_NAME=\n"
+         "}\n"},
+        // Feature indices (the FIDs below index these, in order):
+        //  0: L (1,1)-(5,1)   NETA   4mm
+        //  1: L (5,1)-(5,3)   NETA   2mm
+        //  2: L (8,1)-(8,4)   NETB   3mm
+        //  3: P (1,1)         NETA
+        //  4: P (5,3)         NETA
+        //  5: S plane 1x2mm   NETC
+        //  6: P (6.7,2.7)     NETC
+        //  7: P (7.3,4.3)     NETC
+        {"steps/pcb/layers/top/features",
+         "UNITS=MM\n"
+         "$0 r0.3 M\n"
+         "$1 r1.0 M\n"
+         "L 1 1 5 1 0 P 0\n"
+         "L 5 1 5 3 0 P 0\n"
+         "L 8 1 8 4 0 P 0\n"
+         "P 1 1 1 P 0 0\n"
+         "P 5 3 1 P 0 0\n"
+         "S P 0\n"
+         "OB 6.5 2.5 I\n"
+         "OS 7.5 2.5\n"
+         "OS 7.5 4.5\n"
+         "OS 6.5 4.5\n"
+         "OE\n"
+         "SE\n"
+         "P 6.7 2.7 1 P 0 0\n"
+         "P 7.3 4.3 1 P 0 0\n"},
+        {"steps/pcb/layers/bottom/features",
+         "UNITS=MM\n"
+         "$0 r0.3 M\n"
+         "$1 r1.0 M\n"
+         "L 1 1 3 1 0 P 0\n"
+         "P 1 1 1 P 0 0\n"},
+        {"steps/pcb/layers/mask_top/features",
+         "UNITS=MM\n"
+         "$0 r1.2 M\n"
+         "P 1 1 0 P 0 0\n"},
+        {"steps/pcb/layers/drill/features",
+         "UNITS=MM\n"
+         "$0 r0.4 M\n"
+         "P 1 1 0 P 0 0\n"},
+        {"steps/pcb/layers/drill/tools",
+         "TOOLS {\n"
+         "   NUM=1\n"
+         "   TYPE=VIA\n"
+         "   DRILL_SIZE=15.748\n"
+         "}\n"},
+        {"steps/pcb/profile",
+         "UNITS=MM\n"
+         "S P 0\n"
+         "OB 0 0 I\n"
+         "OS 9 0\n"
+         "OS 9 5\n"
+         "OS 0 5\n"
+         "OE\n"
+         "SE\n"},
+        {"steps/pcb/eda/data",
+         "UNITS=MM\n"
+         "LYR top bottom drill\n"
+         "NET NETA\n"
+         "FID C 0 0\n"
+         "FID C 0 1\n"
+         "FID C 0 3\n"
+         "FID C 0 4\n"
+         "FID C 1 0\n"
+         "FID C 1 1\n"
+         "NET NETB\n"
+         "FID C 0 2\n"
+         "NET NETC\n"
+         "FID C 0 5\n"
+         "FID C 0 6\n"
+         "FID C 0 7\n"},
+    };
+    return files;
+}
+
+static void checkOdbArt(geom::LayerArt& art, const char* label) {
+    CHECK(art.nets.size() == 3);
+    if (art.nets.size() != 3) return;
+    CHECK(art.nets[0].name == "NETA");
+    CHECK(art.nets[1].name == "NETB");
+    CHECK(art.nets[2].name == "NETC");
+    CHECK_NEAR(art.nets[0].routedMm, 8.0, 1e-6);
+    CHECK_NEAR(art.nets[1].routedMm, 3.0, 1e-6);
+    CHECK(art.nets[2].hasPlane);
+    CHECK(art.netSegments.size() == 4);
+
+    // 45mm^2 board from the profile surface.
+    CHECK_NEAR(std::abs(Clipper2Lib::Area(art.outline)) /
+                   (geom::kScale * geom::kScale),
+               45.0, 1e-3);
+    CHECK(art.drills.size() == 1);
+    CHECK(art.barrels.size() == 1);  // TYPE=VIA tool -> plated
+
+    int copper = 0, mask = 0;
+    for (const auto& al : art.layers) {
+        if (al.kind == LayerKind::Copper) ++copper;
+        if (al.kind == LayerKind::Soldermask) ++mask;
+    }
+    CHECK(copper == 2);
+    CHECK(mask == 1);
+
+    // Every pad is a net-carrying snap point (5 pads: 3 NETA, 2 NETC).
+    int neta = 0, netc = 0;
+    for (const auto& np : art.netPoints) {
+        if (np.net == 0) ++neta;
+        if (np.net == 2) ++netc;
+    }
+    CHECK(neta == 3);
+    CHECK(netc == 2);
+
+    // The measurement solver walks ODB++ nets like any others.
+    const geom::BoardMesh mesh = geom::assemble(art, {});
+    const geom::LayerArt::NetSeg* four = findSeg(mesh, 4.0);
+    CHECK(four != nullptr);
+    if (!four) {
+        std::printf("  (%s: no 4mm segment)\n", label);
+        return;
+    }
+    CHECK(art.nets[four->net].name == "NETA");
+    double ax, ay, bx, by;
+    lerp(*four, 0.25, ax, ay);
+    lerp(*four, 0.75, bx, by);
+    CHECK_NEAR(geom::netPathLength(mesh, four->net, ax, ay, bx, by), 2.0,
+               1e-3);
+}
+
+static void testOdbDirectory() {
+    const fs::path dir = fs::temp_directory_path() / "pcbview_fix_odb";
+    for (const auto& [rel, text] : odbFixtureFiles()) {
+        const fs::path p = dir / rel;
+        fs::create_directories(p.parent_path());
+        std::ofstream f(p, std::ios::binary);
+        f << text;
+    }
+    CHECK(odb::isOdbJob(dir.string()));
+    geom::LayerArt art = odb::importJob(dir.string());
+    checkOdbArt(art, "dir");
+}
+
+// The same job as a .tgz with a job-name root folder -- the container format
+// ODB++ actually travels in. Exercises the tar reader, gzip inflate, and
+// root stripping in one pass.
+static void testOdbTgz() {
+    std::string tar;
+    const auto octal = [](char* dst, size_t width, uint64_t v) {
+        std::snprintf(dst, width, "%0*llo", static_cast<int>(width - 1),
+                      static_cast<unsigned long long>(v));
+    };
+    for (const auto& [rel, text] : odbFixtureFiles()) {
+        char h[512] = {};
+        const std::string name = "job1/" + rel;
+        std::memcpy(h, name.c_str(), name.size());
+        octal(h + 100, 8, 0644);
+        octal(h + 108, 8, 0);
+        octal(h + 116, 8, 0);
+        octal(h + 124, 12, text.size());
+        octal(h + 136, 12, 0);
+        std::memset(h + 148, ' ', 8);  // checksum computed over spaces
+        h[156] = '0';
+        std::memcpy(h + 257, "ustar", 5);
+        std::memcpy(h + 263, "00", 2);
+        unsigned sum = 0;
+        for (unsigned char c : std::string(h, 512)) sum += c;
+        octal(h + 148, 7, sum);
+        h[155] = ' ';
+        tar.append(h, 512);
+        tar += text;
+        tar.append(512 - text.size() % 512, '\0');
+    }
+    tar.append(1024, '\0');
+
+    // gzip wrap: fixed header + raw deflate (zlib output minus its 2-byte
+    // header and 4-byte adler) + crc32 + isize.
+    mz_ulong zlen = mz_compressBound(static_cast<mz_ulong>(tar.size()));
+    std::string zbuf(zlen, '\0');
+    CHECK(mz_compress(reinterpret_cast<unsigned char*>(zbuf.data()), &zlen,
+                      reinterpret_cast<const unsigned char*>(tar.data()),
+                      static_cast<mz_ulong>(tar.size())) == MZ_OK);
+    std::string gz("\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x00", 10);
+    gz.append(zbuf.data() + 2, zlen - 6);
+    const uint32_t crc = static_cast<uint32_t>(
+        mz_crc32(MZ_CRC32_INIT,
+                 reinterpret_cast<const unsigned char*>(tar.data()),
+                 tar.size()));
+    const uint32_t isz = static_cast<uint32_t>(tar.size());
+    for (const uint32_t v : {crc, isz})
+        for (int i = 0; i < 4; ++i)
+            gz.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+
+    const fs::path tgz = fs::temp_directory_path() / "pcbview_fix_odb.tgz";
+    {
+        std::ofstream f(tgz, std::ios::binary);
+        f << gz;
+    }
+    CHECK(odb::isOdbJob(tgz.string()));
+    geom::LayerArt art = odb::importJob(tgz.string());
+    checkOdbArt(art, "tgz");
+}
+
+// LZW (.Z) decoder sanity: round-trip against a minimal single-width
+// compressor (data short enough that no code-width bump occurs).
+static void testOdbLzw() {
+    const std::string plain = "TOBEORNOTTOBEORTOBEORNOT";
+    std::string z = "\x1f\x9d";
+    z += static_cast<char>(0x80 | 16);  // block mode, maxbits 16
+    uint32_t buf = 0;
+    int bufBits = 0;
+    const auto emit = [&](int code) {
+        buf |= static_cast<uint32_t>(code) << bufBits;
+        bufBits += 9;
+        while (bufBits >= 8) {
+            z.push_back(static_cast<char>(buf & 0xff));
+            buf >>= 8;
+            bufBits -= 8;
+        }
+    };
+    std::map<std::string, int> dict;
+    int next = 257;
+    std::string w;
+    for (const char c : plain) {
+        const std::string wc = w + c;
+        if (w.empty() || dict.count(wc)) {
+            w = wc;
+            continue;
+        }
+        emit(w.size() == 1 ? static_cast<unsigned char>(w[0]) : dict[w]);
+        dict[wc] = next++;
+        w = std::string(1, c);
+    }
+    if (!w.empty())
+        emit(w.size() == 1 ? static_cast<unsigned char>(w[0]) : dict[w]);
+    if (bufBits > 0) z.push_back(static_cast<char>(buf & 0xff));
+
+    std::string round;
+    CHECK(odb::lzwDecompress(z, round));
+    CHECK(round == plain);
+}
+
 int main() {
     testParserTagged();
     testPackageTagged();
@@ -643,6 +935,9 @@ int main() {
     test356Findings();
     testArcs();
     testStepRepeat();
+    testOdbDirectory();
+    testOdbTgz();
+    testOdbLzw();
     testCorpus();
     if (g_failures == 0) {
         std::printf("OK: all checks passed\n");

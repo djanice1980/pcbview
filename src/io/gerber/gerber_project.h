@@ -12,12 +12,20 @@
 //   2. each file's own %TF.FileFunction attribute;
 //   3. filename heuristics, only as a last resort, with a warning.
 
+#include <clipper2/clipper.h>
+
 #include <string>
 #include <vector>
 
 #include "geom/layer_art.h"
 
 namespace pcbview::gerber {
+
+// Board area from a profile drawn as thin stroked LOOPS (perimeter plus
+// cutouts): unions the strokes into ribbons, keeps outer boundaries, even-odd
+// fills. Shared with the ODB++ importer, whose profile files sometimes stroke
+// the outline the same way instead of filling a surface.
+Clipper2Lib::Paths64 boardFromProfile(const Clipper2Lib::Paths64& strokes);
 
 // Import from any of: a .zip path, a directory, or a .gbrjob path.
 // Throws std::runtime_error if nothing usable is found.

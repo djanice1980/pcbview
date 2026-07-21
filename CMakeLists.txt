@@ -187,6 +187,11 @@ add_executable(pcbview WIN32
     src/io/gerber/gerber_parser.cpp
     src/io/gerber/gerber_project.cpp
     src/io/ipc356/ipc356.cpp
+    src/io/odb/odb_fs.cpp
+    src/io/odb/odb_matrix.cpp
+    src/io/odb/odb_features.cpp
+    src/io/odb/odb_eda.cpp
+    src/io/odb/odb_project.cpp
     src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     ${MINIZ_SOURCES}
@@ -259,6 +264,11 @@ add_executable(pcbview_tests
     src/io/gerber/gerber_parser.cpp
     src/io/gerber/gerber_project.cpp
     src/io/ipc356/ipc356.cpp
+    src/io/odb/odb_fs.cpp
+    src/io/odb/odb_matrix.cpp
+    src/io/odb/odb_features.cpp
+    src/io/odb/odb_eda.cpp
+    src/io/odb/odb_project.cpp
     src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     src/text/stroke_text.cpp

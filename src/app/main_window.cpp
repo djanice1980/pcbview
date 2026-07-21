@@ -62,6 +62,7 @@
 #include "app/theme.h"
 #include "io/gerber/gerber_project.h"
 #include "io/kicad/kicad_importer.h"
+#include "io/odb/odb_project.h"
 #include "model/validate.h"
 
 namespace pcbview::app {
@@ -186,7 +187,8 @@ MainWindow::MainWindow(const QString& path) {
         "<div style='font-size:15px'>No board loaded</div>"
         "<div style='font-size:12px; margin-top:10px'>"
         "Open with <b>Ctrl+O</b>, or drop a <b>.kicad_pcb</b>, a gerber "
-        "<b>.zip</b>, a <b>.gbrjob</b>, or a gerber folder here"
+        "<b>.zip</b>, a <b>.gbrjob</b>, an ODB++ job (<b>.tgz</b> or "
+        "folder), or a gerber folder here"
         "</div></div>");
     placeholder_->setAlignment(Qt::AlignCenter);
     placeholder_->setStyleSheet(QString("background:%1").arg(theme::kBg0));
@@ -584,9 +586,10 @@ void MainWindow::rebuildViewport() {
 bool MainWindow::loadBoard(const QString& path) {
     QApplication::setOverrideCursor(Qt::WaitCursor);
 
-    // A .kicad_pcb has full semantics; anything else (a .zip, a folder, a
-    // .gbrjob) is a Gerber package, which resolves straight to LayerArt with no
-    // nets, pads, or components to recover.
+    // A .kicad_pcb has full semantics; an ODB++ job resolves to LayerArt with
+    // real nets from eda/data; anything else (a .zip, a folder, a .gbrjob) is
+    // a Gerber package. ODB++ is probed before Gerber because both accept
+    // folders and .zips -- matrix/matrix inside is what tells them apart.
     const bool isKicad = path.endsWith(".kicad_pcb", Qt::CaseInsensitive);
 
     BoardModel board;
@@ -598,6 +601,11 @@ bool MainWindow::loadBoard(const QString& path) {
             board = kicad::importPcb(path.toStdString());
             art = geom::buildLayerArt(board);
             for (const std::string& w : board.warnings)
+                warnings << QString::fromStdString(w);
+        } else if (odb::isOdbJob(path.toStdString())) {
+            gerber = true;  // "no BoardModel" path, same as a Gerber package
+            art = odb::importJob(path.toStdString());
+            for (const std::string& w : art.warnings)
                 warnings << QString::fromStdString(w);
         } else {
             gerber = true;
@@ -831,8 +839,9 @@ void MainWindow::onOpen() {
     const QString start = QFileInfo(path_).absolutePath();
     const QString path = QFileDialog::getOpenFileName(
         this, "Open board or gerbers", start,
-        "All supported (*.kicad_pcb *.zip *.gbrjob);;"
-        "KiCad PCB (*.kicad_pcb);;Gerber package (*.zip *.gbrjob);;All files (*)");
+        "All supported (*.kicad_pcb *.zip *.gbrjob *.tgz *.tar.gz *.tar);;"
+        "KiCad PCB (*.kicad_pcb);;Gerber package (*.zip *.gbrjob);;"
+        "ODB++ job (*.tgz *.tar.gz *.tar *.zip);;All files (*)");
     if (!path.isEmpty()) loadBoard(path);
 }
 
@@ -1148,6 +1157,9 @@ bool droppable(const QString& localPath) {
     return localPath.endsWith(".kicad_pcb", Qt::CaseInsensitive) ||
            localPath.endsWith(".zip", Qt::CaseInsensitive) ||
            localPath.endsWith(".gbrjob", Qt::CaseInsensitive) ||
+           localPath.endsWith(".tgz", Qt::CaseInsensitive) ||
+           localPath.endsWith(".tar.gz", Qt::CaseInsensitive) ||
+           localPath.endsWith(".tar", Qt::CaseInsensitive) ||
            QFileInfo(localPath).isDir();
 }
 }  // namespace

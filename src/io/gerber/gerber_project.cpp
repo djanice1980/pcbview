@@ -571,6 +571,8 @@ Paths64 parseDrills(const std::string& text, int segments,
 // mounting hole twice (empty), inside an island within a cutout three times
 // (solid), and so on to any depth. Oversizes every edge by half the pen width
 // (~0.05mm) -- negligible, and invisible once copper is clipped to it.
+}  // namespace
+
 Paths64 boardFromProfile(const Paths64& profileDark) {
     const Paths64 ribbons = Union(profileDark, FillRule::NonZero);
 
@@ -595,6 +597,8 @@ Paths64 boardFromProfile(const Paths64& profileDark) {
     // holes vanish). assemble() consumes the opposite-wound holes correctly.
     return Union(outers, FillRule::EvenOdd);
 }
+
+namespace {
 
 bool endsWithNoCase(const std::string& s, const std::string& suffix) {
     if (s.size() < suffix.size()) return false;
