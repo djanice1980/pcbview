@@ -347,9 +347,18 @@ geom::LayerArt importJob(const std::string& path) {
             parseFeatures(fsys.read(stepDir + "layers/" + ml->name + "/features"));
         FeatureRealizer real(ff, userSymbol, art.warnings);
 
-        // Plating from the layer's tools file: non-plated tool sizes become a
-        // size set; a hole matching one is unplated. No tools file = plated
-        // (the safer default for vias, and what the Gerber path does too).
+        // Plating: some exporters split plated/non-plated into separate drill
+        // LAYERS and say so in the name (KiCad: DRILL_NON-PLATED_F.CU-B.CU);
+        // others tag tools in the layer's tools file. No signal = plated (the
+        // safer default for vias, and what the Gerber path does too).
+        const std::string upperName = [&] {
+            std::string u = ml->name;
+            std::transform(u.begin(), u.end(), u.begin(), ::toupper);
+            return u;
+        }();
+        const bool nonPlatedLayer =
+            upperName.find("NON-PLATED") != std::string::npos ||
+            upperName.find("NON_PLATED") != std::string::npos;
         std::set<long long> nonPlatedSizes;  // in micrometres
         const std::string toolsText =
             fsys.read(stepDir + "layers/" + ml->name + "/tools");
@@ -385,7 +394,8 @@ geom::LayerArt importJob(const std::string& path) {
             const Rect64 bb = GetBounds(polys);
             const long long sizeUm = std::llround(
                 std::max(bb.Width(), bb.Height()) / (geom::kScale * 1e-3));
-            const bool plated = nonPlatedSizes.count(sizeUm) == 0;
+            const bool plated =
+                !nonPlatedLayer && nonPlatedSizes.count(sizeUm) == 0;
             for (const Path64& p : polys) {
                 if (fullSpan) {
                     art.drills.push_back(p);

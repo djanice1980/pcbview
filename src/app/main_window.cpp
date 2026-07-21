@@ -666,6 +666,12 @@ bool MainWindow::loadBoard(const QString& path) {
         d << "drills paths=" << baseArt_.drills.size()
           << " area=" << Clipper2Lib::Area(baseArt_.drills) / 1e12 << "mm2 "
           << bbox(baseArt_.drills) << "\n";
+        d << "nets=" << baseArt_.nets.size()
+          << " segments=" << baseArt_.netSegments.size()
+          << " points=" << baseArt_.netPoints.size();
+        double routed = 0.0;
+        for (const auto& n : baseArt_.nets) routed += n.routedMm;
+        d << " routedSum=" << routed << "mm\n";
         d << "barrels paths=" << baseArt_.barrels.size()
           << " area=" << Clipper2Lib::Area(baseArt_.barrels) / 1e12 << "mm2\n";
         // Report the UNIONED area alongside the raw sum. `art` is a raw pile of

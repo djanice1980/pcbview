@@ -135,7 +135,11 @@ Paths64 translated(Paths64 p, double xMm, double yMm, double rotDegCw,
 // ---- standard symbols ------------------------------------------------------
 
 Paths64 standardSymbol(const std::string& name, bool metricDims) {
-    const double unit = metricDims ? 1.0 : 0.0254;  // mils -> mm
+    // Standard symbol dimensions are MILS in imperial product models and
+    // MICROMETERS in metric ones (spec: the M suffix -- and a metric file --
+    // mean microns). KiCad writes "r600.0" for a 0.6mm drill in a UNITS=MM
+    // file; misreading that as mils inflates every pad ~39x.
+    const double unit = metricDims ? 0.001 : 0.0254;
     const auto starts = [&](const char* p) { return name.rfind(p, 0) == 0; };
     const auto dims = [&](size_t prefixLen) {
         Dims d = splitDims(name.substr(prefixLen));
@@ -266,7 +270,7 @@ double FeatureRealizer::symbolWidthMm(int idx) {
             sym.name.rfind("rect", 0) != 0) {
             const Dims d = splitDims(sym.name.substr(1));
             if (!d.v.empty())
-                width = d.v[0] * (sym.metricDims ? 1.0 : 0.0254);
+                width = d.v[0] * (sym.metricDims ? 0.001 : 0.0254);
         }
         if (width <= 0.0) {
             // Fall back to the realized geometry's larger extent.
@@ -357,7 +361,8 @@ FeaturesFile parseFeatures(const std::string& text, bool metricFile) {
         if (semi != std::string::npos) line.resize(semi);
 
         if (line.rfind("UNITS=", 0) == 0) {
-            unit = line.find("MM") != std::string::npos ? 1.0 : 25.4;
+            metricFile = line.find("MM") != std::string::npos;
+            unit = metricFile ? 1.0 : 25.4;
             continue;
         }
         if (line[0] == '$') {  // symbol table: $<n> <name> [M]
@@ -366,7 +371,9 @@ FeaturesFile parseFeatures(const std::string& text, bool metricFile) {
             ls >> idx >> sym >> m;
             FeaturesFile::Symbol s;
             s.name = sym;
-            s.metricDims = (m == "M");
+            // Micron dimensions: flagged per symbol with M, or implied for
+            // the whole table by a metric file (what KiCad writes).
+            s.metricDims = (m == "M") || metricFile;
             const int n = std::atoi(idx.c_str() + 1);
             if (n >= 0) {
                 if (n >= static_cast<int>(out.symbols.size()))

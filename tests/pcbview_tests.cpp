@@ -620,8 +620,12 @@ static void testCorpus() {
         ++packages;
         const std::string name = entry.path().filename().string();
         try {
+            // A corpus folder holding matrix/matrix is an ODB++ job; anything
+            // else is a Gerber package.
             const geom::LayerArt art =
-                gerber::importPackage(entry.path().string());
+                odb::isOdbJob(entry.path().string())
+                    ? odb::importJob(entry.path().string())
+                    : gerber::importPackage(entry.path().string());
             CHECK(!art.outline.empty());
             bool copper = false;
             for (const auto& al : art.layers)
@@ -696,10 +700,11 @@ static const std::map<std::string, std::string>& odbFixtureFiles() {
         //  5: S plane 1x2mm   NETC
         //  6: P (6.7,2.7)     NETC
         //  7: P (7.3,4.3)     NETC
+        // Symbol dims are MICROMETERS in a metric file (KiCad style, no M).
         {"steps/pcb/layers/top/features",
          "UNITS=MM\n"
-         "$0 r0.3 M\n"
-         "$1 r1.0 M\n"
+         "$0 r300\n"
+         "$1 r1000\n"
          "L 1 1 5 1 0 P 0\n"
          "L 5 1 5 3 0 P 0\n"
          "L 8 1 8 4 0 P 0\n"
@@ -716,17 +721,18 @@ static const std::map<std::string, std::string>& odbFixtureFiles() {
          "P 7.3 4.3 1 P 0 0\n"},
         {"steps/pcb/layers/bottom/features",
          "UNITS=MM\n"
-         "$0 r0.3 M\n"
-         "$1 r1.0 M\n"
+         "$0 r300\n"
+         "$1 r1000\n"
          "L 1 1 3 1 0 P 0\n"
          "P 1 1 1 P 0 0\n"},
+        // The explicit M (microns) suffix, the other spelling of the same.
         {"steps/pcb/layers/mask_top/features",
          "UNITS=MM\n"
-         "$0 r1.2 M\n"
+         "$0 r1200 M\n"
          "P 1 1 0 P 0 0\n"},
         {"steps/pcb/layers/drill/features",
          "UNITS=MM\n"
-         "$0 r0.4 M\n"
+         "$0 r400\n"
          "P 1 1 0 P 0 0\n"},
         {"steps/pcb/layers/drill/tools",
          "TOOLS {\n"
