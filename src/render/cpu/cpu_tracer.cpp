@@ -1411,7 +1411,15 @@ bool CpuTracer::patchChase(std::vector<uint8_t>& bgra, uint32_t chaseMs,
     const size_t n = static_cast<size_t>(width_) * height_;
     if (!chasePatchesValid_ || accumSamples_ <= 0 || bgra.size() != n * 4)
         return false;
-    if (!allowStale && chasePatchSamples_ != accumSamples_) return false;
+    if (chasePatchSamples_ != accumSamples_) {
+        // A stale base is only worth reusing when it is decent. Right after a
+        // restart the base is the 1spp first resolve -- near-black on a
+        // highlight-dimmed scene -- and patching it FROZE that black frame on
+        // screen until the next denoise landed. Below the floor, refuse, and
+        // the caller resolves fresh instead.
+        constexpr int kStaleFloor = 32;
+        if (!allowStale || chasePatchSamples_ < kStaleFloor) return false;
+    }
     // A few percent of the pixels; cheaper single-threaded than a pool kick.
     for (const ChasePatch& cp : chasePatches_) {
         const float k = netChase(cp.phase, chaseMs, true);

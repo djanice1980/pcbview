@@ -955,8 +955,11 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
     const bool denoised = !preview && denoisingEnabled_;
     // Threshold, not equality: the sample count runs 1, 5, 9, ... under the
     // 1-then-4 batches, so testing for exact powers of two never fired and the
-    // display froze on the first raw resolve until full convergence.
-    if (denoised && (s >= cpuNextDenoise_ || converged)) {
+    // display froze on the first raw resolve until full convergence. While the
+    // chase dims the scene, OIDN below ~32 samples produces red-smeared
+    // blotches that would then persist as the stale base -- don't make them.
+    const int kickFloor = chasing ? 32 : 4;
+    if (denoised && (s >= std::max(cpuNextDenoise_, kickFloor) || converged)) {
         cpuTracer_->kickDenoiseResolve(chasing);  // dedupes per sample count
         if (s >= cpuNextDenoise_)
             cpuNextDenoise_ = s < 32 ? std::max(2 * s, 4) : s + 32;
@@ -974,7 +977,11 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
         // Patched in place -- a converged chase frame costs ~3% of the pixels
         // instead of three full-image passes (and, with denoising on, no
         // longer re-runs OIDN every frame).
-    } else if (preview || !denoisingEnabled_ || cpuDisplayCache_.empty()) {
+    } else if (preview || !denoisingEnabled_ || cpuDisplayCache_.empty() ||
+               chasing) {
+        // `chasing` here: when the patch above refused (base too weak or too
+        // stale), the chase must still refresh every frame -- resolve fresh,
+        // exactly as the denoise-off path does, rather than freezing the base.
         cpuDisplayCache_ = cpuTracer_->resolveDisplay(false, 0, chasing);
         if (chasing) cpuTracer_->patchChase(cpuDisplayCache_, chaseMs, true);
     }
