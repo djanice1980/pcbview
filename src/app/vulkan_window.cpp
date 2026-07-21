@@ -576,6 +576,16 @@ void VulkanWindow::applyGlobeTumble(float ax) {
     camera_.roll = std::atan2(-glm::dot(b.up, right0), glm::dot(b.up, up0));
 }
 
+void VulkanWindow::advanceAnimationsBy(double dt) {
+    fixedDt_ = dt;
+    stepExplodeAnimation();
+    stepCameraAnimation();
+    stepZoomAnimation();
+    stepSpinAnimation();
+    fixedDt_ = -1.0;
+    requestUpdate();
+}
+
 void VulkanWindow::startSpin(int axis, float degrees, float seconds) {
     if (seconds <= 0.01f || degrees == 0.0f) return;
     spinAxis_ = axis;
@@ -591,8 +601,7 @@ void VulkanWindow::startSpin(int axis, float degrees, float seconds) {
 
 bool VulkanWindow::stepSpinAnimation() {
     if (!spinActive_) return false;
-    const double dt =
-        std::min(static_cast<double>(spinClock_.restart()) / 1000.0, 0.1);
+    const double dt = clockDt(spinClock_);
     float d = static_cast<float>(spinRate_ * dt);
     if (std::abs(d) >= std::abs(spinRemaining_)) {
         d = spinRemaining_;
@@ -624,10 +633,12 @@ void VulkanWindow::render() {
     // The peel eases toward its target here rather than on a QTimer: rendering
     // is on demand, so the animation drives the frames and the frames drive the
     // animation. When it settles, the loop stops and the GPU goes idle again.
-    const bool exploding = stepExplodeAnimation();
-    const bool gliding = stepCameraAnimation();
-    const bool zooming = stepZoomAnimation();
-    const bool spinning = stepSpinAnimation();
+    // Paused = the video recorder owns the clock; state only moves through
+    // advanceAnimationsBy between frames.
+    const bool exploding = !animationsPaused_ && stepExplodeAnimation();
+    const bool gliding = !animationsPaused_ && stepCameraAnimation();
+    const bool zooming = !animationsPaused_ && stepZoomAnimation();
+    const bool spinning = !animationsPaused_ && stepSpinAnimation();
     const bool stillAnimating = exploding || gliding || zooming || spinning;
 
     // Fast-movement: a drag, pan, or any in-flight animation counts as motion.
@@ -967,8 +978,7 @@ bool VulkanWindow::computeZoomAnchor(const QPointF& posDip) {
 bool VulkanWindow::stepZoomAnimation() {
     if (!zoomAnimating_) return false;
 
-    const double dt =
-        std::min(static_cast<double>(zoomClock_.restart()) / 1000.0, 0.1);
+    const double dt = clockDt(zoomClock_);
 
     // Approach in LOG space: zoom is multiplicative, so a linear approach would
     // rush the far end and crawl the near end of a long glide. A log approach
@@ -1034,8 +1044,7 @@ bool VulkanWindow::stepExplodeAnimation() {
 
     // Clamp dt so a stall (a breakpoint, a swapchain rebuild) does not teleport
     // the stack -- the point of this is that it never jumps.
-    const double dt =
-        std::min(static_cast<double>(explodeClock_.restart()) / 1000.0, 0.1);
+    const double dt = clockDt(explodeClock_);
 
     const float remaining = explodeTarget_ - explodeProgress_;
     if (std::abs(remaining) < 1e-3f) {
@@ -1057,8 +1066,7 @@ bool VulkanWindow::stepExplodeAnimation() {
 bool VulkanWindow::stepCameraAnimation() {
     if (!cameraAnimating_) return false;
 
-    const double dt =
-        std::min(static_cast<double>(cameraClock_.restart()) / 1000.0, 0.1);
+    const double dt = clockDt(cameraClock_);
     // Exponential approach, framerate-independent and eases out on its own.
     // Slightly slower than the peel so a view swing reads as deliberate.
     constexpr double kTimeConstant = 0.10;

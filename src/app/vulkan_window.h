@@ -126,6 +126,14 @@ public:
     // shortest way round, which a 360 by definition is not.
     void startSpin(int axis, float degrees, float seconds);
 
+    // ---- offline (video) animation control ---------------------------------
+    // Recording renders every video frame to full convergence, so animations
+    // must not advance with wall time: pause them, then advance the virtual
+    // clock explicitly between frames. Deterministic by construction -- the
+    // same steppers run, just fed a fixed dt.
+    void setAnimationsPaused(bool on) { animationsPaused_ = on; }
+    void advanceAnimationsBy(double dt);
+
     // How far a ring travels per stage, scaled to the board's size.
     float explodeStepMm() const;
 
@@ -242,6 +250,13 @@ private:
     bool stepCameraAnimation();
     bool stepSpinAnimation();
     void applyGlobeTumble(float ax);
+    // Wall-clock dt with a stall clamp, or the video recorder's fixed dt.
+    double clockDt(QElapsedTimer& clock) {
+        if (fixedDt_ >= 0.0) return fixedDt_;
+        return std::min(static_cast<double>(clock.restart()) / 1000.0, 0.1);
+    }
+    double fixedDt_ = -1.0;
+    bool animationsPaused_ = false;
     bool spinActive_ = false;
     int spinAxis_ = 0;          // 0 yaw, 1 pitch, 2 roll
     float spinRemaining_ = 0;   // radians still to sweep (signed)

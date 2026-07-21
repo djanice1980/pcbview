@@ -105,6 +105,18 @@ private:
     void refreshShowcaseList();
     void saveShowcase();
     void loadShowcase();
+
+    // Offline video recording of the playlist: every frame is rendered to
+    // full convergence (denoise included) before it is encoded, on a fixed
+    // virtual clock -- wall time never touches the output.
+    void recordShowcaseVideo();
+    void startVideoRecording(const QString& outPath, int targetHeight,
+                             int fps, bool preferHevc, int quality,
+                             bool quitWhenDone);
+    void videoNextFrame();
+    void videoFinish(const QString& message);
+    struct VideoJob;
+    VideoJob* videoJob_ = nullptr;
     void onSaveScreenshot();
     // mode: 0 = as shown on screen, 1 = flat overhead (top orthographic),
     // 2 = flat overhead printed at the board's true physical size (1:1).

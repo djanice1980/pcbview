@@ -67,6 +67,7 @@
 #include "app/theme.h"
 #include "io/altium/altium_pcb.h"
 #include "io/gerber/gerber_project.h"
+#include "video/mf_encoder.h"
 #include "io/ipc2581/ipc2581.h"
 #include "io/kicad/kicad_importer.h"
 #include "io/odb/odb_project.h"
@@ -338,6 +339,19 @@ MainWindow::MainWindow(const QString& path) {
             refreshShowcaseList();
             if (showcaseForever_) showcaseForever_->setChecked(true);
             startShowcase();
+        });
+    }
+
+    // Headless video hook: PCBVIEW_RECORD="out.mp4|720|30|h265|0" records
+    // the playlist (from PCBVIEW_SHOWCASE or the saved one) and quits.
+    if (qEnvironmentVariableIsSet("PCBVIEW_RECORD")) {
+        const QStringList f = qEnvironmentVariable("PCBVIEW_RECORD").split('|');
+        QTimer::singleShot(1500, this, [this, f] {
+            startVideoRecording(f.value(0), f.value(1, "720").toInt(),
+                                f.value(2, "30").toInt(),
+                                f.value(3, "h265") != "h264",
+                                f.value(4, "0").toInt(),
+                                /*quitWhenDone=*/true);
         });
     }
 
@@ -2095,6 +2109,14 @@ void MainWindow::buildShowcaseDock() {
             [this](bool on) { showcaseLoops_->setEnabled(!on); });
     playRow->addWidget(showcaseForever_);
     playRow->addStretch(1);
+    auto* recordBtn = new QPushButton("Record…");
+    recordBtn->setToolTip(
+        "Render the playlist to an MP4 (H.265 when the GPU can, else "
+        "H.264).\nEvery frame is fully converged and denoised before it is "
+        "encoded.");
+    connect(recordBtn, &QPushButton::clicked, this,
+            &MainWindow::recordShowcaseVideo);
+    playRow->addWidget(recordBtn);
     showcasePlay_ = new QPushButton("Play");
     connect(showcasePlay_, &QPushButton::clicked, this, [this] {
         if (showcaseIndex_ >= 0) stopShowcase("stopped");
@@ -2225,6 +2247,290 @@ void MainWindow::showcaseAdvance() {
         showcaseTimer_->start(static_cast<int>(holdMs));
     });
     showcaseTimer_->start(100);
+}
+
+// ---- showcase video recording ----------------------------------------------
+//
+// The same playlist the Play button runs, rendered offline: animations are
+// paused and advanced by exactly 1/fps per video frame, and each frame is
+// captured through the converge-then-grab path the screenshot export uses --
+// so a path-traced frame is fully accumulated AND denoised before it lands
+// in the file. Held (static) frames are encoded from the previous capture
+// without re-rendering, which makes holds nearly free.
+
+struct MainWindow::VideoJob {
+    video::MfEncoder enc;
+    bool encOpen = false;
+    QString outPath;
+    int fps = 30;
+    bool preferHevc = true;
+    int quality = 0;  // 0 standard, 1 high
+    float exportScale = 1.0f;
+    float savedScale = 1.0f;
+    double dt = 1.0 / 30.0;
+    std::vector<ShowcaseStep> steps;
+    int stepIndex = 0;
+    bool settling = true;
+    double holdLeft = 0.0;
+    int framesEncoded = 0;
+    int estTotal = 1;
+    bool quitWhenDone = false;  // the headless PCBVIEW_RECORD hook
+    QImage lastImage;
+    bool lastStatic = false;
+    std::vector<uint8_t> scratch;  // tight-stride copy for the encoder
+    QProgressDialog* progress = nullptr;
+};
+
+void MainWindow::recordShowcaseVideo() {
+    if (!loaded_ || showcaseSteps_.empty()) {
+        statusBar()->showMessage(
+            "Add showcase steps first — the recorder renders the playlist.",
+            5000);
+        return;
+    }
+    if (videoJob_) return;
+    stopShowcase();
+
+    // ---- options dialog ----------------------------------------------------
+    QDialog dlg(this);
+    dlg.setWindowTitle("Record showcase video");
+    auto* form = new QFormLayout(&dlg);
+    auto* resBox = new QComboBox;
+    resBox->addItem("Window size (1×)", 0);
+    resBox->addItem("1080p", 1080);
+    resBox->addItem("1440p", 1440);
+    resBox->addItem("4K (2160p)", 2160);
+    resBox->setCurrentIndex(1);
+    form->addRow("Resolution:", resBox);
+    auto* fpsBox = new QComboBox;
+    fpsBox->addItem("24", 24);
+    fpsBox->addItem("30", 30);
+    fpsBox->addItem("60", 60);
+    fpsBox->setCurrentIndex(1);
+    form->addRow("Frame rate:", fpsBox);
+    auto* codecBox = new QComboBox;
+    codecBox->addItem("H.265 (falls back to H.264)");
+    codecBox->addItem("H.264");
+    form->addRow("Codec:", codecBox);
+    auto* qualityBox = new QComboBox;
+    qualityBox->addItem("Standard");
+    qualityBox->addItem("High");
+    form->addRow("Quality:", qualityBox);
+
+    double estSeconds = 0.0;
+    for (const ShowcaseStep& s : showcaseSteps_)
+        estSeconds += s.kind == "spin" ? s.holdSec : s.holdSec + 1.2;
+    auto* info = new QLabel(
+        QString("One pass of %1 steps ≈ %2 s of video.\nThe video keeps the "
+                "viewport's aspect ratio.")
+            .arg(showcaseSteps_.size())
+            .arg(estSeconds, 0, 'f', 1));
+    info->setWordWrap(true);
+    form->addRow(info);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok |
+                                         QDialogButtonBox::Cancel);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+
+    const QString suggested = QFileInfo(path_).absolutePath() + "/" +
+                              QFileInfo(path_).completeBaseName() + ".mp4";
+    const QString out = QFileDialog::getSaveFileName(
+        this, "Save video", suggested, "MP4 video (*.mp4)");
+    if (out.isEmpty()) return;
+
+    startVideoRecording(out, resBox->currentData().toInt(),
+                        fpsBox->currentData().toInt(),
+                        codecBox->currentIndex() == 0,
+                        qualityBox->currentIndex(), /*quitWhenDone=*/false);
+}
+
+void MainWindow::startVideoRecording(const QString& outPath, int targetHeight,
+                                     int fps, bool preferHevc, int quality,
+                                     bool quitWhenDone) {
+    if (videoJob_ || showcaseSteps_.empty()) return;
+    stopShowcase();
+
+    auto* job = new VideoJob;
+    job->outPath = outPath;
+    job->fps = std::clamp(fps, 1, 120);
+    job->dt = 1.0 / job->fps;
+    job->preferHevc = preferHevc;
+    job->quality = quality;
+    job->quitWhenDone = quitWhenDone;
+    job->steps = showcaseSteps_;
+    double estSeconds = 0.0;
+    for (const ShowcaseStep& s : job->steps)
+        estSeconds += s.kind == "spin" ? s.holdSec : s.holdSec + 1.2;
+    job->estTotal = std::max(
+        1, static_cast<int>(std::ceil(estSeconds * job->fps)));
+
+    // Scale so the offscreen render height hits the requested line count.
+    const double windowH =
+        viewport_->height() * viewport_->devicePixelRatio();
+    job->exportScale =
+        targetHeight > 0 && windowH > 0
+            ? static_cast<float>(targetHeight / windowH)
+            : 1.0f;
+    job->exportScale = std::clamp(job->exportScale, 0.25f, 4.0f);
+
+    vk::Renderer* r = viewport_->renderer();
+    if (!r) {
+        delete job;
+        return;
+    }
+    job->savedScale = r->renderScale();
+    r->setRenderScale(job->exportScale);
+    viewport_->setAnimationsPaused(true);
+
+    job->progress = new QProgressDialog("Rendering video…", "Cancel", 0,
+                                        job->estTotal, this);
+    job->progress->setWindowTitle("Showcase video");
+    job->progress->setWindowModality(Qt::WindowModal);
+    job->progress->setMinimumDuration(0);
+    job->progress->setAutoClose(false);
+    job->progress->setValue(0);
+
+    videoJob_ = job;
+    applyShowcaseStep(job->steps[0]);
+    job->settling = true;
+    QTimer::singleShot(0, this, &MainWindow::videoNextFrame);
+}
+
+void MainWindow::videoNextFrame() {
+    VideoJob* job = videoJob_;
+    if (!job) return;
+    if (job->progress->wasCanceled()) {
+        videoFinish("cancelled — partial video kept");
+        return;
+    }
+
+    // Advance the virtual clock by one frame, then run the same
+    // settle-then-hold logic the live player uses, in virtual time.
+    viewport_->advanceAnimationsBy(job->dt);
+    if (job->settling) {
+        if (!viewport_->viewAnimating()) {
+            job->settling = false;
+            const ShowcaseStep& s = job->steps[job->stepIndex];
+            job->holdLeft = s.kind == "spin" ? 0.0 : s.holdSec;
+        }
+    } else {
+        job->holdLeft -= job->dt;
+        if (job->holdLeft <= 0.0) {
+            ++job->stepIndex;
+            if (job->stepIndex >= static_cast<int>(job->steps.size())) {
+                videoFinish({});
+                return;
+            }
+            applyShowcaseStep(job->steps[job->stepIndex]);
+            job->settling = true;
+        }
+    }
+
+    job->progress->setLabelText(
+        QString("Rendering video…  step %1/%2, frame %3")
+            .arg(job->stepIndex + 1)
+            .arg(job->steps.size())
+            .arg(job->framesEncoded + 1));
+
+    // A held frame is identical to the previous one: encode it again without
+    // re-rendering.
+    const bool moving = viewport_->viewAnimating();
+    if (!moving && job->lastStatic && !job->lastImage.isNull()) {
+        const std::string err = job->enc.writeFrame(job->scratch.data());
+        if (!err.empty()) {
+            videoFinish(QString::fromStdString(err));
+            return;
+        }
+        ++job->framesEncoded;
+        job->progress->setValue(
+            std::min(job->framesEncoded, job->estTotal));
+        QTimer::singleShot(0, this, &MainWindow::videoNextFrame);
+        return;
+    }
+
+    grabFrame(
+        [this](const QImage& grabbed) {
+            VideoJob* job = videoJob_;
+            if (!job) return;
+            // Encoders want even dimensions; crop a stray line if needed.
+            QImage img = grabbed;
+            const int w = img.width() & ~1, h = img.height() & ~1;
+            if (w != img.width() || h != img.height())
+                img = img.copy(0, 0, w, h);
+            img = img.convertToFormat(QImage::Format_ARGB32);
+
+            if (!job->encOpen) {
+                const double bpp = job->quality == 1 ? 0.20 : 0.10;
+                const int bitrate = std::max(
+                    2'000'000,
+                    static_cast<int>(static_cast<double>(w) * h * job->fps *
+                                     bpp));
+                const std::string err = job->enc.open(
+                    job->outPath.toStdWString(), w, h, job->fps, bitrate,
+                    job->preferHevc);
+                if (!err.empty()) {
+                    videoFinish(QString::fromStdString(err));
+                    return;
+                }
+                job->encOpen = true;
+            } else if (w * 4LL * h != static_cast<long long>(job->scratch.size())) {
+                videoFinish("frame size changed mid-recording (was the "
+                            "window resized?)");
+                return;
+            }
+
+            // Tight-stride copy: QImage rows may be padded.
+            job->scratch.resize(static_cast<size_t>(w) * h * 4);
+            for (int y = 0; y < h; ++y)
+                std::memcpy(job->scratch.data() +
+                                static_cast<size_t>(y) * w * 4,
+                            img.constScanLine(y), static_cast<size_t>(w) * 4);
+            const std::string err = job->enc.writeFrame(job->scratch.data());
+            if (!err.empty()) {
+                videoFinish(QString::fromStdString(err));
+                return;
+            }
+            job->lastImage = img;
+            job->lastStatic = !viewport_->viewAnimating();
+            ++job->framesEncoded;
+            job->progress->setValue(
+                std::min(job->framesEncoded, job->estTotal));
+            QTimer::singleShot(0, this, &MainWindow::videoNextFrame);
+        },
+        job->exportScale);
+}
+
+void MainWindow::videoFinish(const QString& message) {
+    VideoJob* job = videoJob_;
+    if (!job) return;
+    videoJob_ = nullptr;
+
+    QString codec;
+    if (job->encOpen) {
+        job->enc.finish();
+        codec = job->enc.codecUsed();
+    }
+    if (vk::Renderer* r = viewport_->renderer())
+        r->setRenderScale(job->savedScale);
+    viewport_->setAnimationsPaused(false);
+    job->progress->close();
+    job->progress->deleteLater();
+
+    if (message.isEmpty()) {
+        statusBar()->showMessage(
+            QString("Video saved: %1  ·  %2 frames  ·  %3")
+                .arg(job->outPath)
+                .arg(job->framesEncoded)
+                .arg(codec),
+            10000);
+    } else {
+        statusBar()->showMessage("Video: " + message, 8000);
+    }
+    const bool quit = job->quitWhenDone;
+    delete job;
+    if (quit) QTimer::singleShot(0, qApp, &QApplication::quit);
 }
 
 void MainWindow::saveShowcase() {
