@@ -124,7 +124,7 @@ float viewScale(vec3 worldPos) {
     return length(push.cameraPos.xyz - worldPos);
 }
 
-const float kSubstratePeelAlpha = 0.25;
+// Peeled-substrate target opacity: user-adjustable, in extra.y (x1000).
 
 // True if anything opaque lies between `origin` and `origin + dir*tmax`.
 bool occluded(vec3 origin, vec3 dir, float tmax) {
@@ -239,7 +239,7 @@ void main() {
              + vec3(fresnel) * 0.08;
 
     float alpha = mix(m.albedo.a,
-                      mix(m.albedo.a, kSubstratePeelAlpha, push.params.w),
+                      mix(m.albedo.a, float(m.extra.y) * 0.001, push.params.w),
                       m.params.w);
 
     outColor = vec4(lit, alpha);

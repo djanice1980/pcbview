@@ -163,9 +163,10 @@ float viewScale(vec3 worldPos) {
 }
 
 // How transparent the substrate goes at a full peel. The laminate is what hides
-// the copper, so fading it is what makes an exploded view legible -- but it must
-// stay more solid than the mask (0.72) or the board reads as glass.
-const float kSubstratePeelAlpha = 0.25;
+// the copper, so fading it is what makes an exploded view legible. The target
+// opacity is user-adjustable (Board appearance dialog) and rides in the
+// material table's extra.y as fixed-point x1000 -- the push block is at its
+// 128-byte floor, so the per-material SSBO is where a new scalar fits.
 
 void main() {
     Material m = materialTable.materials[inMaterial];
@@ -273,7 +274,7 @@ void main() {
     // partly transparent as the stack peels, so the inner copper is visible
     // through the laminate. At peel 0 this is exactly 1.0, i.e. unchanged.
     float alpha = mix(m.albedo.a,
-                      mix(m.albedo.a, kSubstratePeelAlpha, push.params.w),
+                      mix(m.albedo.a, float(m.extra.y) * 0.001, push.params.w),
                       m.params.w);
 
     outColor = vec4(lit, alpha);

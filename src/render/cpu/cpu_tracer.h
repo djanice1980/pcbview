@@ -95,6 +95,9 @@ public:
     void setPadShine(float s01);
     // cos(sun angular radius) for the soft-shadow cone; 1 = point sun.
     void setSunCosMax(float c) { sunCosMax_ = c; }
+    // Opacity a fully peeled slab fades to (user-adjustable; mirrors the GPU
+    // renderers' value). Caller restarts accumulation.
+    void setPeelAlpha(float a) { peelAlpha_ = a; }
 
     // Net highlighting, mirroring shaders/pathtrace.comp and board_rt.frag.
     //
@@ -196,6 +199,7 @@ private:
     bool preview_ = false;
     bool flat_ = false;  // preview minus shadow/AO rays: the "raster" look
     float sunCosMax_ = 0.99978f;  // cos(1.2 deg): slider default 15
+    float peelAlpha_ = 0.25f;     // fully-peeled substrate opacity
 
     void* device_ = nullptr;  // RTCDevice
     void* scene_ = nullptr;   // RTCScene

@@ -107,6 +107,12 @@ public:
     // routes the substrate through the blended pass permanently (not only while
     // peeling), which is what "translucent flex" needs.
     void setSubstrateAppearance(float r, float g, float b, float opacity);
+    // Opacity a fully peeled substrate slab fades TO in the exploded view
+    // (the at-rest opacity is albedo.a). Reaches the raster shaders through
+    // MaterialGpu::extra.y, the GPU path tracer through pc.misc.w, and the
+    // Embree tracer through its own copy.
+    void setPeelAlpha(float a);
+    float peelAlpha() const { return peelAlpha_; }
 
     // Soldermask colour (both sides). Opacity is kept at its film default -- the
     // mask reads as a translucent film regardless of tint. Same live-update,
@@ -519,6 +525,7 @@ public:
 private:
     std::array<float, 3> substrateColor_ = {0.72f, 0.61f, 0.38f};  // FR4 tan
     float substrateOpacity_ = 1.0f;
+    float peelAlpha_ = 0.25f;  // fully-peeled substrate opacity
     std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};  // green
     float maskOpacity_ = 0.72f;  // mask albedo.a; drives raster blend + PT show-through
     float componentShine_ = 0.0f;  // 0 matte .. 1 chrome (stylised effect)

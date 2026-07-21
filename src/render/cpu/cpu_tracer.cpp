@@ -42,7 +42,7 @@ inline float maxc(V3 a) { return std::max(a.x, std::max(a.y, a.z)); }
 constexpr float PI = 3.14159265359f;
 const V3 kSunDir = normalize({0.35f, 0.25f, 1.0f});
 const V3 kSunColor = {1.0f * 2.6f, 0.95f * 2.6f, 0.88f * 2.6f};
-constexpr float kSubstratePeelAlpha = 0.25f;
+// Peeled-substrate target opacity is user-adjustable: Ctx::peelAlpha.
 
 // ---- RNG, matching pathtrace.comp --------------------------------------
 inline uint32_t hashu(uint32_t x) {
@@ -397,6 +397,7 @@ struct Ctx {
     const Material* mats;
     const uint32_t* triMat;
     float peel;       // substrate fade amount (0 at rest)
+    float peelAlpha;  // opacity a fully peeled slab fades to
     bool preview;     // RT preview: sun shadow + AO, no GI bounces
     bool flat;        // preview minus shadow/AO: primary visibility only
     float sunCosMax;  // cos(sun angular radius); 1 = point sun
@@ -447,7 +448,7 @@ inline V3 vnrm(const Ctx& c, uint32_t i) {
 inline float effAlpha(const Ctx& c, uint32_t prim) {
     const Material& m = c.mats[c.triMat[prim]];
     float a = m.albedo[3];
-    if (m.fade > 0.5f) a = a * (1.0f - c.peel) + kSubstratePeelAlpha * c.peel;
+    if (m.fade > 0.5f) a = a * (1.0f - c.peel) + c.peelAlpha * c.peel;
     return a;
 }
 inline bool opaquePrim(const Ctx& c, uint32_t prim) {
@@ -1065,6 +1066,7 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
     c.mats = materials_.data();
     c.triMat = triMat_.data();
     c.peel = peel_;  // substrate fade while exploded
+    c.peelAlpha = peelAlpha_;
     c.preview = preview_;
     c.flat = flat_;
     c.sunCosMax = sunCosMax_;

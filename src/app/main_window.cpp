@@ -344,6 +344,11 @@ MainWindow::MainWindow(const QString& path) {
             subOpacity_ = p[3].toFloat();
         }
     }
+    // Exploded-view substrate opacity: persisted, dialog-adjustable, with an
+    // env hook for headless captures (PCBVIEW_PEEL_ALPHA=0.12).
+    peelAlpha_ = qEnvironmentVariableIsSet("PCBVIEW_PEEL_ALPHA")
+                     ? qEnvironmentVariable("PCBVIEW_PEEL_ALPHA").toFloat()
+                     : appSettings().value("peelAlpha", 0.25f).toFloat();
     // Silk clipping changes GEOMETRY, so the board must be re-assembled -- by
     // this point in the constructor it has already been built once with the
     // default. Same pattern as PCBVIEW_THICKNESS above.
@@ -841,6 +846,7 @@ void MainWindow::applyAppearance() {
     if (!viewport_->renderer()) return;
     viewport_->renderer()->setSubstrateAppearance(subColor_[0], subColor_[1],
                                                   subColor_[2], subOpacity_);
+    viewport_->renderer()->setPeelAlpha(peelAlpha_);
     viewport_->renderer()->setMaskColor(maskColor_[0], maskColor_[1],
                                         maskColor_[2], maskOpacity_);
     viewport_->renderer()->setComponentShine(fxComponentShine_ / 100.0f);
@@ -2448,6 +2454,18 @@ void MainWindow::showAppearanceDialog() {
     opRow->addWidget(opacityVal);
     form->addRow("Substrate opacity", opRow);
 
+    // Opacity a fully peeled slab fades TO in the exploded view. Separate from
+    // the at-rest opacity above: at rest the board should look like a board,
+    // exploded it should read like glass so inner copper shows through.
+    auto* peelOp = new QSlider(Qt::Horizontal);
+    peelOp->setRange(2, 60);
+    peelOp->setValue(static_cast<int>(peelAlpha_ * 100.0f + 0.5f));
+    auto* peelOpVal = new QLabel(QString::number(peelOp->value()) + "%");
+    auto* peelOpRow = new QHBoxLayout;
+    peelOpRow->addWidget(peelOp);
+    peelOpRow->addWidget(peelOpVal);
+    form->addRow("Substrate opacity (exploded)", peelOpRow);
+
     // --- Soldermask colour ---
     auto* maskBtn = new QPushButton("Choose…");
     QColor maskCurrent =
@@ -2512,6 +2530,13 @@ void MainWindow::showAppearanceDialog() {
                 opacityVal->setText(QString::number(v) + "%");
                 applyColor();
             });
+    connect(peelOp, &QSlider::valueChanged, this, [this, peelOpVal](int v) {
+        peelOpVal->setText(QString::number(v) + "%");
+        peelAlpha_ = v / 100.0f;
+        appSettings().setValue("peelAlpha", peelAlpha_);
+        if (viewport_->renderer()) viewport_->renderer()->setPeelAlpha(peelAlpha_);
+        viewport_->requestUpdate();
+    });
     connect(maskBtn, &QPushButton::clicked, &dlg,
             [this, &maskCurrent, paintMask, &dlg] {
                 const QColor c = QColorDialog::getColor(maskCurrent, &dlg,

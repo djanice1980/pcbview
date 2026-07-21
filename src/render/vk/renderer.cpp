@@ -66,7 +66,8 @@ struct PtPush {
     float right[4];
     float up[4];
     uint32_t dim[4]; // width, height, maxDepth, frameSeed
-    float misc[4];   // x = peel amount 0..1 (substrate fade), yzw unused
+    float misc[4];   // x = peel amount 0..1, y = cos(sun radius),
+                     // z = ortho flag, w = fully-peeled substrate opacity
     // x = first translucent-film triangle (global index) -- the shader re-bases
     // BLAS geometry 1's geometry-local primitive indices with this.
     uint32_t counts[4];
@@ -1118,6 +1119,7 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             // cos(sun angular radius); slider maps 0..1 -> 0..8 degrees.
             p.misc[1] = std::cos(shadowSoftness_ * 8.0f * 3.14159265f / 180.0f);
             p.misc[2] = rayOrtho_ ? 1.0f : 0.0f;
+            p.misc[3] = peelAlpha_;  // fully-peeled substrate opacity
             p.counts[0] = opaqueTriCount_;
             // Highlighted net, as int bits (-1 = none), and its emission
             // strength in hundredths.
@@ -2737,6 +2739,10 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         // shader can turn gl_PrimitiveID into a global index.
         materials[item.material].extra[0] =
             static_cast<uint32_t>(triMaterial.size());
+        // extra.y = fully-peeled substrate opacity, fixed-point x1000 (only
+        // fade materials read it; set everywhere for simplicity).
+        materials[item.material].extra[1] =
+            static_cast<uint32_t>(peelAlpha_ * 1000.0f + 0.5f);
         const uint32_t triCount = item.indexCount / 3;
         for (uint32_t t = 0; t < triCount; ++t) {
             triMaterial.push_back(item.material);
@@ -3311,6 +3317,26 @@ void Renderer::setMaskColor(float r, float g, float b, float opacity) {
     // the change only appears once the camera next moves.
     resetAccumulation();
     ptDenoisedValid_ = false;
+}
+
+void Renderer::setPeelAlpha(float a) {
+    a = std::clamp(a, 0.02f, 1.0f);
+    if (std::abs(a - peelAlpha_) < 1e-3f) return;
+    peelAlpha_ = a;
+    // The raster shaders read it per material (push constants are at their
+    // 128-byte floor); fixed-point in extra.y, matching uploadBoard.
+    if (!materials_.empty() && materialBuffer_.handle) {
+        for (MaterialGpu& m : materials_)
+            m.extra[1] = static_cast<uint32_t>(a * 1000.0f + 0.5f);
+        vkDeviceWaitIdle(device_.handle);
+        uploadViaStaging(materialBuffer_, materials_.data(),
+                         materials_.size() * sizeof(MaterialGpu));
+    }
+    if (cpuMode_ && cpuTracer_) cpuTracer_->setPeelAlpha(a);
+    resetAccumulation();  // a converged translucency mix is now stale
+    ptDenoisedValid_ = false;
+    cpuDisplayCache_.clear();
+    cpuPass_ = 0;
 }
 
 void Renderer::setSubstrateAppearance(float r, float g, float b, float opacity) {
