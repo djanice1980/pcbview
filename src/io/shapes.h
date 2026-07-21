@@ -9,8 +9,10 @@
 #include <algorithm>
 #include <cmath>
 #include <numbers>
+#include <string>
 
 #include "geom/layer_art.h"
+#include "text/stroke_text.h"
 
 namespace pcbview::io {
 
@@ -124,6 +126,51 @@ inline Clipper2Lib::Paths64 placed(Clipper2Lib::Paths64 p, double xMm,
             std::reverse(path.begin(), path.end());
     }
     return p;
+}
+
+// Text as stroked polygons via the Newstroke engine, in the importers'
+// Y-UP space (text::layout emits KiCad's Y-down; the flip happens here).
+// The anchor is the string's LEFT-BOTTOM corner (what ODB++ and Altium
+// use) unless `centred`; rotation is degrees CCW; mirror flips about the
+// anchor for bottom-side text.
+inline Clipper2Lib::Paths64 strokedText(const std::string& utf8, double xMm,
+                                        double yMm, double sizeMm,
+                                        double thicknessMm, double rotDegCcw,
+                                        bool mirror, bool centred = false) {
+    using namespace Clipper2Lib;
+    if (utf8.empty() || sizeMm <= 1e-6 || thicknessMm <= 1e-6) return {};
+    text::TextStyle style;
+    style.size = {sizeMm, sizeMm};
+    style.thickness = thicknessMm;
+    const auto lines = text::layout(utf8, {0.0, 0.0}, style);
+    double dx = 0, dy = 0;
+    if (!centred) {
+        dx = text::measure(utf8, style) * 0.5;
+        dy = sizeMm * 0.5;
+    }
+    const double th = rotDegCcw * std::numbers::pi / 180.0;
+    const double c = std::cos(th), s = std::sin(th);
+    ClipperOffset co;
+    co.ArcTolerance(geom::kScale * 0.001);
+    bool any = false;
+    for (const text::Polyline& line : lines) {
+        Path64 spine;
+        for (const Vec2& p : line) {
+            double lx = p.x + dx;
+            double ly = -p.y + dy;  // Y-down layout -> Y-up board
+            if (mirror) lx = -lx;
+            const double rx = lx * c - ly * s;
+            const double ry = lx * s + ly * c;
+            spine.push_back(toClip(xMm + rx, yMm + ry));
+        }
+        if (spine.size() < 2) continue;
+        co.AddPath(spine, JoinType::Round, EndType::Round);
+        any = true;
+    }
+    if (!any) return {};
+    Paths64 out;
+    co.Execute(thicknessMm * 0.5 * geom::kScale, out);
+    return out;
 }
 
 // Sequential dark/clear compositor, batching consecutive darks into one

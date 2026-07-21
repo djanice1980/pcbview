@@ -92,6 +92,17 @@ public:
         subEnd_ = nullptr;
     }
 
+    std::string readRaw(size_t n) {
+        if (remaining() < n) {
+            pos_ = end_;
+            error_ = true;
+            return {};
+        }
+        std::string s(pos_, n);
+        pos_ += n;
+        return s;
+    }
+
     // u8-length-prefixed string (pad names).
     std::string readShortString() {
         const uint8_t len = read<uint8_t>();
@@ -472,6 +483,50 @@ geom::LayerArt importPcbDoc(const std::string& path) {
             art.nets.push_back({prop(kv, "NAME", "~"), 0.0, 0});
         }
     }
+
+    // ---- WideStrings6: UTF-16 string table for modern text records --------
+    std::map<uint32_t, std::string> wideStrings;
+    {
+        const std::string data = findData("WideStrings6");
+        Reader r(data.data(), data.size());
+        while (r.remaining() >= 8 && !r.error()) {
+            const uint32_t index = r.read<uint32_t>();
+            const uint32_t length = r.read<uint32_t>();
+            std::string s;
+            if (length > 2) {
+                if (length > r.remaining()) break;
+                // UTF-16LE incl. terminator; narrow the latin subset.
+                const std::string raw = r.readRaw(length);
+                for (size_t i = 0; i + 3 < raw.size(); i += 2) {
+                    const uint16_t ch =
+                        static_cast<uint8_t>(raw[i]) |
+                        (static_cast<uint8_t>(raw[i + 1]) << 8);
+                    s.push_back(ch < 0x80 ? static_cast<char>(ch) : '?');
+                }
+            }
+            wideStrings.emplace(index, std::move(s));
+        }
+    }
+
+    // ---- Components6: designators + name/comment visibility ---------------
+    std::vector<std::string> designators;
+    std::vector<bool> nameOn, commentOn;
+    {
+        const std::string data = findData("Components6");
+        Reader r(data.data(), data.size());
+        while (r.remaining() >= 4 && !r.error()) {
+            const auto kv = r.readProperties();
+            if (kv.empty()) break;
+            designators.push_back(prop(kv, "SOURCEDESIGNATOR"));
+            const auto onFlag = [&](const char* key, bool def) {
+                const std::string v = prop(kv, key);
+                if (v.empty()) return def;
+                return v == "T" || v == "TRUE";
+            };
+            nameOn.push_back(onFlag("NAMEON", true));
+            commentOn.push_back(onFlag("COMMENTON", false));
+        }
+    }
     const auto netOf = [&](uint16_t n) -> int {
         return n != kNoNet && n < art.nets.size() ? static_cast<int>(n) : -1;
     };
@@ -728,17 +783,75 @@ geom::LayerArt importPcbDoc(const std::string& path) {
             regions.push_back(std::move(rg));
         }
     }
+    struct TextRec {
+        int layer = 0;
+        uint16_t component = 0xFFFF;
+        double x = 0, y = 0, height = 1.0, rotation = 0, strokeWidth = 0;
+        bool mirror = false;
+        std::string text;
+    };
+    std::vector<TextRec> texts;
     {
         const std::string data = findData("Texts6");
         Reader r(data.data(), data.size());
         while (r.remaining() >= 4 && !r.error()) {
-            if (r.read<uint8_t>() != 5) break;
-            r.beginSubrecord();
+            if (r.read<uint8_t>() != 5) break;  // ALTIUM_RECORD::TEXT
+            const size_t sub1 = r.beginSubrecord();
+            TextRec t;
+            t.layer = r.read<uint8_t>();
+            r.skip(6);
+            t.component = r.read<uint16_t>();
+            r.skip(4);
+            t.x = r.readMm();
+            t.y = r.readMm();
+            t.height = r.readMm();
+            r.skip(2);  // stroke font id
+            t.rotation = r.read<double>();
+            t.mirror = r.read<uint8_t>() != 0;
+            t.strokeWidth = r.readMm();
+            uint32_t wideIndex = 0xFFFFFFFF;
+            bool isComment = false, isDesignator = false;
+            if (sub1 >= 123 && r.subRemaining() >= 6 + 64 + 1 + 4 + 4) {
+                isComment = r.read<uint8_t>() != 0;
+                isDesignator = r.read<uint8_t>() != 0;
+                r.skip(4);   // font style
+                r.skip(64);  // fontname UTF-16
+                r.skip(1);
+                r.skip(4);  // margin border
+                wideIndex = r.read<uint32_t>();
+            }
             r.endSubrecord();
-            // Second subrecord holds the string.
+            // Subrecord 2: legacy 8-bit string; the wide-string table wins
+            // when this text has an entry (modern files).
             r.beginSubrecord();
+            t.text = r.readShortString();
             r.endSubrecord();
-            ++textCount;
+            const auto wide = wideStrings.find(wideIndex);
+            if (wide != wideStrings.end() && !wide->second.empty())
+                t.text = wide->second;
+            // Visibility: Altium hides a component's designator/comment text
+            // via NAMEON/COMMENTON -- respect that or every hidden part
+            // number lands on the silk as clutter.
+            if (t.component < designators.size()) {
+                if (isComment && !commentOn[t.component]) continue;
+                if (isDesignator && !nameOn[t.component]) continue;
+            }
+            // Special strings: ".Designator" resolves through Components6;
+            // ".Comment" has no board-side value to resolve -- count it.
+            std::string lower = t.text;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (lower == ".designator" && t.component < designators.size())
+                t.text = designators[t.component];
+            else if (!lower.empty() && lower[0] == '.') {
+                ++textCount;
+                continue;
+            }
+            if (t.text.empty()) {
+                ++textCount;
+                continue;
+            }
+            texts.push_back(std::move(t));
         }
     }
 
@@ -930,6 +1043,20 @@ geom::LayerArt importPcbDoc(const std::string& path) {
         else if (io::DarkClearAcc* acc = simpleTarget(f.layer)) acc->dark(polys);
         else skip(f.layer);
     }
+    for (const TextRec& t : texts) {
+        const double pen =
+            t.strokeWidth > 1e-6 && t.strokeWidth < t.height
+                ? t.strokeWidth
+                : t.height * 0.15;
+        const Paths64 polys = io::strokedText(t.text, t.x, t.y, t.height, pen,
+                                              t.rotation, t.mirror);
+        if (polys.empty()) continue;
+        const int si = stackIndexOf(t.layer);
+        if (si >= 0) addCopper(si, -1, polys);
+        else if (io::DarkClearAcc* acc = simpleTarget(t.layer)) acc->dark(polys);
+        else skip(t.layer);
+    }
+
     for (const Region& rg : regions) {
         if (rg.keepout || rg.outline.empty()) continue;
         if (rg.kind == Region::Kind::Copper) {

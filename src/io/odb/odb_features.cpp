@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "geom/layer_art.h"
+#include "io/shapes.h"
 
 using namespace Clipper2Lib;
 
@@ -294,8 +295,18 @@ bool FeatureRealizer::symbolIsSquare(int idx) {
 
 Paths64 FeatureRealizer::realize(const Feature& f) {
     switch (f.kind) {
-        case Feature::Kind::Text:
-            return {};
+        case Feature::Kind::Text: {
+            if (f.text.empty() || f.ye <= 0) return {};
+            // font_width semantics vary by writer: a value under half the
+            // char height is taken as the pen width; anything else falls
+            // back to a typical 12% pen.
+            const double thickness =
+                (f.fontWidth > 1e-6 && f.fontWidth < f.ye * 0.5)
+                    ? f.fontWidth
+                    : f.ye * 0.12;
+            return io::strokedText(f.text, f.xs, f.ys, f.ye, thickness,
+                                   f.rotDeg, f.mirror);
+        }
         case Feature::Kind::Surface:
             return f.surface;
         case Feature::Kind::Pad:
@@ -479,10 +490,46 @@ FeaturesFile parseFeatures(const std::string& text, bool metricFile) {
             f.dark = (pol != "N");
             out.features.push_back(std::move(f));
             surfaceIdx = static_cast<int>(out.features.size()) - 1;
-        } else if (tag == "T" || tag == "B") {
+        } else if (tag == "T") {
             closeSurface();
+            // T <x> <y> <font> <polarity> <orient> <xsize> <ysize>
+            //   <font_width> <text...> [version]
             Feature f;
             f.kind = Feature::Kind::Text;
+            std::string font, pol;
+            int orient = 0;
+            double xs = 0, ys = 0, w = 0, h = 0;
+            ls >> xs >> ys >> font >> pol >> orient >> w >> h >> f.fontWidth;
+            f.xs = xs * unit;
+            f.ys = ys * unit;
+            f.xe = w * unit;
+            f.ye = h * unit;
+            f.fontWidth *= unit;
+            f.dark = (pol != "N");
+            if (orient >= 8) {
+                ls >> f.rotDeg;  // CCW, native
+                f.mirror = (orient == 9);
+            } else {
+                f.rotDeg = 90.0 * (orient & 3);
+                f.mirror = orient >= 4;
+            }
+            std::string rest;
+            std::getline(ls, rest);
+            // Trim, then drop a trailing lone version token ("1").
+            size_t a = rest.find_first_not_of(" \t");
+            size_t b = rest.find_last_not_of(" \t");
+            if (a != std::string::npos) rest = rest.substr(a, b - a + 1);
+            else rest.clear();
+            if (rest.size() > 2 &&
+                rest.compare(rest.size() - 2, 2, " 1") == 0)
+                rest.resize(rest.size() - 2);
+            f.text = rest;
+            if (f.text.empty()) ++out.textCount;
+            out.features.push_back(std::move(f));
+        } else if (tag == "B") {
+            closeSurface();
+            Feature f;
+            f.kind = Feature::Kind::Text;  // barcode: placeholder, unrendered
             out.features.push_back(std::move(f));
             ++out.textCount;
         }

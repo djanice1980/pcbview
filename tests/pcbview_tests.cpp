@@ -835,6 +835,28 @@ static void testOdbDirectory() {
     checkOdbArt(art, "dir");
 }
 
+// ODB++ text: tokenization (multi-word string, trailing version token) and
+// stroke realization through the shared Newstroke path.
+static void testOdbText() {
+    const odb::FeaturesFile tf = odb::parseFeatures(
+        "UNITS=MM\n"
+        "T 1 1 standard P 0 0.8 0.8 0.1 HELLO WORLD 1\n");
+    CHECK(tf.features.size() == 1);
+    if (tf.features.empty()) return;
+    CHECK(tf.features[0].kind == odb::Feature::Kind::Text);
+    CHECK(tf.features[0].text == "HELLO WORLD");
+    CHECK(tf.textCount == 0);  // rendered, not skipped
+    std::vector<std::string> warnings;
+    odb::FeatureRealizer real(tf, nullptr, warnings);
+    const Clipper2Lib::Paths64 polys = real.realize(tf.features[0]);
+    CHECK(!polys.empty());
+    // Ballpark: 10 chars at 0.8mm live in a sane bbox near the anchor.
+    const Clipper2Lib::Rect64 bb = Clipper2Lib::GetBounds(polys);
+    CHECK(bb.Width() / geom::kScale > 2.0);
+    CHECK(bb.Width() / geom::kScale < 12.0);
+    CHECK(bb.Height() / geom::kScale < 2.0);
+}
+
 // The same job as a .tgz with a job-name root folder -- the container format
 // ODB++ actually travels in. Exercises the tar reader, gzip inflate, and
 // root stripping in one pass.
@@ -1313,6 +1335,32 @@ static void testAltiumPcbDoc() {
         pad(1, 2, 6.7, 2.7, 1.0, 1.0, 0) + pad(1, 2, 7.3, 4.3, 1.0, 1.0, 0);
 
     // NETC plane: a polygon with no stored pour -> solid fallback fill.
+    // One text on Top Overlay: "R1" at (2,2), 1mm, unrotated. 40-byte
+    // subrecord1 (the minimal legacy form) + the 8-bit string subrecord.
+    std::string texts6;
+    {
+        std::string g;
+        g.push_back(33);  // TOP_OVERLAY
+        g.append(6, '\0');
+        put16(g, 0xFFFF);  // component
+        g.append(4, '\0');
+        putI32(g, mm(2));
+        putI32(g, mm(2));
+        putI32(g, mm(1));  // height
+        put16(g, 0);       // stroke font
+        putF64(g, 0.0);    // rotation
+        g.push_back(0);    // not mirrored
+        putI32(g, mm(0.15));
+        texts6.push_back(5);  // TEXT
+        put32(texts6, static_cast<uint32_t>(g.size()));
+        texts6 += g;
+        std::string s;
+        s.push_back(2);
+        s += "R1";
+        put32(texts6, static_cast<uint32_t>(s.size()));
+        texts6 += s;
+    }
+
     const std::string polygons6 = props(
         "|LAYER=TOP|NET=2|"
         "VX0=255.906mil|VY0=98.4252mil|"
@@ -1329,6 +1377,7 @@ static void testAltiumPcbDoc() {
                                       {"Nets6", nets6},
                                       {"Tracks6", tracks6},
                                       {"Pads6", pads6},
+                                      {"Texts6", texts6},
                                       {"Polygons6", polygons6}});
 
     const fs::path file = fs::temp_directory_path() / "pcbview_fix.PcbDoc";
@@ -1372,12 +1421,19 @@ static void testAltiumPcbDoc() {
     CHECK(art.barrels.size() == 1);
 
     int copper = 0, mask = 0;
+    double silkArea = 0;
     for (const auto& al : art.layers) {
         if (al.kind == LayerKind::Copper) ++copper;
         if (al.kind == LayerKind::Soldermask) ++mask;
+        if (al.kind == LayerKind::Silkscreen)
+            silkArea += std::abs(Clipper2Lib::Area(al.art)) /
+                        (geom::kScale * geom::kScale);
     }
     CHECK(copper == 2);
     CHECK(mask == 2);  // derived openings on both faces
+    // The "R1" text stroked onto Top Overlay: some ink, sane size.
+    CHECK(silkArea > 0.05);
+    CHECK(silkArea < 2.0);
 
     // Real stackup thickness: 2x1.4mil copper + 60mil dielectric + 2 masks.
     CHECK_NEAR(art.thickness, 2 * 0.03556 + 1.524 + 0.020, 1e-6);
@@ -1444,6 +1500,7 @@ int main() {
     testArcs();
     testStepRepeat();
     testOdbDirectory();
+    testOdbText();
     testOdbTgz();
     testOdbLzw();
     testIpc2581();

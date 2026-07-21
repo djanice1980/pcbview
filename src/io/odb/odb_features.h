@@ -24,11 +24,15 @@ struct Feature {
     // Pad: xs,ys is the flash position.
     double xs = 0, ys = 0, xe = 0, ye = 0, xc = 0, yc = 0;
     bool cw = false;       // Arc direction
-    double rotDeg = 0;     // Pad: clockwise rotation
-    bool mirror = false;   // Pad: mirrored in x before rotation
+    double rotDeg = 0;     // Pad: clockwise rotation. Text: CCW.
+    bool mirror = false;   // Pad/Text: mirrored before rotation
     // Surface: resolved solid polygons (islands minus holes), mm scaled by
     // geom::kScale, ready to union.
     Clipper2Lib::Paths64 surface;
+    // Text: string plus size (xe = char width, ye = char height, both mm)
+    // and the record's font_width field, whose unit varies by writer.
+    std::string text;
+    double fontWidth = 0;
 };
 
 struct FeaturesFile {
@@ -38,7 +42,7 @@ struct FeaturesFile {
     };
     std::vector<Symbol> symbols;
     std::vector<Feature> features;  // file order == eda FID feature index
-    int textCount = 0;              // T records met (not rendered)
+    int textCount = 0;              // barcodes and unrenderable text
 };
 
 // `metricFile`: fallback when the file has no UNITS line (older jobs are
