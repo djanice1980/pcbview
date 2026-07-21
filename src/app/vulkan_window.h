@@ -120,9 +120,10 @@ public:
     }
 
     // Constant-rate camera spin: sweep `degrees` about one axis (0 = yaw /
-    // turntable, 1 = pitch / tumble, 2 = roll / twist) over `seconds`.
-    // The eased view glide cannot express this -- setViewTarget normalises
-    // to the shortest way round, which a 360 by definition is not.
+    // turntable, 1 = pitch / tumble, 2 = roll / twist, 3 = flip -- the
+    // screen-vertical tumble right-drag does) over `seconds`. The eased
+    // view glide cannot express this -- setViewTarget normalises to the
+    // shortest way round, which a 360 by definition is not.
     void startSpin(int axis, float degrees, float seconds);
 
     // How far a ring travels per stage, scaled to the board's size.
@@ -240,6 +241,7 @@ private:
     void setViewTarget(const Camera& dest, bool snap);
     bool stepCameraAnimation();
     bool stepSpinAnimation();
+    void applyGlobeTumble(float ax);
     bool spinActive_ = false;
     int spinAxis_ = 0;          // 0 yaw, 1 pitch, 2 roll
     float spinRemaining_ = 0;   // radians still to sweep (signed)

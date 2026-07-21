@@ -1978,6 +1978,8 @@ constexpr ShowcaseKindDef kShowcaseKinds[] = {
     // For spins the seconds box is the SWEEP duration, not a hold.
     {"Spin 360° (turntable)", "spin", "yaw,360"},
     {"Spin 180° (turntable)", "spin", "yaw,180"},
+    {"Flip 360° (over the side)", "spin", "flip,360"},
+    {"Flip 180° (show the back)", "spin", "flip,180"},
     {"Tumble 360° (pitch)", "spin", "pitch,360"},
     {"Tumble 180° (pitch)", "spin", "pitch,180"},
     {"Twist 360° (roll)", "spin", "roll,360"},
@@ -2140,6 +2142,7 @@ void MainWindow::applyShowcaseStep(const ShowcaseStep& step) {
         const QStringList f = step.param.split(',');
         const int axis = f.value(0) == "pitch" ? 1
                          : f.value(0) == "roll" ? 2
+                         : f.value(0) == "flip" ? 3
                                                 : 0;
         const float deg = f.size() > 1 ? f[1].toFloat() : 360.0f;
         viewport_->startSpin(axis, deg,

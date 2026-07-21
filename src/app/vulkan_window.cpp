@@ -553,6 +553,29 @@ void VulkanWindow::setViewIso() {
     setViewTarget(dest, false);
 }
 
+// One increment of the globe tumble: rotate the eye offset about the
+// CURRENT camera-up, then decompose the result back into yaw/pitch/roll --
+// that parameterisation cannot express the rotation as a single-angle
+// change. Shared by right-drag and the "flip" showcase spin.
+void VulkanWindow::applyGlobeTumble(float ax) {
+    if (ax == 0.0f) return;
+    const Basis b = cameraBasis(camera_);
+    // Up is the rotation axis, so it is invariant; only the eye offset
+    // moves. Same sign convention as yaw (matches left-drag feel at a level
+    // view, where up == world Z).
+    const glm::vec3 offset = rotateAbout(-b.forward, b.up, ax);
+    camera_.pitch = std::asin(glm::clamp(offset.z, -1.0f, 1.0f));
+    if (std::abs(offset.x) + std::abs(offset.y) > 1e-6f)
+        camera_.yaw = std::atan2(offset.x, -offset.y);
+    // Whatever part of the new orientation yaw/pitch can't express lands in
+    // roll: compare the carried-over up against the unrolled reference basis
+    // at the new yaw/pitch.
+    const glm::vec3 right0(std::cos(camera_.yaw), std::sin(camera_.yaw),
+                           0.0f);
+    const glm::vec3 up0 = glm::cross(right0, -offset);
+    camera_.roll = std::atan2(-glm::dot(b.up, right0), glm::dot(b.up, up0));
+}
+
 void VulkanWindow::startSpin(int axis, float degrees, float seconds) {
     if (seconds <= 0.01f || degrees == 0.0f) return;
     spinAxis_ = axis;
@@ -576,6 +599,12 @@ bool VulkanWindow::stepSpinAnimation() {
         spinActive_ = false;
     }
     spinRemaining_ -= d;
+    if (spinAxis_ == 3) {
+        // Flip: the screen-vertical tumble. The decomposition keeps the
+        // angles canonical on its own.
+        applyGlobeTumble(d);
+        return spinActive_;
+    }
     float* angle = spinAxis_ == 1   ? &camera_.pitch
                    : spinAxis_ == 2 ? &camera_.roll
                                     : &camera_.yaw;
@@ -845,25 +874,7 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
         // yaw/pitch/roll parameterisation can't express as one increment --
         // so rotate the basis and decompose back into yaw/pitch/roll.
         const float s = 0.008f;
-        const float ax = static_cast<float>(delta.x()) * s;
-        if (ax != 0.0f) {
-            const Basis b = cameraBasis(camera_);
-            // Up is the rotation axis, so it is invariant; only the eye
-            // offset moves. Same sign convention as yaw (matches left-drag
-            // feel at a level view, where up == world Z).
-            const glm::vec3 offset = rotateAbout(-b.forward, b.up, ax);
-            camera_.pitch = std::asin(glm::clamp(offset.z, -1.0f, 1.0f));
-            if (std::abs(offset.x) + std::abs(offset.y) > 1e-6f)
-                camera_.yaw = std::atan2(offset.x, -offset.y);
-            // Whatever part of the new orientation yaw/pitch can't express
-            // lands in roll: compare the carried-over up against the
-            // unrolled reference basis at the new yaw/pitch.
-            const glm::vec3 right0(std::cos(camera_.yaw),
-                                   std::sin(camera_.yaw), 0.0f);
-            const glm::vec3 up0 = glm::cross(right0, -offset);
-            camera_.roll = std::atan2(-glm::dot(b.up, right0),
-                                      glm::dot(b.up, up0));
-        }
+        applyGlobeTumble(static_cast<float>(delta.x()) * s);
         camera_.roll =
             wrapPi(camera_.roll + static_cast<float>(delta.y()) * s);
         requestUpdate();
