@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <numbers>
 #include <sstream>
 #include <string_view>
@@ -392,6 +393,7 @@ public:
                                 Paths64{});
             na.routedMm = netLen_[name];
             na.segments = netSegs_[name];
+            na.hasRegion = regionNets_.count(name) > 0;
             img.nets.push_back(std::move(na));
         }
         // Do NOT normalize winding here. image_ is the result of Clipper boolean
@@ -434,6 +436,7 @@ private:
     std::string currentNet_;                       // active %TO.N%, "" if none
     std::map<std::string, Paths64> netPaths_;
     std::vector<GerberImage::Flash> flashes_;
+    std::set<std::string> regionNets_;  // nets that drew a G36 region
     std::map<std::string, double> netLen_;
     std::map<std::string, std::vector<NetArea::Seg>> netSegs_;
     bool pendingDark_ = true;
@@ -870,7 +873,10 @@ private:
     void endRegion() {
         if (regionContour_.size() >= 3) regionContours_.push_back(regionContour_);
         regionContour_.clear();
-        if (!regionContours_.empty()) addDark(regionContours_);
+        if (!regionContours_.empty()) {
+            if (!currentNet_.empty()) regionNets_.insert(currentNet_);
+            addDark(regionContours_);
+        }
         regionContours_.clear();
     }
 };

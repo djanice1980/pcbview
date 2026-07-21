@@ -93,6 +93,10 @@ struct BoardMesh {
     // Z of the board's top surface (masks included, components excluded) --
     // the plane free measurement points are projected onto.
     std::vector<SnapPoint> snapPoints;
+    // Mirrored from LayerArt: nets derived from copper connectivity. A
+    // same-net pair here is PROVEN connected (island membership), so a
+    // missing track route means "joined through the copper", not "unknown".
+    bool netsArePseudo = false;
     double boardTopZ = 0.0;
     // Net table for the measure tool (from KiCad, or from Gerber X2 %TO.N%
     // attributes when the package carries them), plus

@@ -54,6 +54,9 @@ struct NetArea {
     double routedMm = 0.0;
     struct Seg { double ax, ay, bx, by; };
     std::vector<Seg> segments;
+    // A G36 region was drawn under this net's tag: pour/plane copper, which
+    // contributes area but no walkable segment.
+    bool hasRegion = false;
 };
 
 struct GerberImage {

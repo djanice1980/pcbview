@@ -807,6 +807,7 @@ geom::LayerArt importPackage(const std::string& path) {
                                                    static_cast<int>(art.nets.size()));
             if (inserted) art.nets.push_back({na.name, 0.0, 0});
             art.nets[it->second].routedMm += na.routedMm;
+            if (na.hasRegion) art.nets[it->second].hasPlane = true;
             for (const NetArea::Seg& sg : na.segments)
                 art.netSegments.push_back({sg.ax, sg.ay, sg.bx, sg.by, it->second});
         }

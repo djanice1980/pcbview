@@ -179,6 +179,10 @@ struct LayerArt {
         // now -- summed from the untagged strokes assigned to their islands --
         // but area remains the honest headline for a net that is mostly pour.)
         double copperMm2 = 0.0;
+        // The net has pour/plane copper (an X2 region or a KiCad zone fill)
+        // that the track graph cannot walk -- so "no track route" between two
+        // of its points can honestly say "joined through the plane" instead.
+        bool hasPlane = false;
     };
     std::vector<NetInfo> nets;
 

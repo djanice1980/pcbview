@@ -1483,10 +1483,18 @@ void VulkanWindow::buildOverlay() {
                 *mesh_, measureANet_, measureA_.x, measureA_.y, end.x, end.y);
             char l1[96], l2[64], l3[64];
             std::snprintf(l1, sizeof(l1), "Net %s", net.name.c_str());
-            if (path >= 0.0)
+            if (path >= 0.0) {
                 std::snprintf(l2, sizeof(l2), "Shortest route %.3f mm", path);
-            else
+            } else if (mesh_->netsArePseudo) {
+                // Derived nets ARE connectivity: same group = proven joined.
+                std::snprintf(l2, sizeof(l2),
+                              "Connected through copper (pour/plane)");
+            } else if (net.hasPlane) {
+                std::snprintf(l2, sizeof(l2),
+                              "Joined through pour/plane copper");
+            } else {
                 std::snprintf(l2, sizeof(l2), "No track route between points");
+            }
             std::snprintf(l3, sizeof(l3), "Net total %.3f mm, %d via%s",
                           net.routedMm, net.viaCount,
                           net.viaCount == 1 ? "" : "s");
@@ -1555,6 +1563,10 @@ void VulkanWindow::updateReadout() {
                 if (path >= 0.0)
                     text += QString("shortest route %1 mm, ")
                                 .arg(path, 0, 'f', 3);
+                else if (mesh_->netsArePseudo)
+                    text += "connected through copper (pour/plane), ";
+                else if (net.hasPlane)
+                    text += "joined through pour/plane copper, ";
                 text += QString("total %1 mm routed")
                             .arg(net.routedMm, 0, 'f', 3);
             }

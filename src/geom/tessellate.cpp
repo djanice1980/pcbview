@@ -761,6 +761,12 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
         }
         for (const ZoneFill& zone : board.zones) {
             if (zone.layer != layerIndex) continue;
+            // A zone fill is pour copper: the net can be "joined through the
+            // plane" where its track graph has no route.
+            {
+                const int ni = netOf(zone.net);
+                if (ni >= 0) art.nets[ni].hasPlane = true;
+            }
             Paths64 fill;
             for (const Polygon& poly : zone.polygons) {
                 Path64 path;
@@ -1329,6 +1335,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
     out.copperFinish = art.copperFinish;
     out.nets = art.nets;
     out.netSegments = art.netSegments;
+    out.netsArePseudo = art.netsArePseudo;
     {
         const auto centre = [](const Path64& p) {
             double sx = 0.0, sy = 0.0;
