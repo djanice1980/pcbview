@@ -789,7 +789,11 @@ private:
         // the alternative -- an analytic arc length that disagrees with the
         // walked graph -- would make the total and the between-two-points
         // distance contradict each other.
-        if (!regionMode_ && !currentNet_.empty()) {
+        // Untagged draws record too, into the "" bucket: a package with no
+        // X2 net attributes still has every stroke, and once pseudo-nets are
+        // derived from the copper these are exactly the graph the measure
+        // tool needs. Tagged packages never read the "" bucket's segments.
+        if (!regionMode_) {
             const auto edge = [&](double ax, double ay, double bx, double by) {
                 const double len = std::hypot(bx - ax, by - ay);
                 if (len <= 1e-9) return;

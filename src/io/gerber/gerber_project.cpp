@@ -823,6 +823,14 @@ geom::LayerArt importPackage(const std::string& path) {
         al.thickness = copperT;
         al.z = total - maskT - static_cast<double>(i) * pitch - copperT;
         al.art = std::move(copper[i].dark);
+        // Untagged strokes, kept per layer for pseudo-net inference (which
+        // assigns each to the island containing it). Nothing reads these when
+        // the package carries real nets.
+        for (const NetArea& na : copper[i].nets) {
+            if (!na.name.empty()) continue;
+            for (const NetArea::Seg& sg : na.segments)
+                al.looseSegments.push_back({sg.ax, sg.ay, sg.bx, sg.by});
+        }
         // Per-net split of this layer's copper, so the mesh keeps net identity
         // per triangle. Anything with no TO.N stays in the -1 bucket and
         // behaves exactly as Gerber always has.

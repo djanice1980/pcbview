@@ -745,15 +745,17 @@ void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
                 handleMeasureClick(e->position());
                 updateReadout();
             } else {
-                // Net pick: the snap points already carry net identity, so a
-                // click near a pad or via names the signal under the cursor.
-                // A click on bare laminate clears the highlight.
+                // Net pick: snap points, the nearest track segment, or (deep)
+                // the copper triangle under the cursor -- so a click names the
+                // signal on pads, mid-trace and pours alike, on real AND
+                // derived nets. A click on bare laminate still clears: nothing
+                // there names a net, so net stays -1.
                 glm::vec3 p;
                 bool snapped = false;
                 int net = -1;
-                screenToBoard(e->position(), p, snapped, net);
+                screenToBoard(e->position(), p, snapped, net, /*deep=*/true);
                 // Ctrl adds to the selection instead of replacing it.
-                emit netPicked(snapped ? net : -1,
+                emit netPicked(net,
                                (e->modifiers() & Qt::ControlModifier) != 0);
             }
         }
@@ -1047,41 +1049,53 @@ void VulkanWindow::setMeasureMode(bool on) {
     requestUpdate();
 }
 
+// Net for an arbitrary world point: a snap point within a hair wins; failing
+// that, the nearest track segment names the net -- mid-trace points are the
+// common case for measuring along a run.
+int VulkanWindow::netAtWorld(const glm::vec3& p) const {
+    if (!mesh_) return -1;
+    for (const geom::SnapPoint& sp : mesh_->snapPoints) {
+        const glm::vec3 w(sp.pos[0], sp.pos[1], sp.pos[2]);
+        if (glm::length(w - p) < 0.05f) return sp.net;
+    }
+    int net = -1;
+    double bestD = 0.6;  // mm
+    for (const geom::LayerArt::NetSeg& s : mesh_->netSegments) {
+        if (s.net < 0) continue;
+        const double vx = s.bx - s.ax, vy = s.by - s.ay;
+        const double ll = vx * vx + vy * vy;
+        double tt =
+            ll > 1e-12 ? ((p.x - s.ax) * vx + (p.y - s.ay) * vy) / ll : 0.0;
+        tt = std::clamp(tt, 0.0, 1.0);
+        const double d = std::hypot(p.x - (s.ax + vx * tt),
+                                    p.y - (s.ay + vy * tt));
+        if (d < bestD) {
+            bestD = d;
+            net = s.net;
+        }
+    }
+    return net;
+}
+
+// Re-resolve a pinned measurement's nets against the CURRENT net table. Nets
+// can appear after the pins were placed -- inferring pseudo-nets is exactly
+// that flow -- and without this the along-the-copper readout stayed dark on
+// endpoints that now sit on perfectly good nets.
+void VulkanWindow::refreshMeasurementNets() {
+    if (measureStage_ < 1) return;
+    measureANet_ = netAtWorld(measureA_);
+    if (measureStage_ >= 2) measureBNet_ = netAtWorld(measureB_);
+    updateReadout();
+    requestUpdate();
+}
+
 void VulkanWindow::setMeasurement(float ax, float ay, float az, float bx,
                                   float by, float bz) {
     measureMode_ = true;
     measureA_ = {ax, ay, az};
     measureB_ = {bx, by, bz};
-    // Resolve nets like a click would: a snap point within a hair of the
-    // position wins; failing that, the nearest track segment names the net --
-    // mid-trace points are the common case for measuring along a run.
-    const auto netAt = [&](const glm::vec3& p) -> int {
-        if (!mesh_) return -1;
-        for (const geom::SnapPoint& sp : mesh_->snapPoints) {
-            const glm::vec3 w(sp.pos[0], sp.pos[1], sp.pos[2]);
-            if (glm::length(w - p) < 0.05f) return sp.net;
-        }
-        int net = -1;
-        double bestD = 0.6;  // mm
-        for (const geom::LayerArt::NetSeg& s : mesh_->netSegments) {
-            if (s.net < 0) continue;
-            const double vx = s.bx - s.ax, vy = s.by - s.ay;
-            const double ll = vx * vx + vy * vy;
-            double tt = ll > 1e-12
-                            ? ((p.x - s.ax) * vx + (p.y - s.ay) * vy) / ll
-                            : 0.0;
-            tt = std::clamp(tt, 0.0, 1.0);
-            const double d = std::hypot(p.x - (s.ax + vx * tt),
-                                        p.y - (s.ay + vy * tt));
-            if (d < bestD) {
-                bestD = d;
-                net = s.net;
-            }
-        }
-        return net;
-    };
-    measureANet_ = netAt(measureA_);
-    measureBNet_ = netAt(measureB_);
+    measureANet_ = netAtWorld(measureA_);
+    measureBNet_ = netAtWorld(measureB_);
     measureStage_ = 2;
     emit measureModeChanged(true);
     updateReadout();
@@ -1107,7 +1121,7 @@ bool VulkanWindow::worldToScreen(const glm::vec3& w, float& px,
 }
 
 bool VulkanWindow::screenToBoard(const QPointF& posDip, glm::vec3& out,
-                                 bool& snapped, int& net) {
+                                 bool& snapped, int& net, bool deep) {
     snapped = false;
     net = -1;
     if (!haveViewProj_ || !mesh_) return false;
@@ -1181,6 +1195,42 @@ bool VulkanWindow::screenToBoard(const QPointF& posDip, glm::vec3& out,
             }
         }
     }
+    // Deep lookup (clicks only -- a full triangle scan is too slow for every
+    // hover move): whichever net-tagged copper TRIANGLE contains the point.
+    // This is what names pads, pours and zone copper -- geometry that has no
+    // centreline segment -- on real and derived nets alike. Topmost wins,
+    // since the pick ray came from above.
+    if (deep && net < 0) {
+        float bestZ = -std::numeric_limits<float>::infinity();
+        for (const geom::Part& part : mesh_->parts) {
+            if (part.triNet.empty()) continue;
+            const auto& vs = part.mesh.vertices;
+            const auto& is = part.mesh.indices;
+            const size_t tris = std::min(part.triNet.size(), is.size() / 3);
+            for (size_t ti = 0; ti < tris; ++ti) {
+                const int tn = part.triNet[ti];
+                if (tn < 0) continue;
+                const auto& v0 = vs[is[ti * 3 + 0]].position;
+                const auto& v1 = vs[is[ti * 3 + 1]].position;
+                const auto& v2 = vs[is[ti * 3 + 2]].position;
+                const float z =
+                    static_cast<float>((v0[2] + v1[2] + v2[2]) / 3.0);
+                if (z <= bestZ) continue;
+                // 2D sign test, tolerant of either winding.
+                const auto side = [&](const auto& a, const auto& b) {
+                    return (out.x - a[0]) * (b[1] - a[1]) -
+                           (out.y - a[1]) * (b[0] - a[0]);
+                };
+                const double s0 = side(v0, v1), s1 = side(v1, v2),
+                             s2 = side(v2, v0);
+                const bool allNeg = s0 <= 0 && s1 <= 0 && s2 <= 0;
+                const bool allPos = s0 >= 0 && s1 >= 0 && s2 >= 0;
+                if (!allNeg && !allPos) continue;
+                bestZ = z;
+                net = tn;
+            }
+        }
+    }
     return true;
 }
 
@@ -1188,7 +1238,7 @@ void VulkanWindow::handleMeasureClick(const QPointF& posDip) {
     glm::vec3 p;
     bool snapped = false;
     int net = -1;
-    if (!screenToBoard(posDip, p, snapped, net)) return;
+    if (!screenToBoard(posDip, p, snapped, net, /*deep=*/true)) return;
     if (measureStage_ == 1) {
         measureB_ = p;
         measureBNet_ = net;

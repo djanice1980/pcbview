@@ -147,6 +147,9 @@ public:
     // synthesised, but the rendering/readout path can still be verified.
     void setMeasurement(float ax, float ay, float az, float bx, float by,
                         float bz);
+    // Re-resolve a pinned measurement's endpoint nets -- call after the net
+    // table changes (pseudo-net inference), so the routed readout catches up.
+    void refreshMeasurementNets();
 
     // Camera readout drawn INTO the frame (not the status bar), so a capture
     // carries the exact view that produced it and can be reproduced from the
@@ -232,11 +235,15 @@ private:
     // with; cursor -> board point by unprojecting through its inverse and
     // intersecting the board-top plane, with snap targets checked first.
     bool worldToScreen(const glm::vec3& w, float& px, float& py) const;
-    // `net` returns the snapped point's index into mesh_->nets, -1 if the
-    // pick was free or the point carries no net.
+    // `net` returns the point's index into mesh_->nets, -1 when nothing under
+    // it names one. Resolution order: snap point, nearest track segment, and
+    // (with `deep`, clicks only -- too slow for hover) the copper triangle
+    // containing the point, which covers pads and pours on real and derived
+    // nets alike.
     bool screenToBoard(const QPointF& posDip, glm::vec3& out, bool& snapped,
-                       int& net);
+                       int& net, bool deep = false);
     void handleMeasureClick(const QPointF& posDip);
+    int netAtWorld(const glm::vec3& p) const;
     // Rebuild the renderer overlay (measure line + dimension callouts) for
     // this frame. Cheap; called from render() after the matrices are known.
     void buildOverlay();

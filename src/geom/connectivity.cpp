@@ -1,6 +1,7 @@
 #include "geom/connectivity.h"
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -207,6 +208,10 @@ PseudoNetStats extractPseudoNets(LayerArt& art, const ProgressFn& progress) {
     report("Publishing nets", 98);
     art.nets.clear();
     for (ArtLayer* al : copper) al->netArt.clear();
+    // (layer, island) -> published net index, for the segment assignment below.
+    std::vector<std::vector<int>> islandNet(perLayer.size());
+    for (size_t li = 0; li < perLayer.size(); ++li)
+        islandNet[li].assign(perLayer[li].size(), -1);
     for (size_t g = 0; g < groups.size(); ++g) {
         LayerArt::NetInfo info;
         info.name = "~" + std::to_string(g + 1);
@@ -215,10 +220,33 @@ PseudoNetStats extractPseudoNets(LayerArt& art, const ProgressFn& progress) {
         info.copperMm2 = groups[g].area / (kScale * kScale);
         art.nets.push_back(std::move(info));
         for (const auto& [li, ii] : groups[g].members) {
+            islandNet[li][ii] = static_cast<int>(g);
             ArtLayer::NetRegion nr;
             nr.net = static_cast<int>(g);
             nr.paths = perLayer[li][ii].paths;
             copper[li]->netArt.push_back(std::move(nr));
+        }
+    }
+
+    // Give the pseudo-nets their SEGMENT GRAPH: every untagged stroke the
+    // parser kept (per layer) belongs to whichever island contains its
+    // midpoint, and therefore to that island's group. This is what makes
+    // click-to-identify and along-the-copper measurement work on derived
+    // nets exactly as they do on a real netlist -- without it, pseudo-nets
+    // could be highlighted but never walked. Also the panel's routed length.
+    art.netSegments.clear();
+    for (size_t li = 0; li < copper.size(); ++li) {
+        for (const ArtLayer::LooseSeg& sg : copper[li]->looseSegments) {
+            const Point64 mid{
+                static_cast<int64_t>(std::llround((sg.ax + sg.bx) * 0.5 * kScale)),
+                static_cast<int64_t>(std::llround((sg.ay + sg.by) * 0.5 * kScale))};
+            const int hit = islandAt(perLayer[li], mid);
+            if (hit < 0) continue;  // a stroke wholly erased by clear polarity
+            const int net = islandNet[li][hit];
+            if (net < 0) continue;
+            art.netSegments.push_back({sg.ax, sg.ay, sg.bx, sg.by, net});
+            art.nets[net].routedMm +=
+                std::hypot(sg.bx - sg.ax, sg.by - sg.ay);
         }
     }
     art.netsArePseudo = true;

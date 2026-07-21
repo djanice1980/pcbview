@@ -1956,6 +1956,9 @@ void MainWindow::inferNetsFromCopper() {
     }
     reassemble();      // netArt changed, so the mesh must carry the new net ids
     populateNets();
+    // A measurement pinned BEFORE the inference now has nets to resolve
+    // against; without this its routed readout stayed dark.
+    viewport_->refreshMeasurementNets();
     dlg.close();
     // Quote both numbers. The total alone reads as an explosion on a dense
     // board, when most of what it found is copper that really is isolated.

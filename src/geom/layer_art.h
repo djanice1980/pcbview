@@ -74,6 +74,16 @@ struct ArtLayer {
     double z = 0.0;  // bottom of the film
     double thickness = 0.0;
 
+    // Linear draws on THIS layer that carried no net tag (mm, net unused).
+    // Kept per layer because pseudo-net inference assigns each one to the
+    // copper island containing it -- and islands from different layers
+    // overlap in 2D, so a flat list could tag a bottom-layer stroke with a
+    // top-layer net. Unused (and empty) when the package carries real nets.
+    struct LooseSeg {
+        double ax = 0, ay = 0, bx = 0, by = 0;
+    };
+    std::vector<LooseSeg> looseSegments;
+
     // What `art` MEANS depends on kind, and the difference is load-bearing:
     //   Copper / Silkscreen : the filled geometry itself
     //   Soldermask          : the OPENINGS, not the film
@@ -165,10 +175,9 @@ struct LayerArt {
         std::string name;
         double routedMm = 0.0;
         int viaCount = 0;
-        // Copper area in mm^2. Meaningful for DERIVED nets, which have no
-        // track centrelines to sum a routed length from -- Gerber copper is
-        // filled regions, not routes, so reporting 0.0 mm routed would be
-        // inventing a number rather than measuring one.
+        // Copper area in mm^2, for DERIVED nets. (Those also get a routedMm
+        // now -- summed from the untagged strokes assigned to their islands --
+        // but area remains the honest headline for a net that is mostly pour.)
         double copperMm2 = 0.0;
     };
     std::vector<NetInfo> nets;
