@@ -1976,22 +1976,23 @@ constexpr ShowcaseKindDef kShowcaseKinds[] = {
     {"Explode 100%", "explode", "100"},
     {"Collapse (explode 0%)", "explode", "0"},
     // For spins the seconds box is the SWEEP duration, not a hold. Negative
-    // degrees run the same sweep the other way; CW/CCW describe the board as
-    // seen from the top.
-    {"Spin 360° CW (turntable)", "spin", "yaw,360"},
-    {"Spin 360° CCW (turntable)", "spin", "yaw,-360"},
-    {"Spin 180° CW (turntable)", "spin", "yaw,180"},
-    {"Spin 180° CCW (turntable)", "spin", "yaw,-180"},
-    {"Flip 360° rightward", "spin", "flip,360"},
-    {"Flip 360° leftward", "spin", "flip,-360"},
-    {"Flip 180° rightward (show back)", "spin", "flip,180"},
-    {"Flip 180° leftward (show back)", "spin", "flip,-180"},
-    {"Tumble 360° forward (pitch)", "spin", "pitch,-360"},
-    {"Tumble 360° backward (pitch)", "spin", "pitch,360"},
-    {"Tumble 180° forward (pitch)", "spin", "pitch,-180"},
-    {"Tumble 180° backward (pitch)", "spin", "pitch,180"},
-    {"Twist 360° CW (roll)", "spin", "roll,360"},
-    {"Twist 360° CCW (roll)", "spin", "roll,-360"},
+    // degrees run the same sweep the other way. Direction words are the
+    // USER'S perception (set by report, not derivation) -- the earlier
+    // geometric labels read as opposite.
+    {"Spin 360° CCW (turntable)", "spin", "yaw,360"},
+    {"Spin 360° CW (turntable)", "spin", "yaw,-360"},
+    {"Spin 180° CCW (turntable)", "spin", "yaw,180"},
+    {"Spin 180° CW (turntable)", "spin", "yaw,-180"},
+    {"Flip 360° leftward", "spin", "flip,360"},
+    {"Flip 360° rightward", "spin", "flip,-360"},
+    {"Flip 180° leftward (show back)", "spin", "flip,180"},
+    {"Flip 180° rightward (show back)", "spin", "flip,-180"},
+    {"Tumble 360° backward (pitch)", "spin", "pitch,-360"},
+    {"Tumble 360° forward (pitch)", "spin", "pitch,360"},
+    {"Tumble 180° backward (pitch)", "spin", "pitch,-180"},
+    {"Tumble 180° forward (pitch)", "spin", "pitch,180"},
+    {"Twist 360° CCW (roll)", "spin", "roll,360"},
+    {"Twist 360° CW (roll)", "spin", "roll,-360"},
 };
 }  // namespace
 
