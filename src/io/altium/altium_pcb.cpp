@@ -406,6 +406,10 @@ geom::LayerArt importPcbDoc(const std::string& path) {
         int id = 0;
         std::string name;
         double copperThick = 0.035, dielBelow = 0.0;
+        // Internal plane (ids 39-54): NEGATIVE content -- the layer is a
+        // net-tied copper sheet and its primitives are the clearances.
+        bool plane = false;
+        std::string planeNet;
     };
     std::vector<StackLayer> copperStack;
     std::vector<Vertex> boardVerts;
@@ -417,14 +421,14 @@ geom::LayerArt importPcbDoc(const std::string& path) {
         const auto kv = r.readProperties();
         boardVerts = verticesFromProps(kv);
 
-        // The stackup is a linked list over LAYER<n> records; only layers on
-        // the chain from TOP (id 1) to BOTTOM (id 32) are in the build.
+        // The stackup is a linked list over LAYER<n> records, TOP (id 1) to
+        // BOTTOM (id 32). The chain routinely passes through INTERNAL PLANE
+        // ids (39-54) on 4+ layer boards -- those are copper layers too.
         const auto layerProps = [&](int id, const char* field) {
             return prop(kv, "LAYER" + std::to_string(id) + field);
         };
         int id = kTopLayer;
-        for (int guard = 0; guard < 64 && id >= kTopLayer && id <= kBottomLayer;
-             ++guard) {
+        for (int guard = 0; guard < 64 && id >= kTopLayer && id <= 54; ++guard) {
             StackLayer sl;
             sl.id = id;
             sl.name = layerProps(id, "NAME");
@@ -433,6 +437,11 @@ geom::LayerArt importPcbDoc(const std::string& path) {
             const double dh = milPropToMm(layerProps(id, "DIELHEIGHT"));
             if (ct > 0) sl.copperThick = ct;
             sl.dielBelow = dh;
+            if (id >= 39 && id <= 54) {
+                sl.plane = true;
+                sl.planeNet =
+                    prop(kv, "PLANE" + std::to_string(id - 38) + "NETNAME");
+            }
             copperStack.push_back(sl);
             if (id == kBottomLayer) break;
             const int next = std::atoi(layerProps(id, "NEXT").c_str());
@@ -766,13 +775,60 @@ geom::LayerArt importPcbDoc(const std::string& path) {
     std::vector<Bucket> copperB(copperStack.size());
     io::DarkClearAcc maskTopB, maskBotB, silkTopB, silkBotB;
 
-    const auto addCopper = [&](int stackIdx, int net, const Paths64& polys) {
+    const auto planeNetOf = [&](int stackIdx) -> int {
+        const std::string& n = copperStack[stackIdx].planeNet;
+        if (n.empty() || n == "(No Net)") return -1;
+        for (size_t i = 0; i < art.nets.size(); ++i)
+            if (art.nets[i].name == n) return static_cast<int>(i);
+        return -1;
+    };
+    // On a PLANE layer everything inverts: the sheet is copper and a
+    // primitive is a clearance -- except split-plane copper regions, which
+    // arrive with forceDark. A primitive on the plane's own net cuts
+    // nothing (it is connected).
+    const auto addCopper = [&](int stackIdx, int net, const Paths64& polys,
+                               bool forceDark = false) {
         if (stackIdx < 0 || polys.empty()) return;
         Bucket& b = copperB[stackIdx];
+        if (copperStack[stackIdx].plane && !forceDark) {
+            if (net >= 0 && net == planeNetOf(stackIdx)) return;
+            b.comp.clear(polys);
+            return;
+        }
         b.comp.dark(polys);
         Paths64& bucket = b.netDark[net];
         bucket.insert(bucket.end(), polys.begin(), polys.end());
     };
+
+    // Board area, needed early to prime the plane sheets. Cutout regions are
+    // already parsed.
+    Paths64 boardArea;
+    {
+        Path64 outline = pathFromVertices(boardVerts);
+        if (outline.size() >= 3) {
+            if (Area(outline) < 0)
+                std::reverse(outline.begin(), outline.end());
+            boardArea = {outline};
+            Paths64 cutouts;
+            for (const Region& rg : regions)
+                if (rg.kind == Region::Kind::BoardCutout)
+                    cutouts.insert(cutouts.end(), rg.outline.begin(),
+                                   rg.outline.end());
+            if (!cutouts.empty())
+                boardArea = Difference(boardArea, cutouts, FillRule::NonZero);
+        }
+    }
+    const double planePullback = 0.508;   // Altium's default 20mil rule
+    const double planeClearance = 0.508;  // ditto for pads/vias through it
+    for (size_t i = 0; i < copperStack.size(); ++i) {
+        if (!copperStack[i].plane || boardArea.empty()) continue;
+        const Paths64 sheet =
+            InflatePaths(boardArea, -planePullback * geom::kScale,
+                         JoinType::Round, EndType::Polygon);
+        const int pnet = planeNetOf(static_cast<int>(i));
+        addCopper(static_cast<int>(i), pnet, sheet, /*forceDark=*/true);
+        if (pnet >= 0) art.nets[pnet].hasPlane = true;
+    }
     // A primitive's target: copper stack index, or a mask/silk accumulator.
     const auto simpleTarget = [&](int layerId) -> io::DarkClearAcc* {
         switch (layerId) {
@@ -809,7 +865,8 @@ geom::LayerArt importPcbDoc(const std::string& path) {
         if (si >= 0) {
             const int net = netOf(t.net);
             addCopper(si, net, polys);
-            if (net >= 0 && !t.polygonoutline) {
+            // Tracks on a plane layer are clearance strokes, not routes.
+            if (net >= 0 && !t.polygonoutline && !copperStack[si].plane) {
                 art.netSegments.push_back({t.x1, t.y1, t.x2, t.y2, net});
                 art.nets[net].routedMm +=
                     std::hypot(t.x2 - t.x1, t.y2 - t.y1);
@@ -862,7 +919,10 @@ geom::LayerArt importPcbDoc(const std::string& path) {
             const int si = stackIndexOf(rg.layer);
             if (si >= 0) {
                 const int net = netOf(rg.net);
-                addCopper(si, net, rg.outline);
+                // On a plane layer a copper region is a SPLIT PLANE piece --
+                // positive copper even though everything else inverts.
+                addCopper(si, net, rg.outline,
+                          /*forceDark=*/copperStack[si].plane);
                 if (net >= 0) art.nets[net].hasPlane = true;
             } else if (io::DarkClearAcc* acc = simpleTarget(rg.layer)) {
                 acc->dark(rg.outline);
@@ -908,6 +968,14 @@ geom::LayerArt importPcbDoc(const std::string& path) {
                           top ? p.topShape : p.botShape,
                           top ? p.topW : p.botW, top ? p.topH : p.botH,
                           top ? p.roundRadiusTop : -1);
+                } else if (copperStack[i].plane) {
+                    // Through a plane, a pad is a clearance around its hole
+                    // (or a connection, which addCopper resolves by net).
+                    if (p.holesize > 0)
+                        addCopper(static_cast<int>(i), net,
+                                  {io::circlePath(
+                                      p.x, p.y,
+                                      p.holesize * 0.5 + planeClearance)});
                 } else {
                     flash(static_cast<int>(i), p.midShape, p.midW, p.midH, -1);
                 }
@@ -957,7 +1025,17 @@ geom::LayerArt importPcbDoc(const std::string& path) {
         const int hi =
             siEnd < 0 ? static_cast<int>(copperStack.size()) - 1 : siEnd;
         const Paths64 ring{io::circlePath(v.x, v.y, v.diameter * 0.5)};
-        for (int i = lo; i <= hi; ++i) addCopper(i, netOf(v.net), ring);
+        for (int i = lo; i <= hi; ++i) {
+            if (copperStack[i].plane) {
+                // Clearance around the barrel unless the via is on the
+                // plane's net (then it connects and cuts nothing).
+                addCopper(i, netOf(v.net),
+                          {io::circlePath(v.x, v.y,
+                                          v.holesize * 0.5 + planeClearance)});
+            } else {
+                addCopper(i, netOf(v.net), ring);
+            }
+        }
         if (netOf(v.net) >= 0) ++art.nets[netOf(v.net)].viaCount;
 
         const Path64 hole = io::circlePath(v.x, v.y, v.holesize * 0.5);
@@ -1000,11 +1078,15 @@ geom::LayerArt importPcbDoc(const std::string& path) {
         al.kind = LayerKind::Copper;
         al.thickness = copperStack[i].copperThick;
         al.z = zOf[i];
+        const bool hadClears = copperB[i].comp.sawClear;
         al.art = copperB[i].comp.take();
         for (auto& [net, darks] : copperB[i].netDark) {
             geom::ArtLayer::NetRegion nr;
             nr.net = net;
-            nr.paths = Union(darks, FillRule::NonZero);
+            // Plane layers erase clearances out of the sheet; the net split
+            // must be clipped to what survived.
+            nr.paths = hadClears ? Intersect(darks, al.art, FillRule::NonZero)
+                                 : Union(darks, FillRule::NonZero);
             if (!nr.paths.empty()) al.netArt.push_back(std::move(nr));
         }
         art.layers.push_back(std::move(al));
@@ -1037,20 +1119,7 @@ geom::LayerArt importPcbDoc(const std::string& path) {
 
     // ---- outline -----------------------------------------------------------
     {
-        Path64 outline = pathFromVertices(boardVerts);
-        Paths64 board;
-        if (outline.size() >= 3) {
-            if (Area(outline) < 0)
-                std::reverse(outline.begin(), outline.end());
-            board = {outline};
-        }
-        Paths64 cutouts;
-        for (const Region& rg : regions)
-            if (rg.kind == Region::Kind::BoardCutout)
-                cutouts.insert(cutouts.end(), rg.outline.begin(),
-                               rg.outline.end());
-        if (!board.empty() && !cutouts.empty())
-            board = Difference(board, cutouts, FillRule::NonZero);
+        Paths64 board = boardArea;  // computed before plane priming
         if (board.empty()) {
             Paths64 all;
             for (const geom::ArtLayer& al : art.layers)
