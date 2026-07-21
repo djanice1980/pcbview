@@ -1643,7 +1643,10 @@ void VulkanWindow::keyPressEvent(QKeyEvent* e) {
                     requestUpdate();
                     return;
                 }
-                break;
+                // Otherwise: un-highlight every net, same as clicking bare
+                // board -- the pick handler treats -1 as "clear".
+                emit netPicked(-1, false);
+                return;
             default:
                 break;
         }

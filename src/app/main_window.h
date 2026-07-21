@@ -178,6 +178,7 @@ private:
     QTreeWidget* netList_ = nullptr;
     QLineEdit* netFilter_ = nullptr;
     QPushButton* inferNetsBtn_ = nullptr;
+    QPushButton* clearNetsBtn_ = nullptr;
     QLabel* pseudoNetNote_ = nullptr;
     int highlightedNet_ = -1;
     QMenu* recentMenu_ = nullptr;

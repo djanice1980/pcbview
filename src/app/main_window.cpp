@@ -24,6 +24,7 @@
 #include <QPlainTextEdit>
 #include <QProgressDialog>
 #include <QLineEdit>
+#include <QShortcut>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
@@ -1822,10 +1823,25 @@ void MainWindow::buildNetDock() {
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(4);
 
+    // Filter plus a Clear button: the list drives highlighting through Qt
+    // selection, and plain clicks can only ever REPLACE a selection -- so
+    // without this there is no discoverable way back to "nothing selected"
+    // (the other routes: Esc, or clicking bare board).
+    auto* filterRow = new QHBoxLayout;
+    filterRow->setContentsMargins(0, 0, 0, 0);
+    filterRow->setSpacing(4);
     netFilter_ = new QLineEdit;
     netFilter_->setPlaceholderText("Filter nets…");
     netFilter_->setClearButtonEnabled(true);
-    layout->addWidget(netFilter_);
+    filterRow->addWidget(netFilter_, 1);
+    clearNetsBtn_ = new QPushButton("Clear");
+    clearNetsBtn_->setToolTip(
+        "Un-highlight every net (Esc, or click bare board, does the same)");
+    clearNetsBtn_->setVisible(false);
+    connect(clearNetsBtn_, &QPushButton::clicked, this,
+            [this] { highlightNet(-1); });
+    filterRow->addWidget(clearNetsBtn_);
+    layout->addLayout(filterRow);
 
     // Derive connectivity from copper when the package has no netlist. On
     // DEMAND, deliberately: inferred data must never appear on load looking
@@ -1887,6 +1903,10 @@ void MainWindow::buildNetDock() {
                           !it->text(0).contains(t, Qt::CaseInsensitive));
         }
     });
+    // Esc while the panel has focus = the same clear.
+    auto* escClear = new QShortcut(QKeySequence(Qt::Key_Escape), panel);
+    escClear->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(escClear, &QShortcut::activated, this, [this] { highlightNet(-1); });
 
     dock->setContent(panel);
     dock->setMinimumWidth(230);
@@ -2145,6 +2165,8 @@ void MainWindow::applyNetHighlights() {
             }
         }
     }
+
+    if (clearNetsBtn_) clearNetsBtn_->setVisible(!highlightedNets_.empty());
 
     if (highlightedNets_.empty()) {
         statusBar()->clearMessage();
