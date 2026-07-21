@@ -302,19 +302,18 @@ void VulkanWindow::createDeviceAndRenderer() {
     if (qEnvironmentVariableIsSet("PCBVIEW_RENDER_SCALE"))
         renderer_->setRenderScale(qgetenv("PCBVIEW_RENDER_SCALE").toFloat());
 
-    // Fast movement (raster while moving) defaults OFF everywhere now, still
-    // persisted per device class with an env override. It used to default ON
-    // for the CPU device on the assumption that raster is the cheap fallback
-    // there -- profiling showed the opposite: llvmpipe executes the full scene
-    // pass inside a synchronous present (~130ms), while the Embree preview's
-    // whole frame is ~21ms. Downgrading to raster during motion made moving
-    // SLOWER.
+    // Fast movement: ON by default for the CPU device, OFF for a GPU, persisted
+    // per device class with an env override. The CPU downgrade no longer means
+    // llvmpipe raster (which profiling showed was the SLOW path) -- since the
+    // Embree-everything change it drops to the flat preview, one primary ray
+    // per pixel, genuinely the cheapest way this device can draw a frame while
+    // the camera moves.
     if (qEnvironmentVariableIsSet("PCBVIEW_FAST_MOVE"))
         fastMove_ = qgetenv("PCBVIEW_FAST_MOVE").toInt() != 0;
     else
         fastMove_ = appSettings()
                         .value(cpuRender() ? "fastMovementCpu" : "fastMovementGpu",
-                               false)
+                               cpuRender())
                         .toBool();
     // A fresh renderer starts in whatever mode we set below; clear any stale
     // motion-downgrade latch from the previous device so the two agree.

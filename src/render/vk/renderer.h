@@ -525,7 +525,7 @@ public:
 private:
     std::array<float, 3> substrateColor_ = {0.72f, 0.61f, 0.38f};  // FR4 tan
     float substrateOpacity_ = 1.0f;
-    float peelAlpha_ = 0.25f;  // fully-peeled substrate opacity
+    float peelAlpha_ = 0.02f;  // fully-peeled substrate opacity
     std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};  // green
     float maskOpacity_ = 0.72f;  // mask albedo.a; drives raster blend + PT show-through
     float componentShine_ = 0.0f;  // 0 matte .. 1 chrome (stylised effect)

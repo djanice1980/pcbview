@@ -145,7 +145,7 @@ private:
     float subOpacity_ = 1.0f;
     // Opacity a fully peeled substrate slab fades to in the exploded view.
     // Persisted ("peelAlpha"); adjustable in the Board appearance dialog.
-    float peelAlpha_ = 0.25f;
+    float peelAlpha_ = 0.02f;
     std::array<float, 3> maskColor_ = {0.010f, 0.246f, 0.025f};
     float maskOpacity_ = 0.72f;
     // Effects menu (stylised, persisted; 0-100 slider values).

@@ -348,7 +348,7 @@ MainWindow::MainWindow(const QString& path) {
     // env hook for headless captures (PCBVIEW_PEEL_ALPHA=0.12).
     peelAlpha_ = qEnvironmentVariableIsSet("PCBVIEW_PEEL_ALPHA")
                      ? qEnvironmentVariable("PCBVIEW_PEEL_ALPHA").toFloat()
-                     : appSettings().value("peelAlpha", 0.25f).toFloat();
+                     : appSettings().value("peelAlpha", 0.02f).toFloat();
     // Silk clipping changes GEOMETRY, so the board must be re-assembled -- by
     // this point in the constructor it has already been built once with the
     // default. Same pattern as PCBVIEW_THICKNESS above.

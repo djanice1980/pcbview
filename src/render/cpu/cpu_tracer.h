@@ -199,7 +199,7 @@ private:
     bool preview_ = false;
     bool flat_ = false;  // preview minus shadow/AO rays: the "raster" look
     float sunCosMax_ = 0.99978f;  // cos(1.2 deg): slider default 15
-    float peelAlpha_ = 0.25f;     // fully-peeled substrate opacity
+    float peelAlpha_ = 0.02f;     // fully-peeled substrate opacity
 
     void* device_ = nullptr;  // RTCDevice
     void* scene_ = nullptr;   // RTCScene
