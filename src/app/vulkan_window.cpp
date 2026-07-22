@@ -582,8 +582,63 @@ void VulkanWindow::advanceAnimationsBy(double dt) {
     stepCameraAnimation();
     stepZoomAnimation();
     stepSpinAnimation();
+    stepPathAnimation();
     fixedDt_ = -1.0;
     requestUpdate();
+}
+
+void VulkanWindow::startPath(std::vector<PathKey> keys, double durationSec) {
+    if (keys.size() < 2 || durationSec <= 0.05) return;
+    pathKeys_ = std::move(keys);
+    pathDuration_ = durationSec;
+    pathT_ = 0.0;
+    pathActive_ = true;
+    cameraAnimating_ = false;
+    zoomAnimating_ = false;
+    spinActive_ = false;
+    pathClock_.restart();
+    requestUpdate();
+}
+
+bool VulkanWindow::stepPathAnimation() {
+    if (!pathActive_) return false;
+    pathT_ += clockDt(pathClock_);
+    // Normalised position along the key list; the keys are uniform in time.
+    double u = pathT_ / pathDuration_;
+    if (u >= 1.0) {
+        u = 1.0;
+        pathActive_ = false;
+    }
+    const int n = static_cast<int>(pathKeys_.size());
+    const double f = u * (n - 1);
+    const int i1 = std::min(static_cast<int>(f), n - 2);
+    const float t = static_cast<float>(f - i1);
+    const int i0 = std::max(i1 - 1, 0);
+    const int i2 = i1 + 1;
+    const int i3 = std::min(i1 + 2, n - 1);
+    // Catmull-Rom per channel. The capture unwrapped angles, so no wrap
+    // handling is needed here.
+    const auto cr = [&](auto get) {
+        const float p0 = get(pathKeys_[i0]), p1 = get(pathKeys_[i1]);
+        const float p2 = get(pathKeys_[i2]), p3 = get(pathKeys_[i3]);
+        const float t2 = t * t, t3 = t2 * t;
+        return 0.5f * ((2.0f * p1) + (-p0 + p2) * t +
+                       (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+                       (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+    };
+    camera_.yaw = cr([](const PathKey& k) { return k.yaw; });
+    camera_.pitch = cr([](const PathKey& k) { return k.pitch; });
+    camera_.roll = cr([](const PathKey& k) { return k.roll; });
+    camera_.distance =
+        std::max(1e-3f, cr([](const PathKey& k) { return k.distance; }));
+    camera_.targetX = cr([](const PathKey& k) { return k.tx; });
+    camera_.targetY = cr([](const PathKey& k) { return k.ty; });
+    camera_.targetZ = cr([](const PathKey& k) { return k.tz; });
+    const float ex =
+        std::max(0.0f, cr([](const PathKey& k) { return k.explode; }));
+    explodeProgress_ = explodeTarget_ = ex;
+    pushExplode();
+    return pathActive_;
 }
 
 void VulkanWindow::startSpin(int axis, float degrees, float seconds) {
@@ -639,7 +694,9 @@ void VulkanWindow::render() {
     const bool gliding = !animationsPaused_ && stepCameraAnimation();
     const bool zooming = !animationsPaused_ && stepZoomAnimation();
     const bool spinning = !animationsPaused_ && stepSpinAnimation();
-    const bool stillAnimating = exploding || gliding || zooming || spinning;
+    const bool pathing = !animationsPaused_ && stepPathAnimation();
+    const bool stillAnimating =
+        exploding || gliding || zooming || spinning || pathing;
 
     // Fast-movement: a drag, pan, or any in-flight animation counts as motion.
     // While moving, render plain raster; restore the requested mode when it

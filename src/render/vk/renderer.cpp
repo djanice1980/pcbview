@@ -1730,6 +1730,24 @@ void Renderer::createSwapchain(uint32_t width, uint32_t height) {
     info.preTransform = caps.currentTransform;
     info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     info.presentMode = VK_PRESENT_MODE_FIFO_KHR;  // always available
+    if (uncappedPresent_) {
+        // The recorder wants frames as fast as the GPU makes them, not at
+        // the display's refresh. Prefer IMMEDIATE, take MAILBOX, else stay
+        // capped on FIFO.
+        uint32_t nModes = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(device_.gpu.handle, surface_,
+                                                  &nModes, nullptr);
+        std::vector<VkPresentModeKHR> modes(nModes);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(device_.gpu.handle, surface_,
+                                                  &nModes, modes.data());
+        for (const VkPresentModeKHR want :
+             {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR}) {
+            if (std::find(modes.begin(), modes.end(), want) != modes.end()) {
+                info.presentMode = want;
+                break;
+            }
+        }
+    }
     info.clipped = VK_TRUE;
     check(vkCreateSwapchainKHR(device_.handle, &info, nullptr, &swapchain_),
           "vkCreateSwapchainKHR");
@@ -3799,10 +3817,11 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     present.pImageIndices = &imageIndex;
     VkResult presented = vkQueuePresentKHR(device_.graphicsQueue, &present);
 
-    if (!capturePath_.empty()) {
+    if (!capturePath_.empty() || captureBuffer_) {
         vkQueueWaitIdle(device_.graphicsQueue);
         captureImage(imageIndex);
         capturePath_.clear();
+        captureBuffer_ = nullptr;
     }
 
     frame_ = (frame_ + 1) % kFramesInFlight;
@@ -3812,6 +3831,13 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     }
     check(presented, "vkQueuePresentKHR");
     return true;
+}
+
+void Renderer::setUncappedPresent(bool on) {
+    if (uncappedPresent_ == on) return;
+    uncappedPresent_ = on;
+    if (extent_.width > 0 && extent_.height > 0)
+        resize(extent_.width, extent_.height);
 }
 
 void Renderer::resize(uint32_t width, uint32_t height) {
@@ -3910,6 +3936,21 @@ void Renderer::captureImage(uint32_t imageIndex) {
     void* mapped = nullptr;
     check(vkMapMemory(device_.handle, host.memory, 0, size, 0, &mapped),
           "vkMapMemory(capture)");
+
+    // In-memory capture: hand the tight top-down BGRA straight over -- the
+    // video encoder wants exactly this, and skipping the BMP round-trip is a
+    // large part of what makes recording fast.
+    if (captureBuffer_) {
+        captureBuffer_->pixels.assign(
+            static_cast<const uint8_t*>(mapped),
+            static_cast<const uint8_t*>(mapped) + size);
+        captureBuffer_->width = srcExtent.width;
+        captureBuffer_->height = srcExtent.height;
+        captureBuffer_->done = true;
+        vkUnmapMemory(device_.handle, host.memory);
+        destroyBuffer(host);
+        return;
+    }
 
     // The swapchain is B8G8R8A8_SRGB, which is already the byte order a 24-bit
     // BMP wants -- so no channel swap, just drop alpha and flip rows.

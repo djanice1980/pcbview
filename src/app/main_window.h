@@ -9,7 +9,9 @@
 
 #include <array>
 #include <functional>
+#include <map>
 #include <memory>
+#include <vector>
 
 class QCheckBox;
 class QComboBox;
@@ -106,6 +108,15 @@ private:
     void saveShowcase();
     void loadShowcase();
 
+    // Custom movements: sample the camera while the user drives, store the
+    // keys under an id, and play them back as a "path" step.
+    void toggleMoveRecording();
+    std::map<QString, std::vector<VulkanWindow::PathKey>> showcasePaths_;
+    int nextPathId_ = 1;
+    QTimer* moveRecTimer_ = nullptr;
+    std::vector<VulkanWindow::PathKey> moveRecKeys_;
+    QPushButton* moveRecBtn_ = nullptr;
+
     // Offline video recording of the playlist: every frame is rendered to
     // full convergence (denoise included) before it is encoded, on a fixed
     // virtual clock -- wall time never touches the output.
@@ -114,6 +125,7 @@ private:
                              int fps, bool preferHevc, int quality,
                              bool quitWhenDone);
     void videoNextFrame();
+    void videoEncodeCaptured();
     void videoFinish(const QString& message);
     struct VideoJob;
     VideoJob* videoJob_ = nullptr;

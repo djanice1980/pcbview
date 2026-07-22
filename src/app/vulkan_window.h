@@ -116,7 +116,7 @@ public:
     bool viewAnimating() const {
         const float d = explodeProgress_ - explodeTarget_;
         return cameraAnimating_ || zoomAnimating_ || spinActive_ ||
-               d > 1e-4f || d < -1e-4f;
+               pathActive_ || d > 1e-4f || d < -1e-4f;
     }
 
     // Constant-rate camera spin: sweep `degrees` about one axis (0 = yaw /
@@ -133,6 +133,19 @@ public:
     // same steppers run, just fed a fixed dt.
     void setAnimationsPaused(bool on) { animationsPaused_ = on; }
     void advanceAnimationsBy(double dt);
+
+    // ---- custom movement paths ---------------------------------------------
+    // A recorded user movement: uniformly-sampled camera poses (plus the
+    // peel), replayed with Catmull-Rom interpolation over `durationSec`.
+    // The showcase's "record a custom move" feature samples cameraPose()
+    // while the user drives, then plays the result back through this.
+    struct PathKey {
+        float yaw = 0, pitch = 0, roll = 0, distance = 0;
+        float tx = 0, ty = 0, tz = 0;
+        float explode = 0;
+    };
+    const Camera& cameraPose() const { return camera_; }
+    void startPath(std::vector<PathKey> keys, double durationSec);
 
     // How far a ring travels per stage, scaled to the board's size.
     float explodeStepMm() const;
@@ -249,6 +262,11 @@ private:
     void setViewTarget(const Camera& dest, bool snap);
     bool stepCameraAnimation();
     bool stepSpinAnimation();
+    bool stepPathAnimation();
+    std::vector<PathKey> pathKeys_;
+    double pathT_ = 0.0, pathDuration_ = 0.0;
+    bool pathActive_ = false;
+    QElapsedTimer pathClock_;
     void applyGlobeTumble(float ax);
     // Wall-clock dt with a stall clamp, or the video recorder's fixed dt.
     double clockDt(QElapsedTimer& clock) {

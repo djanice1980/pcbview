@@ -261,6 +261,24 @@ public:
         captureScene_ = sceneTarget;
     }
 
+    // In-memory capture of the offscreen scene image: tight top-down BGRA,
+    // no file round-trip. `out->done` flips true after the frame that
+    // fulfils it. The video recorder's per-frame path.
+    struct CaptureBuffer {
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0, height = 0;
+        bool done = false;
+    };
+    void requestCaptureToBuffer(CaptureBuffer* out) {
+        captureBuffer_ = out;
+        captureScene_ = true;
+    }
+
+    // Uncapped presentation (IMMEDIATE/MAILBOX when the surface offers it):
+    // the video recorder renders far faster than the display refresh, and
+    // FIFO would chain every frame to vsync. Recreates the swapchain.
+    void setUncappedPresent(bool on);
+
     const FrameStats& stats() const { return stats_; }
 
 private:
@@ -426,6 +444,8 @@ private:
 
     void captureImage(uint32_t imageIndex);
     bool captureScene_ = false;  // capture sceneColor_ instead of the swapchain
+    CaptureBuffer* captureBuffer_ = nullptr;
+    bool uncappedPresent_ = false;
 
     Buffer vertexBuffer_;
     Buffer indexBuffer_;

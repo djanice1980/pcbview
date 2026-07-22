@@ -1353,6 +1353,43 @@ void MainWindow::buildMenus() {
         viewport_->requestUpdate();
     });
 
+    // Viewport size presets: pin the render area to an aspect for video
+    // framing (the recorder keeps the viewport's aspect), or free it.
+    QMenu* vpSize = view->addMenu("Viewport si&ze");
+    const auto setViewportSize = [this](int w, int h) {
+        if (!viewportContainer_) return;
+        if (w <= 0) {
+            viewportContainer_->setMinimumSize(0, 0);
+            viewportContainer_->setMaximumSize(QWIDGETSIZE_MAX,
+                                               QWIDGETSIZE_MAX);
+        } else {
+            viewportContainer_->setFixedSize(w, h);
+        }
+    };
+    vpSize->addAction("Free (fill window)", this,
+                      [setViewportSize] { setViewportSize(0, 0); });
+    vpSize->addSeparator();
+    vpSize->addAction("16:9 — 1280 × 720", this,
+                      [setViewportSize] { setViewportSize(1280, 720); });
+    vpSize->addAction("16:9 — 1600 × 900", this,
+                      [setViewportSize] { setViewportSize(1600, 900); });
+    vpSize->addAction("21:9 — 1290 × 552", this,
+                      [setViewportSize] { setViewportSize(1290, 552); });
+    vpSize->addAction("1:1 — 900 × 900", this,
+                      [setViewportSize] { setViewportSize(900, 900); });
+    vpSize->addAction("9:16 portrait — 540 × 960", this,
+                      [setViewportSize] { setViewportSize(540, 960); });
+    vpSize->addAction("Custom…", this, [this, setViewportSize] {
+        bool ok = false;
+        const int w = QInputDialog::getInt(this, "Viewport size", "Width:",
+                                           1280, 200, 4000, 10, &ok);
+        if (!ok) return;
+        const int h = QInputDialog::getInt(this, "Viewport size", "Height:",
+                                           720, 200, 3000, 10, &ok);
+        if (!ok) return;
+        setViewportSize(w, h);
+    });
+
     view->addSeparator();
     // Measurement tools. The M shortcut lives in the viewport's own
     // keyPressEvent (native QWindow -- QAction shortcuts never fire while it
@@ -2109,6 +2146,13 @@ void MainWindow::buildShowcaseDock() {
             [this](bool on) { showcaseLoops_->setEnabled(!on); });
     playRow->addWidget(showcaseForever_);
     playRow->addStretch(1);
+    moveRecBtn_ = new QPushButton("Rec move");
+    moveRecBtn_->setToolTip(
+        "Record your own camera movement (drag, zoom, explode) as a step.\n"
+        "Click, drive the board, click again to stop.");
+    connect(moveRecBtn_, &QPushButton::clicked, this,
+            &MainWindow::toggleMoveRecording);
+    playRow->addWidget(moveRecBtn_);
     auto* recordBtn = new QPushButton("Record…");
     recordBtn->setToolTip(
         "Render the playlist to an MP4 (H.265 when the GPU can, else "
@@ -2148,6 +2192,7 @@ void MainWindow::refreshShowcaseList() {
     for (size_t i = 0; i < showcaseSteps_.size(); ++i) {
         const ShowcaseStep& s = showcaseSteps_[i];
         QString label = s.param;
+        if (s.kind == "path") label = "Custom move";
         for (const auto& k : kShowcaseKinds)
             if (s.kind == k.kind && s.param == k.param) label = k.label;
         auto* item = new QListWidgetItem(
@@ -2155,6 +2200,75 @@ void MainWindow::refreshShowcaseList() {
         item->setData(Qt::UserRole, static_cast<int>(i));
         showcaseList_->addItem(item);
     }
+}
+
+// Sample the live camera at 20Hz while the user drives; stopping turns the
+// take into a "path" step whose seconds field is the recorded duration
+// (retime it like any step -- playback stretches to fit).
+void MainWindow::toggleMoveRecording() {
+    if (!moveRecTimer_) {
+        moveRecTimer_ = new QTimer(this);
+        moveRecTimer_->setInterval(50);
+        connect(moveRecTimer_, &QTimer::timeout, this, [this] {
+            const Camera& c = viewport_->cameraPose();
+            VulkanWindow::PathKey k;
+            k.yaw = c.yaw;
+            k.pitch = c.pitch;
+            k.roll = c.roll;
+            k.distance = c.distance;
+            k.tx = c.targetX;
+            k.ty = c.targetY;
+            k.tz = c.targetZ;
+            k.explode = viewport_->explodeProgress();
+            // Unwrap angles against the previous key so interpolation never
+            // takes a 2-pi shortcut through the wrap.
+            if (!moveRecKeys_.empty()) {
+                const auto unwrap = [](float prev, float v) {
+                    constexpr float kPi = 3.14159265f, kTwoPi = 6.28318531f;
+                    while (v - prev > kPi) v -= kTwoPi;
+                    while (v - prev < -kPi) v += kTwoPi;
+                    return v;
+                };
+                const VulkanWindow::PathKey& p = moveRecKeys_.back();
+                k.yaw = unwrap(p.yaw, k.yaw);
+                k.pitch = unwrap(p.pitch, k.pitch);
+                k.roll = unwrap(p.roll, k.roll);
+            }
+            moveRecKeys_.push_back(k);
+            moveRecBtn_->setText(
+                QString("Stop (%1s)").arg(moveRecKeys_.size() * 0.05, 0, 'f',
+                                          1));
+        });
+    }
+    if (!moveRecTimer_->isActive()) {
+        if (!loaded_) return;
+        stopShowcase();
+        moveRecKeys_.clear();
+        moveRecTimer_->start();
+        statusBar()->showMessage(
+            "Recording movement — drive the board, then click Stop.");
+        return;
+    }
+    moveRecTimer_->stop();
+    moveRecBtn_->setText("Rec move");
+    if (moveRecKeys_.size() < 4) {
+        statusBar()->showMessage("Movement too short — not added.", 4000);
+        return;
+    }
+    const QString id = QString("p%1").arg(nextPathId_++);
+    const double duration = moveRecKeys_.size() * 0.05;
+    showcasePaths_[id] = std::move(moveRecKeys_);
+    moveRecKeys_.clear();
+    ShowcaseStep s;
+    s.kind = "path";
+    s.param = id;
+    s.holdSec = duration;
+    showcaseSteps_.push_back(s);
+    refreshShowcaseList();
+    saveShowcase();
+    statusBar()->showMessage(
+        QString("Custom movement added (%1s).").arg(duration, 0, 'f', 1),
+        4000);
 }
 
 void MainWindow::applyShowcaseStep(const ShowcaseStep& step) {
@@ -2179,6 +2293,10 @@ void MainWindow::applyShowcaseStep(const ShowcaseStep& step) {
         const float deg = f.size() > 1 ? f[1].toFloat() : 360.0f;
         viewport_->startSpin(axis, deg,
                              static_cast<float>(std::max(step.holdSec, 0.5)));
+    } else if (step.kind == "path") {
+        const auto it = showcasePaths_.find(step.param);
+        if (it != showcasePaths_.end())
+            viewport_->startPath(it->second, std::max(step.holdSec, 0.2));
     }
     // Future kinds ("layers", "net") dispatch here.
 }
@@ -2243,7 +2361,9 @@ void MainWindow::showcaseAdvance() {
             showcaseAdvance();
         });
         const double holdMs =
-            step.kind == "spin" ? 0.0 : step.holdSec * 1000.0;
+            step.kind == "spin" || step.kind == "path"
+                ? 0.0
+                : step.holdSec * 1000.0;
         showcaseTimer_->start(static_cast<int>(holdMs));
     });
     showcaseTimer_->start(100);
@@ -2275,9 +2395,14 @@ struct MainWindow::VideoJob {
     int framesEncoded = 0;
     int estTotal = 1;
     bool quitWhenDone = false;  // the headless PCBVIEW_RECORD hook
-    QImage lastImage;
     bool lastStatic = false;
-    std::vector<uint8_t> scratch;  // tight-stride copy for the encoder
+    bool haveFrame = false;      // scratch holds the previous encoded frame
+    vk::Renderer::CaptureBuffer cap;
+    bool capturing = false, capRequested = false;
+    int convergeBudget = 0;
+    QMetaObject::Connection frameConn;
+    std::vector<uint8_t> scratch;  // tight even-cropped copy for the encoder
+    int encW = 0, encH = 0;
     QProgressDialog* progress = nullptr;
 };
 
@@ -2319,7 +2444,9 @@ void MainWindow::recordShowcaseVideo() {
 
     double estSeconds = 0.0;
     for (const ShowcaseStep& s : showcaseSteps_)
-        estSeconds += s.kind == "spin" ? s.holdSec : s.holdSec + 1.2;
+        estSeconds += s.kind == "spin" || s.kind == "path"
+                          ? s.holdSec
+                          : s.holdSec + 1.2;
     auto* info = new QLabel(
         QString("One pass of %1 steps ≈ %2 s of video.\nThe video keeps the "
                 "viewport's aspect ratio.")
@@ -2362,7 +2489,9 @@ void MainWindow::startVideoRecording(const QString& outPath, int targetHeight,
     job->steps = showcaseSteps_;
     double estSeconds = 0.0;
     for (const ShowcaseStep& s : job->steps)
-        estSeconds += s.kind == "spin" ? s.holdSec : s.holdSec + 1.2;
+        estSeconds += s.kind == "spin" || s.kind == "path"
+                          ? s.holdSec
+                          : s.holdSec + 1.2;
     job->estTotal = std::max(
         1, static_cast<int>(std::ceil(estSeconds * job->fps)));
 
@@ -2382,7 +2511,36 @@ void MainWindow::startVideoRecording(const QString& outPath, int targetHeight,
     }
     job->savedScale = r->renderScale();
     r->setRenderScale(job->exportScale);
+    r->setUncappedPresent(true);  // render at GPU speed, not display speed
     viewport_->setAnimationsPaused(true);
+
+    // One persistent frame hook drives every capture: wait for convergence
+    // (accumulation + denoise), request the in-memory grab, hand it to the
+    // encoder step.
+    job->frameConn = connect(viewport_, &VulkanWindow::frameRendered, this,
+                             [this] {
+        VideoJob* job = videoJob_;
+        if (!job || !job->capturing) return;
+        vk::Renderer* r = viewport_->renderer();
+        if (!r) return;
+        if (!job->capRequested) {
+            if (r->accumulating() && ++job->convergeBudget < 3000) {
+                viewport_->requestUpdate();
+                return;
+            }
+            job->cap.done = false;
+            r->requestCaptureToBuffer(&job->cap);
+            job->capRequested = true;
+            viewport_->requestUpdate();
+            return;
+        }
+        if (!job->cap.done) {
+            viewport_->requestUpdate();
+            return;
+        }
+        job->capturing = false;
+        videoEncodeCaptured();
+    });
 
     job->progress = new QProgressDialog("Rendering video…", "Cancel", 0,
                                         job->estTotal, this);
@@ -2413,7 +2571,8 @@ void MainWindow::videoNextFrame() {
         if (!viewport_->viewAnimating()) {
             job->settling = false;
             const ShowcaseStep& s = job->steps[job->stepIndex];
-            job->holdLeft = s.kind == "spin" ? 0.0 : s.holdSec;
+            job->holdLeft =
+                s.kind == "spin" || s.kind == "path" ? 0.0 : s.holdSec;
         }
     } else {
         job->holdLeft -= job->dt;
@@ -2437,7 +2596,7 @@ void MainWindow::videoNextFrame() {
     // A held frame is identical to the previous one: encode it again without
     // re-rendering.
     const bool moving = viewport_->viewAnimating();
-    if (!moving && job->lastStatic && !job->lastImage.isNull()) {
+    if (!moving && job->lastStatic && job->haveFrame) {
         const std::string err = job->enc.writeFrame(job->scratch.data());
         if (!err.empty()) {
             videoFinish(QString::fromStdString(err));
@@ -2450,56 +2609,63 @@ void MainWindow::videoNextFrame() {
         return;
     }
 
-    grabFrame(
-        [this](const QImage& grabbed) {
-            VideoJob* job = videoJob_;
-            if (!job) return;
-            // Encoders want even dimensions; crop a stray line if needed.
-            QImage img = grabbed;
-            const int w = img.width() & ~1, h = img.height() & ~1;
-            if (w != img.width() || h != img.height())
-                img = img.copy(0, 0, w, h);
-            img = img.convertToFormat(QImage::Format_ARGB32);
+    // Kick the converge-then-capture sequence; the frameRendered hook picks
+    // it up and videoEncodeCaptured() finishes the frame.
+    job->capturing = true;
+    job->capRequested = false;
+    job->convergeBudget = 0;
+    viewport_->requestUpdate();
+}
 
-            if (!job->encOpen) {
-                const double bpp = job->quality == 1 ? 0.20 : 0.10;
-                const int bitrate = std::max(
-                    2'000'000,
-                    static_cast<int>(static_cast<double>(w) * h * job->fps *
-                                     bpp));
-                const std::string err = job->enc.open(
-                    job->outPath.toStdWString(), w, h, job->fps, bitrate,
-                    job->preferHevc);
-                if (!err.empty()) {
-                    videoFinish(QString::fromStdString(err));
-                    return;
-                }
-                job->encOpen = true;
-            } else if (w * 4LL * h != static_cast<long long>(job->scratch.size())) {
-                videoFinish("frame size changed mid-recording (was the "
-                            "window resized?)");
-                return;
-            }
+// The captured pixels arrive as tight top-down BGRA at the render scale;
+// crop to even dimensions and feed the encoder.
+void MainWindow::videoEncodeCaptured() {
+    VideoJob* job = videoJob_;
+    if (!job) return;
+    const int w = static_cast<int>(job->cap.width) & ~1;
+    const int h = static_cast<int>(job->cap.height) & ~1;
+    if (w <= 0 || h <= 0) {
+        videoFinish("empty capture");
+        return;
+    }
 
-            // Tight-stride copy: QImage rows may be padded.
-            job->scratch.resize(static_cast<size_t>(w) * h * 4);
-            for (int y = 0; y < h; ++y)
-                std::memcpy(job->scratch.data() +
-                                static_cast<size_t>(y) * w * 4,
-                            img.constScanLine(y), static_cast<size_t>(w) * 4);
-            const std::string err = job->enc.writeFrame(job->scratch.data());
-            if (!err.empty()) {
-                videoFinish(QString::fromStdString(err));
-                return;
-            }
-            job->lastImage = img;
-            job->lastStatic = !viewport_->viewAnimating();
-            ++job->framesEncoded;
-            job->progress->setValue(
-                std::min(job->framesEncoded, job->estTotal));
-            QTimer::singleShot(0, this, &MainWindow::videoNextFrame);
-        },
-        job->exportScale);
+    if (!job->encOpen) {
+        const double bpp = job->quality == 1 ? 0.20 : 0.10;
+        const int bitrate = std::max(
+            2'000'000,
+            static_cast<int>(static_cast<double>(w) * h * job->fps * bpp));
+        const std::string err =
+            job->enc.open(job->outPath.toStdWString(), w, h, job->fps,
+                          bitrate, job->preferHevc);
+        if (!err.empty()) {
+            videoFinish(QString::fromStdString(err));
+            return;
+        }
+        job->encOpen = true;
+        job->encW = w;
+        job->encH = h;
+    } else if (w != job->encW || h != job->encH) {
+        videoFinish("frame size changed mid-recording (was the window "
+                    "resized?)");
+        return;
+    }
+
+    job->scratch.resize(static_cast<size_t>(w) * h * 4);
+    const int srcRow = static_cast<int>(job->cap.width) * 4;
+    for (int y = 0; y < h; ++y)
+        std::memcpy(job->scratch.data() + static_cast<size_t>(y) * w * 4,
+                    job->cap.pixels.data() + static_cast<size_t>(y) * srcRow,
+                    static_cast<size_t>(w) * 4);
+    const std::string err = job->enc.writeFrame(job->scratch.data());
+    if (!err.empty()) {
+        videoFinish(QString::fromStdString(err));
+        return;
+    }
+    job->haveFrame = true;
+    job->lastStatic = !viewport_->viewAnimating();
+    ++job->framesEncoded;
+    job->progress->setValue(std::min(job->framesEncoded, job->estTotal));
+    QTimer::singleShot(0, this, &MainWindow::videoNextFrame);
 }
 
 void MainWindow::videoFinish(const QString& message) {
@@ -2512,8 +2678,11 @@ void MainWindow::videoFinish(const QString& message) {
         job->enc.finish();
         codec = job->enc.codecUsed();
     }
-    if (vk::Renderer* r = viewport_->renderer())
+    QObject::disconnect(job->frameConn);
+    if (vk::Renderer* r = viewport_->renderer()) {
         r->setRenderScale(job->savedScale);
+        r->setUncappedPresent(false);
+    }
     viewport_->setAnimationsPaused(false);
     job->progress->close();
     job->progress->deleteLater();
@@ -2542,6 +2711,20 @@ void MainWindow::saveShowcase() {
     if (showcaseLoops_) s.setValue("showcaseLoops", showcaseLoops_->value());
     if (showcaseForever_)
         s.setValue("showcaseRepeat", showcaseForever_->isChecked());
+
+    // Custom movement keys: id:val,val,...|id:... (8 floats per key).
+    QStringList paths;
+    for (const auto& [id, keys] : showcasePaths_) {
+        QStringList vals;
+        vals.reserve(static_cast<int>(keys.size()) * 8);
+        for (const auto& k : keys)
+            for (const float v : {k.yaw, k.pitch, k.roll, k.distance, k.tx,
+                                  k.ty, k.tz, k.explode})
+                vals << QString::number(v, 'f', 4);
+        paths << id + ":" + vals.join(',');
+    }
+    s.setValue("showcasePathData", paths.join('|'));
+    s.setValue("showcasePathNextId", nextPathId_);
 }
 
 void MainWindow::loadShowcase() {
@@ -2558,10 +2741,42 @@ void MainWindow::loadShowcase() {
         st.holdSec = f[2].toDouble();
         showcaseSteps_.push_back(st);
     }
-    if (showcaseLoops_)
+    // Blockers, or the widgets' change-signals fire saveShowcase() MID-LOAD
+    // and overwrite the not-yet-parsed path data with an empty map.
+    if (showcaseLoops_) {
+        const QSignalBlocker block(showcaseLoops_);
         showcaseLoops_->setValue(s.value("showcaseLoops", 1).toInt());
-    if (showcaseForever_)
+    }
+    if (showcaseForever_) {
+        const QSignalBlocker block(showcaseForever_);
         showcaseForever_->setChecked(s.value("showcaseRepeat", false).toBool());
+        showcaseLoops_->setEnabled(!showcaseForever_->isChecked());
+    }
+
+    showcasePaths_.clear();
+    for (const QString& entry : s.value("showcasePathData")
+                                    .toString()
+                                    .split('|', Qt::SkipEmptyParts)) {
+        const int colon = entry.indexOf(':');
+        if (colon <= 0) continue;
+        const QString id = entry.left(colon);
+        const QStringList vals = entry.mid(colon + 1).split(',');
+        std::vector<VulkanWindow::PathKey> keys;
+        for (int i = 0; i + 7 < vals.size(); i += 8) {
+            VulkanWindow::PathKey k;
+            k.yaw = vals[i].toFloat();
+            k.pitch = vals[i + 1].toFloat();
+            k.roll = vals[i + 2].toFloat();
+            k.distance = vals[i + 3].toFloat();
+            k.tx = vals[i + 4].toFloat();
+            k.ty = vals[i + 5].toFloat();
+            k.tz = vals[i + 6].toFloat();
+            k.explode = vals[i + 7].toFloat();
+            keys.push_back(k);
+        }
+        if (keys.size() >= 2) showcasePaths_[id] = std::move(keys);
+    }
+    nextPathId_ = s.value("showcasePathNextId", 1).toInt();
     refreshShowcaseList();
 }
 
