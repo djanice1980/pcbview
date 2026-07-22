@@ -116,7 +116,7 @@ public:
     bool viewAnimating() const {
         const float d = explodeProgress_ - explodeTarget_;
         return cameraAnimating_ || zoomAnimating_ || spinActive_ ||
-               pathActive_ || d > 1e-4f || d < -1e-4f;
+               pathActive_ || timedZoomActive_ || d > 1e-4f || d < -1e-4f;
     }
 
     // Constant-rate camera spin: sweep `degrees` about one axis (0 = yaw /
@@ -154,6 +154,14 @@ public:
     };
     const Camera& cameraPose() const { return camera_; }
     void startPath(std::vector<PathKey> keys, double durationSec);
+
+    // Timed zoom to a percentage of the DEFAULT FRAMED size (100% = the
+    // distance frameBoard would pick, so "zoom to 100% in 3s" lands the
+    // board at its loaded size). Distance only -- yaw/pitch/roll and the
+    // target stay wherever the user placed them -- swept at constant rate
+    // in log space over `seconds`.
+    void startTimedZoom(float percent, float seconds);
+    float framedDistance() const;
 
     // How far a ring travels per stage, scaled to the board's size.
     float explodeStepMm() const;
@@ -278,6 +286,11 @@ private:
     double pathT_ = 0.0, pathDuration_ = 0.0;
     bool pathActive_ = false;
     QElapsedTimer pathClock_;
+    bool stepTimedZoomAnimation();
+    bool timedZoomActive_ = false;
+    float tzStart_ = 0.0f, tzTarget_ = 0.0f;
+    double tzT_ = 0.0, tzDur_ = 0.0;
+    QElapsedTimer tzClock_;
     void applyGlobeTumble(float ax);
     // Wall-clock dt with a stall clamp, or the video recorder's fixed dt.
     double clockDt(QElapsedTimer& clock) {

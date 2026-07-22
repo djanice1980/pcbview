@@ -29,6 +29,7 @@
 #include <QSpinBox>
 #include <QCheckBox>
 #include <QToolButton>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
@@ -2060,6 +2061,15 @@ constexpr ShowcaseKindDef kShowcaseKinds[] = {
     {"Tumble 180° forward (pitch)", "spin", "pitch,180"},
     {"Twist 360° CW (roll)", "spin", "roll,360"},
     {"Twist 360° CCW (roll)", "spin", "roll,-360"},
+    // Zoom to a percentage of the default framed size over the step's
+    // seconds. Angles and target stay put -- place the board manually, then
+    // let the step fly it in (or out).
+    {"Zoom to 100% (framed size)", "zoom", "100"},
+    {"Zoom to 150%", "zoom", "150"},
+    {"Zoom to 200% (close-up)", "zoom", "200"},
+    {"Zoom to 50% (pull back)", "zoom", "50"},
+    {"Zoom to 25% (far)", "zoom", "25"},
+    {"Zoom to custom %…", "zoom", "custom"},
 };
 }  // namespace
 
@@ -2093,6 +2103,14 @@ void MainWindow::buildShowcaseDock() {
         s.kind = k.kind;
         s.param = k.param;
         s.holdSec = showcaseHold_->value();
+        if (s.kind == "zoom" && s.param == "custom") {
+            bool ok = false;
+            const int pct = QInputDialog::getInt(
+                this, "Zoom step", "Zoom to (% of framed size):", 100, 1,
+                1000, 5, &ok);
+            if (!ok) return;
+            s.param = QString::number(pct);
+        }
         showcaseSteps_.push_back(s);
         refreshShowcaseList();
         saveShowcase();
@@ -2136,6 +2154,49 @@ void MainWindow::buildShowcaseDock() {
                 showcaseSteps_ = std::move(reordered);
                 refreshShowcaseList();
                 saveShowcase();
+            });
+    showcaseList_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(showcaseList_, &QWidget::customContextMenuRequested, this,
+            [this](const QPoint& pos) {
+                QListWidgetItem* item = showcaseList_->itemAt(pos);
+                if (!item) return;
+                const int row = showcaseList_->row(item);
+                if (row < 0 ||
+                    row >= static_cast<int>(showcaseSteps_.size()))
+                    return;
+                QMenu menu(showcaseList_);
+                QAction* retime = menu.addAction("Change seconds…");
+                QAction* del = menu.addAction("Delete step");
+                QAction* chosen =
+                    menu.exec(showcaseList_->mapToGlobal(pos));
+                if (chosen == del) {
+                    const ShowcaseStep removed = showcaseSteps_[row];
+                    showcaseSteps_.erase(showcaseSteps_.begin() + row);
+                    // A custom move nobody references any more can go too.
+                    if (removed.kind == "path") {
+                        bool used = false;
+                        for (const ShowcaseStep& s : showcaseSteps_)
+                            if (s.kind == "path" && s.param == removed.param)
+                                used = true;
+                        if (!used) showcasePaths_.erase(removed.param);
+                    }
+                    refreshShowcaseList();
+                    saveShowcase();
+                } else if (chosen == retime) {
+                    ShowcaseStep& s = showcaseSteps_[row];
+                    bool ok = false;
+                    const double v = QInputDialog::getDouble(
+                        this, "Step duration",
+                        s.kind == "spin" || s.kind == "path" ||
+                                s.kind == "zoom"
+                            ? "Motion duration (seconds):"
+                            : "Hold time (seconds):",
+                        s.holdSec, 0.0, 600.0, 1, &ok);
+                    if (!ok) return;
+                    s.holdSec = v;
+                    refreshShowcaseList();
+                    saveShowcase();
+                }
             });
     auto* delSc = new QShortcut(QKeySequence::Delete, showcaseList_);
     delSc->setContext(Qt::WidgetShortcut);
@@ -2210,6 +2271,7 @@ void MainWindow::refreshShowcaseList() {
         const ShowcaseStep& s = showcaseSteps_[i];
         QString label = s.param;
         if (s.kind == "path") label = "Custom move";
+        else if (s.kind == "zoom") label = "Zoom to " + s.param + "%";
         for (const auto& k : kShowcaseKinds)
             if (s.kind == k.kind && s.param == k.param) label = k.label;
         auto* item = new QListWidgetItem(
@@ -2314,6 +2376,10 @@ void MainWindow::applyShowcaseStep(const ShowcaseStep& step) {
         const auto it = showcasePaths_.find(step.param);
         if (it != showcasePaths_.end())
             viewport_->startPath(it->second, std::max(step.holdSec, 0.2));
+    } else if (step.kind == "zoom") {
+        viewport_->startTimedZoom(std::max(1.0f, step.param.toFloat()),
+                                  static_cast<float>(
+                                      std::max(step.holdSec, 0.2)));
     }
     // Future kinds ("layers", "net") dispatch here.
 }
@@ -2378,7 +2444,8 @@ void MainWindow::showcaseAdvance() {
             showcaseAdvance();
         });
         const double holdMs =
-            step.kind == "spin" || step.kind == "path"
+            step.kind == "spin" || step.kind == "path" ||
+                    step.kind == "zoom"
                 ? 0.0
                 : step.holdSec * 1000.0;
         showcaseTimer_->start(static_cast<int>(holdMs));
@@ -2465,7 +2532,8 @@ void MainWindow::recordShowcaseVideo() {
 
     double estSeconds = 0.0;
     for (const ShowcaseStep& s : showcaseSteps_)
-        estSeconds += s.kind == "spin" || s.kind == "path"
+        estSeconds += s.kind == "spin" || s.kind == "path" ||
+                              s.kind == "zoom"
                           ? s.holdSec
                           : s.holdSec + 1.2;
     auto* info = new QLabel(
@@ -2521,7 +2589,8 @@ void MainWindow::startVideoRecording(const QString& outPath, QSize target,
     job->steps = showcaseSteps_;
     double estSeconds = 0.0;
     for (const ShowcaseStep& s : job->steps)
-        estSeconds += s.kind == "spin" || s.kind == "path"
+        estSeconds += s.kind == "spin" || s.kind == "path" ||
+                              s.kind == "zoom"
                           ? s.holdSec
                           : s.holdSec + 1.2;
     job->estTotal = std::max(
@@ -2602,8 +2671,10 @@ void MainWindow::videoNextFrame() {
         if (!viewport_->viewAnimating()) {
             job->settling = false;
             const ShowcaseStep& s = job->steps[job->stepIndex];
-            job->holdLeft =
-                s.kind == "spin" || s.kind == "path" ? 0.0 : s.holdSec;
+            job->holdLeft = s.kind == "spin" || s.kind == "path" ||
+                                    s.kind == "zoom"
+                                ? 0.0
+                                : s.holdSec;
         }
     } else {
         job->holdLeft -= job->dt;

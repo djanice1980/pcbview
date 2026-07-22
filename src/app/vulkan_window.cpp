@@ -503,6 +503,20 @@ void VulkanWindow::setViewTarget(const Camera& dest, bool snap) {
     requestUpdate();
 }
 
+// The distance frameBoard chooses -- the "default loaded size" that zoom
+// percentages are measured against.
+float VulkanWindow::framedDistance() const {
+    if (!mesh_) return camera_.distance;
+    const auto& b = mesh_->bounds;
+    const float spanX = static_cast<float>(b.max[0] - b.min[0]);
+    const float spanY = static_cast<float>(b.max[1] - b.min[1]);
+    const float span = std::max(spanX, spanY);
+    // Back off far enough that the larger dimension fits the vertical FOV
+    // with a little margin.
+    const float halfFov = glm::radians(camera_.fovDegrees) * 0.5f;
+    return (span * 0.62f) / std::tan(halfFov);
+}
+
 void VulkanWindow::frameBoard(bool snap) {
     if (!mesh_) return;
     const auto& b = mesh_->bounds;
@@ -510,16 +524,38 @@ void VulkanWindow::frameBoard(bool snap) {
     dest.targetX = static_cast<float>((b.min[0] + b.max[0]) * 0.5);
     dest.targetY = static_cast<float>((b.min[1] + b.max[1]) * 0.5);
     dest.targetZ = static_cast<float>((b.min[2] + b.max[2]) * 0.5);
-
-    const float spanX = static_cast<float>(b.max[0] - b.min[0]);
-    const float spanY = static_cast<float>(b.max[1] - b.min[1]);
-    const float span = std::max(spanX, spanY);
-
-    // Back off far enough that the larger dimension fits the vertical FOV with
-    // a little margin.
-    const float halfFov = glm::radians(dest.fovDegrees) * 0.5f;
-    dest.distance = (span * 0.62f) / std::tan(halfFov);
+    dest.distance = framedDistance();
     setViewTarget(dest, snap);
+}
+
+void VulkanWindow::startTimedZoom(float percent, float seconds) {
+    if (seconds <= 0.05f || percent <= 0.0f) return;
+    tzStart_ = camera_.distance;
+    // 200% shows the board twice its framed size = half the distance.
+    tzTarget_ = std::max(1e-3f, framedDistance() * (100.0f / percent));
+    tzT_ = 0.0;
+    tzDur_ = seconds;
+    timedZoomActive_ = true;
+    // The zoom owns the distance; a leftover glide would fight it.
+    zoomAnimating_ = false;
+    cameraAnimating_ = false;
+    tzClock_.restart();
+    requestUpdate();
+}
+
+bool VulkanWindow::stepTimedZoomAnimation() {
+    if (!timedZoomActive_) return false;
+    tzT_ += clockDt(tzClock_);
+    double u = tzT_ / tzDur_;
+    if (u >= 1.0) {
+        u = 1.0;
+        timedZoomActive_ = false;
+    }
+    // Log-space sweep: constant perceptual rate at any distance, and it
+    // lands exactly on the target.
+    camera_.distance =
+        tzStart_ * std::pow(tzTarget_ / tzStart_, static_cast<float>(u));
+    return timedZoomActive_;
 }
 
 void VulkanWindow::setViewTop() {
@@ -583,6 +619,7 @@ void VulkanWindow::advanceAnimationsBy(double dt) {
     stepZoomAnimation();
     stepSpinAnimation();
     stepPathAnimation();
+    stepTimedZoomAnimation();
     fixedDt_ = -1.0;
     requestUpdate();
 }
@@ -695,8 +732,9 @@ void VulkanWindow::render() {
     const bool zooming = !animationsPaused_ && stepZoomAnimation();
     const bool spinning = !animationsPaused_ && stepSpinAnimation();
     const bool pathing = !animationsPaused_ && stepPathAnimation();
+    const bool timedZooming = !animationsPaused_ && stepTimedZoomAnimation();
     const bool stillAnimating =
-        exploding || gliding || zooming || spinning || pathing;
+        exploding || gliding || zooming || spinning || pathing || timedZooming;
 
     // Fast-movement: a drag, pan, or any in-flight animation counts as motion.
     // While moving, render plain raster; restore the requested mode when it
