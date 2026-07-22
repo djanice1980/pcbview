@@ -279,6 +279,13 @@ public:
     // FIFO would chain every frame to vsync. Recreates the swapchain.
     void setUncappedPresent(bool on);
 
+    // Explicit offscreen resolution: while set (non-zero), the scene renders
+    // at exactly this extent regardless of the window or the internal-res
+    // slider -- 4K video from any window. The swapchain blit stretches, so
+    // the on-screen preview is distorted when the aspect differs; the
+    // CAPTURE is exact. (0,0) returns to window x scale.
+    void setCaptureExtent(uint32_t w, uint32_t h);
+
     const FrameStats& stats() const { return stats_; }
 
 private:
@@ -446,6 +453,7 @@ private:
     bool captureScene_ = false;  // capture sceneColor_ instead of the swapchain
     CaptureBuffer* captureBuffer_ = nullptr;
     bool uncappedPresent_ = false;
+    VkExtent2D captureExtent_{0, 0};
 
     Buffer vertexBuffer_;
     Buffer indexBuffer_;

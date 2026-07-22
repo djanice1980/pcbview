@@ -121,9 +121,8 @@ private:
     // full convergence (denoise included) before it is encoded, on a fixed
     // virtual clock -- wall time never touches the output.
     void recordShowcaseVideo();
-    void startVideoRecording(const QString& outPath, int targetHeight,
-                             int fps, bool preferHevc, int quality,
-                             bool quitWhenDone);
+    void startVideoRecording(const QString& outPath, QSize target, int fps,
+                             bool preferHevc, int quality, bool quitWhenDone);
     void videoNextFrame();
     void videoEncodeCaptured();
     void videoFinish(const QString& message);

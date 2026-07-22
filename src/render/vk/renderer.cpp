@@ -1832,12 +1832,18 @@ void Renderer::createSceneTargets() {
     // when trace-bound but a loss for plain raster on llvmpipe, where the linear
     // upscale blit back to the window costs more than the rasterisation saved.
     const uint32_t maxDim = device_.gpu.maxImageDimension2D;
-    sceneExtent_.width = std::clamp(
-        static_cast<uint32_t>(std::lround(extent_.width * renderScale_)), 1u,
-        maxDim);
-    sceneExtent_.height = std::clamp(
-        static_cast<uint32_t>(std::lround(extent_.height * renderScale_)), 1u,
-        maxDim);
+    if (captureExtent_.width > 0 && captureExtent_.height > 0) {
+        // Video recording owns the resolution outright.
+        sceneExtent_.width = std::clamp(captureExtent_.width, 1u, maxDim);
+        sceneExtent_.height = std::clamp(captureExtent_.height, 1u, maxDim);
+    } else {
+        sceneExtent_.width = std::clamp(
+            static_cast<uint32_t>(std::lround(extent_.width * renderScale_)),
+            1u, maxDim);
+        sceneExtent_.height = std::clamp(
+            static_cast<uint32_t>(std::lround(extent_.height * renderScale_)),
+            1u, maxDim);
+    }
 
     // SAMPLED so the bloom extract pass can read the finished scene.
     sceneColor_ = createImage(sceneExtent_, colorFormat_,
@@ -3836,6 +3842,13 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
 void Renderer::setUncappedPresent(bool on) {
     if (uncappedPresent_ == on) return;
     uncappedPresent_ = on;
+    if (extent_.width > 0 && extent_.height > 0)
+        resize(extent_.width, extent_.height);
+}
+
+void Renderer::setCaptureExtent(uint32_t w, uint32_t h) {
+    if (captureExtent_.width == w && captureExtent_.height == h) return;
+    captureExtent_ = {w, h};
     if (extent_.width > 0 && extent_.height > 0)
         resize(extent_.width, extent_.height);
 }

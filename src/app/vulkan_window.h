@@ -134,6 +134,14 @@ public:
     void setAnimationsPaused(bool on) { animationsPaused_ = on; }
     void advanceAnimationsBy(double dt);
 
+    // Camera aspect override for offscreen video: the projection normally
+    // follows the window, but a recording at a different aspect must follow
+    // the capture extent instead. 0 = follow the window.
+    void setAspectOverride(float aspect) {
+        aspectOverride_ = aspect;
+        requestUpdate();
+    }
+
     // ---- custom movement paths ---------------------------------------------
     // A recorded user movement: uniformly-sampled camera poses (plus the
     // peel), replayed with Catmull-Rom interpolation over `durationSec`.
@@ -223,6 +231,9 @@ signals:
     // filter never sees these events either. Both were tried. Forwarding from
     // the one place known to receive them is the reliable route.
     void unhandledKey(int key, Qt::KeyboardModifiers modifiers);
+    // R while the viewport has focus: toggle showcase movement recording --
+    // the mouse is busy driving the camera, so it must be a key.
+    void moveRecordToggled();
     // progress in stages, and the total number of stages a full peel takes.
     void explodeChanged(float progress, float maxProgress);
 
@@ -275,6 +286,7 @@ private:
     }
     double fixedDt_ = -1.0;
     bool animationsPaused_ = false;
+    float aspectOverride_ = 0.0f;
     bool spinActive_ = false;
     int spinAxis_ = 0;          // 0 yaw, 1 pitch, 2 roll
     float spinRemaining_ = 0;   // radians still to sweep (signed)

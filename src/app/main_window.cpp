@@ -347,8 +347,22 @@ MainWindow::MainWindow(const QString& path) {
     if (qEnvironmentVariableIsSet("PCBVIEW_RECORD")) {
         const QStringList f = qEnvironmentVariable("PCBVIEW_RECORD").split('|');
         QTimer::singleShot(1500, this, [this, f] {
-            startVideoRecording(f.value(0), f.value(1, "720").toInt(),
-                                f.value(2, "30").toInt(),
+            // "1920x1080" = exact; a bare height keeps the window aspect.
+            const QString res = f.value(1, "720");
+            QSize target;
+            if (res.contains('x')) {
+                target = QSize(res.section('x', 0, 0).toInt() & ~1,
+                               res.section('x', 1, 1).toInt() & ~1);
+            } else {
+                const int h = res.toInt() & ~1;
+                const double windowAspect =
+                    viewport_->height() > 0
+                        ? static_cast<double>(viewport_->width()) /
+                              viewport_->height()
+                        : 16.0 / 9.0;
+                target = QSize(static_cast<int>(h * windowAspect) & ~1, h);
+            }
+            startVideoRecording(f.value(0), target, f.value(2, "30").toInt(),
                                 f.value(3, "h265") != "h264",
                                 f.value(4, "0").toInt(),
                                 /*quitWhenDone=*/true);
@@ -563,6 +577,8 @@ void MainWindow::buildViewport() {
                 }
             });
     // Clicking the board picks the net under the cursor.
+    connect(viewport_, &VulkanWindow::moveRecordToggled, this,
+            &MainWindow::toggleMoveRecording);
     connect(viewport_, &VulkanWindow::netPicked, this,
             [this](int net, bool add) {
                 if (add) toggleHighlightNet(net);
@@ -2149,7 +2165,8 @@ void MainWindow::buildShowcaseDock() {
     moveRecBtn_ = new QPushButton("Rec move");
     moveRecBtn_->setToolTip(
         "Record your own camera movement (drag, zoom, explode) as a step.\n"
-        "Click, drive the board, click again to stop.");
+        "Start, drive the board, stop. The R key toggles this too, so the\n"
+        "mouse stays free for the movement itself.");
     connect(moveRecBtn_, &QPushButton::clicked, this,
             &MainWindow::toggleMoveRecording);
     playRow->addWidget(moveRecBtn_);
@@ -2385,8 +2402,6 @@ struct MainWindow::VideoJob {
     int fps = 30;
     bool preferHevc = true;
     int quality = 0;  // 0 standard, 1 high
-    float exportScale = 1.0f;
-    float savedScale = 1.0f;
     double dt = 1.0 / 30.0;
     std::vector<ShowcaseStep> steps;
     int stepIndex = 0;
@@ -2421,10 +2436,13 @@ void MainWindow::recordShowcaseVideo() {
     dlg.setWindowTitle("Record showcase video");
     auto* form = new QFormLayout(&dlg);
     auto* resBox = new QComboBox;
-    resBox->addItem("Window size (1×)", 0);
-    resBox->addItem("1080p", 1080);
-    resBox->addItem("1440p", 1440);
-    resBox->addItem("4K (2160p)", 2160);
+    resBox->addItem("Window size", QSize(0, 0));
+    resBox->addItem("1920 × 1080", QSize(1920, 1080));
+    resBox->addItem("2560 × 1440", QSize(2560, 1440));
+    resBox->addItem("3840 × 2160 (4K)", QSize(3840, 2160));
+    resBox->addItem("2560 × 1080 (21:9)", QSize(2560, 1080));
+    resBox->addItem("1080 × 1920 (portrait)", QSize(1080, 1920));
+    resBox->addItem("Custom…", QSize(-1, -1));
     resBox->setCurrentIndex(1);
     form->addRow("Resolution:", resBox);
     auto* fpsBox = new QComboBox;
@@ -2448,8 +2466,9 @@ void MainWindow::recordShowcaseVideo() {
                           ? s.holdSec
                           : s.holdSec + 1.2;
     auto* info = new QLabel(
-        QString("One pass of %1 steps ≈ %2 s of video.\nThe video keeps the "
-                "viewport's aspect ratio.")
+        QString("One pass of %1 steps ≈ %2 s of video.\nRendered offscreen "
+                "at exactly the chosen size — the window preview may look "
+                "stretched while recording.")
             .arg(showcaseSteps_.size())
             .arg(estSeconds, 0, 'f', 1));
     info->setWordWrap(true);
@@ -2467,13 +2486,23 @@ void MainWindow::recordShowcaseVideo() {
         this, "Save video", suggested, "MP4 video (*.mp4)");
     if (out.isEmpty()) return;
 
-    startVideoRecording(out, resBox->currentData().toInt(),
-                        fpsBox->currentData().toInt(),
+    QSize target = resBox->currentData().toSize();
+    if (target.width() < 0) {  // Custom…
+        bool ok = false;
+        const int w = QInputDialog::getInt(this, "Video size", "Width:", 1920,
+                                           320, 7680, 2, &ok);
+        if (!ok) return;
+        const int h = QInputDialog::getInt(this, "Video size", "Height:",
+                                           1080, 240, 4320, 2, &ok);
+        if (!ok) return;
+        target = QSize(w & ~1, h & ~1);
+    }
+    startVideoRecording(out, target, fpsBox->currentData().toInt(),
                         codecBox->currentIndex() == 0,
                         qualityBox->currentIndex(), /*quitWhenDone=*/false);
 }
 
-void MainWindow::startVideoRecording(const QString& outPath, int targetHeight,
+void MainWindow::startVideoRecording(const QString& outPath, QSize target,
                                      int fps, bool preferHevc, int quality,
                                      bool quitWhenDone) {
     if (videoJob_ || showcaseSteps_.empty()) return;
@@ -2495,22 +2524,19 @@ void MainWindow::startVideoRecording(const QString& outPath, int targetHeight,
     job->estTotal = std::max(
         1, static_cast<int>(std::ceil(estSeconds * job->fps)));
 
-    // Scale so the offscreen render height hits the requested line count.
-    const double windowH =
-        viewport_->height() * viewport_->devicePixelRatio();
-    job->exportScale =
-        targetHeight > 0 && windowH > 0
-            ? static_cast<float>(targetHeight / windowH)
-            : 1.0f;
-    job->exportScale = std::clamp(job->exportScale, 0.25f, 4.0f);
-
     vk::Renderer* r = viewport_->renderer();
     if (!r) {
         delete job;
         return;
     }
-    job->savedScale = r->renderScale();
-    r->setRenderScale(job->exportScale);
+    // Render offscreen at EXACTLY the requested size, projection to match --
+    // 4K video from any window, menus untouched. (0,0) keeps window x scale.
+    if (target.width() > 0 && target.height() > 0) {
+        r->setCaptureExtent(static_cast<uint32_t>(target.width()),
+                            static_cast<uint32_t>(target.height()));
+        viewport_->setAspectOverride(static_cast<float>(target.width()) /
+                                     static_cast<float>(target.height()));
+    }
     r->setUncappedPresent(true);  // render at GPU speed, not display speed
     viewport_->setAnimationsPaused(true);
 
@@ -2680,9 +2706,10 @@ void MainWindow::videoFinish(const QString& message) {
     }
     QObject::disconnect(job->frameConn);
     if (vk::Renderer* r = viewport_->renderer()) {
-        r->setRenderScale(job->savedScale);
+        r->setCaptureExtent(0, 0);
         r->setUncappedPresent(false);
     }
+    viewport_->setAspectOverride(0.0f);
     viewport_->setAnimationsPaused(false);
     job->progress->close();
     job->progress->deleteLater();

@@ -715,6 +715,9 @@ void VulkanWindow::render() {
     const Basis basis = cameraBasis(camera_);
     const glm::vec3 eye = basis.eye;
     const glm::mat4 view = viewFromBasis(basis);
+    // Recording at another aspect: the projection must match the capture
+    // extent, not the window.
+    const float aspect = aspectOverride_ > 0.0f ? aspectOverride_ : w / h;
 
     // Near plane scales with the orbit distance rather than sitting at a fixed
     // hair's breadth. Reversed-Z makes precision forgiving, but there is no
@@ -724,7 +727,7 @@ void VulkanWindow::render() {
     glm::mat4 proj;
     if (camera_.orthographic) {
         const float halfH = orthoHalfHeight();
-        const float halfW = halfH * (w / h);
+        const float halfW = halfH * aspect;
         // Depth range brackets the SCENE, not the eye.
         //
         // A parallel projection has no viewpoint: geometry BEHIND the camera
@@ -740,7 +743,7 @@ void VulkanWindow::render() {
                              camera_.distance - r, camera_.distance + r);
     } else {
         proj = infiniteReverseZPerspective(glm::radians(camera_.fovDegrees),
-                                           w / h, zNear);
+                                           aspect, zNear);
     }
     proj[1][1] *= -1.0f;  // Vulkan's Y is flipped relative to GL
     const glm::mat4 viewProj = proj * view;
@@ -758,7 +761,7 @@ void VulkanWindow::render() {
             // Half-extents in mm, from the same definition as the raster
             // ortho projection above.
             const float halfH = orthoHalfHeight();
-            const float halfW = halfH * (w / h);
+            const float halfW = halfH * aspect;
             right = basis.right * halfW;
             up = basis.up * halfH;
             // Parallel rays start ON the camera plane, so anything behind it
@@ -769,7 +772,7 @@ void VulkanWindow::render() {
             rayEye -= fwd * sceneRadius();
         } else {
             const float tanY = std::tan(glm::radians(camera_.fovDegrees) * 0.5f);
-            const float tanX = tanY * (w / h);
+            const float tanX = tanY * aspect;
             right = basis.right * tanX;
             up = basis.up * tanY;
         }
@@ -1752,6 +1755,9 @@ void VulkanWindow::keyPressEvent(QKeyEvent* e) {
             case Qt::Key_M:
                 setMeasureMode(!measureMode_);
                 emit measureModeChanged(measureMode_);
+                return;
+            case Qt::Key_R:
+                emit moveRecordToggled();
                 return;
             case Qt::Key_Escape:
                 // Clear the current measurement but stay in measure mode.
