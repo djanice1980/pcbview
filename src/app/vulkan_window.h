@@ -289,6 +289,7 @@ private:
     bool stepTimedZoomAnimation();
     bool timedZoomActive_ = false;
     float tzStart_ = 0.0f, tzTarget_ = 0.0f;
+    float tzFromTarget_[3] = {0, 0, 0}, tzToTarget_[3] = {0, 0, 0};
     double tzT_ = 0.0, tzDur_ = 0.0;
     QElapsedTimer tzClock_;
     void applyGlobeTumble(float ax);

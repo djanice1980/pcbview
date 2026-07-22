@@ -533,6 +533,23 @@ void VulkanWindow::startTimedZoom(float percent, float seconds) {
     tzStart_ = camera_.distance;
     // 200% shows the board twice its framed size = half the distance.
     tzTarget_ = std::max(1e-3f, framedDistance() * (100.0f / percent));
+    // Pin the approach to the BOARD: wheel zoom-to-cursor and panning move
+    // the orbit target around, and flying toward a stray target sends the
+    // board sliding out of frame. The sweep glides the target back to the
+    // bounds centre, so the zoom lands on the true framed view.
+    tzFromTarget_[0] = camera_.targetX;
+    tzFromTarget_[1] = camera_.targetY;
+    tzFromTarget_[2] = camera_.targetZ;
+    if (mesh_) {
+        const auto& b = mesh_->bounds;
+        tzToTarget_[0] = static_cast<float>((b.min[0] + b.max[0]) * 0.5);
+        tzToTarget_[1] = static_cast<float>((b.min[1] + b.max[1]) * 0.5);
+        tzToTarget_[2] = static_cast<float>((b.min[2] + b.max[2]) * 0.5);
+    } else {
+        tzToTarget_[0] = tzFromTarget_[0];
+        tzToTarget_[1] = tzFromTarget_[1];
+        tzToTarget_[2] = tzFromTarget_[2];
+    }
     tzT_ = 0.0;
     tzDur_ = seconds;
     timedZoomActive_ = true;
@@ -553,8 +570,13 @@ bool VulkanWindow::stepTimedZoomAnimation() {
     }
     // Log-space sweep: constant perceptual rate at any distance, and it
     // lands exactly on the target.
-    camera_.distance =
-        tzStart_ * std::pow(tzTarget_ / tzStart_, static_cast<float>(u));
+    const float fu = static_cast<float>(u);
+    camera_.distance = tzStart_ * std::pow(tzTarget_ / tzStart_, fu);
+    // Smoothstep the re-centre so it eases rather than jerking sideways.
+    const float su = fu * fu * (3.0f - 2.0f * fu);
+    camera_.targetX = tzFromTarget_[0] + (tzToTarget_[0] - tzFromTarget_[0]) * su;
+    camera_.targetY = tzFromTarget_[1] + (tzToTarget_[1] - tzFromTarget_[1]) * su;
+    camera_.targetZ = tzFromTarget_[2] + (tzToTarget_[2] - tzFromTarget_[2]) * su;
     return timedZoomActive_;
 }
 
