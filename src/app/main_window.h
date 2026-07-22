@@ -107,6 +107,13 @@ private:
     void refreshShowcaseList();
     void saveShowcase();
     void loadShowcase();
+    QString packShowcaseSteps() const;
+    QString packShowcasePaths(bool referencedOnly) const;
+    void unpackShowcaseSteps(const QString& packed);
+    void unpackShowcasePaths(const QString& packed);
+    void saveShowcaseTemplateAs();
+    void loadShowcaseTemplate(const QString& name);
+    void rebuildTemplatesMenu(QMenu* menu);
 
     // Custom movements: sample the camera while the user drives, store the
     // keys under an id, and play them back as a "path" step.

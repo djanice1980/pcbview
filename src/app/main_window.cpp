@@ -2209,6 +2209,22 @@ void MainWindow::buildShowcaseDock() {
     });
     layout->addWidget(showcaseList_);
 
+    // Named templates: keep a favorite set of views around for reuse.
+    auto* tplRow = new QHBoxLayout;
+    tplRow->setSpacing(4);
+    auto* tplBtn = new QPushButton("Templates…");
+    tplBtn->setToolTip(
+        "Save the current playlist as a named template, or load a saved\n"
+        "one. Templates carry their custom recorded moves with them.\n"
+        "Loading replaces the current playlist.");
+    auto* tplMenu = new QMenu(tplBtn);
+    connect(tplMenu, &QMenu::aboutToShow, this,
+            [this, tplMenu] { rebuildTemplatesMenu(tplMenu); });
+    tplBtn->setMenu(tplMenu);
+    tplRow->addWidget(tplBtn);
+    tplRow->addStretch(1);
+    layout->addLayout(tplRow);
+
     // Loop controls + transport.
     auto* playRow = new QHBoxLayout;
     playRow->setSpacing(4);
@@ -2860,19 +2876,23 @@ void MainWindow::videoFinish(const QString& message) {
     if (quit) QTimer::singleShot(0, qApp, &QApplication::quit);
 }
 
-void MainWindow::saveShowcase() {
+QString MainWindow::packShowcaseSteps() const {
     QStringList parts;
     for (const ShowcaseStep& s : showcaseSteps_)
         parts << QString("%1:%2:%3").arg(s.kind, s.param).arg(s.holdSec);
-    QSettings s = appSettings();
-    s.setValue("showcaseSteps", parts.join(";"));
-    if (showcaseLoops_) s.setValue("showcaseLoops", showcaseLoops_->value());
-    if (showcaseForever_)
-        s.setValue("showcaseRepeat", showcaseForever_->isChecked());
+    return parts.join(';');
+}
 
-    // Custom movement keys: id:val,val,...|id:... (8 floats per key).
+// Custom movement keys: id:val,val,...|id:... (8 floats per key).
+QString MainWindow::packShowcasePaths(bool referencedOnly) const {
     QStringList paths;
     for (const auto& [id, keys] : showcasePaths_) {
+        if (referencedOnly) {
+            bool used = false;
+            for (const ShowcaseStep& s : showcaseSteps_)
+                if (s.kind == "path" && s.param == id) used = true;
+            if (!used) continue;
+        }
         QStringList vals;
         vals.reserve(static_cast<int>(keys.size()) * 8);
         for (const auto& k : keys)
@@ -2881,16 +2901,12 @@ void MainWindow::saveShowcase() {
                 vals << QString::number(v, 'f', 4);
         paths << id + ":" + vals.join(',');
     }
-    s.setValue("showcasePathData", paths.join('|'));
-    s.setValue("showcasePathNextId", nextPathId_);
+    return paths.join('|');
 }
 
-void MainWindow::loadShowcase() {
-    QSettings s = appSettings();
+void MainWindow::unpackShowcaseSteps(const QString& packed) {
     showcaseSteps_.clear();
-    const QString packed = s.value("showcaseSteps").toString();
-    for (const QString& part :
-         packed.split(';', Qt::SkipEmptyParts)) {
+    for (const QString& part : packed.split(';', Qt::SkipEmptyParts)) {
         const QStringList f = part.split(':');
         if (f.size() != 3) continue;
         ShowcaseStep st;
@@ -2899,22 +2915,11 @@ void MainWindow::loadShowcase() {
         st.holdSec = f[2].toDouble();
         showcaseSteps_.push_back(st);
     }
-    // Blockers, or the widgets' change-signals fire saveShowcase() MID-LOAD
-    // and overwrite the not-yet-parsed path data with an empty map.
-    if (showcaseLoops_) {
-        const QSignalBlocker block(showcaseLoops_);
-        showcaseLoops_->setValue(s.value("showcaseLoops", 1).toInt());
-    }
-    if (showcaseForever_) {
-        const QSignalBlocker block(showcaseForever_);
-        showcaseForever_->setChecked(s.value("showcaseRepeat", false).toBool());
-        showcaseLoops_->setEnabled(!showcaseForever_->isChecked());
-    }
+}
 
+void MainWindow::unpackShowcasePaths(const QString& packed) {
     showcasePaths_.clear();
-    for (const QString& entry : s.value("showcasePathData")
-                                    .toString()
-                                    .split('|', Qt::SkipEmptyParts)) {
+    for (const QString& entry : packed.split('|', Qt::SkipEmptyParts)) {
         const int colon = entry.indexOf(':');
         if (colon <= 0) continue;
         const QString id = entry.left(colon);
@@ -2934,8 +2939,151 @@ void MainWindow::loadShowcase() {
         }
         if (keys.size() >= 2) showcasePaths_[id] = std::move(keys);
     }
-    nextPathId_ = s.value("showcasePathNextId", 1).toInt();
+    // New recordings must never collide with ids we just loaded.
+    int maxId = 0;
+    for (const auto& [id, keys] : showcasePaths_)
+        if (id.startsWith('p')) maxId = std::max(maxId, id.mid(1).toInt());
+    nextPathId_ = std::max(nextPathId_, maxId + 1);
+}
+
+void MainWindow::saveShowcase() {
+    QSettings s = appSettings();
+    s.setValue("showcaseSteps", packShowcaseSteps());
+    if (showcaseLoops_) s.setValue("showcaseLoops", showcaseLoops_->value());
+    if (showcaseForever_)
+        s.setValue("showcaseRepeat", showcaseForever_->isChecked());
+    s.setValue("showcasePathData", packShowcasePaths(false));
+    s.setValue("showcasePathNextId", nextPathId_);
+}
+
+void MainWindow::loadShowcase() {
+    QSettings s = appSettings();
+    unpackShowcaseSteps(s.value("showcaseSteps").toString());
+    // Blockers, or the widgets' change-signals fire saveShowcase() MID-LOAD
+    // and overwrite the not-yet-parsed path data with an empty map.
+    if (showcaseLoops_) {
+        const QSignalBlocker block(showcaseLoops_);
+        showcaseLoops_->setValue(s.value("showcaseLoops", 1).toInt());
+    }
+    if (showcaseForever_) {
+        const QSignalBlocker block(showcaseForever_);
+        showcaseForever_->setChecked(s.value("showcaseRepeat", false).toBool());
+        showcaseLoops_->setEnabled(!showcaseForever_->isChecked());
+    }
+    unpackShowcasePaths(s.value("showcasePathData").toString());
+    nextPathId_ =
+        std::max(nextPathId_, s.value("showcasePathNextId", 1).toInt());
     refreshShowcaseList();
+}
+
+// Templates are named copies of the playlist stored in the settings list
+// "showcaseTemplates", one item per template:
+//   name=<percent-encoded>&steps=<packed>&paths=<packed>&loops=N&repeat=0|1
+// '&' can appear in no field: names are percent-encoded and the packed
+// step/path strings only ever contain [A-Za-z0-9 . , : ; | -].
+static QString templateField(const QString& item, const QString& key) {
+    for (const QString& f : item.split('&'))
+        if (f.startsWith(key + '=')) return f.mid(key.size() + 1);
+    return {};
+}
+
+static QString templateName(const QString& item) {
+    return QUrl::fromPercentEncoding(templateField(item, "name").toUtf8());
+}
+
+void MainWindow::saveShowcaseTemplateAs() {
+    if (showcaseSteps_.empty()) {
+        statusBar()->showMessage(
+            "Showcase: nothing to save — the playlist is empty", 5000);
+        return;
+    }
+    bool ok = false;
+    const QString name =
+        QInputDialog::getText(this, "Save template", "Template name:",
+                              QLineEdit::Normal, {}, &ok)
+            .trimmed();
+    if (!ok || name.isEmpty()) return;
+    const QString item =
+        "name=" + QString::fromUtf8(QUrl::toPercentEncoding(name)) +
+        "&steps=" + packShowcaseSteps() +
+        "&paths=" + packShowcasePaths(true) +
+        "&loops=" +
+        QString::number(showcaseLoops_ ? showcaseLoops_->value() : 1) +
+        "&repeat=" +
+        (showcaseForever_ && showcaseForever_->isChecked() ? "1" : "0");
+    QSettings s = appSettings();
+    QStringList items = s.value("showcaseTemplates").toStringList();
+    bool replaced = false;
+    for (QString& existing : items)
+        if (templateName(existing) == name) {
+            existing = item;
+            replaced = true;
+        }
+    if (!replaced) items << item;
+    s.setValue("showcaseTemplates", items);
+    statusBar()->showMessage(QString("Showcase: template \"%1\" %2")
+                                 .arg(name, replaced ? "replaced" : "saved"),
+                             5000);
+}
+
+void MainWindow::loadShowcaseTemplate(const QString& name) {
+    const QStringList items =
+        appSettings().value("showcaseTemplates").toStringList();
+    for (const QString& item : items) {
+        if (templateName(item) != name) continue;
+        unpackShowcaseSteps(templateField(item, "steps"));
+        unpackShowcasePaths(templateField(item, "paths"));
+        if (showcaseLoops_) {
+            const QSignalBlocker block(showcaseLoops_);
+            showcaseLoops_->setValue(
+                std::max(1, templateField(item, "loops").toInt()));
+        }
+        if (showcaseForever_) {
+            const QSignalBlocker block(showcaseForever_);
+            showcaseForever_->setChecked(templateField(item, "repeat") == "1");
+            showcaseLoops_->setEnabled(!showcaseForever_->isChecked());
+        }
+        refreshShowcaseList();
+        saveShowcase();  // the template becomes the live playlist
+        statusBar()->showMessage("Showcase: loaded template \"" + name + "\"",
+                                 5000);
+        return;
+    }
+    statusBar()->showMessage("Showcase: template \"" + name + "\" not found",
+                             5000);
+}
+
+void MainWindow::rebuildTemplatesMenu(QMenu* menu) {
+    menu->clear();
+    QAction* save = menu->addAction("Save current as…");
+    connect(save, &QAction::triggered, this,
+            &MainWindow::saveShowcaseTemplateAs);
+    const QStringList items =
+        appSettings().value("showcaseTemplates").toStringList();
+    if (items.isEmpty()) return;
+    menu->addSeparator();
+    for (const QString& item : items) {
+        const QString name = templateName(item);
+        QAction* a = menu->addAction("Load \"" + name + "\"");
+        connect(a, &QAction::triggered, this,
+                [this, name] { loadShowcaseTemplate(name); });
+    }
+    menu->addSeparator();
+    QMenu* del = menu->addMenu("Delete template");
+    for (const QString& item : items) {
+        const QString name = templateName(item);
+        QAction* a = del->addAction(name);
+        connect(a, &QAction::triggered, this, [this, name] {
+            QSettings s = appSettings();
+            QStringList items = s.value("showcaseTemplates").toStringList();
+            items.removeIf([&name](const QString& it) {
+                return templateName(it) == name;
+            });
+            s.setValue("showcaseTemplates", items);
+            statusBar()->showMessage(
+                "Showcase: deleted template \"" + name + "\"", 5000);
+        });
+    }
 }
 
 // Tick off any stackup row whose part was hidden from the environment, so the
