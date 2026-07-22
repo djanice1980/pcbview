@@ -2412,10 +2412,13 @@ struct MainWindow::VideoJob {
     bool quitWhenDone = false;  // the headless PCBVIEW_RECORD hook
     bool lastStatic = false;
     bool haveFrame = false;      // scratch holds the previous encoded frame
-    vk::Renderer::CaptureBuffer cap;
-    bool capturing = false, capRequested = false;
+    // Pipelined capture state: the frame hook converges, arms the ring copy,
+    // then the driver moves on while the GPU drains behind it.
+    bool awaitingConverge = false, armedThisFrame = false;
+    int pipeDepth = 1;
     int convergeBudget = 0;
     QMetaObject::Connection frameConn;
+    std::vector<uint8_t> fetch;    // raw fetched pixels (full extent)
     std::vector<uint8_t> scratch;  // tight even-cropped copy for the encoder
     int encW = 0, encH = 0;
     QProgressDialog* progress = nullptr;
@@ -2539,33 +2542,35 @@ void MainWindow::startVideoRecording(const QString& outPath, QSize target,
     }
     r->setUncappedPresent(true);  // render at GPU speed, not display speed
     viewport_->setAnimationsPaused(true);
+    // Ring depth is re-budgeted for THIS recording's extent -- N+3 when the
+    // host-visible heap allows it, less when it doesn't.
+    job->pipeDepth = std::max(1, r->beginPipelinedCapture(3));
 
-    // One persistent frame hook drives every capture: wait for convergence
-    // (accumulation + denoise), request the in-memory grab, hand it to the
-    // encoder step.
+    // The frame hook: converge (accumulation + denoise), then arm the
+    // in-frame ring copy. The frame AFTER the armed one confirms the copy is
+    // queued; the driver then advances immediately -- the GPU finishes the
+    // capture behind the next frame's work.
     job->frameConn = connect(viewport_, &VulkanWindow::frameRendered, this,
                              [this] {
         VideoJob* job = videoJob_;
-        if (!job || !job->capturing) return;
+        if (!job) return;
         vk::Renderer* r = viewport_->renderer();
         if (!r) return;
-        if (!job->capRequested) {
-            if (r->accumulating() && ++job->convergeBudget < 3000) {
-                viewport_->requestUpdate();
-                return;
-            }
-            job->cap.done = false;
-            r->requestCaptureToBuffer(&job->cap);
-            job->capRequested = true;
+        if (job->armedThisFrame) {
+            // The armed frame has been submitted; its copy is in the queue.
+            job->armedThisFrame = false;
+            videoEncodeCaptured();
+            return;
+        }
+        if (!job->awaitingConverge) return;
+        if (r->accumulating() && ++job->convergeBudget < 3000) {
             viewport_->requestUpdate();
             return;
         }
-        if (!job->cap.done) {
-            viewport_->requestUpdate();
-            return;
-        }
-        job->capturing = false;
-        videoEncodeCaptured();
+        job->awaitingConverge = false;
+        r->armPipelinedCapture();
+        job->armedThisFrame = true;
+        viewport_->requestUpdate();
     });
 
     job->progress = new QProgressDialog("Rendering video…", "Cancel", 0,
@@ -2619,10 +2624,17 @@ void MainWindow::videoNextFrame() {
             .arg(job->steps.size())
             .arg(job->framesEncoded + 1));
 
-    // A held frame is identical to the previous one: encode it again without
-    // re-rendering.
+    // A held frame is identical to the previous one: encode it again
+    // without re-rendering. The ring must drain first, or duplicates would
+    // jump the queue ahead of still-pending captures.
     const bool moving = viewport_->viewAnimating();
     if (!moving && job->lastStatic && job->haveFrame) {
+        if (vk::Renderer* r = viewport_->renderer()) {
+            while (r->pendingCaptures() > 0) {
+                r->waitCapture(UINT64_MAX);
+                if (!videoDrainOne()) return;  // encode error ended the job
+            }
+        }
         const std::string err = job->enc.writeFrame(job->scratch.data());
         if (!err.empty()) {
             videoFinish(QString::fromStdString(err));
@@ -2635,24 +2647,46 @@ void MainWindow::videoNextFrame() {
         return;
     }
 
-    // Kick the converge-then-capture sequence; the frameRendered hook picks
-    // it up and videoEncodeCaptured() finishes the frame.
-    job->capturing = true;
-    job->capRequested = false;
+    // Kick the converge-then-arm sequence; the frameRendered hook takes it
+    // from here.
+    job->awaitingConverge = true;
     job->convergeBudget = 0;
     viewport_->requestUpdate();
 }
 
-// The captured pixels arrive as tight top-down BGRA at the render scale;
-// crop to even dimensions and feed the encoder.
+// The armed frame's copy is queued on the GPU. Drain whatever fences have
+// already signalled, block only when the ring is FULL, and advance to the
+// next video frame -- the overlap is exactly the ring depth.
 void MainWindow::videoEncodeCaptured() {
     VideoJob* job = videoJob_;
     if (!job) return;
-    const int w = static_cast<int>(job->cap.width) & ~1;
-    const int h = static_cast<int>(job->cap.height) & ~1;
+    vk::Renderer* r = viewport_->renderer();
+    if (!r) return;
+
+    while (r->captureReady()) {
+        if (!videoDrainOne()) return;
+    }
+    if (!r->captureSlotFree()) {
+        r->waitCapture(UINT64_MAX);
+        if (!videoDrainOne()) return;
+    }
+    job->lastStatic = !viewport_->viewAnimating();
+    QTimer::singleShot(0, this, &MainWindow::videoNextFrame);
+}
+
+// Fetch and encode the oldest completed capture. False = the job ended
+// (encoder error).
+bool MainWindow::videoDrainOne() {
+    VideoJob* job = videoJob_;
+    if (!job) return false;
+    vk::Renderer* r = viewport_->renderer();
+    uint32_t cw = 0, ch = 0;
+    if (!r || !r->fetchCapture(job->fetch, cw, ch)) return true;
+    const int w = static_cast<int>(cw) & ~1;
+    const int h = static_cast<int>(ch) & ~1;
     if (w <= 0 || h <= 0) {
         videoFinish("empty capture");
-        return;
+        return false;
     }
 
     if (!job->encOpen) {
@@ -2665,33 +2699,31 @@ void MainWindow::videoEncodeCaptured() {
                           bitrate, job->preferHevc);
         if (!err.empty()) {
             videoFinish(QString::fromStdString(err));
-            return;
+            return false;
         }
         job->encOpen = true;
         job->encW = w;
         job->encH = h;
     } else if (w != job->encW || h != job->encH) {
-        videoFinish("frame size changed mid-recording (was the window "
-                    "resized?)");
-        return;
+        videoFinish("frame size changed mid-recording");
+        return false;
     }
 
     job->scratch.resize(static_cast<size_t>(w) * h * 4);
-    const int srcRow = static_cast<int>(job->cap.width) * 4;
+    const int srcRow = static_cast<int>(cw) * 4;
     for (int y = 0; y < h; ++y)
         std::memcpy(job->scratch.data() + static_cast<size_t>(y) * w * 4,
-                    job->cap.pixels.data() + static_cast<size_t>(y) * srcRow,
+                    job->fetch.data() + static_cast<size_t>(y) * srcRow,
                     static_cast<size_t>(w) * 4);
     const std::string err = job->enc.writeFrame(job->scratch.data());
     if (!err.empty()) {
         videoFinish(QString::fromStdString(err));
-        return;
+        return false;
     }
     job->haveFrame = true;
-    job->lastStatic = !viewport_->viewAnimating();
     ++job->framesEncoded;
     job->progress->setValue(std::min(job->framesEncoded, job->estTotal));
-    QTimer::singleShot(0, this, &MainWindow::videoNextFrame);
+    return true;
 }
 
 void MainWindow::videoFinish(const QString& message) {
@@ -2706,6 +2738,26 @@ void MainWindow::videoFinish(const QString& message) {
     }
     QObject::disconnect(job->frameConn);
     if (vk::Renderer* r = viewport_->renderer()) {
+        // The last frames of the show may still be in the ring: best-effort
+        // tail drain, no recursion into this function on error.
+        while (message.isEmpty() && job->encOpen &&
+               r->pendingCaptures() > 0 && r->waitCapture(UINT64_MAX)) {
+            uint32_t cw = 0, ch = 0;
+            if (!r->fetchCapture(job->fetch, cw, ch)) break;
+            const int w = static_cast<int>(cw) & ~1;
+            const int h = static_cast<int>(ch) & ~1;
+            if (w != job->encW || h != job->encH) break;
+            job->scratch.resize(static_cast<size_t>(w) * h * 4);
+            const int srcRow = static_cast<int>(cw) * 4;
+            for (int y = 0; y < h; ++y)
+                std::memcpy(
+                    job->scratch.data() + static_cast<size_t>(y) * w * 4,
+                    job->fetch.data() + static_cast<size_t>(y) * srcRow,
+                    static_cast<size_t>(w) * 4);
+            if (!job->enc.writeFrame(job->scratch.data()).empty()) break;
+            ++job->framesEncoded;
+        }
+        r->endPipelinedCapture();
         r->setCaptureExtent(0, 0);
         r->setUncappedPresent(false);
     }

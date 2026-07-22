@@ -170,6 +170,7 @@ Renderer::~Renderer() {
     if (device_.handle == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(device_.handle);
 
+    endPipelinedCapture();
     if (rtSupported_) destroyPathTracer();
     destroyAccelerationStructures();
     destroyBuffer(vertexBuffer_);
@@ -3722,7 +3723,10 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     toBlit[0] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     toBlit[0].srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
     toBlit[0].srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    toBlit[0].dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+    // COPY included: the pipelined video capture reads the same image right
+    // after the blit, in the copy stage.
+    toBlit[0].dstStageMask =
+        VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
     toBlit[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
     toBlit[0].oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     toBlit[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -3754,6 +3758,31 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     vkCmdBlitImage(cmd, sceneColor_.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                    images_[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                    &blit, VK_FILTER_LINEAR);
+
+    // --- Pipelined video capture: copy the scene into a ring slot INSIDE ---
+    // this frame's command stream. No queue drain: the slot's own fence is
+    // signalled by an empty follow-up submit, so the CPU only ever waits
+    // when the ring is full.
+    CapSlot* armedSlot = nullptr;
+    if (armCapture_ && !capRing_.empty() &&
+        capCount_ < static_cast<int>(capRing_.size())) {
+        CapSlot& slot = capRing_[capTail_];
+        if (slot.buf.size >=
+            static_cast<VkDeviceSize>(sceneExtent_.width) *
+                sceneExtent_.height * 4) {
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {sceneExtent_.width, sceneExtent_.height, 1};
+            vkCmdCopyImageToBuffer(cmd, sceneColor_.handle,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   slot.buf.handle, 1, &copy);
+            slot.ext = sceneExtent_;
+            capTail_ = (capTail_ + 1) % static_cast<int>(capRing_.size());
+            ++capCount_;
+            armedSlot = &slot;
+        }
+        armCapture_ = false;
+    }
 
     // --- Pass 2: the UI, straight onto the swapchain at native resolution ---
     VkImageMemoryBarrier2 toUi{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
@@ -3815,6 +3844,15 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     check(vkQueueSubmit(device_.graphicsQueue, 1, &submit, inFlight_[frame_]),
           "vkQueueSubmit");
 
+    if (armedSlot) {
+        // Fence-only submit: queue order guarantees the capture copy above
+        // has executed by the time this fence signals.
+        VkSubmitInfo fenceOnly{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        check(vkQueueSubmit(device_.graphicsQueue, 1, &fenceOnly,
+                            armedSlot->fence),
+              "vkQueueSubmit(capture fence)");
+    }
+
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
     present.pWaitSemaphores = &renderFinished_[imageIndex];
@@ -3844,6 +3882,83 @@ void Renderer::setUncappedPresent(bool on) {
     uncappedPresent_ = on;
     if (extent_.width > 0 && extent_.height > 0)
         resize(extent_.width, extent_.height);
+}
+
+int Renderer::beginPipelinedCapture(int wantedDepth) {
+    endPipelinedCapture();
+    const VkDeviceSize per =
+        static_cast<VkDeviceSize>(sceneExtent_.width) * sceneExtent_.height *
+        4;
+    if (per == 0) return 0;
+
+    // Budget check, EVERY time: the ring must stay under a tenth of the
+    // biggest host-visible heap (system RAM on discrete GPUs, the shared
+    // pool on integrated ones -- where this genuinely bites at 4K).
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(device_.gpu.handle, &mp);
+    VkDeviceSize hostHeap = 0;
+    for (uint32_t t = 0; t < mp.memoryTypeCount; ++t)
+        if (mp.memoryTypes[t].propertyFlags &
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            hostHeap = std::max(hostHeap,
+                                mp.memoryHeaps[mp.memoryTypes[t].heapIndex].size);
+    int depth = std::max(1, wantedDepth);
+    while (depth > 1 && per * depth > hostHeap / 10) --depth;
+
+    capRing_.resize(depth);
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    for (CapSlot& s : capRing_) {
+        s.buf = createReadbackBuffer(per);
+        check(vkCreateFence(device_.handle, &fi, nullptr, &s.fence),
+              "vkCreateFence(capture slot)");
+    }
+    capHead_ = capTail_ = capCount_ = 0;
+    armCapture_ = false;
+    return depth;
+}
+
+void Renderer::endPipelinedCapture() {
+    if (capRing_.empty()) return;
+    vkQueueWaitIdle(device_.graphicsQueue);
+    for (CapSlot& s : capRing_) {
+        if (s.fence) vkDestroyFence(device_.handle, s.fence, nullptr);
+        destroyBuffer(s.buf);
+    }
+    capRing_.clear();
+    capHead_ = capTail_ = capCount_ = 0;
+    armCapture_ = false;
+}
+
+bool Renderer::captureReady() {
+    if (capCount_ == 0) return false;
+    return vkGetFenceStatus(device_.handle, capRing_[capHead_].fence) ==
+           VK_SUCCESS;
+}
+
+bool Renderer::waitCapture(uint64_t timeoutNs) {
+    if (capCount_ == 0) return false;
+    return vkWaitForFences(device_.handle, 1, &capRing_[capHead_].fence,
+                           VK_TRUE, timeoutNs) == VK_SUCCESS;
+}
+
+bool Renderer::fetchCapture(std::vector<uint8_t>& out, uint32_t& w,
+                            uint32_t& h) {
+    if (!captureReady()) return false;
+    CapSlot& slot = capRing_[capHead_];
+    const VkDeviceSize size =
+        static_cast<VkDeviceSize>(slot.ext.width) * slot.ext.height * 4;
+    void* mapped = nullptr;
+    check(vkMapMemory(device_.handle, slot.buf.memory, 0, size, 0, &mapped),
+          "vkMapMemory(capture slot)");
+    out.assign(static_cast<const uint8_t*>(mapped),
+               static_cast<const uint8_t*>(mapped) + size);
+    vkUnmapMemory(device_.handle, slot.buf.memory);
+    w = slot.ext.width;
+    h = slot.ext.height;
+    vkResetFences(device_.handle, 1, &slot.fence);
+    capHead_ = (capHead_ + 1) % static_cast<int>(capRing_.size());
+    --capCount_;
+    return true;
 }
 
 void Renderer::setCaptureExtent(uint32_t w, uint32_t h) {

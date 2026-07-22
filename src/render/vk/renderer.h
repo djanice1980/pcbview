@@ -286,6 +286,26 @@ public:
     // CAPTURE is exact. (0,0) returns to window x scale.
     void setCaptureExtent(uint32_t w, uint32_t h);
 
+    // ---- pipelined capture (video) -----------------------------------------
+    // A ring of host staging slots: the capture copy rides inside the
+    // frame's own command stream and each slot gets its own fence, so the
+    // GPU renders frames ahead while earlier ones drain to the encoder. The
+    // ring depth is granted from a HOST-VISIBLE HEAP BUDGET check -- sized
+    // for the current scene extent, capped so the ring stays under a tenth
+    // of the heap. Returns the depth granted.
+    int beginPipelinedCapture(int wantedDepth);
+    void endPipelinedCapture();
+    // Capture the next drawFrame into the ring (no-op if the ring is full).
+    void armPipelinedCapture() { armCapture_ = true; }
+    bool captureReady();                      // oldest slot's fence signalled?
+    bool waitCapture(uint64_t timeoutNs);     // block for the oldest slot
+    bool fetchCapture(std::vector<uint8_t>& out, uint32_t& w, uint32_t& h);
+    int pendingCaptures() const { return capCount_; }
+    bool captureSlotFree() const {
+        return !capRing_.empty() &&
+               capCount_ < static_cast<int>(capRing_.size());
+    }
+
     const FrameStats& stats() const { return stats_; }
 
 private:
@@ -454,6 +474,14 @@ private:
     CaptureBuffer* captureBuffer_ = nullptr;
     bool uncappedPresent_ = false;
     VkExtent2D captureExtent_{0, 0};
+    struct CapSlot {
+        Buffer buf;
+        VkFence fence = VK_NULL_HANDLE;
+        VkExtent2D ext{0, 0};
+    };
+    std::vector<CapSlot> capRing_;
+    int capHead_ = 0, capTail_ = 0, capCount_ = 0;
+    bool armCapture_ = false;
 
     Buffer vertexBuffer_;
     Buffer indexBuffer_;

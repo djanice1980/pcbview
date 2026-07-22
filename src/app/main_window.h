@@ -125,6 +125,7 @@ private:
                              bool preferHevc, int quality, bool quitWhenDone);
     void videoNextFrame();
     void videoEncodeCaptured();
+    bool videoDrainOne();
     void videoFinish(const QString& message);
     struct VideoJob;
     VideoJob* videoJob_ = nullptr;
