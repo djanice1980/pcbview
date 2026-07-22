@@ -2226,9 +2226,17 @@ void MainWindow::buildShowcaseDock() {
     moveRecBtn_ = new QPushButton("Rec move");
     moveRecBtn_->setToolTip(
         "Record your own camera movement (drag, zoom, explode) as a step.\n"
-        "Start, drive the board, stop. The R key toggles this too, so the\n"
+        "Start, drive the board, stop. Ctrl+Shift+R toggles this anywhere\n"
+        "in the app (plain R works while the viewport has focus), so the\n"
         "mouse stays free for the movement itself.");
     connect(moveRecBtn_, &QPushButton::clicked, this,
+            &MainWindow::toggleMoveRecording);
+    // Application-wide: the viewport is a native QWindow, so widget
+    // shortcuts never fire while IT has focus (R covers that side); this
+    // covers every widget in the app.
+    auto* recSc = new QShortcut(QKeySequence("Ctrl+Shift+R"), this);
+    recSc->setContext(Qt::ApplicationShortcut);
+    connect(recSc, &QShortcut::activated, this,
             &MainWindow::toggleMoveRecording);
     playRow->addWidget(moveRecBtn_);
     auto* recordBtn = new QPushButton("Record…");
