@@ -13,7 +13,9 @@ namespace {
 // before a straight one and slow diagonal moves snap to an axis.
 constexpr float kStickDeadZone = 0.16f;
 // Triggers rest at zero but chatter a little; ignore the bottom of the range.
-constexpr float kTriggerFloor = 0.06f;
+// Kept low so the very start of the pull already does something -- a high
+// floor makes the first part of the travel feel dead.
+constexpr float kTriggerFloor = 0.02f;
 
 float axisNorm(int16_t v) {
     // SDL's range is [-32768, 32767]; the asymmetry means a full negative push

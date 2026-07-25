@@ -237,8 +237,11 @@ void VulkanWindow::stepGamepad() {
     // shoulders they give a pressure-proportional peel rate: ease into it for
     // a slow reveal, bury the trigger to throw the stack apart.
     if (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f) {
+        // 2.4/s: a full pull sweeps the stack apart in a little under half a
+        // second. The original 0.9 needed over a second of held trigger, which
+        // read as the control being unresponsive rather than gentle.
         setExplodeProgress(explodeProgress_ +
-                           (g.rightTrigger - g.leftTrigger) * 0.9f * fdt);
+                           (g.rightTrigger - g.leftTrigger) * 2.4f * fdt);
         moved = true;
     }
 
@@ -278,7 +281,10 @@ void VulkanWindow::stepGamepad() {
                 // actually gets you to the other side of the board. So the
                 // twist axis turns the board and the flat-turn axis flips it.
                 camera_.pitch = wrapPi(camera_.pitch + ax * fdt);  // nose
-                camera_.yaw = wrapPi(camera_.yaw + az * fdt);      // twist
+                // Twist is NEGATED: user-confirmed on hardware that the
+                // steering-wheel motion turned the board the wrong way. Do not
+                // "correct" this back from SDL's right-hand rule.
+                camera_.yaw = wrapPi(camera_.yaw - az * fdt);      // twist
                 if (ay != 0.0f) applyGlobeTumble(ay * fdt);        // flip
                 moved = true;
             }
