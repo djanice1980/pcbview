@@ -1087,32 +1087,25 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
     // driving, so the animation should not fight the drag.
     cameraAnimating_ = false;
     lastPos_ = e->position();
-    // Plain left-drag turns the board (yaw+pitch). The SECONDARY rotations --
-    // globe tumble and roll -- are gated behind Alt, on either button, so a
-    // stray right-drag can no longer knock the board off its axis. Latched at
-    // press time: releasing Alt mid-drag should not change what the drag does.
-    const bool alt = (e->modifiers() & Qt::AltModifier) != 0;
     if (e->button() == Qt::LeftButton) {
-        if (alt) {
-            draggingInv_ = true;
-        } else {
-            dragging_ = true;
-            // A left CLICK (press+release without a drag) is a pick: a
-            // measurement point in measure mode, otherwise the net under the
-            // cursor. A drag still turns the board either way. Track the
-            // candidacy here and cancel it once the cursor moves.
-            clickCandidate_ = true;
-            pressPos_ = e->position();
-        }
+        dragging_ = true;
+        // A left CLICK (press+release without a drag) is a pick: a
+        // measurement point in measure mode, otherwise the net under the
+        // cursor. A drag still orbits either way. Track the candidacy here
+        // and cancel it once the cursor moves.
+        clickCandidate_ = true;
+        pressPos_ = e->position();
     }
-    if (e->button() == Qt::RightButton && alt) draggingInv_ = true;
+    // Left-drag is yaw+pitch; right-drag is yaw+ROLL (horizontal spins the
+    // board on its axis, vertical twists it cw/ccw); middle pans. User
+    // request: the right button covers the rotation left-drag can't do.
+    if (e->button() == Qt::RightButton) draggingInv_ = true;
     if (e->button() == Qt::MiddleButton) panning_ = true;
 }
 
 void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
     if (e->button() == Qt::LeftButton) {
         dragging_ = false;
-        draggingInv_ = false;  // Alt+left-drag tumbles; clear that too
         if (clickCandidate_) {
             clickCandidate_ = false;
             if (measureMode_) {
@@ -1162,15 +1155,7 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
 
     if (dragging_) {
         const float s = 0.008f;
-        // DIRECT MANIPULATION: the face you grabbed follows the cursor, as if
-        // your hand were on the board. Adding the delta orbits the CAMERA to
-        // the right instead, which swings the near face LEFT -- the board moves
-        // opposite your hand, and that is what reads as "I am flying a camera
-        // around a bolted-down board" rather than turning the board itself.
-        // Verified by capture, not derived: drag right, watch the near edge.
-        // NOTE: this is the DRAG mapping only. startSpin() is untouched, so the
-        // showcase CW/CCW step labels keep meaning what they already mean.
-        camera_.yaw = wrapPi(camera_.yaw - static_cast<float>(delta.x()) * s);
+        camera_.yaw = wrapPi(camera_.yaw + static_cast<float>(delta.x()) * s);
         // No clamp: the basis is pole-safe, so pitch rotates through and keeps
         // going. Past vertical the view inverts, which is correct.
         camera_.pitch =

@@ -861,28 +861,33 @@ rather than sitting at a fixed hair's breadth.
     generator already carries — no new plumbing. Sun is `-fwd + 0.45*up +
     0.30*right`, dominated by `-fwd` so a top view still reads as lit from
     overhead the way the old world sun did.
-- **The board turns; the camera does not — but there is NO model matrix, and it
-  does not need one.** Everything world-fixed in this scene is purely
-  DIRECTIONAL (a sun direction, a sky gradient); there is no floor and no
-  positional landmark. So rotating the board by R under fixed lights renders
-  identically to orbiting the camera by R⁻¹ with the lights carried along.
-  That equivalence is why "make the PCB move instead of the camera" cost a
-  light-rig change plus a sign flip, instead of a model matrix threaded through
-  the vertex shader, the ray-query TLAS, the compute tracer's own traversal,
-  `screenToBoard` picking and `frameBoard`. Do not "finish the job" by adding a
-  real model transform; it would be a large, risky, pixel-identical change.
-  - Left-drag NEGATES the yaw delta so the grabbed face follows the cursor
-    (direct manipulation). Adding it orbits the camera right, which swings the
-    near face LEFT — the board moving opposite your hand is exactly what reads
-    as "I am flying a camera around a bolted-down board". Verified by capture,
-    not derived. Pitch was already correct and is untouched.
-  - This is the DRAG mapping only. `startSpin()` is deliberately untouched, so
-    the showcase CW/CCW step labels keep meaning what they already mean.
-  - Globe-tumble + roll are gated behind **Alt** (either button) so a stray
-    right-drag cannot knock the board off its axis. Note for testing: Windows
-    mouse messages have no `MK_ALT` flag, so Qt reads Alt from `GetKeyState`,
-    which `PostMessage` never updates — the Alt path CANNOT be exercised by a
-    posted-message harness, only by a real keypress.
+- **The board is moving to a REAL model transform (in progress).** An earlier
+  attempt (e4b7df4, reverted in the mouse-control half) exploited the fact that
+  everything world-fixed here is purely DIRECTIONAL — a sun direction and a sky
+  gradient, no floor, no positional landmark — so rotating the board by R under
+  fixed lights renders identically to orbiting the camera by R⁻¹ with the
+  lights carried along. That equivalence is real, and it is why the light-rig
+  change alone made the shading sweep correctly. **But it is not sufficient**,
+  for two reasons:
+  - It is a fake. The board is still nailed to the origin, so nothing else in
+    the app can treat it as an object that has a pose.
+  - **VR breaks the equivalence outright.** There the camera IS the user's
+    head; the app does not control it and cannot apply R⁻¹ to it. The board
+    must genuinely move, which means a transform through `board.vert`, the
+    ray-query TLAS instance, the compute tracer's ray/hit transforms,
+    `screenToBoard` picking and `frameBoard` bounds.
+  - Mouse controls were restored to their original mapping (plain right-drag
+    tumbles; left-drag yaw ADDS its delta) — the direct-manipulation sign flip
+    and the Alt gate were both rejected. Whatever drives the model transform
+    must preserve that original on-screen feel.
+  - Showcase is part of this, not a follow-up: `startSpin`/`startPath` and the
+    recorded custom moves persist CAMERA pose (8 floats per key in
+    `showcasePathData`, plus saved templates). Moving rotation to the board
+    must not invalidate playlists already saved in `~/.pcbview/settings.xml`.
+  - Testing note: Windows mouse messages have no `MK_ALT` flag, so Qt reads Alt
+    from `GetKeyState`, which `PostMessage` never updates — an Alt-gated
+    binding cannot be exercised by a posted-message harness, only by a real
+    keypress.
   - **The key is POSITIONAL, not a fixed direction**, placed at
     `eye + (camRight+camUp)*0.55*viewDist` and pointed per-fragment. A directional
     key hits every point on a flat face at the same angle, so a large flat top
