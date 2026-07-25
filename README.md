@@ -243,7 +243,13 @@ on an Xbox pad. The pad only steers while pcbview is the active application.
 | Collapse / explode | `L2` / `R2` (analog — press harder to peel faster) |
 | Fit / Iso / Top / Bottom | South / East / West / North (`✕ ○ □ △`, `A B X Y`) |
 | Level the roll | `L3` |
-| Hold and turn | Hold the DualSense touchpad and twist the pad — 1:1, so a 30° twist turns the board 30° |
+| Hold and turn | Hold the DualSense touchpad and move the pad — 1:1, so a 30° motion turns the board 30° |
+
+Hold-and-turn maps the pad's three motions to the three useful board motions:
+nose up/down pitches it, twisting it like a steering wheel turns it left and
+right, and turning it flat flips it left/right to the other side. View roll is
+deliberately not driven — it only tips the horizon and is disorienting to steer
+by hand.
 
 Hold-and-turn calibrates out the gyro's zero-rate offset while the touchpad is
 not held, so the board stays still until the pad actually moves. Set

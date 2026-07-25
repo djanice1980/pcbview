@@ -260,11 +260,18 @@ void VulkanWindow::stepGamepad() {
             const float ay = std::abs(gy) > kGyroNoise ? gy : 0.0f;
             const float az = std::abs(gz) > kGyroNoise ? gz : 0.0f;
             if (ax != 0.0f || ay != 0.0f || az != 0.0f) {
-                // SDL reports rad/s about the pad's own axes, right-handed:
-                // +y is yaw left, +x is pitch, +z is roll.
-                camera_.yaw = wrapPi(camera_.yaw + ay * fdt);
-                camera_.pitch = wrapPi(camera_.pitch + ax * fdt);
-                camera_.roll = wrapPi(camera_.roll + az * fdt);
+                // SDL reports rad/s about the pad's OWN axes, right-handed:
+                // +x is nose up/down, +y is turning it flat, +z is twisting it
+                // like a steering wheel.
+                //
+                // Roll is deliberately NOT driven here. Rolling the view just
+                // tips the horizon and is disorienting to steer by hand; the
+                // useful third motion is the left-right FLIP, which is what
+                // actually gets you to the other side of the board. So the
+                // twist axis turns the board and the flat-turn axis flips it.
+                camera_.pitch = wrapPi(camera_.pitch + ax * fdt);  // nose
+                camera_.yaw = wrapPi(camera_.yaw + az * fdt);      // twist
+                if (ay != 0.0f) applyGlobeTumble(ay * fdt);        // flip
                 moved = true;
             }
             padSteering_ = true;
