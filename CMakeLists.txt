@@ -85,6 +85,40 @@ FetchContent_Declare(cgltf
 )
 FetchContent_MakeAvailable(cgltf)
 
+# SDL3 (zlib licence, GPL-3-compatible): the gamepad layer. Qt6 dropped
+# QtGamepad -- it was a Qt5 module and was never ported -- so there is no
+# in-toolkit option. SDL is chosen over raw XInput because XInput cannot see a
+# DualSense over Bluetooth (it is not an XInput device), and over hand-rolled
+# HID because the DualSense's USB and Bluetooth report layouts differ, the BT
+# one is CRC'd, and getting a byte offset wrong yields sticks that almost work.
+# It also carries the community mapping database and a Linux backend, which the
+# planned Linux port will want.
+#
+# INPUT ONLY: Qt owns the window, the event loop and the rendering, so every
+# other subsystem is off. HIDAPI is what talks to the DualSense; SENSOR is what
+# exposes its gyro. This does add a couple of minutes to a cold CI build.
+FetchContent_Declare(sdl3
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG release-3.4.12
+    GIT_SHALLOW TRUE
+)
+set(SDL_SHARED       OFF CACHE BOOL "" FORCE)
+set(SDL_STATIC       ON  CACHE BOOL "" FORCE)
+set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+set(SDL_EXAMPLES     OFF CACHE BOOL "" FORCE)
+set(SDL_INSTALL      OFF CACHE BOOL "" FORCE)
+set(SDL_VIDEO        OFF CACHE BOOL "" FORCE)
+set(SDL_AUDIO        OFF CACHE BOOL "" FORCE)
+set(SDL_RENDER       OFF CACHE BOOL "" FORCE)
+set(SDL_GPU          OFF CACHE BOOL "" FORCE)
+set(SDL_CAMERA       OFF CACHE BOOL "" FORCE)
+set(SDL_DIALOG       OFF CACHE BOOL "" FORCE)
+set(SDL_JOYSTICK     ON  CACHE BOOL "" FORCE)
+set(SDL_HAPTIC       ON  CACHE BOOL "" FORCE)
+set(SDL_HIDAPI       ON  CACHE BOOL "" FORCE)
+set(SDL_SENSOR       ON  CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(sdl3)
+
 # Intel Open Image Denoise: the neural denoiser for the path tracer (Apache-2.0,
 # GPL-3-compatible). Prebuilt binary package -- header + import lib + runtime DLLs.
 FetchContent_Declare(oidn
@@ -224,6 +258,7 @@ add_executable(pcbview WIN32
     src/app/component_import.cpp
     src/app/theme.cpp
     src/app/viewer.cpp
+    src/input/gamepad.cpp
     assets/icons.qrc
     assets/pcbview.rc
     ${SHADER_OUTPUTS}
@@ -268,6 +303,7 @@ target_link_libraries(pcbview PRIVATE
     Vulkan::Vulkan
     Clipper2
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::PrintSupport
+    SDL3::SDL3-static
     ${OIDN_DIR}/lib/OpenImageDenoise.lib
     ${EMBREE_DIR}/lib/embree4.lib
 )

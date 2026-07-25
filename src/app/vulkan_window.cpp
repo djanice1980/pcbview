@@ -2,7 +2,9 @@
 
 #include <QElapsedTimer>
 #include <QFile>
+#include <QGuiApplication>
 #include <QKeyEvent>
+#include <QTimer>
 #include <QMouseEvent>
 #include <QPlatformSurfaceEvent>
 #include <QSettings>
@@ -151,6 +153,101 @@ float wrapPi(float a) {
 
 VulkanWindow::VulkanWindow(const geom::BoardMesh* mesh) : mesh_(mesh) {
     setSurfaceType(QSurface::VulkanSurface);
+
+    // ~120 Hz. Polling is cheap (SDL keeps the state; this just reads it) and
+    // it has to run even when nothing is being drawn, because on-demand
+    // rendering means an idle app produces no frames to piggyback on.
+    if (gamepad_.available()) {
+        padTimer_ = new QTimer(this);
+        padTimer_->setInterval(8);
+        connect(padTimer_, &QTimer::timeout, this, &VulkanWindow::stepGamepad);
+        padTimer_->start();
+        padClock_.start();
+    }
+}
+
+void VulkanWindow::stepGamepad() {
+    // The video recorder owns the clock while paused; a stray stick must not
+    // be able to shift the camera midway through a render.
+    if (animationsPaused_) return;
+    // Only drive the view while pcbview is the active application, or a pad
+    // being used in another window would quietly steer the board in the
+    // background.
+    if (QGuiApplication::applicationState() != Qt::ApplicationActive) {
+        padSteering_ = false;
+        return;
+    }
+
+    const input::GamepadState& g = gamepad_.poll();
+    if (!g.connected) {
+        padSteering_ = false;
+        return;
+    }
+
+    // Real elapsed time, so the response is identical at any poll rate or
+    // frame rate.
+    double dt = static_cast<double>(padClock_.restart()) / 1000.0;
+    if (dt <= 0.0 || dt > 0.25) dt = 0.016;  // first tick / after a stall
+    const float fdt = static_cast<float>(dt);
+    bool moved = false;
+
+    // Left stick TURNS THE BOARD, matching the mouse exactly: push right and
+    // the face you are looking at goes right. Same negated yaw as the drag
+    // path -- see mouseMoveEvent.
+    if (g.leftX != 0.0f || g.leftY != 0.0f) {
+        constexpr float kTurnRate = 2.2f;  // rad/s at full deflection
+        camera_.yaw = wrapPi(camera_.yaw - g.leftX * kTurnRate * fdt);
+        camera_.pitch = wrapPi(camera_.pitch - g.leftY * kTurnRate * fdt);
+        moved = true;
+    }
+
+    // Right stick pans across the screen plane, like the middle-drag.
+    if (g.rightX != 0.0f || g.rightY != 0.0f) {
+        const Basis b = cameraBasis(camera_);
+        const float scale = camera_.distance * 1.1f * fdt;
+        const glm::vec3 move =
+            -b.right * g.rightX * scale - b.up * g.rightY * scale;
+        camera_.targetX += move.x;
+        camera_.targetY += move.y;
+        camera_.targetZ += move.z;
+        moved = true;
+    }
+
+    // Triggers dolly: right pulls in, left pushes out. Exponential so the rate
+    // is constant in perceived terms rather than crawling when close and
+    // rocketing when far.
+    if (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f) {
+        const float rate = (g.leftTrigger - g.rightTrigger) * 1.6f * fdt;
+        camera_.distance =
+            std::clamp(camera_.distance * std::exp(rate), 0.5f, 5000.0f);
+        // A wheel glide in flight would fight this.
+        zoomAnimating_ = false;
+        moved = true;
+    }
+
+    // Shoulders explode and collapse the stack while held.
+    if (g.heldRightShoulder != g.heldLeftShoulder) {
+        setExplodeProgress(explodeProgress_ +
+                           (g.heldRightShoulder ? 1.0f : -1.0f) * 0.9f * fdt);
+        moved = true;
+    }
+
+    // Face buttons pick views, by position so one mapping fits both pads:
+    // south/east/west/north = cross/circle/square/triangle = A/B/X/Y.
+    if (g.pressedSouth) frameBoard();
+    if (g.pressedEast) setViewIso();
+    if (g.pressedWest) setViewTop();
+    if (g.pressedNorth) setViewBottom();
+    // Roll is otherwise Alt-only now; give the stick click a way back to level.
+    if (g.pressedLeftStick) {
+        camera_.roll = 0.0f;
+        moved = true;
+    }
+    const bool acted = g.pressedSouth || g.pressedEast || g.pressedWest ||
+                       g.pressedNorth || g.pressedLeftStick;
+
+    padSteering_ = g.steering;
+    if (moved || acted) requestUpdate();
 }
 
 void VulkanWindow::setMesh(const geom::BoardMesh* mesh) {
@@ -762,7 +859,8 @@ void VulkanWindow::render() {
     // While moving, render plain raster; restore the requested mode when it
     // stops. The animation flags double as the settle timer -- they stay true
     // until the ease reaches its target, and a mouse drag restores on release.
-    applyMotionQuality(dragging_ || draggingInv_ || panning_ || stillAnimating);
+    applyMotionQuality(dragging_ || draggingInv_ || panning_ || padSteering_ ||
+                       stillAnimating);
 
     QElapsedTimer timer;
     timer.start();

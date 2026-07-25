@@ -25,10 +25,15 @@
 #include <memory>
 
 #include "geom/tessellate.h"
+#include "input/gamepad.h"
 #include "render/common/device.h"
 #include "render/vk/renderer.h"
 
+class QTimer;
+
 namespace pcbview::app {
+
+using pcbview::input::Gamepad;
 
 struct Camera {
     float targetX = 0.0f, targetY = 0.0f, targetZ = 0.0f;
@@ -286,6 +291,16 @@ private:
     double pathT_ = 0.0, pathDuration_ = 0.0;
     bool pathActive_ = false;
     QElapsedTimer pathClock_;
+    // Controller. Polled on its own timer because rendering is on demand: with
+    // nothing moving there are no frames, so there would be nothing to notice a
+    // stick being pushed. A poll that finds motion requests a frame, and from
+    // there the render loop carries it like any other animation.
+    void stepGamepad();
+    input::Gamepad gamepad_;
+    QTimer* padTimer_ = nullptr;
+    QElapsedTimer padClock_;
+    bool padSteering_ = false;
+
     bool stepTimedZoomAnimation();
     bool timedZoomActive_ = false;
     float tzStart_ = 0.0f, tzTarget_ = 0.0f;
