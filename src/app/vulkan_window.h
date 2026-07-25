@@ -322,11 +322,24 @@ private:
     glm::vec3 boardPivot() const;
 
 public:
-    // Turn the board itself, about an axis given in BOARD space. This is what
-    // VR will drive from a Sense controller's grip, and what the mouse and
-    // showcase drive on the desktop.
-    void rotateBoard(const glm::vec3& axisBoardSpace, float radians);
+    // Turn the board itself about a WORLD-space axis (the rotation is composed
+    // on the left, i.e. applied in the parent frame). This is what VR will
+    // drive from a Sense controller's grip.
+    void rotateBoard(const glm::vec3& axisWorldSpace, float radians);
     void setBoardRotation(const glm::quat& q);
+
+    // Turn the board by exactly as much as moving the camera from `before` to
+    // `after` would have appeared to, and leave the camera alone.
+    //
+    // This is how every rotation gesture is routed, and it exists to kill a
+    // whole bug class. Rendering an un-rotated board from camera orientation B
+    // is the SAME IMAGE as rendering a board rotated by A*inverse(B) from
+    // camera orientation A. So instead of hand-deriving an axis and a sign for
+    // each gesture -- which is exactly what has gone wrong repeatedly here --
+    // the gesture is run against a throwaway copy of the camera and the
+    // resulting orientation change is handed over wholesale. The on-screen
+    // result is identical to the old camera-orbit code BY CONSTRUCTION.
+    void adoptCameraDeltaIntoBoard(const Camera& before, const Camera& after);
     const BoardPose& boardPose() const { return board_; }
     // Board -> world. Rotation happens about the bounds centre so the centre
     // holds still and the camera's orbit target stays meaningful.
