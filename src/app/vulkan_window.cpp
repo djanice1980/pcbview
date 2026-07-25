@@ -237,11 +237,17 @@ void VulkanWindow::stepGamepad() {
     // shoulders they give a pressure-proportional peel rate: ease into it for
     // a slow reveal, bury the trigger to throw the stack apart.
     if (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f) {
-        // 2.4/s: a full pull sweeps the stack apart in a little under half a
-        // second. The original 0.9 needed over a second of held trigger, which
-        // read as the control being unresponsive rather than gentle.
-        setExplodeProgress(explodeProgress_ +
-                           (g.rightTrigger - g.leftTrigger) * 2.4f * fdt);
+        // Two knobs, because "eager" has two causes. kRate is the top speed at
+        // a full pull; kCurve bends the response so LIGHT pressure already
+        // moves the stack -- an exponent below 1 lifts the bottom of the travel
+        // without moving either endpoint, which is where a linear trigger feels
+        // dead. Turn kRate down for a slower sweep, kCurve up (toward 1.0) for
+        // a more linear, less twitchy pull.
+        constexpr float kRate = 4.0f;   // full pull: end to end in ~0.25s
+        constexpr float kCurve = 0.55f;
+        const float pull = std::pow(g.rightTrigger, kCurve) -
+                           std::pow(g.leftTrigger, kCurve);
+        setExplodeProgress(explodeProgress_ + pull * kRate * fdt);
         moved = true;
     }
 
