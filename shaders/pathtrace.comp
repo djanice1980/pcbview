@@ -86,7 +86,32 @@ vec3 vnrm(uint i) { return vec3(vtx[6u*i+3u], vtx[6u*i+4u], vtx[6u*i+5u]); }
 // a contained sun. Rays that escape sample this -- that IS the lighting. Kept
 // deliberately dim so the physically-accumulated board reads rich and matte
 // rather than washed out (path tracing blows out fast under a bright dome).
-const vec3 kSunDir = normalize(vec3(0.35, 0.25, 1.0));
+// The rig RIDES WITH THE VIEWER. A world-fixed sun means the board is bolted
+// to the floor and you fly a camera around it: the shading never changes as you
+// drag, which is exactly what reads as "the camera is moving, not the board".
+// Carrying the rig with the camera makes the sun sweep across the board as it
+// turns -- the look of turning an object in your hands under a studio lamp.
+//
+// This is EQUIVALENT to rotating the board itself, and that is why there is no
+// model matrix here: everything world-fixed in this scene is purely DIRECTIONAL
+// (a sun direction and a sky gradient), with no floor or positional landmark.
+// Rotating the board by R under fixed lights renders identically to orbiting
+// the camera by R-inverse with the lights carried along -- so we get the feel
+// for free, with no TLAS transform, no re-picking and no re-framing.
+// board.frag's key/fill rig has always been camera-relative; this makes the
+// path tracer agree with it instead of contradicting it.
+vec3 rigRight() { return normalize(pc.right.xyz); }
+vec3 rigUp()    { return normalize(pc.up.xyz); }
+vec3 rigFwd()   { return normalize(pc.fwd.xyz); }
+
+// Key light over the viewer's shoulder: mostly BEHIND the eye, lifted and
+// pushed right. Dominated by -fwd on purpose, so a top view still reads as lit
+// from straight overhead the way the old world +Z sun did, and a bottom view
+// lights the underside instead of leaving it black -- the same reasoning that
+// made board.frag's rig camera-relative in the first place.
+vec3 rigSunDir() {
+    return normalize(-rigFwd() + 0.45 * rigUp() + 0.30 * rigRight());
+}
 const vec3 kSunColorBase = vec3(1.0, 0.95, 0.88) * 2.6;
 
 // Highlighting a net turns the lights down. This is the difference between a
@@ -99,9 +124,11 @@ float sceneDim() { return int(pc.counts.y) >= 0 ? 0.18 : 1.0; }
 #define kSunColor (kSunColorBase * sceneDim())
 
 vec3 sky(vec3 d) {
-    float t = clamp(d.z * 0.5 + 0.5, 0.0, 1.0);
+    // Gradient axis is the viewer's up, not world +Z, so the dome turns with
+    // the rig -- otherwise the board would turn under a sky that stayed put.
+    float t = clamp(dot(d, rigUp()) * 0.5 + 0.5, 0.0, 1.0);
     vec3 env = mix(vec3(0.11, 0.12, 0.15), vec3(0.42, 0.44, 0.49), t);
-    float sun = pow(max(dot(d, kSunDir), 0.0), 350.0);
+    float sun = pow(max(dot(d, rigSunDir()), 0.0), 350.0);
     return (env + kSunColorBase * sun) * sceneDim();
 }
 
@@ -419,7 +446,7 @@ void main() {
         // pads catch a warm sheen instead of a lifeless grey reflection.
         // The sun direction is sampled within its angular cone per sample, so
         // shadows gain real penumbras (sharp at contact, softer with distance).
-        vec3 sunDir = sampleCone(kSunDir, pc.misc.y);
+        vec3 sunDir = sampleCone(rigSunDir(), pc.misc.y);
         float ndl = max(dot(n, sunDir), 0.0);
         if (ndl > 0.0 && !occluded(p + gn * 0.03, sunDir, 1.0e5)) {
             const float rough = clamp(m.params.x, 0.04, 1.0);

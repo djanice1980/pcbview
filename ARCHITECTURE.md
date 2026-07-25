@@ -848,10 +848,41 @@ rather than sitting at a fixed hair's breadth.
   two-sided rendering for safety"; that is what caused the artefact.
   extrude()'s winding is consistent and was verified by enabling culling and
   observing that nothing disappeared.
-- **Lighting is camera-relative.** A world-fixed key light leaves the underside
-  permanently in shadow, so the bottom view renders dark — useless for
-  inspection. The key/fill rig is built from the view vector, offset up-and-right
-  so facing surfaces still have falloff (a pure headlight reads flat).
+- **Lighting is camera-relative — in BOTH renderers.** A world-fixed key light
+  leaves the underside permanently in shadow, so the bottom view renders dark —
+  useless for inspection. The key/fill rig is built from the view vector, offset
+  up-and-right so facing surfaces still have falloff (a pure headlight reads
+  flat).
+  - The **path tracer did not get this fix until 2026-07-21**: `kSunDir` was a
+    world constant `(0.35, 0.25, 1.0)` and `sky()` keyed its gradient off world
+    `d.z`, so a PT bottom view rendered murky green with the sun disc glaring in
+    frame behind the board (verified by A/B capture). `rigSunDir()`/`rigUp()`
+    now build the rig from the `right`/`up`/`fwd` push constants the ray
+    generator already carries — no new plumbing. Sun is `-fwd + 0.45*up +
+    0.30*right`, dominated by `-fwd` so a top view still reads as lit from
+    overhead the way the old world sun did.
+- **The board turns; the camera does not — but there is NO model matrix, and it
+  does not need one.** Everything world-fixed in this scene is purely
+  DIRECTIONAL (a sun direction, a sky gradient); there is no floor and no
+  positional landmark. So rotating the board by R under fixed lights renders
+  identically to orbiting the camera by R⁻¹ with the lights carried along.
+  That equivalence is why "make the PCB move instead of the camera" cost a
+  light-rig change plus a sign flip, instead of a model matrix threaded through
+  the vertex shader, the ray-query TLAS, the compute tracer's own traversal,
+  `screenToBoard` picking and `frameBoard`. Do not "finish the job" by adding a
+  real model transform; it would be a large, risky, pixel-identical change.
+  - Left-drag NEGATES the yaw delta so the grabbed face follows the cursor
+    (direct manipulation). Adding it orbits the camera right, which swings the
+    near face LEFT — the board moving opposite your hand is exactly what reads
+    as "I am flying a camera around a bolted-down board". Verified by capture,
+    not derived. Pitch was already correct and is untouched.
+  - This is the DRAG mapping only. `startSpin()` is deliberately untouched, so
+    the showcase CW/CCW step labels keep meaning what they already mean.
+  - Globe-tumble + roll are gated behind **Alt** (either button) so a stray
+    right-drag cannot knock the board off its axis. Note for testing: Windows
+    mouse messages have no `MK_ALT` flag, so Qt reads Alt from `GetKeyState`,
+    which `PostMessage` never updates — the Alt path CANNOT be exercised by a
+    posted-message harness, only by a real keypress.
   - **The key is POSITIONAL, not a fixed direction**, placed at
     `eye + (camRight+camUp)*0.55*viewDist` and pointed per-fragment. A directional
     key hits every point on a flat face at the same angle, so a large flat top
@@ -1128,7 +1159,7 @@ interactive run. All are opt-in. Grouped by purpose:
   (0 = collapsed; up to `maxRank`, ~mid+1 with components), snapped not animated.
 - `PCBVIEW_START_ORTHO=1` — open in orthographic projection.
 - `PCBVIEW_START_DISTANCE=<mm>` — opening camera distance (overrides fit).
-- `PCBVIEW_START_ROLL=<radians>` — opening camera roll (right-drag vertical
+- `PCBVIEW_START_ROLL=<radians>` — opening camera roll (Alt+drag vertical
   can't be synthesised).
 - `PCBVIEW_START_YAW` / `PCBVIEW_START_PITCH=<radians>` — explicit orbit
   angles for views the three presets cannot express. A grazing pitch is how

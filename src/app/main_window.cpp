@@ -254,7 +254,7 @@ MainWindow::MainWindow(const QString& path) {
         }
     }
 
-    // Headless roll hook (right-drag vertical can't be synthesised); radians.
+    // Headless roll hook (Alt+drag vertical can't be synthesised); radians.
     if (qEnvironmentVariableIsSet("PCBVIEW_START_ROLL"))
         viewport_->camera().roll =
             qEnvironmentVariable("PCBVIEW_START_ROLL").toFloat();

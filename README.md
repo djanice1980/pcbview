@@ -209,10 +209,14 @@ highlight**.
 
 ## Controls
 
+The board turns like an object in your hand: the face you grab follows the
+cursor, and the light rig travels with you, so the sun sweeps across the board
+as it turns rather than staying pinned to it.
+
 | Action | Control |
 |---|---|
-| Orbit / pan / zoom | Left-drag / middle-drag / scroll |
-| Globe-spin + twist | Right-drag (horizontal tumbles about the screen-vertical axis; vertical twists cw/ccw) |
+| Turn the board / pan / zoom | Left-drag / middle-drag / scroll |
+| Globe-spin + twist | `Alt` + drag (horizontal tumbles about the screen-vertical axis; vertical twists cw/ccw) |
 | Exploded view | `Ctrl` + scroll |
 | Top / Bottom / Isometric | `T` / `B` / `I` |
 | Fit to board | `F` |
