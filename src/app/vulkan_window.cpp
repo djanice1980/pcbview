@@ -191,33 +191,33 @@ void VulkanWindow::stepGamepad() {
     const float fdt = static_cast<float>(dt);
     bool moved = false;
 
-    // Left stick TURNS THE BOARD, matching the mouse exactly: push right and
+    // RIGHT stick TURNS THE BOARD, matching the mouse exactly: push right and
     // the face you are looking at goes right. Same negated yaw as the drag
     // path -- see mouseMoveEvent.
-    if (g.leftX != 0.0f || g.leftY != 0.0f) {
+    if (g.rightX != 0.0f || g.rightY != 0.0f) {
         constexpr float kTurnRate = 2.2f;  // rad/s at full deflection
-        camera_.yaw = wrapPi(camera_.yaw - g.leftX * kTurnRate * fdt);
-        camera_.pitch = wrapPi(camera_.pitch - g.leftY * kTurnRate * fdt);
+        camera_.yaw = wrapPi(camera_.yaw - g.rightX * kTurnRate * fdt);
+        camera_.pitch = wrapPi(camera_.pitch - g.rightY * kTurnRate * fdt);
         moved = true;
     }
 
-    // Right stick pans across the screen plane, like the middle-drag.
-    if (g.rightX != 0.0f || g.rightY != 0.0f) {
+    // LEFT stick pans across the screen plane, like the middle-drag.
+    if (g.leftX != 0.0f || g.leftY != 0.0f) {
         const Basis b = cameraBasis(camera_);
         const float scale = camera_.distance * 1.1f * fdt;
         const glm::vec3 move =
-            -b.right * g.rightX * scale - b.up * g.rightY * scale;
+            -b.right * g.leftX * scale - b.up * g.leftY * scale;
         camera_.targetX += move.x;
         camera_.targetY += move.y;
         camera_.targetZ += move.z;
         moved = true;
     }
 
-    // Triggers dolly: right pulls in, left pushes out. Exponential so the rate
-    // is constant in perceived terms rather than crawling when close and
-    // rocketing when far.
-    if (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f) {
-        const float rate = (g.leftTrigger - g.rightTrigger) * 1.6f * fdt;
+    // L1/R1 dolly: R1 pulls in, L1 pushes out. Exponential so the rate is
+    // constant in perceived terms rather than crawling when close and
+    // rocketing when far. Digital buttons, so this is a fixed rate.
+    if (g.heldLeftShoulder != g.heldRightShoulder) {
+        const float rate = (g.heldLeftShoulder ? 1.0f : -1.0f) * 1.6f * fdt;
         camera_.distance =
             std::clamp(camera_.distance * std::exp(rate), 0.5f, 5000.0f);
         // A wheel glide in flight would fight this.
@@ -225,10 +225,12 @@ void VulkanWindow::stepGamepad() {
         moved = true;
     }
 
-    // Shoulders explode and collapse the stack while held.
-    if (g.heldRightShoulder != g.heldLeftShoulder) {
+    // L2/R2 explode and collapse the stack. These are ANALOG, so unlike the
+    // shoulders they give a pressure-proportional peel rate: ease into it for
+    // a slow reveal, bury the trigger to throw the stack apart.
+    if (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f) {
         setExplodeProgress(explodeProgress_ +
-                           (g.heldRightShoulder ? 1.0f : -1.0f) * 0.9f * fdt);
+                           (g.rightTrigger - g.leftTrigger) * 0.9f * fdt);
         moved = true;
     }
 

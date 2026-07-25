@@ -228,6 +228,28 @@ as it turns rather than staying pinned to it.
 | Print (as shown) | `Ctrl`+`P` |
 | Hide both side panels | `\` |
 
+### Controller
+
+A DualSense or Xbox pad is picked up automatically when connected, and hot-plug
+works mid-session. Buttons are read by POSITION, so one mapping serves both:
+south/east/west/north is cross/circle/square/triangle on a DualSense and A/B/X/Y
+on an Xbox pad. The pad only steers while pcbview is the active application.
+
+| Action | Control |
+|---|---|
+| Turn the board | Right stick |
+| Pan | Left stick |
+| Zoom out / in | `L1` / `R1` |
+| Collapse / explode | `L2` / `R2` (analog — press harder to peel faster) |
+| Fit / Iso / Top / Bottom | South / East / West / North (`✕ ○ □ △`, `A B X Y`) |
+| Level the roll | `L3` |
+| Hold and turn | Hold the DualSense touchpad and twist the pad — 1:1, so a 30° twist turns the board 30° |
+
+Hold-and-turn calibrates out the gyro's zero-rate offset while the touchpad is
+not held, so the board stays still until the pad actually moves. Set
+`PCBVIEW_PAD_DEBUG=1` to dump live stick, trigger and gyro values if a control
+misbehaves.
+
 Layer visibility, appearance (thickness / substrate / mask), and the print modes
 live in the menus. Each side panel has a **pin** and a **hide** button — hide tucks
 it to a spine on the edge that pops open on hover; pin keeps it open.
