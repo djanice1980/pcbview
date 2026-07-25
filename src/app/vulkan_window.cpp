@@ -223,9 +223,13 @@ void VulkanWindow::stepGamepad() {
         const float scale = camera_.distance * 1.1f * fdt;
         const glm::vec3 move =
             -b.right * g.leftX * scale - b.up * g.leftY * scale;
-        camera_.targetX += move.x;
-        camera_.targetY += move.y;
-        camera_.targetZ += move.z;
+        if (padObjectMode_) {
+            board_.translation += board_.rotation * (-move);  // see the mouse
+        } else {
+            camera_.targetX += move.x;
+            camera_.targetY += move.y;
+            camera_.targetZ += move.z;
+        }
         moved = true;
     }
 
@@ -712,7 +716,7 @@ glm::vec3 VulkanWindow::boardPivot() const {
 
 glm::mat4 VulkanWindow::boardMatrix() const {
     const glm::vec3 c = boardPivot();
-    return glm::translate(glm::mat4(1.0f), c) *
+    return glm::translate(glm::mat4(1.0f), board_.translation + c) *
            glm::mat4_cast(board_.rotation) *
            glm::translate(glm::mat4(1.0f), -c);
 }
@@ -780,6 +784,11 @@ float VulkanWindow::framedDistance() const {
 
 void VulkanWindow::frameBoard(bool snap) {
     if (!mesh_) return;
+    // Fit is the way back. Object mode can slide the board clean out of the
+    // frame, and without this there would be no recovery short of dragging it
+    // home by hand. Orientation is deliberately kept -- you asked to frame it,
+    // not to un-turn it.
+    board_.translation = glm::vec3(0.0f);
     const auto& b = mesh_->bounds;
     Camera dest = camera_;
     dest.targetX = static_cast<float>((b.min[0] + b.max[0]) * 0.5);
@@ -1068,7 +1077,11 @@ void VulkanWindow::render() {
     // picking, the depth sort, the overlay -- is consistently in board space
     // with no further changes.
     Basis basis = cameraBasis(renderCam);
-    if (board_.rotation != glm::quat(1.0f, 0.0f, 0.0f, 0.0f)) {
+    // Test BOTH halves of the pose. Guarding on rotation alone silently threw
+    // away every translation while the board was still square-on -- the board
+    // simply refused to slide until you had also turned it.
+    if (board_.rotation != glm::quat(1.0f, 0.0f, 0.0f, 0.0f) ||
+        board_.translation != glm::vec3(0.0f)) {
         const glm::mat4 inv = glm::inverse(boardMatrix());
         const glm::mat3 invR(inv);
         basis.eye = glm::vec3(inv * glm::vec4(basis.eye, 1.0f));
@@ -1235,6 +1248,10 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
     static const bool forceObject =
         qEnvironmentVariableIsSet("PCBVIEW_OBJECT_MODE");
     objectDrag_ = forceObject || (e->modifiers() & Qt::ShiftModifier) != 0;
+    // Say so. Object mode is otherwise invisible until you have already moved
+    // something, and if the modifier is not arriving at all there is nothing to
+    // tell you that either.
+    if (objectDrag_) emit objectModeChanged(true);
     // PCBVIEW_INPUT_DEBUG=1 reports what Qt actually delivered. Separates "the
     // modifier never arrived" from "the modifier arrived and was ignored",
     // which look identical from the outside.
@@ -1348,9 +1365,22 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
         const float scale = camera_.distance * 0.0015f;
         const glm::vec3 move = -b.right * static_cast<float>(delta.x()) * scale +
                                b.up * static_cast<float>(delta.y()) * scale;
-        camera_.targetX += move.x;
-        camera_.targetY += move.y;
-        camera_.targetZ += move.z;
+        if (objectDrag_) {
+            // OBJECT MODE: slide the BOARD through space and leave the
+            // viewpoint anchored. This is the half that was missing -- rotation
+            // alone only spins the board in place at frame centre, which reads
+            // as a turntable however it turns. Negated because moving the
+            // viewpoint one way and the board the other look the same, and
+            // rotated into world space because cameraBasis() here is the
+            // BOARD-space basis (see render(): the render basis in board space
+            // is exactly cameraBasis(camera_)), while translation is applied in
+            // world space by boardMatrix().
+            board_.translation += board_.rotation * (-move);
+        } else {
+            camera_.targetX += move.x;
+            camera_.targetY += move.y;
+            camera_.targetZ += move.z;
+        }
         requestUpdate();
     }
 }

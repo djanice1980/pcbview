@@ -511,9 +511,9 @@ void MainWindow::buildViewport() {
     connect(viewport_, &VulkanWindow::objectModeChanged, this,
             [this](bool on) {
                 statusBar()->showMessage(
-                    on ? "Object mode: the right stick turns the board with "
-                         "your hand (R3 to switch back)"
-                       : "View mode: the right stick swings around the board "
+                    on ? "Object mode — drag turns the board with your hand, "
+                         "middle-drag slides it through space. F re-centres."
+                       : "View mode — drag swings around the board "
                          "(R3 for object mode)",
                     5000);
             });

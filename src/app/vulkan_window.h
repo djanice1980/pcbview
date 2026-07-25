@@ -57,6 +57,12 @@ struct BoardPose {
     // Rotation about the board's bounds centre, so the centre holds still and
     // the orbit target stays valid without transforming it.
     glm::quat rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    // WORLD-space offset, applied after the rotation. This is what lets the
+    // board leave the middle of the frame: rotation alone only ever spins it
+    // in place, which is indistinguishable from a turntable no matter which
+    // way it turns. Sliding it through space while the viewpoint stays put is
+    // the thing that actually reads as "I moved the object".
+    glm::vec3 translation = glm::vec3(0.0f);
 };
 
 struct Camera {
