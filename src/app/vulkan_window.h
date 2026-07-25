@@ -300,6 +300,12 @@ private:
     QTimer* padTimer_ = nullptr;
     QElapsedTimer padClock_;
     bool padSteering_ = false;
+    // Gyro zero-rate bias. A DualSense at rest reports roughly 0.01 rad/s, not
+    // zero (measured), which is ~0.6 deg/s -- enough to rotate the board 38
+    // degrees a minute on its own. Learned continuously while NOT grabbing,
+    // then subtracted, so the board is dead still until the pad actually moves.
+    float gyroBias_[3] = {0.0f, 0.0f, 0.0f};
+    bool gyroBiasReady_ = false;
 
     bool stepTimedZoomAnimation();
     bool timedZoomActive_ = false;

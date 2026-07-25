@@ -149,6 +149,7 @@ const GamepadState& Gamepad::poll() {
         SDL_GAMEPAD_BUTTON_DPAD_UP,        SDL_GAMEPAD_BUTTON_DPAD_DOWN,
         SDL_GAMEPAD_BUTTON_DPAD_LEFT,      SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
         SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,  SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
+        SDL_GAMEPAD_BUTTON_TOUCHPAD,
     };
     unsigned now = 0;
     for (unsigned i = 0; i < sizeof(kButtons) / sizeof(kButtons[0]); ++i)
@@ -172,6 +173,7 @@ const GamepadState& Gamepad::poll() {
     state_.pressedRightShoulder = (went & (1u << 13)) != 0;
     state_.heldLeftShoulder = (now & (1u << 12)) != 0;
     state_.heldRightShoulder = (now & (1u << 13)) != 0;
+    state_.heldTouchpad = (now & (1u << 14)) != 0;
 
     if (state_.hasGyro) {
         float g[3] = {0.0f, 0.0f, 0.0f};

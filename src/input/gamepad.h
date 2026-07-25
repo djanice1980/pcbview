@@ -31,6 +31,9 @@ struct GamepadState {
     bool pressedLeftShoulder = false, pressedRightShoulder = false;
 
     bool heldLeftShoulder = false, heldRightShoulder = false;
+    // DualSense touchpad click. Absent on an Xbox pad, which simply never
+    // reports it -- used as the gyro "grab", so it costs no existing binding.
+    bool heldTouchpad = false;
 
     // Angular velocity in rad/s, present on pads with a gyro (DualSense).
     // Zero and hasGyro=false on an Xbox pad, which has none.

@@ -232,6 +232,43 @@ void VulkanWindow::stepGamepad() {
         moved = true;
     }
 
+    // GYRO HOLD-AND-TURN: hold the touchpad and physically twist the pad, and
+    // the board turns with it -- the flat-screen rehearsal of grabbing the
+    // board with a Sense controller in VR. Gain is 1:1 on purpose: twist 30
+    // degrees, the board turns 30 degrees, which is what makes it feel like an
+    // object rather than a rate control.
+    if (g.hasGyro) {
+        if (!g.heldTouchpad) {
+            // Not grabbing: learn the zero-rate bias. Slow, so a deliberate
+            // motion while not grabbing cannot poison it much, and it keeps
+            // tracking the thermal drift these MEMS parts have.
+            const float a = gyroBiasReady_ ? 0.02f : 1.0f;
+            gyroBias_[0] += (g.gyroX - gyroBias_[0]) * a;
+            gyroBias_[1] += (g.gyroY - gyroBias_[1]) * a;
+            gyroBias_[2] += (g.gyroZ - gyroBias_[2]) * a;
+            gyroBiasReady_ = true;
+        } else {
+            const float gx = g.gyroX - gyroBias_[0];
+            const float gy = g.gyroY - gyroBias_[1];
+            const float gz = g.gyroZ - gyroBias_[2];
+            // Anything below the noise floor is bias we failed to model, not
+            // intent; without this the board creeps while you hold still.
+            constexpr float kGyroNoise = 0.02f;  // rad/s
+            const float ax = std::abs(gx) > kGyroNoise ? gx : 0.0f;
+            const float ay = std::abs(gy) > kGyroNoise ? gy : 0.0f;
+            const float az = std::abs(gz) > kGyroNoise ? gz : 0.0f;
+            if (ax != 0.0f || ay != 0.0f || az != 0.0f) {
+                // SDL reports rad/s about the pad's own axes, right-handed:
+                // +y is yaw left, +x is pitch, +z is roll.
+                camera_.yaw = wrapPi(camera_.yaw + ay * fdt);
+                camera_.pitch = wrapPi(camera_.pitch + ax * fdt);
+                camera_.roll = wrapPi(camera_.roll + az * fdt);
+                moved = true;
+            }
+            padSteering_ = true;
+        }
+    }
+
     // Face buttons pick views, by position so one mapping fits both pads:
     // south/east/west/north = cross/circle/square/triangle = A/B/X/Y.
     if (g.pressedSouth) frameBoard();
@@ -246,7 +283,28 @@ void VulkanWindow::stepGamepad() {
     const bool acted = g.pressedSouth || g.pressedEast || g.pressedWest ||
                        g.pressedNorth || g.pressedLeftStick;
 
-    padSteering_ = g.steering;
+    // Assigned, not OR'd into the gyro block's earlier write, because that
+    // write would otherwise be clobbered here.
+    padSteering_ = g.steering || (g.hasGyro && g.heldTouchpad);
+
+    // PCBVIEW_PAD_DEBUG=1: throttled dump of what the pad is actually
+    // reporting. Sticks that read stuck at an extreme, a trigger that rests
+    // off zero, or a gyro frozen at exactly 0,0,0 (rather than jittering) each
+    // point at a different layer, which is otherwise guesswork.
+    static const bool padDebug = qEnvironmentVariableIsSet("PCBVIEW_PAD_DEBUG");
+    if (padDebug) {
+        static QElapsedTimer logClock;
+        if (!logClock.isValid() || logClock.elapsed() > 250) {
+            logClock.restart();
+            std::printf("pad L(%+.2f,%+.2f) R(%+.2f,%+.2f) T(%.2f,%.2f) "
+                        "gyro(%+.3f,%+.3f,%+.3f) yaw=%+.3f pitch=%+.3f\n",
+                        g.leftX, g.leftY, g.rightX, g.rightY, g.leftTrigger,
+                        g.rightTrigger, g.gyroX, g.gyroY, g.gyroZ, camera_.yaw,
+                        camera_.pitch);
+            std::fflush(stdout);
+        }
+    }
+
     if (moved || acted) requestUpdate();
 }
 
