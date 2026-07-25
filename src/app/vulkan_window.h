@@ -21,6 +21,7 @@
 #include <QWindow>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <memory>
 
@@ -34,6 +35,29 @@ class QTimer;
 namespace pcbview::app {
 
 using pcbview::input::Gamepad;
+
+// The board's own orientation in the world, independent of the camera.
+//
+// Why this exists at all: until now the board was nailed to the origin and
+// "turning it" meant orbiting the camera the other way. Those are visually
+// identical -- everything world-fixed in this scene is directional -- but the
+// board had no pose, and VR breaks the trick outright, because there the
+// camera IS the user's head and the app cannot counter-rotate it.
+//
+// How it is applied is the subtle part. Rather than transforming a million
+// vertices, the CAMERA is transformed into the board's frame once per frame
+// (see render()). That works because every consumer downstream -- picking, the
+// translucent depth sort, the Z-axis explode, netPathLength's 2D test, the
+// BLAS/TLAS, the net-span and net-light tables -- is ALREADY written in board
+// space; it was simply called world space when the two always coincided.
+// Transforming rays into object space is the standard ray-tracing move, and it
+// keeps the acceleration structures static (no per-frame TLAS rebuild) and the
+// path tracer's world-hit-point / model-normal mix consistent.
+struct BoardPose {
+    // Rotation about the board's bounds centre, so the centre holds still and
+    // the orbit target stays valid without transforming it.
+    glm::quat rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+};
 
 struct Camera {
     float targetX = 0.0f, targetY = 0.0f, targetZ = 0.0f;
@@ -291,6 +315,24 @@ private:
     double pathT_ = 0.0, pathDuration_ = 0.0;
     bool pathActive_ = false;
     QElapsedTimer pathClock_;
+    // The board's pose, and the point it turns about (its bounds centre, in
+    // board space). Kept as a quaternion so repeated small rotations cannot
+    // accumulate shear or scale the way a re-multiplied matrix does.
+    BoardPose board_;
+    glm::vec3 boardPivot() const;
+
+public:
+    // Turn the board itself, about an axis given in BOARD space. This is what
+    // VR will drive from a Sense controller's grip, and what the mouse and
+    // showcase drive on the desktop.
+    void rotateBoard(const glm::vec3& axisBoardSpace, float radians);
+    void setBoardRotation(const glm::quat& q);
+    const BoardPose& boardPose() const { return board_; }
+    // Board -> world. Rotation happens about the bounds centre so the centre
+    // holds still and the camera's orbit target stays meaningful.
+    glm::mat4 boardMatrix() const;
+
+private:
     // Controller. Polled on its own timer because rendering is on demand: with
     // nothing moving there are no frames, so there would be nothing to notice a
     // stick being pushed. A poll that finds motion requests a frame, and from

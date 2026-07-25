@@ -154,6 +154,14 @@ float wrapPi(float a) {
 VulkanWindow::VulkanWindow(const geom::BoardMesh* mesh) : mesh_(mesh) {
     setSurfaceType(QSurface::VulkanSurface);
 
+    // Headless hook for the board's own pose, in radians about board +Z. The
+    // point of it is to prove the board turns INDEPENDENTLY of the camera:
+    // with this set, the view direction is untouched but the board is not.
+    if (qEnvironmentVariableIsSet("PCBVIEW_BOARD_YAW")) {
+        rotateBoard(glm::vec3(0.0f, 0.0f, 1.0f),
+                    qEnvironmentVariable("PCBVIEW_BOARD_YAW").toFloat());
+    }
+
     // ~120 Hz. Polling is cheap (SDL keeps the state; this just reads it) and
     // it has to run even when nothing is being drawn, because on-demand
     // rendering means an idle app produces no frames to piggyback on.
@@ -669,6 +677,38 @@ void VulkanWindow::setViewTarget(const Camera& dest, bool snap) {
 
 // The distance frameBoard chooses -- the "default loaded size" that zoom
 // percentages are measured against.
+glm::vec3 VulkanWindow::boardPivot() const {
+    if (!mesh_) return glm::vec3(0.0f);
+    const auto& b = mesh_->bounds;
+    return glm::vec3(static_cast<float>((b.min[0] + b.max[0]) * 0.5),
+                     static_cast<float>((b.min[1] + b.max[1]) * 0.5),
+                     static_cast<float>((b.min[2] + b.max[2]) * 0.5));
+}
+
+glm::mat4 VulkanWindow::boardMatrix() const {
+    const glm::vec3 c = boardPivot();
+    return glm::translate(glm::mat4(1.0f), c) *
+           glm::mat4_cast(board_.rotation) *
+           glm::translate(glm::mat4(1.0f), -c);
+}
+
+void VulkanWindow::rotateBoard(const glm::vec3& axisBoardSpace, float radians) {
+    if (radians == 0.0f) return;
+    const float len = glm::length(axisBoardSpace);
+    if (len < 1e-6f) return;
+    // Compose on the LEFT of the existing rotation: the axis arrives in board
+    // space, which is the frame the caller (mouse, gyro, a Sense grip) was
+    // already reasoning in.
+    board_.rotation = glm::normalize(
+        glm::angleAxis(radians, axisBoardSpace / len) * board_.rotation);
+    requestUpdate();
+}
+
+void VulkanWindow::setBoardRotation(const glm::quat& q) {
+    board_.rotation = glm::normalize(q);
+    requestUpdate();
+}
+
 float VulkanWindow::framedDistance() const {
     if (!mesh_) return camera_.distance;
     const auto& b = mesh_->bounds;
@@ -937,7 +977,23 @@ void VulkanWindow::render() {
     const float h = static_cast<float>(height() * dpr);
     if (w < 1.0f || h < 1.0f) return;
 
-    const Basis basis = cameraBasis(camera_);
+    // MOVE THE CAMERA INTO THE BOARD'S FRAME, rather than moving the board's
+    // geometry into the world. The two are equivalent, and this direction is
+    // enormously cheaper and safer: the vertex/index buffers, the BLAS and
+    // TLAS, the net-span and net-light tables and every CPU pick test stay
+    // exactly as they are, all of them already expressed in board space. Do
+    // this ONCE here and everything downstream -- raster, both tracers,
+    // picking, the depth sort, the overlay -- is consistently in board space
+    // with no further changes.
+    Basis basis = cameraBasis(camera_);
+    if (board_.rotation != glm::quat(1.0f, 0.0f, 0.0f, 0.0f)) {
+        const glm::mat4 inv = glm::inverse(boardMatrix());
+        const glm::mat3 invR(inv);
+        basis.eye = glm::vec3(inv * glm::vec4(basis.eye, 1.0f));
+        basis.forward = invR * basis.forward;
+        basis.right = invR * basis.right;
+        basis.up = invR * basis.up;
+    }
     const glm::vec3 eye = basis.eye;
     const glm::mat4 view = viewFromBasis(basis);
     // Recording at another aspect: the projection must match the capture
