@@ -320,6 +320,15 @@ private:
     // accumulate shear or scale the way a re-multiplied matrix does.
     BoardPose board_;
     glm::vec3 boardPivot() const;
+    // The orientation the scene is actually rendered from. Captured on the
+    // first frame -- so PCBVIEW_START_VIEW and the opening frameBoard still
+    // choose the initial view -- and fixed from then on: rotations move the
+    // board, not this. rotPrev_ is the last camera orientation already handed
+    // over, so only the CHANGE is applied and external writers (a VR grip, the
+    // gyro) can compose into the same pose without fighting it.
+    Camera viewAnchor_;
+    Camera rotPrev_;
+    bool rotAnchorValid_ = false;
 
 public:
     // Turn the board itself about a WORLD-space axis (the rotation is composed

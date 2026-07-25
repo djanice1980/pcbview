@@ -738,9 +738,19 @@ void VulkanWindow::adoptCameraDeltaIntoBoard(const Camera& before,
                                              const Camera& after) {
     const glm::quat qb = cameraOrientation(cameraBasis(before));
     const glm::quat qa = cameraOrientation(cameraBasis(after));
+    // Composed on the RIGHT, and that is not a style choice. The pose has to
+    // satisfy B = anchor * inverse(camera) at every step. Right-composition
+    // telescopes to exactly that:
+    //     B2 = B1*(q1*q2') = (q0*q1')*(q1*q2') = q0*q2'
+    // whereas left-composition yields q1*q2'*q0*q1', which is only the same
+    // thing when the rotations commute -- i.e. when they share an axis. That
+    // is why a pure-yaw drag looked perfect while jumping to the Top preset,
+    // which mixes pitch into an existing yaw, came out oblique.
     board_.rotation =
-        glm::normalize(qb * glm::inverse(qa) * board_.rotation);
-    requestUpdate();
+        glm::normalize(board_.rotation * (qb * glm::inverse(qa)));
+    // No requestUpdate(): this runs from inside render(), where asking for
+    // another frame would just burn one doing nothing. Gesture handlers
+    // request their own.
 }
 
 float VulkanWindow::framedDistance() const {
@@ -1011,6 +1021,31 @@ void VulkanWindow::render() {
     const float h = static_cast<float>(height() * dpr);
     if (w < 1.0f || h < 1.0f) return;
 
+    // EVERY rotation in the app -- mouse drags, the gamepad's right stick, the
+    // gyro, showcase spins, the Top/Bottom/Iso presets, recorded custom moves
+    // -- is still authored against camera_, exactly as it always was. This one
+    // place hands that orientation change to the BOARD instead and pins the
+    // rendering camera to a fixed anchor. Converting centrally is why none of
+    // those had to be rewritten and why nothing persisted had to change: a
+    // PathKey still stores camera angles, and still means the same picture, so
+    // playlists and templates already saved keep working untouched.
+    if (!rotAnchorValid_) {
+        viewAnchor_ = camera_;
+        rotPrev_ = camera_;
+        rotAnchorValid_ = true;
+    }
+    if (camera_.yaw != rotPrev_.yaw || camera_.pitch != rotPrev_.pitch ||
+        camera_.roll != rotPrev_.roll) {
+        adoptCameraDeltaIntoBoard(rotPrev_, camera_);
+        rotPrev_ = camera_;
+    }
+    // The camera keeps camera_'s distance and target -- zoom and pan really do
+    // move the viewer -- but never its orientation.
+    Camera renderCam = camera_;
+    renderCam.yaw = viewAnchor_.yaw;
+    renderCam.pitch = viewAnchor_.pitch;
+    renderCam.roll = viewAnchor_.roll;
+
     // MOVE THE CAMERA INTO THE BOARD'S FRAME, rather than moving the board's
     // geometry into the world. The two are equivalent, and this direction is
     // enormously cheaper and safer: the vertex/index buffers, the BLAS and
@@ -1019,7 +1054,7 @@ void VulkanWindow::render() {
     // this ONCE here and everything downstream -- raster, both tracers,
     // picking, the depth sort, the overlay -- is consistently in board space
     // with no further changes.
-    Basis basis = cameraBasis(camera_);
+    Basis basis = cameraBasis(renderCam);
     if (board_.rotation != glm::quat(1.0f, 0.0f, 0.0f, 0.0f)) {
         const glm::mat4 inv = glm::inverse(boardMatrix());
         const glm::mat3 invR(inv);
@@ -1245,19 +1280,12 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
 
     if (dragging_) {
         const float s = 0.008f;
-        // Turns the BOARD, not the camera. The gesture is still computed with
-        // the original camera maths -- on a throwaway copy -- and the resulting
-        // orientation change is handed to the board, so the image is what the
-        // old camera-orbit code produced. See adoptCameraDeltaIntoBoard.
-        const Camera before = camera_;
         camera_.yaw = wrapPi(camera_.yaw + static_cast<float>(delta.x()) * s);
         // No clamp: the basis is pole-safe, so pitch rotates through and keeps
         // going. Past vertical the view inverts, which is correct.
         camera_.pitch =
             wrapPi(camera_.pitch + static_cast<float>(delta.y()) * s);
-        const Camera after = camera_;
-        camera_ = before;  // the camera does not move; the board does
-        adoptCameraDeltaIntoBoard(before, after);
+        requestUpdate();
     } else if (draggingInv_) {
         // Right-drag covers the two SCREEN-relative rotations left-drag
         // doesn't: horizontal tumbles the board about the screen-VERTICAL
@@ -1267,13 +1295,10 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
         // yaw/pitch/roll parameterisation can't express as one increment --
         // so rotate the basis and decompose back into yaw/pitch/roll.
         const float s = 0.008f;
-        const Camera before = camera_;
         applyGlobeTumble(static_cast<float>(delta.x()) * s);
         camera_.roll =
             wrapPi(camera_.roll + static_cast<float>(delta.y()) * s);
-        const Camera after = camera_;
-        camera_ = before;  // the camera does not move; the board does
-        adoptCameraDeltaIntoBoard(before, after);
+        requestUpdate();
     } else if (panning_) {
         // Pan across the SCREEN plane, using the camera's own right/up. Using
         // world Z as "up" made a vertical drag push the board through its own
