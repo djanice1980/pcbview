@@ -271,6 +271,9 @@ signals:
     // R while the viewport has focus: toggle showcase movement recording --
     // the mouse is busy driving the camera, so it must be a key.
     void moveRecordToggled();
+    // Object mode came on or off from the pad, so the UI can say so -- a
+    // toggle with no readout is a trap.
+    void objectModeChanged(bool on);
     // progress in stages, and the total number of stages a full peel takes.
     void explodeChanged(float progress, float maxProgress);
 
@@ -329,6 +332,19 @@ private:
     Camera viewAnchor_;
     Camera rotPrev_;
     bool rotAnchorValid_ = false;
+
+    // OBJECT MODE. Both modes turn the board pose -- that is the only thing
+    // that ever moves now -- but they differ in WHICH WAY, and that difference
+    // is the whole point:
+    //   default: the board swings opposite your hand, the familiar feel of
+    //            swinging a camera around a fixed board.
+    //   object:  the face you grabbed follows your cursor, the feel of having
+    //            your hand on the board.
+    // Latched at mouse-press so releasing Shift mid-drag cannot flip the sense
+    // of a drag underneath you. The pad's copy is a TOGGLE, not a hold: a stick
+    // click you must keep held while pushing that same stick is unusable.
+    bool objectDrag_ = false;
+    bool padObjectMode_ = false;
 
 public:
     // Turn the board itself about a WORLD-space axis (the rotation is composed

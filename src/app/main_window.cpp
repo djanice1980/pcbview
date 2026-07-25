@@ -507,6 +507,16 @@ void MainWindow::buildViewport() {
             &MainWindow::onFrameRendered);
     connect(viewport_, &VulkanWindow::statusMessage, this,
             [this](const QString& t) { toolbarInfo_->setText(t); });
+    // R3 is a toggle, so it needs to say which way it just went.
+    connect(viewport_, &VulkanWindow::objectModeChanged, this,
+            [this](bool on) {
+                statusBar()->showMessage(
+                    on ? "Object mode: the right stick turns the board with "
+                         "your hand (R3 to switch back)"
+                       : "View mode: the right stick swings around the board "
+                         "(R3 for object mode)",
+                    5000);
+            });
     // The renderer's parts only exist after upload, so reconcile then -- and
     // push the substrate appearance, which the renderer resets to default tan on
     // every uploadBoard.

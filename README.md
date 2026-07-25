@@ -212,6 +212,7 @@ highlight**.
 | Action | Control |
 |---|---|
 | Orbit / pan / zoom | Left-drag / middle-drag / scroll |
+| Turn the board itself | `Shift` + left-drag (the face you grab follows the cursor) |
 | Globe-spin + twist | Right-drag (horizontal tumbles about the screen-vertical axis; vertical twists cw/ccw) |
 | Exploded view | `Ctrl` + scroll |
 | Top / Bottom / Isometric | `T` / `B` / `I` |
@@ -239,6 +240,7 @@ on an Xbox pad. The pad only steers while pcbview is the active application.
 | Collapse / explode | `L2` / `R2` (analog — press harder to peel faster) |
 | Fit / Iso / Top / Bottom | South / East / West / North (`✕ ○ □ △`, `A B X Y`) |
 | Level the roll | `L3` |
+| Switch turn sense | `R3` (toggles between turning the board with your hand and swinging around it) |
 | Hold and turn | Hold the DualSense touchpad and move the pad — 1:1, so a 30° motion turns the board 30° |
 
 Hold-and-turn maps the pad's three motions to the three useful board motions:

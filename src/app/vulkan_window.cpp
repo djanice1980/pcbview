@@ -204,7 +204,15 @@ void VulkanWindow::stepGamepad() {
     // path -- see mouseMoveEvent.
     if (g.rightX != 0.0f || g.rightY != 0.0f) {
         constexpr float kTurnRate = 2.2f;  // rad/s at full deflection
-        camera_.yaw = wrapPi(camera_.yaw - g.rightX * kTurnRate * fdt);
+        // R3 flips the turn sense, the pad's equivalent of holding Shift with
+        // the mouse. NOTE the two devices default to OPPOSITE senses: the pad
+        // grabs-and-turns, the mouse swings around the board. That is not
+        // deliberate design, it is history -- the pad mapping was written while
+        // the mouse was briefly inverted, and only the mouse got reverted. Both
+        // feels are now reachable on both devices, so it is a one-character
+        // change to align them either way once a preference is stated.
+        const float turn = padObjectMode_ ? kTurnRate : -kTurnRate;
+        camera_.yaw = wrapPi(camera_.yaw + g.rightX * turn * fdt);
         camera_.pitch = wrapPi(camera_.pitch - g.rightY * kTurnRate * fdt);
         moved = true;
     }
@@ -304,13 +312,18 @@ void VulkanWindow::stepGamepad() {
     if (g.pressedEast) setViewIso();
     if (g.pressedWest) setViewTop();
     if (g.pressedNorth) setViewBottom();
-    // Roll is otherwise Alt-only now; give the stick click a way back to level.
+    // L3 levels the roll; R3 toggles object mode.
     if (g.pressedLeftStick) {
         camera_.roll = 0.0f;
         moved = true;
     }
+    if (g.pressedRightStick) {
+        padObjectMode_ = !padObjectMode_;
+        emit objectModeChanged(padObjectMode_);
+    }
     const bool acted = g.pressedSouth || g.pressedEast || g.pressedWest ||
-                       g.pressedNorth || g.pressedLeftStick;
+                       g.pressedNorth || g.pressedLeftStick ||
+                       g.pressedRightStick;
 
     // Assigned, not OR'd into the gyro block's earlier write, because that
     // write would otherwise be clobbered here.
@@ -1212,6 +1225,28 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
     // driving, so the animation should not fight the drag.
     cameraAnimating_ = false;
     lastPos_ = e->position();
+    // Shift latches OBJECT MODE for the whole drag: hand on the board rather
+    // than camera around it.
+    // PCBVIEW_OBJECT_MODE=1 forces it on. Qt builds mouse modifiers from
+    // GetKeyState rather than the message's MK_ flags, so NO keyboard modifier
+    // can be delivered by a posted-message harness -- this hook is what lets
+    // the object-mode behaviour itself be tested, leaving only "did the Shift
+    // arrive" to a real keyboard. Also handy for scripted captures.
+    static const bool forceObject =
+        qEnvironmentVariableIsSet("PCBVIEW_OBJECT_MODE");
+    objectDrag_ = forceObject || (e->modifiers() & Qt::ShiftModifier) != 0;
+    // PCBVIEW_INPUT_DEBUG=1 reports what Qt actually delivered. Separates "the
+    // modifier never arrived" from "the modifier arrived and was ignored",
+    // which look identical from the outside.
+    static const bool inputDebug =
+        qEnvironmentVariableIsSet("PCBVIEW_INPUT_DEBUG");
+    if (inputDebug) {
+        std::printf("press: button=%d modifiers=0x%08x objectDrag=%d\n",
+                    static_cast<int>(e->button()),
+                    static_cast<unsigned>(e->modifiers()),
+                    static_cast<int>(objectDrag_));
+        std::fflush(stdout);
+    }
     if (e->button() == Qt::LeftButton) {
         dragging_ = true;
         // A left CLICK (press+release without a drag) is a pick: a
@@ -1280,7 +1315,13 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
 
     if (dragging_) {
         const float s = 0.008f;
-        camera_.yaw = wrapPi(camera_.yaw + static_cast<float>(delta.x()) * s);
+        // Object mode NEGATES the horizontal: the grabbed face then travels
+        // with the cursor instead of away from it. Only the horizontal --
+        // dragging down already tips the near edge down, i.e. vertical is
+        // ALREADY direct manipulation in both modes, so flipping it too would
+        // break the half that was right.
+        const float turn = objectDrag_ ? -s : s;
+        camera_.yaw = wrapPi(camera_.yaw + static_cast<float>(delta.x()) * turn);
         // No clamp: the basis is pole-safe, so pitch rotates through and keeps
         // going. Past vertical the view inverts, which is correct.
         camera_.pitch =
