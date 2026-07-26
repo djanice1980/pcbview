@@ -137,6 +137,46 @@ bool occluded(vec3 origin, vec3 dir, float tmax) {
            gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
+// The same sun the path tracer uses, so raster and traced modes agree about
+// where the light is. See pathtrace.comp's kSunDirWorld.
+const vec3 kSunDirWorld = normalize(vec3(0.35, 0.25, 1.0));
+
+// Fractional visibility of a sun that has ANGULAR SIZE, rather than a single
+// yes/no ray against a point light.
+//
+// A point sun gives every shadow a razor edge at every distance, which is the
+// giveaway that a render is not path-traced: real contact shadows are crisp
+// where an object meets the board and soften as they run away from it. Taps are
+// spread across a small disc about the sun direction, so an edge lands
+// somewhere between fully lit and fully shadowed depending on how much of the
+// sun is blocked.
+//
+// A FIXED pattern, like the AO kernel: no per-pixel randomness, so no shimmer.
+// Banding instead of noise is the right trade here -- the eye forgives a soft
+// gradient and cannot forgive a boiling one, least of all in a headset.
+float sunVisibility(vec3 p, vec3 n, vec3 dir, float tmax) {
+    // ~1.5 degrees of angular radius, near enough the real sun.
+    const float radius = 0.026;
+    vec3 up = abs(dir.z) < 0.99 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t = normalize(cross(up, dir));
+    vec3 b = cross(dir, t);
+
+    // Centre plus two rings, offset so they do not line up radially.
+    const vec2 disc[8] = vec2[](
+        vec2( 1.00,  0.00), vec2( 0.00,  1.00),
+        vec2(-1.00,  0.00), vec2( 0.00, -1.00),
+        vec2( 0.38,  0.38), vec2(-0.38,  0.38),
+        vec2(-0.38, -0.38), vec2( 0.38, -0.38));
+
+    float open = occluded(p, dir, tmax) ? 0.0 : 1.0;
+    for (int i = 0; i < 8; ++i) {
+        vec3 d = normalize(dir + (t * disc[i].x + b * disc[i].y) * radius);
+        if (dot(n, d) <= 0.0) continue;      // below the horizon: no light anyway
+        if (!occluded(p, d, tmax)) open += 1.0;
+    }
+    return open / 9.0;
+}
+
 // Fraction of a short hemisphere around the normal that is open. 1 = fully open,
 // 0 = fully enclosed. A fixed kernel biased toward the normal -- no per-pixel
 // randomness, so it is temporally stable (no shimmer).
@@ -185,9 +225,27 @@ void main() {
     float viewDist = viewScale(inWorldPos);
     // Directional key in ORTHO, positional in perspective -- see board.frag
     // for why a positional lamp blackens edge walls in a parallel projection.
+    //
+    // cameraPos.w carries the lighting mode rather than a plain on/off, because
+    // the push block is already at 128 bytes -- the size every Vulkan device is
+    // required to offer and some offer nothing beyond. A float used as a
+    // boolean has room for a third state and costs nothing.
+    //   0 = no ray tracing, 1 = RT with the camera-relative key, 2 = RT with a
+    //   world-fixed sun.
+    //
+    // The camera-relative key is a deliberate choice on the desktop: the light
+    // sits over your shoulder however you orbit, so nothing is ever lit from
+    // behind. In a HEADSET that same rule glues the sun to your skull -- turn
+    // your head and every shadow swings with it, and the board never appears to
+    // sit in a lit room. The world-fixed sun is the same one the path tracer
+    // uses, so the two modes agree about where the light comes from.
+    const bool worldSun = push.cameraPos.w > 1.5;
     vec3 keyDir;
     float keyDist;
-    if (push.camAxis.w > 0.0) {
+    if (worldSun) {
+        keyDir = kSunDirWorld;
+        keyDist = 1.0e5;
+    } else if (push.camAxis.w > 0.0) {
         keyDir = normalize(-push.camAxis.xyz + camRight * 0.55 + camUp * 0.55);
         keyDist = 1.0e4;
     } else {
@@ -205,10 +263,7 @@ void main() {
     float shadow = 1.0;
     float ao = 1.0;
     if (push.cameraPos.w > 0.5) {
-        if (!occluded(inWorldPos + n * 0.05, keyDir, keyDist))
-            shadow = 1.0;
-        else
-            shadow = 0.0;
+        shadow = sunVisibility(inWorldPos + n * 0.05, n, keyDir, keyDist);
         ao = ambientOcclusion(inWorldPos, n);
     }
 

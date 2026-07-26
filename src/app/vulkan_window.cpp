@@ -249,6 +249,8 @@ void VulkanWindow::stepVr() {
             // the desktop can afford the round trip and gets the better result.
             renderer_->setPathTraceBatch(0);
             renderer_->setGpuDenoisePasses(0);
+            // The desktop wants its key light back over the viewer's shoulder.
+            renderer_->setRasterWorldSun(false);
             renderer_->setRenderMode(ptEnabled_ && ptAvailable()
                                          ? vk::RenderMode::PathTraced
                                          : vk::RenderMode::Raster);
@@ -303,6 +305,12 @@ void VulkanWindow::stepVr() {
             renderer_->setRenderMode(vk::RenderMode::Raster);
             renderer_->setRayTracing(rtAvailable());
         }
+        // A sun that stays put in the room. The desktop's key light rides the
+        // camera, which is right when you orbit with a mouse and wrong the
+        // moment the camera is your head: every shadow would swing as you
+        // looked around, and the board would never read as an object standing
+        // in a lit room.
+        renderer_->setRasterWorldSun(true);
     }
 
     // Render at a fraction of the headset's rate and let the COMPOSITOR fill

@@ -3901,7 +3901,11 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // the stack starts peeling.
     const bool rtOn = rtRequested_ && rtSupported_ &&
                       tlas_ != VK_NULL_HANDLE && explodeProgress_ < 0.01f;
-    push.cameraPos[3] = rtOn ? 1.0f : 0.0f;
+    // 0 = off, 1 = RT with the camera-relative key, 2 = RT with a world-fixed
+    // sun. Three states in the float that used to be a boolean, because the
+    // push block already occupies the 128 bytes every Vulkan device is
+    // guaranteed to provide and some provide nothing more.
+    push.cameraPos[3] = rtOn ? (rasterWorldSun_ ? 2.0f : 1.0f) : 0.0f;
     push.params[0] = explodeStep_;
     push.params[1] = explodeProgress_;
     push.params[2] = maxRank_;

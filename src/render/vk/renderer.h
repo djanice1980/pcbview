@@ -333,6 +333,17 @@ public:
     // this never leaves the GPU.
     void setGpuDenoisePasses(int passes) { gpuDenoisePasses_ = passes; }
 
+    // Light the raster path from a world-fixed sun instead of the
+    // camera-relative key.
+    //
+    // The camera-relative key is right on a desktop: the lamp stays over your
+    // shoulder however you orbit, so the board is never lit from behind. In a
+    // headset the same rule glues the sun to your skull -- every shadow swings
+    // as you turn your head, and the board never reads as an object sitting in
+    // a lit room. This is the sun the path tracer already uses, so the two
+    // modes agree about where the light comes from.
+    void setRasterWorldSun(bool on) { rasterWorldSun_ = on; }
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the
@@ -667,6 +678,7 @@ private:
     // Identity quaternion until the board is turned.
     float boardRotInv_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     bool offscreenOnly_ = false;
+    bool rasterWorldSun_ = false;
     int ptBatchOverride_ = 0;   // 0 = interactive heuristic
     float rayEye_[3] = {0, 0, 0};
     float rayFwd_[3] = {0, 0, 1};
