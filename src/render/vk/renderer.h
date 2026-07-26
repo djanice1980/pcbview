@@ -304,6 +304,16 @@ public:
     // where sceneColor_ is already sitting in TRANSFER_SRC_OPTIMAL.
     void blitSceneToImage(VkImage dst, uint32_t dstWidth, uint32_t dstHeight);
 
+    // Render the scene and stop -- no swapchain image acquired, nothing shown
+    // in the window, nothing presented. sceneColor_ is still left in
+    // TRANSFER_SRC_OPTIMAL, so blitSceneToImage works exactly as before.
+    //
+    // VR needs this because the window can only show ONE viewpoint: presenting
+    // both eyes in turn makes it flicker between two cameras. The left eye
+    // presents (and so the window becomes a mirror of it) and the right eye
+    // renders offscreen.
+    void setOffscreenOnly(bool on) { offscreenOnly_ = on; }
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the
@@ -637,6 +647,7 @@ private:
     bool rayOrtho_ = false;
     // Identity quaternion until the board is turned.
     float boardRotInv_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    bool offscreenOnly_ = false;
     float rayEye_[3] = {0, 0, 0};
     float rayFwd_[3] = {0, 0, 1};
     float rayRight_[3] = {1, 0, 0};

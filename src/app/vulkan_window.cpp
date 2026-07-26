@@ -193,6 +193,15 @@ void VulkanWindow::stepVr() {
     if (!vr_->active()) {  // the runtime ended the session
         if (vrTimer_) vrTimer_->stop();
         vr_.reset();
+        // Hand the window back. Leaving offscreenOnly_ set would stop the
+        // desktop presenting entirely -- a dead window after taking the
+        // headset off -- and leaving the mode forced would strand the user in
+        // a renderer they never picked.
+        renderer_->setOffscreenOnly(false);
+        if (!qEnvironmentVariableIsSet("PCBVIEW_VR_PT"))
+            renderer_->setRenderMode(vrPrevMode_);
+        renderer_->setUncappedPresent(false);
+        requestUpdate();
         return;
     }
     // PCBVIEW_VR_MONO=1 renders eye 0 ONCE and sends those identical pixels to
@@ -229,6 +238,10 @@ void VulkanWindow::stepVr() {
             // the matrices this loop hands over were used by the raster path
             // alone. Set it per eye, from that eye's own frustum.
             renderer_->setRayCamera(e.eye, e.fwd, e.right, e.up, false);
+            // Eye 0 presents, so the desktop window becomes a mirror of the
+            // left eye; eye 1 renders offscreen. Presenting both made the
+            // window flip between two viewpoints every frame.
+            renderer_->setOffscreenOnly(i != 0);
             renderer_->drawFrame(e.viewProj, e.eye);
             vr_->submitEye(static_cast<int>(i), *renderer_);
         }
@@ -605,10 +618,33 @@ void VulkanWindow::createDeviceAndRenderer() {
         if (vr_->begin(*xrSystem_, instance_, device_.handle,
                        device_.gpu.handle, device_.gpu.graphicsQueueFamily,
                        device_.graphicsQueue)) {
-            // Each eye also presents to the desktop window as a side effect of
-            // going through drawFrame; uncapping stops vsync throttling the
-            // headset down to the monitor's refresh.
+            // Eye 0 presents to the desktop window as a mirror; uncapping stops
+            // vsync throttling the headset down to the monitor's refresh.
             renderer_->setUncappedPresent(true);
+
+            // Real-time ray-traced raster, not the path tracer.
+            //
+            // The path tracer is PROGRESSIVE: it accumulates samples at a fixed
+            // camera and resets the moment the camera moves, dropping the
+            // denoised frame with it so the image does not freeze on a stale
+            // one. In VR the camera moves every single frame, and the two eyes
+            // are different cameras besides, so accumulation can never get past
+            // one sample and the denoiser never validates. The result is a
+            // permanently raw, grainy image -- which is exactly what a broken
+            // denoiser looks like, because functionally it is one.
+            //
+            // Raster with ray-queried shadows and AO is single-pass: no
+            // accumulation, nothing to reset, clean at 90 Hz per eye. Set
+            // PCBVIEW_VR_PT=1 to path-trace anyway and accept the noise.
+            if (!qEnvironmentVariableIsSet("PCBVIEW_VR_PT")) {
+                vrPrevMode_ = renderer_->renderMode();
+                renderer_->setRenderMode(vk::RenderMode::Raster);
+                renderer_->setRayTracing(rtAvailable());
+                std::printf("vr: using ray-traced raster (the path tracer "
+                            "cannot converge while the head moves; "
+                            "PCBVIEW_VR_PT=1 overrides)\n");
+                std::fflush(stdout);
+            }
             vrTimer_ = new QTimer(this);
             vrTimer_->setInterval(1);  // the runtime does the real pacing
             connect(vrTimer_, &QTimer::timeout, this, &VulkanWindow::stepVr);
@@ -1175,6 +1211,13 @@ bool VulkanWindow::stepSpinAnimation() {
 
 void VulkanWindow::render() {
     if (!initialised_ || !renderer_) return;
+    // While the headset is running, stepVr owns the renderer. Both paths call
+    // setRayCamera, and the path tracer keys accumulation off the camera, so
+    // the two of them alternating meant every VR frame reset the accumulator
+    // to a desktop viewpoint and back -- the window flickering between two
+    // cameras, and the headset stuck at one noisy sample. The window is fed by
+    // eye 0's present instead.
+    if (vr_ && vr_->active()) return;
 
     // The peel eases toward its target here rather than on a QTimer: rendering
     // is on demand, so the animation drives the frames and the frames drive the

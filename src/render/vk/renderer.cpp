@@ -3545,13 +3545,20 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
                          const std::function<void(VkCommandBuffer)>& drawUi) {
     vkWaitForFences(device_.handle, 1, &inFlight_[frame_], VK_TRUE, UINT64_MAX);
 
+    // Offscreen: render the scene and stop. No swapchain image is acquired,
+    // nothing is blitted to the window, nothing is presented. VR uses this for
+    // the second eye -- the window can only show one of them, and presenting
+    // both in turn is what made it flicker between two viewpoints.
     uint32_t imageIndex = 0;
-    VkResult acquire =
-        vkAcquireNextImageKHR(device_.handle, swapchain_, UINT64_MAX,
-                              imageAvailable_[frame_], VK_NULL_HANDLE, &imageIndex);
-    if (acquire == VK_ERROR_OUT_OF_DATE_KHR) return false;
-    if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
-        check(acquire, "vkAcquireNextImageKHR");
+    if (!offscreenOnly_) {
+        VkResult acquire =
+            vkAcquireNextImageKHR(device_.handle, swapchain_, UINT64_MAX,
+                                  imageAvailable_[frame_], VK_NULL_HANDLE,
+                                  &imageIndex);
+        if (acquire == VK_ERROR_OUT_OF_DATE_KHR) return false;
+        if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
+            check(acquire, "vkAcquireNextImageKHR");
+        }
     }
 
     vkResetFences(device_.handle, 1, &inFlight_[frame_]);
@@ -3851,18 +3858,37 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     toBlit[0].image = sceneColor_.handle;
     toBlit[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
-    toBlit[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    toBlit[1].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    toBlit[1].dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
-    toBlit[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    toBlit[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    toBlit[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toBlit[1].image = images_[imageIndex];
-    toBlit[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    // toBlit[0] is issued in BOTH modes: it is what leaves sceneColor_ in
+    // TRANSFER_SRC_OPTIMAL, which is exactly the state blitSceneToImage relies
+    // on to hand the finished eye to the runtime. Only the window's own image
+    // is skipped when there is no window image to write.
+    if (!offscreenOnly_) {
+        toBlit[1] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        toBlit[1].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        toBlit[1].dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+        toBlit[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        toBlit[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toBlit[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toBlit[1].image = images_[imageIndex];
+        toBlit[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    }
 
-    dep.imageMemoryBarrierCount = 2;
+    dep.imageMemoryBarrierCount = offscreenOnly_ ? 1u : 2u;
     dep.pImageMemoryBarriers = toBlit;
     vkCmdPipelineBarrier2(cmd, &dep);
+
+    if (offscreenOnly_) {
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo solo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        solo.commandBufferCount = 1;
+        solo.pCommandBuffers = &cmd;
+        // No semaphores: nothing was acquired, so there is nothing to wait on
+        // and nothing downstream waiting to present.
+        check(vkQueueSubmit(device_.graphicsQueue, 1, &solo, inFlight_[frame_]),
+              "vkQueueSubmit(offscreen)");
+        frame_ = (frame_ + 1) % kFramesInFlight;
+        return true;
+    }
 
     VkImageBlit blit{};
     blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
