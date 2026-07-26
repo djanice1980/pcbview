@@ -329,26 +329,17 @@ private:
     // accumulate shear or scale the way a re-multiplied matrix does.
     BoardPose board_;
     glm::vec3 boardPivot() const;
-    // The orientation the scene is actually rendered from. Captured on the
-    // first frame -- so PCBVIEW_START_VIEW and the opening frameBoard still
-    // choose the initial view -- and fixed from then on: rotations move the
-    // board, not this. rotPrev_ is the last camera orientation already handed
-    // over, so only the CHANGE is applied and external writers (a VR grip, the
-    // gyro) can compose into the same pose without fighting it.
-    Camera viewAnchor_;
-    Camera rotPrev_;
-    bool rotAnchorValid_ = false;
-
-    // OBJECT MODE. Both modes turn the board pose -- that is the only thing
-    // that ever moves now -- but they differ in WHICH WAY, and that difference
-    // is the whole point:
-    //   default: the board swings opposite your hand, the familiar feel of
-    //            swinging a camera around a fixed board.
-    //   object:  the face you grabbed follows your cursor, the feel of having
-    //            your hand on the board.
-    // Latched at mouse-press so releasing Shift mid-drag cannot flip the sense
-    // of a drag underneath you. The pad's copy is a TOGGLE, not a hold: a stick
-    // click you must keep held while pushing that same stick is unusable.
+    // OBJECT MODE selects the MECHANISM, not the direction. The gesture maths
+    // is identical either way, so the board appears to move the same; what
+    // changes is which thing actually turns, and with the sun fixed in the
+    // world that difference is plainly visible:
+    //   object mode - the board turns, light sweeps ACROSS it, sky holds still
+    //   view mode   - the camera turns, the board's shading holds, sky sweeps
+    // An earlier attempt had BOTH modes turning the board and differing only in
+    // sign, which is exactly why they felt like the same thing.
+    // Latched at mouse-press so releasing Shift mid-drag cannot change the
+    // sense of a drag underneath you. The pad's copy is a TOGGLE, not a hold: a
+    // stick click you must keep held while pushing that same stick is unusable.
     bool objectDrag_ = false;
     bool padObjectMode_ = false;
 

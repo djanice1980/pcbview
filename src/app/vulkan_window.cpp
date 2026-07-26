@@ -204,16 +204,14 @@ void VulkanWindow::stepGamepad() {
     // path -- see mouseMoveEvent.
     if (g.rightX != 0.0f || g.rightY != 0.0f) {
         constexpr float kTurnRate = 2.2f;  // rad/s at full deflection
-        // R3 flips the turn sense, the pad's equivalent of holding Shift with
-        // the mouse. NOTE the two devices default to OPPOSITE senses: the pad
-        // grabs-and-turns, the mouse swings around the board. That is not
-        // deliberate design, it is history -- the pad mapping was written while
-        // the mouse was briefly inverted, and only the mouse got reverted. Both
-        // feels are now reachable on both devices, so it is a one-character
-        // change to align them either way once a preference is stated.
-        const float turn = padObjectMode_ ? kTurnRate : -kTurnRate;
-        camera_.yaw = wrapPi(camera_.yaw + g.rightX * turn * fdt);
-        camera_.pitch = wrapPi(camera_.pitch - g.rightY * kTurnRate * fdt);
+        // R3 picks the MECHANISM, not the direction: same stick sense either
+        // way, but object mode turns the board under a fixed sun while view
+        // mode flies the camera around a fixed board.
+        Camera after = camera_;
+        after.yaw = wrapPi(after.yaw - g.rightX * kTurnRate * fdt);
+        after.pitch = wrapPi(after.pitch - g.rightY * kTurnRate * fdt);
+        if (padObjectMode_) adoptCameraDeltaIntoBoard(camera_, after);
+        else camera_ = after;
         moved = true;
     }
 
@@ -221,8 +219,10 @@ void VulkanWindow::stepGamepad() {
     if (g.leftX != 0.0f || g.leftY != 0.0f) {
         const Basis b = cameraBasis(camera_);
         const float scale = camera_.distance * 1.1f * fdt;
+        // Both axes reversed on request: the pad's pan felt backwards against
+        // the mouse's middle-drag.
         const glm::vec3 move =
-            -b.right * g.leftX * scale - b.up * g.leftY * scale;
+            b.right * g.leftX * scale + b.up * g.leftY * scale;
         if (padObjectMode_) {
             board_.translation += board_.rotation * (-move);  // see the mouse
         } else {
@@ -289,6 +289,10 @@ void VulkanWindow::stepGamepad() {
             const float ay = std::abs(gy) > kGyroNoise ? gy : 0.0f;
             const float az = std::abs(gz) > kGyroNoise ? gz : 0.0f;
             if (ax != 0.0f || ay != 0.0f || az != 0.0f) {
+                // Hold-and-turn always moves the BOARD, whatever R3 says --
+                // that is what "hold and turn" means, and it is the rehearsal
+                // for grabbing the board with a Sense controller.
+                const Camera before = camera_;
                 // SDL reports rad/s about the pad's OWN axes, right-handed:
                 // +x is nose up/down, +y is turning it flat, +z is twisting it
                 // like a steering wheel.
@@ -304,6 +308,9 @@ void VulkanWindow::stepGamepad() {
                 // "correct" this back from SDL's right-hand rule.
                 camera_.yaw = wrapPi(camera_.yaw - az * fdt);      // twist
                 if (ay != 0.0f) applyGlobeTumble(ay * fdt);        // flip
+                const Camera after = camera_;
+                camera_ = before;
+                adoptCameraDeltaIntoBoard(before, after);
                 moved = true;
             }
             padSteering_ = true;
@@ -1043,30 +1050,17 @@ void VulkanWindow::render() {
     const float h = static_cast<float>(height() * dpr);
     if (w < 1.0f || h < 1.0f) return;
 
-    // EVERY rotation in the app -- mouse drags, the gamepad's right stick, the
-    // gyro, showcase spins, the Top/Bottom/Iso presets, recorded custom moves
-    // -- is still authored against camera_, exactly as it always was. This one
-    // place hands that orientation change to the BOARD instead and pins the
-    // rendering camera to a fixed anchor. Converting centrally is why none of
-    // those had to be rewritten and why nothing persisted had to change: a
-    // PathKey still stores camera angles, and still means the same picture, so
-    // playlists and templates already saved keep working untouched.
-    if (!rotAnchorValid_) {
-        viewAnchor_ = camera_;
-        rotPrev_ = camera_;
-        rotAnchorValid_ = true;
-    }
-    if (camera_.yaw != rotPrev_.yaw || camera_.pitch != rotPrev_.pitch ||
-        camera_.roll != rotPrev_.roll) {
-        adoptCameraDeltaIntoBoard(rotPrev_, camera_);
-        rotPrev_ = camera_;
-    }
-    // The camera keeps camera_'s distance and target -- zoom and pan really do
-    // move the viewer -- but never its orientation.
-    Camera renderCam = camera_;
-    renderCam.yaw = viewAnchor_.yaw;
-    renderCam.pitch = viewAnchor_.pitch;
-    renderCam.roll = viewAnchor_.roll;
+    // TWO GENUINELY DIFFERENT MECHANISMS, not two directions:
+    //   view mode   - the CAMERA turns (camera_), the board holds still. With
+    //                 the sun world-fixed, the board's shading is CONSTANT and
+    //                 the sky sweeps past: you are flying around a lit object.
+    //   object mode - the BOARD turns (board_), the camera holds still. The sun
+    //                 stays put, so light sweeps ACROSS the board and the sky
+    //                 does not move: you are turning an object under a lamp.
+    // An earlier attempt had both modes turning the board and differing only in
+    // sign, which is why they felt identical -- the mechanism is the difference,
+    // not the direction. Gestures pick their sink; render() just draws.
+    Basis basis = cameraBasis(camera_);
 
     // MOVE THE CAMERA INTO THE BOARD'S FRAME, rather than moving the board's
     // geometry into the world. The two are equivalent, and this direction is
@@ -1076,7 +1070,6 @@ void VulkanWindow::render() {
     // this ONCE here and everything downstream -- raster, both tracers,
     // picking, the depth sort, the overlay -- is consistently in board space
     // with no further changes.
-    Basis basis = cameraBasis(renderCam);
     // Test BOTH halves of the pose. Guarding on rotation alone silently threw
     // away every translation while the board was still square-on -- the board
     // simply refused to slide until you had also turned it.
@@ -1338,17 +1331,16 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
 
     if (dragging_) {
         const float s = 0.008f;
-        // Object mode NEGATES the horizontal: the grabbed face then travels
-        // with the cursor instead of away from it. Only the horizontal --
-        // dragging down already tips the near edge down, i.e. vertical is
-        // ALREADY direct manipulation in both modes, so flipping it too would
-        // break the half that was right.
-        const float turn = objectDrag_ ? -s : s;
-        camera_.yaw = wrapPi(camera_.yaw + static_cast<float>(delta.x()) * turn);
+        // Identical gesture maths either way, so the board APPEARS to move the
+        // same. What differs is which thing actually turns, and therefore
+        // whether the light sweeps across the board or stays put on it.
+        Camera after = camera_;
+        after.yaw = wrapPi(after.yaw + static_cast<float>(delta.x()) * s);
         // No clamp: the basis is pole-safe, so pitch rotates through and keeps
         // going. Past vertical the view inverts, which is correct.
-        camera_.pitch =
-            wrapPi(camera_.pitch + static_cast<float>(delta.y()) * s);
+        after.pitch = wrapPi(after.pitch + static_cast<float>(delta.y()) * s);
+        if (objectDrag_) adoptCameraDeltaIntoBoard(camera_, after);
+        else camera_ = after;
         requestUpdate();
     } else if (draggingInv_) {
         // Right-drag covers the two SCREEN-relative rotations left-drag
@@ -1359,9 +1351,15 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
         // yaw/pitch/roll parameterisation can't express as one increment --
         // so rotate the basis and decompose back into yaw/pitch/roll.
         const float s = 0.008f;
+        const Camera before = camera_;
         applyGlobeTumble(static_cast<float>(delta.x()) * s);
         camera_.roll =
             wrapPi(camera_.roll + static_cast<float>(delta.y()) * s);
+        if (objectDrag_) {
+            const Camera after = camera_;
+            camera_ = before;  // the camera holds; the board turns
+            adoptCameraDeltaIntoBoard(before, after);
+        }
         requestUpdate();
     } else if (panning_) {
         // Pan across the SCREEN plane, using the camera's own right/up. Using

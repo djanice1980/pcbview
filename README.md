@@ -212,7 +212,8 @@ highlight**.
 | Action | Control |
 |---|---|
 | Orbit / pan / zoom | Left-drag / middle-drag / scroll |
-| Turn the board itself | `Shift` + left-drag (the face you grab follows the cursor) |
+| Turn the board itself | `Shift` + drag (see object mode below) |
+| Slide the board through space | `Shift` + middle-drag (`F` re-centres) |
 | Globe-spin + twist | Right-drag (horizontal tumbles about the screen-vertical axis; vertical twists cw/ccw) |
 | Exploded view | `Ctrl` + scroll |
 | Top / Bottom / Isometric | `T` / `B` / `I` |
@@ -224,6 +225,21 @@ highlight**.
 | Save screenshot | `Ctrl`+`S` |
 | Print (as shown) | `Ctrl`+`P` |
 | Hide both side panels | `\` |
+
+### View mode and object mode
+
+The sun is fixed in the world, and the two modes differ in what actually moves
+under it — which is visible, not just conceptual:
+
+- **View mode** (default) moves the **camera** around a stationary board. The
+  board's shading stays put and the sky sweeps past: you are walking around a
+  lit object.
+- **Object mode** (`Shift` with the mouse, `R3` on a controller) turns the
+  **board** while the camera holds still. The sky does not move and light
+  sweeps across the board as it turns: you are handling the object. Only in
+  this mode can the board be slid through space, and `F` brings it back.
+
+The gesture is identical in both; only the mechanism changes.
 
 ### Controller
 
