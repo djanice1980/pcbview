@@ -27,6 +27,7 @@
 #include "app/viewer.h"
 #include "geom/tessellate.h"
 #include "render/cpu/cpu_tracer.h"
+#include "xr/xr_probe.h"
 #include "io/gerber/gerber_parser.h"
 #include "io/gerber/gerber_project.h"
 #include "io/kicad/kicad_importer.h"
@@ -506,6 +507,7 @@ int main(int argc, char** argv) {
         if (std::string(argv[1]) == "--view" && argc == 2)
             return pcbview::app::runViewer("");
         if (std::string(argv[1]) == "--gpu-info") return gpuReport();
+        if (std::string(argv[1]) == "--xr-probe") return pcbview::xr::probe();
         if (std::string(argv[1]) == "--cpu-trace" && argc >= 4)
             return cpuTrace(argv[2], argv[3]);
         if (std::string(argv[1]) == "--gerber-probe" && argc >= 3)

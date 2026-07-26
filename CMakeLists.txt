@@ -119,6 +119,21 @@ set(SDL_HIDAPI       ON  CACHE BOOL "" FORCE)
 set(SDL_SENSOR       ON  CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(sdl3)
 
+# OpenXR SDK (Apache-2.0, GPL-3-compatible): the loader for VR. The runtime
+# itself is whatever the system has registered -- on this machine SteamVR, which
+# is what drives a PSVR2 through Sony's PC adapter. Only the loader is built;
+# the API layers, samples and tests are not.
+FetchContent_Declare(openxr
+    GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git
+    GIT_TAG release-1.1.61
+    GIT_SHALLOW TRUE
+)
+set(DYNAMIC_LOADER   OFF CACHE BOOL "" FORCE)  # static loader, no extra DLL
+set(BUILD_TESTS      OFF CACHE BOOL "" FORCE)
+set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+set(BUILD_SAMPLES    OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(openxr)
+
 # Intel Open Image Denoise: the neural denoiser for the path tracer (Apache-2.0,
 # GPL-3-compatible). Prebuilt binary package -- header + import lib + runtime DLLs.
 FetchContent_Declare(oidn
@@ -259,6 +274,7 @@ add_executable(pcbview WIN32
     src/app/theme.cpp
     src/app/viewer.cpp
     src/input/gamepad.cpp
+    src/xr/xr_probe.cpp
     assets/icons.qrc
     assets/pcbview.rc
     ${SHADER_OUTPUTS}
@@ -304,6 +320,7 @@ target_link_libraries(pcbview PRIVATE
     Clipper2
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::PrintSupport
     SDL3::SDL3-static
+    OpenXR::openxr_loader
     ${OIDN_DIR}/lib/OpenImageDenoise.lib
     ${EMBREE_DIR}/lib/embree4.lib
 )
