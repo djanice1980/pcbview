@@ -26,6 +26,16 @@ layout(set = 0, binding = 3, rgba32f) uniform readonly image2D normalImg;
 layout(push_constant) uniform Push {
     uvec4 dim;      // x width, y height, z step width, w pass index
     vec4 sigma;     // x normal power, y luminance, z albedo, w input scale
+    // x = 1/samples, for the GUIDES.
+    //
+    // The tracer accumulates its albedo and normal AOVs the same way it
+    // accumulates colour -- they are running SUMS, not averages, because a
+    // single sample's first-hit albedo is a coin flip under stochastic mask
+    // alpha. So they need dividing too. Reading them raw made the albedo
+    // difference scale with the sample count, and at 16 spp that drove the
+    // material weight to zero for any difference at all, rejecting nearly every
+    // tap: the filter ran and did almost nothing.
+    vec4 misc;
 } pc;
 
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -39,7 +49,7 @@ void main() {
     // already-averaged image and pass 1.0.
     const vec3 centre = imageLoad(srcImg, px).rgb * pc.sigma.w;
     const vec3 nRaw = imageLoad(normalImg, px).xyz;
-    const vec3 aC = imageLoad(albedoImg, px).rgb;
+    const vec3 aC = imageLoad(albedoImg, px).rgb * pc.misc.x;
     const float lC = luma(centre);
 
     // Background (no geometry hit) has a zero normal. Filtering it against the
@@ -72,7 +82,7 @@ void main() {
             const vec3 nQraw = imageLoad(normalImg, q).xyz;
             if (dot(nQraw, nQraw) < 1e-6) continue;  // never pull sky in
             const vec3 nQ = normalize(nQraw);
-            const vec3 aQ = imageLoad(albedoImg, q).rgb;
+            const vec3 aQ = imageLoad(albedoImg, q).rgb * pc.misc.x;
 
             // Orientation: a high power makes this fall off sharply, so a tap
             // across a component's edge contributes almost nothing.

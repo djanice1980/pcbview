@@ -1987,6 +1987,7 @@ namespace {
 struct DnPush {
     uint32_t dim[4];   // w, h, step width, pass index
     float sigma[4];    // normal power, luminance, albedo, input scale
+    float misc[4];     // x = 1/samples for the guide AOVs
 };
 }  // namespace
 
@@ -2137,9 +2138,13 @@ void Renderer::recordGpuDenoise(VkCommandBuffer cmd) {
         push.sigma[1] = 4.0f;    // luminance
         push.sigma[2] = 0.20f;   // albedo
         // Only the first pass sees the raw accumulation sum.
-        push.sigma[3] =
-            p == 0 ? 1.0f / static_cast<float>(std::max(ptSampleCount_, 1))
-                   : 1.0f;
+        const float invSamples =
+            1.0f / static_cast<float>(std::max(ptSampleCount_, 1));
+        push.sigma[3] = p == 0 ? invSamples : 1.0f;
+        // The guides are sums on EVERY pass -- unlike the colour, which is only
+        // a sum on the first, since later passes read an already-averaged
+        // image. So this divide does not turn off after pass 0.
+        push.misc[0] = invSamples;
         vkCmdPushConstants(cmd, dnPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(push), &push);
         vkCmdDispatch(cmd, gx, gy, 1);
