@@ -511,6 +511,8 @@ int main(int argc, char** argv) {
         if (std::string(argv[1]) == "--xr-probe") return pcbview::xr::probe();
         if (std::string(argv[1]) == "--xr-device-test")
             return pcbview::xr::deviceTest();
+        if (std::string(argv[1]) == "--xr-input-test")
+            return pcbview::xr::inputTest();
         if (std::string(argv[1]) == "--cpu-trace" && argc >= 4)
             return cpuTrace(argv[2], argv[3]);
         if (std::string(argv[1]) == "--gerber-probe" && argc >= 3)
