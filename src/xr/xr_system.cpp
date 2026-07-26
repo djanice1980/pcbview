@@ -989,7 +989,16 @@ glm::mat4 placement(const float centre[3], float scale,
     // Yaw only: taking the full head rotation would tilt the board with every
     // glance, and rolling a PCB because you tipped your head is nauseating.
     const glm::vec3 fwd = anchorRot * glm::vec3(0.0f, 0.0f, -1.0f);
-    const float yaw = std::atan2(fwd.x, -fwd.z);
+    // atan2(-x, -z), and the negations are not cosmetic. angleAxis(t, +Y)
+    // maps (0,0,-1) to (-sin t, 0, -cos t), so matching the facing direction
+    // needs sin t = -fwd.x and cos t = -fwd.z. Using atan2(fwd.x, -fwd.z)
+    // yields the yaw MIRRORED about the Z axis, which for anyone not facing
+    // -Z puts the board BEHIND them -- facing +X it landed at -0.6 on X,
+    // exactly backwards. A board seen from behind has its left and right
+    // exchanged in BOTH eyes, which is why swapping the eye images, mirroring
+    // the projection and flipping the frustum offset all changed nothing:
+    // none of them address standing on the wrong side of the thing.
+    const float yaw = std::atan2(-fwd.x, -fwd.z);
     const glm::quat flat = glm::angleAxis(yaw, glm::vec3(0.0f, 1.0f, 0.0f));
 
     glm::mat4 m(1.0f);
