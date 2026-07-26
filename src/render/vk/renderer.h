@@ -314,6 +314,14 @@ public:
     // renders offscreen.
     void setOffscreenOnly(bool on) { offscreenOnly_ = on; }
 
+    // Which accumulation buffer the path tracer builds into. Stereo needs one
+    // per eye: sharing a single accumulator means each eye's camera resets the
+    // other's progress every frame, pinning both at one sample forever. Slot 0
+    // is the only one used until something asks for another, so the desktop
+    // path is untouched. `count` sizes the pool (1 = desktop, 2 = stereo).
+    void setAccumulationSlots(int count);
+    void setAccumulationSlot(int slot);
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the
@@ -710,6 +718,39 @@ private:
         dnDisplayed_ = 0;
         ++ptGeneration_;
     }
+    // --- Per-eye accumulation ----------------------------------------------
+    // Stereo path tracing needs TWO accumulators. With one, the eyes take turns
+    // wiping each other: eye 0 accumulates, eye 1's camera resets it, eye 0
+    // resets it back, forever at one sample. Nothing ever converges no matter
+    // how still you hold your head.
+    //
+    // Rather than index every use of ptAccum_ and friends, the live members ARE
+    // the active slot and setAccumulationSlot swaps them out to a stash and the
+    // other slot's in. These are handles and counters, so a swap is a few dozen
+    // bytes; the images themselves never move. That keeps the change contained
+    // here instead of spread across every path-tracing site.
+    struct PtSlotState {
+        Image accum, albedo, normal, netPhase, denoised;
+        VkDescriptorSet ptSet = VK_NULL_HANDLE;
+        VkDescriptorSet tonemapSet = VK_NULL_HANDLE;
+        int sampleCount = 0;
+        bool imagesInitialised = false;
+        bool denoisedValid = false;
+        int dnDisplayed = 0;
+        uint32_t generation = 0;
+    };
+    PtSlotState ptStash_[2];
+    int ptSlot_ = 0;
+    // True once a second slot is live. The async denoiser is deliberately held
+    // off while it is: OIDN takes tens of milliseconds at eye resolution, so it
+    // could never keep up with a headset anyway, and a pass that started
+    // against one slot must not land its output in another.
+    bool ptMultiSlot_ = false;
+    void stashPtSlot(PtSlotState& s) const;
+    void loadPtSlot(const PtSlotState& s);
+    // Rebuild the path-tracer images for whichever slot is currently live.
+    void recreatePtImagesLive();
+
     VkDescriptorSetLayout ptSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout tonemapSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool ptPool_ = VK_NULL_HANDLE;

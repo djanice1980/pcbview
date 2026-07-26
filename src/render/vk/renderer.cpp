@@ -666,12 +666,15 @@ void Renderer::createPathTracer() {
                                       &tonemapSetLayout_),
           "tonemap set layout");
 
+    // Doubled: stereo path tracing needs a second accumulation slot, with its
+    // own pt and tonemap sets pointing at its own images. Allocating the room
+    // up front is a handful of descriptors and avoids rebuilding the pool later.
     VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},  // + netColour, netSpan
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7}};  // 4 pt + 3 tonemap
+        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16},  // + netColour, netSpan
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 14}};  // (4 pt + 3 tonemap) x 2
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pi.maxSets = 2;
+    pi.maxSets = 4;
     pi.poolSizeCount = 3;
     pi.pPoolSizes = sizes;
     check(vkCreateDescriptorPool(device_.handle, &pi, nullptr, &ptPool_), "pt pool");
@@ -846,6 +849,15 @@ void Renderer::destroyPathTracer() {
     destroyImage(ptNormal_);
     destroyImage(ptNetPhase_);
     destroyImage(ptDenoised_);
+    // The second accumulation slot, if stereo ever brought one into being. The
+    // pool is gone by now, so its descriptor sets need no freeing.
+    destroyImage(ptStash_[1].accum);
+    destroyImage(ptStash_[1].albedo);
+    destroyImage(ptStash_[1].normal);
+    destroyImage(ptStash_[1].netPhase);
+    destroyImage(ptStash_[1].denoised);
+    ptStash_[1].ptSet = ptStash_[1].tonemapSet = VK_NULL_HANDLE;
+    ptMultiSlot_ = false;
 }
 
 void Renderer::updatePathTraceDescriptors() {
@@ -1445,6 +1457,13 @@ bool Renderer::denoiseTick() {
         ptAccum_.handle == VK_NULL_HANDLE) {
         return false;
     }
+    // Not while stereo is running. A pass spans several frames -- readback,
+    // worker, write-back -- and the live slot changes between every one of
+    // them, so its output would land in whichever eye happened to be current
+    // when it finished. OIDN also costs tens of milliseconds at eye
+    // resolution, so it could not keep pace with a headset even if the
+    // bookkeeping were free. Accumulation alone is what cleans stereo up.
+    if (ptMultiSlot_) return false;
 
     switch (dnState_) {
         case DenoiseState::Idle: {
@@ -1908,34 +1927,149 @@ void Renderer::createSceneTargets() {
         // The async denoise's fenced readback references these images; drain it
         // before they go away.
         abortDenoise();
-        destroyImage(ptAccum_);
-        destroyImage(ptAlbedo_);
-        destroyImage(ptNormal_);
-        destroyImage(ptNetPhase_);
-        destroyImage(ptDenoised_);
-        // STORAGE for compute R/W, TRANSFER_SRC/DST for the denoise readback and
-        // write-back copies.
-        const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT |
-                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        ptAccum_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
-                               VK_IMAGE_ASPECT_COLOR_BIT);
-        ptAlbedo_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
-                                VK_IMAGE_ASPECT_COLOR_BIT);
-        ptNormal_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
-                                VK_IMAGE_ASPECT_COLOR_BIT);
-        // First-hit net phase AOV: .r = phase along the net, .g = 1 when this
-        // pixel directly shows highlighted copper. Lets the chase run as a
-        // display-time modulation, leaving the accumulated radiance untouched.
-        ptNetPhase_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
-                                  VK_IMAGE_ASPECT_COLOR_BIT);
-        ptDenoised_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
-                                  VK_IMAGE_ASPECT_COLOR_BIT);
-        ptImagesInitialised_ = false;  // need the UNDEFINED->GENERAL transition
-        ptDenoisedValid_ = false;
-        resetAccumulation();            // resolution changed; restart accumulation
+        // Slot 0 is always the live one here, so the stash and the live members
+        // cannot be confused while images are being rebuilt.
+        setAccumulationSlot(0);
+        recreatePtImagesLive();
         if (ptSet_) updatePathTraceDescriptors();
+
+        // The second slot gets the same treatment by briefly making it live and
+        // reusing the very same code -- there is no second copy of the creation
+        // or descriptor logic to drift out of step with this one.
+        if (ptMultiSlot_ && ptStash_[1].ptSet) {
+            PtSlotState live;
+            stashPtSlot(live);
+            loadPtSlot(ptStash_[1]);
+            recreatePtImagesLive();
+            updatePathTraceDescriptors();
+            stashPtSlot(ptStash_[1]);
+            loadPtSlot(live);
+        }
     }
+}
+
+// Rebuild the path-tracer images for whichever slot is currently live.
+void Renderer::recreatePtImagesLive() {
+    destroyImage(ptAccum_);
+    destroyImage(ptAlbedo_);
+    destroyImage(ptNormal_);
+    destroyImage(ptNetPhase_);
+    destroyImage(ptDenoised_);
+    // STORAGE for compute R/W, TRANSFER_SRC/DST for the denoise readback and
+    // write-back copies.
+    const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ptAccum_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                           VK_IMAGE_ASPECT_COLOR_BIT);
+    ptAlbedo_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+    ptNormal_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+    // First-hit net phase AOV: .r = phase along the net, .g = 1 when this
+    // pixel directly shows highlighted copper. Lets the chase run as a
+    // display-time modulation, leaving the accumulated radiance untouched.
+    ptNetPhase_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                              VK_IMAGE_ASPECT_COLOR_BIT);
+    ptDenoised_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                              VK_IMAGE_ASPECT_COLOR_BIT);
+    ptImagesInitialised_ = false;  // need the UNDEFINED->GENERAL transition
+    ptDenoisedValid_ = false;
+    resetAccumulation();           // resolution changed; restart accumulation
+}
+
+void Renderer::stashPtSlot(PtSlotState& s) const {
+    s.accum = ptAccum_;
+    s.albedo = ptAlbedo_;
+    s.normal = ptNormal_;
+    s.netPhase = ptNetPhase_;
+    s.denoised = ptDenoised_;
+    s.ptSet = ptSet_;
+    s.tonemapSet = tonemapSet_;
+    s.sampleCount = ptSampleCount_;
+    s.imagesInitialised = ptImagesInitialised_;
+    s.denoisedValid = ptDenoisedValid_;
+    s.dnDisplayed = dnDisplayed_;
+    s.generation = ptGeneration_;
+}
+
+void Renderer::loadPtSlot(const PtSlotState& s) {
+    ptAccum_ = s.accum;
+    ptAlbedo_ = s.albedo;
+    ptNormal_ = s.normal;
+    ptNetPhase_ = s.netPhase;
+    ptDenoised_ = s.denoised;
+    ptSet_ = s.ptSet;
+    tonemapSet_ = s.tonemapSet;
+    ptSampleCount_ = s.sampleCount;
+    ptImagesInitialised_ = s.imagesInitialised;
+    ptDenoisedValid_ = s.denoisedValid;
+    dnDisplayed_ = s.dnDisplayed;
+    ptGeneration_ = s.generation;
+}
+
+void Renderer::setAccumulationSlots(int count) {
+    const bool want = count >= 2;
+    if (want == ptMultiSlot_) return;
+    if (!rtSupported_) return;
+
+    if (want) {
+        // Park on slot 0 so the live members are unambiguously slot 0's.
+        setAccumulationSlot(0);
+        if (ptStash_[1].ptSet == VK_NULL_HANDLE && ptPool_) {
+            VkDescriptorSetAllocateInfo ai{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = ptPool_;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &ptSetLayout_;
+            check(vkAllocateDescriptorSets(device_.handle, &ai,
+                                           &ptStash_[1].ptSet),
+                  "pt set (slot 1)");
+            ai.pSetLayouts = &tonemapSetLayout_;
+            check(vkAllocateDescriptorSets(device_.handle, &ai,
+                                           &ptStash_[1].tonemapSet),
+                  "tonemap set (slot 1)");
+        }
+        ptMultiSlot_ = true;
+        // Build slot 1's images at the current resolution, through the same
+        // path createSceneTargets uses.
+        if (sceneExtent_.width > 0 && sceneExtent_.height > 0) {
+            PtSlotState live;
+            stashPtSlot(live);
+            loadPtSlot(ptStash_[1]);
+            recreatePtImagesLive();
+            updatePathTraceDescriptors();
+            stashPtSlot(ptStash_[1]);
+            loadPtSlot(live);
+        }
+    } else {
+        setAccumulationSlot(0);
+        abortDenoise();
+        vkDeviceWaitIdle(device_.handle);
+        // The descriptor sets stay allocated -- cheap, and re-entering stereo
+        // then costs nothing. Only the images are given back.
+        destroyImage(ptStash_[1].accum);
+        destroyImage(ptStash_[1].albedo);
+        destroyImage(ptStash_[1].normal);
+        destroyImage(ptStash_[1].netPhase);
+        destroyImage(ptStash_[1].denoised);
+        ptStash_[1].imagesInitialised = false;
+        ptStash_[1].sampleCount = 0;
+        ptMultiSlot_ = false;
+    }
+}
+
+void Renderer::setAccumulationSlot(int slot) {
+    slot = std::clamp(slot, 0, 1);
+    if (slot == ptSlot_) return;
+    if (slot == 1 && (!ptMultiSlot_ || ptStash_[1].ptSet == VK_NULL_HANDLE))
+        return;
+    // An in-flight denoise reads THIS slot's images and writes THIS slot's
+    // output, so it must not straddle a swap.
+    abortDenoise();
+    stashPtSlot(ptStash_[ptSlot_]);
+    ptSlot_ = slot;
+    loadPtSlot(ptStash_[ptSlot_]);
 }
 
 void Renderer::destroySceneTargets() {

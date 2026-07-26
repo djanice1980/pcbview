@@ -245,6 +245,9 @@ void VulkanWindow::stepVr() {
         if (vrOwnsRenderer_) {
             vrOwnsRenderer_ = false;
             renderer_->setOffscreenOnly(false);
+            // Back to a single accumulator: the desktop has one viewpoint, and
+            // this also lets the denoiser run again.
+            renderer_->setAccumulationSlots(1);
             renderer_->setRenderMode(ptEnabled_ && ptAvailable()
                                          ? vk::RenderMode::PathTraced
                                          : vk::RenderMode::Raster);
@@ -261,6 +264,10 @@ void VulkanWindow::stepVr() {
             renderer_->setRenderMode(vk::RenderMode::Raster);
             renderer_->setRayTracing(rtAvailable());
         }
+        // One accumulation buffer per eye, and only while path tracing needs
+        // them -- raster accumulates nothing, so a second set of full-resolution
+        // RGBA32F images would be pure waste.
+        renderer_->setAccumulationSlots(allowPt ? 2 : 1);
     }
 
     // Render at a fraction of the headset's rate and let the COMPOSITOR fill
@@ -313,6 +320,10 @@ void VulkanWindow::stepVr() {
             // direction and zoom into both eyes, with no head tracking, while
             // the matrices this loop hands over were used by the raster path
             // alone. Set it per eye, from that eye's own frustum.
+            // This eye's own accumulator. Without it the two eyes share one and
+            // reset each other every frame -- neither ever gets past a single
+            // sample, however still you hold your head.
+            renderer_->setAccumulationSlot(static_cast<int>(i));
             renderer_->setRayCamera(e.eye, e.fwd, e.right, e.up, false);
             // Eye 0 presents, so the desktop window becomes a mirror of the
             // left eye; eye 1 renders offscreen. Presenting both made the
