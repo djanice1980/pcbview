@@ -376,9 +376,20 @@ void VulkanWindow::stepVr() {
             // left eye; eye 1 renders offscreen. Presenting both made the
             // window flip between two viewpoints every frame.
             renderer_->setOffscreenOnly(i != 0);
+            // Acquire BEFORE rendering so the copy into the eye rides inside
+            // the frame's own command buffer. Done afterwards, as its own
+            // submit, it could not know the frame had finished and had to
+            // bracket itself with full device and queue waits -- four GPU
+            // stalls a frame, with nothing pipelined.
+            uint32_t ew = 0, eh = 0;
+            const VkImage eyeImage =
+                vr_->acquireEye(static_cast<int>(i), &ew, &eh);
+            if (eyeImage != VK_NULL_HANDLE)
+                renderer_->setVrTarget(eyeImage, ew, eh);
             renderer_->drawFrame(e.viewProj, e.eye);
             if (i < 2) vrSamples_[i] = renderer_->accumulatedSamples();
-            vr_->submitEye(static_cast<int>(i), *renderer_);
+            if (eyeImage != VK_NULL_HANDLE)
+                vr_->releaseEye(static_cast<int>(i));
         }
     }
     // Per-eye convergence, about once a second while path tracing. Whether

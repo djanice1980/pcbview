@@ -3670,6 +3670,60 @@ void Renderer::setSubstrateAppearance(float r, float g, float b, float opacity) 
     ptDenoisedValid_ = false;
 }
 
+void Renderer::recordVrBlit(VkCommandBuffer cmd) {
+    if (vrTarget_ == VK_NULL_HANDLE || sceneColor_.handle == VK_NULL_HANDLE)
+        return;
+
+    const VkImage dst = vrTarget_;
+    const uint32_t dw = vrTargetW_, dh = vrTargetH_;
+    // Consumed: one frame, one target. A stale handle surviving into a later
+    // frame would copy into a swapchain image the runtime had taken back.
+    vrTarget_ = VK_NULL_HANDLE;
+
+    auto barrier = [&](VkImageLayout from, VkImageLayout to,
+                       VkAccessFlags2 srcAccess, VkAccessFlags2 dstAccess) {
+        VkImageMemoryBarrier2 m{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        m.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        m.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        m.srcAccessMask = srcAccess;
+        m.dstAccessMask = dstAccess;
+        m.oldLayout = from;
+        m.newLayout = to;
+        m.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        m.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        m.image = dst;
+        m.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.imageMemoryBarrierCount = 1;
+        d.pImageMemoryBarriers = &m;
+        vkCmdPipelineBarrier2(cmd, &d);
+    };
+
+    // Runtime images come back with undefined contents, so discarding is right:
+    // every pixel is about to be written.
+    barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+    VkImageBlit region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.srcOffsets[1] = {static_cast<int32_t>(sceneExtent_.width),
+                            static_cast<int32_t>(sceneExtent_.height), 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstOffsets[1] = {static_cast<int32_t>(dw),
+                            static_cast<int32_t>(dh), 1};
+    // LINEAR: this is also the supersample resolve.
+    vkCmdBlitImage(cmd, sceneColor_.handle,
+                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                   VK_FILTER_LINEAR);
+
+    // OpenXR wants its swapchain images back as colour attachments.
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+}
+
 void Renderer::blitSceneToImage(VkImage dst, uint32_t dstWidth,
                                 uint32_t dstHeight) {
     if (dst == VK_NULL_HANDLE || sceneColor_.handle == VK_NULL_HANDLE) return;
@@ -4100,6 +4154,10 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     dep.imageMemoryBarrierCount = offscreenOnly_ ? 1u : 2u;
     dep.pImageMemoryBarriers = toBlit;
     vkCmdPipelineBarrier2(cmd, &dep);
+
+    // sceneColor_ is in TRANSFER_SRC_OPTIMAL now, so the eye copy belongs here
+    // -- inside the frame, ordered by the barrier above, waiting on nothing.
+    recordVrBlit(cmd);
 
     if (offscreenOnly_) {
         vkEndCommandBuffer(cmd);

@@ -304,6 +304,23 @@ public:
     // where sceneColor_ is already sitting in TRANSFER_SRC_OPTIMAL.
     void blitSceneToImage(VkImage dst, uint32_t dstWidth, uint32_t dstHeight);
 
+    // Hand the eye's swapchain image to the FRAME, so the copy rides inside the
+    // frame's own command buffer instead of being a separate submit.
+    //
+    // blitSceneToImage has to stall -- a full vkDeviceWaitIdle before it, a
+    // vkQueueWaitIdle after -- because as an independent submit it has no other
+    // way to know the frame it is copying has finished. Two stalls per eye, four
+    // per frame, with the CPU and GPU fully serialised and nothing pipelined.
+    // Recorded inside the frame instead, a pipeline barrier orders it and no
+    // one waits for anything. The image must be acquired BEFORE drawFrame.
+    // Cleared automatically once consumed, so a stale target can never leak
+    // into a later frame.
+    void setVrTarget(VkImage image, uint32_t width, uint32_t height) {
+        vrTarget_ = image;
+        vrTargetW_ = width;
+        vrTargetH_ = height;
+    }
+
     // Render the scene and stop -- no swapchain image acquired, nothing shown
     // in the window, nothing presented. sceneColor_ is still left in
     // TRANSFER_SRC_OPTIMAL, so blitSceneToImage works exactly as before.
@@ -679,6 +696,11 @@ private:
     float boardRotInv_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     bool offscreenOnly_ = false;
     bool rasterWorldSun_ = false;
+    VkImage vrTarget_ = VK_NULL_HANDLE;
+    uint32_t vrTargetW_ = 0, vrTargetH_ = 0;
+    // Copy sceneColor_ into vrTarget_ using the frame's own command buffer.
+    // sceneColor_ is already in TRANSFER_SRC_OPTIMAL by the time this runs.
+    void recordVrBlit(VkCommandBuffer cmd);
     int ptBatchOverride_ = 0;   // 0 = interactive heuristic
     float rayEye_[3] = {0, 0, 0};
     float rayFwd_[3] = {0, 0, 1};

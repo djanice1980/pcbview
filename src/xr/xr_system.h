@@ -129,8 +129,17 @@ public:
     // Pumps events and waits on the runtime's frame pacing. False means do not
     // render this frame (not focused, or the session ended -- check active()).
     bool beginFrame(std::vector<Eye>* eyes);
-    // Hands the renderer's finished scene to the runtime for eye `index`.
-    void submitEye(int index, vk::Renderer& renderer);
+    // Acquire eye `index`'s next swapchain image, ready to be rendered INTO.
+    // Returns VK_NULL_HANDLE if the runtime would not give one up.
+    //
+    // Split from the release so the renderer can copy into the image inside its
+    // own command buffer. The old submitEye did acquire, copy and release in
+    // one call, which forced the copy to be an independent submit -- and an
+    // independent submit has no way to know the frame it is copying has
+    // finished, so it had to bracket itself with full device and queue waits.
+    // Four GPU stalls a frame, and the whole reason the headset felt choppy.
+    VkImage acquireEye(int index, uint32_t* width, uint32_t* height);
+    void releaseEye(int index);
     void endFrame();
 
     // Where the board sits in the room: how far in front, how high, and how

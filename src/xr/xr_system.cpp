@@ -1455,23 +1455,31 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     return !eyes->empty();
 }
 
-void VrSession::submitEye(int index, vk::Renderer& renderer) {
+VkImage VrSession::acquireEye(int index, uint32_t* width, uint32_t* height) {
     if (!chains_ || index < 0 || index >= static_cast<int>(chains_->size()))
-        return;
+        return VK_NULL_HANDLE;
     // Eye 0 opens a rendered frame: from here the images hold THESE poses, and
     // that is what the layer must advertise until they are redrawn.
     if (index == 0) submitViews_ = lastViews_;
     Chain& c = (*chains_)[index];
     uint32_t idx = 0;
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (XR_FAILED(xrAcquireSwapchainImage(c.chain, &ai, &idx))) return;
+    if (XR_FAILED(xrAcquireSwapchainImage(c.chain, &ai, &idx)))
+        return VK_NULL_HANDLE;
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wi.timeout = XR_INFINITE_DURATION;
     xrWaitSwapchainImage(c.chain, &wi);
     acquired_[index] = idx;
-    renderer.blitSceneToImage(c.images[idx], c.width, c.height);
+    if (width) *width = c.width;
+    if (height) *height = c.height;
+    return c.images[idx];
+}
+
+void VrSession::releaseEye(int index) {
+    if (!chains_ || index < 0 || index >= static_cast<int>(chains_->size()))
+        return;
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    xrReleaseSwapchainImage(c.chain, &ri);
+    xrReleaseSwapchainImage((*chains_)[index].chain, &ri);
 }
 
 void VrSession::endFrame() {
