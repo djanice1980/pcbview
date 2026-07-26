@@ -179,6 +179,32 @@ void VulkanWindow::stepVr() {
 
     static const bool allowPt = qEnvironmentVariableIsSet("PCBVIEW_VR_PT");
 
+    // Every VR setting, read once, in one place. They are environment
+    // variables and an environment variable set in a shell OUTLIVES the run
+    // that set it -- so these are also what gets printed below, because a
+    // leftover PCBVIEW_VR_PT reads as a mysteriously slow, mysteriously fuzzy
+    // "raster" mode and there is no way to tell from inside the headset.
+    static const int spp = [] {
+        bool ok = false;
+        const int n = qgetenv("PCBVIEW_VR_SPP").toInt(&ok);
+        return (ok && n >= 1 && n <= 256) ? n : 16;
+    }();
+    static const int dnPasses = [] {
+        bool ok = false;
+        const int n = qgetenv("PCBVIEW_VR_DENOISE").toInt(&ok);
+        return (ok && n >= 0 && n <= 5) ? n : 5;
+    }();
+    static const float ss = [] {
+        bool ok = false;
+        const float f = qgetenv("PCBVIEW_VR_SS").toFloat(&ok);
+        return (ok && f >= 1.0f && f <= 2.0f) ? f : 1.0f;
+    }();
+    static const int rateDiv = [] {
+        bool ok = false;
+        const int n = qgetenv("PCBVIEW_VR_RATE_DIV").toInt(&ok);
+        return (ok && n >= 1 && n <= 4) ? n : 1;
+    }();
+
     // Where the board sits in the room. Refreshed each frame so loading a
     // different board re-places it rather than leaving it the old size.
     const auto& b = mesh_->bounds;
@@ -279,11 +305,6 @@ void VulkanWindow::stepVr() {
         // budget in one frame sidesteps the question entirely.
         //
         // PCBVIEW_VR_SPP sets the budget.
-        static const int spp = [] {
-            bool ok = false;
-            const int n = qgetenv("PCBVIEW_VR_SPP").toInt(&ok);
-            return (ok && n >= 1 && n <= 256) ? n : 16;
-        }();
         renderer_->setPathTraceBatch(allowPt ? spp : 0);
 
         // GPU a-trous cleanup on top, so a modest sample count can look like a
@@ -291,12 +312,27 @@ void VulkanWindow::stepVr() {
         // memory, about 200 MB per eye per frame at this resolution, which is
         // why it is asynchronous and why it can never serve a headset.
         // PCBVIEW_VR_DENOISE=0 disables it for comparison.
-        static const int dnPasses = [] {
-            bool ok = false;
-            const int n = qgetenv("PCBVIEW_VR_DENOISE").toInt(&ok);
-            return (ok && n >= 0 && n <= 5) ? n : 5;
-        }();
         renderer_->setGpuDenoisePasses(allowPt ? dnPasses : 0);
+
+        // Say what is actually running, once.
+        //
+        // Every one of these is an environment variable, and an environment
+        // variable set in a shell OUTLIVES the run that set it. Testing a
+        // path-traced build and then launching again without it leaves path
+        // tracing on, which reads as a mysteriously slow, mysteriously fuzzy
+        // "raster" mode. Printing the configuration costs one line and removes
+        // the whole class of confusion.
+        static bool cfgDumped = false;
+        if (!cfgDumped) {
+            cfgDumped = true;
+            std::printf("vr-cfg: %s, spp=%d, supersample=%.2fx, denoise=%d, "
+                        "rate=1/%d, world-sun=yes\n",
+                        allowPt ? "PATH TRACED (PCBVIEW_VR_PT)"
+                                : "ray-traced raster",
+                        allowPt ? spp : 0, ss, allowPt ? dnPasses : 0,
+                        rateDiv);
+            std::fflush(stdout);
+        }
         // Held every frame: initialisation applies the saved ptEnabled_ after
         // the session is created and would otherwise overwrite this, and the
         // render-mode menu can change it mid-session. setRenderMode returns
@@ -332,12 +368,7 @@ void VulkanWindow::stepVr() {
     //
     // Worth revisiting via XR_KHR_composition_layer_depth, which hands the
     // runtime a depth buffer and lets it warp per pixel. Until then, render
-    // every frame. PCBVIEW_VR_RATE_DIV still forces a divisor for testing.
-    static const int rateDiv = [] {
-        bool ok = false;
-        const int n = qgetenv("PCBVIEW_VR_RATE_DIV").toInt(&ok);
-        return (ok && n >= 1 && n <= 4) ? n : 1;
-    }();
+    // every frame. PCBVIEW_VR_RATE_DIV (read at the top) forces a divisor.
     const bool drawThisFrame = render && (++vrFrameCount_ % rateDiv) == 0;
 
     if (drawThisFrame) {
@@ -357,11 +388,13 @@ void VulkanWindow::stepVr() {
             // asking for a larger scene here is the whole change --
             // blitSceneToImage maps the full source onto the full destination
             // with a LINEAR filter, which is the downsample.
-            static const float ss = [] {
-                bool ok = false;
-                const float f = qgetenv("PCBVIEW_VR_SS").toFloat(&ok);
-                return (ok && f >= 1.0f && f <= 2.0f) ? f : 1.5f;
-            }();
+            // Defaults to 1.0 -- native, no supersampling.
+            //
+            // 1.5x was added to fix aliased edges and costs 2.25x the PIXELS,
+            // which multiplies every shadow and AO ray behind each one. That is
+            // a poor trade at eye resolution across two eyes: it buys smoother
+            // silhouettes at more than double the frame time. Raise it only if
+            // there is headroom to spare.
             renderer_->setCaptureExtent(
                 static_cast<uint32_t>(std::lround(e.width * ss)),
                 static_cast<uint32_t>(std::lround(e.height * ss)));

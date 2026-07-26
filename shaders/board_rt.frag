@@ -161,20 +161,30 @@ float sunVisibility(vec3 p, vec3 n, vec3 dir, float tmax) {
     vec3 t = normalize(cross(up, dir));
     vec3 b = cross(dir, t);
 
-    // Centre plus two rings, offset so they do not line up radially.
-    const vec2 disc[8] = vec2[](
-        vec2( 1.00,  0.00), vec2( 0.00,  1.00),
-        vec2(-1.00,  0.00), vec2( 0.00, -1.00),
-        vec2( 0.38,  0.38), vec2(-0.38,  0.38),
-        vec2(-0.38, -0.38), vec2( 0.38, -0.38));
+    // Centre plus four, rotated 45 degrees so they straddle both axes.
+    //
+    // Four and not eight: shadow rays are the single most expensive thing this
+    // shader does, and at eye resolution across two eyes, nine taps against one
+    // was enough on its own to take a headset from smooth to a slideshow. Five
+    // still reads as a soft edge; the difference from nine is visible only if
+    // you go looking for it, and it costs nearly half as much.
+    const vec2 disc[4] = vec2[](
+        vec2( 0.71,  0.71), vec2(-0.71,  0.71),
+        vec2(-0.71, -0.71), vec2( 0.71, -0.71));
 
     float open = occluded(p, dir, tmax) ? 0.0 : 1.0;
-    for (int i = 0; i < 8; ++i) {
+    // Count the taps actually taken. Dividing by a fixed five while skipping
+    // below-horizon directions would score those skips as shadow and darken
+    // every grazing surface -- and the cosine falloff is already applied
+    // separately, so encoding it again here would double it.
+    float taps = 1.0;
+    for (int i = 0; i < 4; ++i) {
         vec3 d = normalize(dir + (t * disc[i].x + b * disc[i].y) * radius);
         if (dot(n, d) <= 0.0) continue;      // below the horizon: no light anyway
+        taps += 1.0;
         if (!occluded(p, d, tmax)) open += 1.0;
     }
-    return open / 9.0;
+    return open / taps;
 }
 
 // Fraction of a short hemisphere around the normal that is open. 1 = fully open,
