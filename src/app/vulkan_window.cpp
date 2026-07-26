@@ -177,6 +177,24 @@ VulkanWindow::VulkanWindow(const geom::BoardMesh* mesh) : mesh_(mesh) {
 void VulkanWindow::stepVr() {
     if (!vr_ || !renderer_ || !mesh_) return;
 
+    // Forced EVERY FRAME, deliberately. Setting it once when the session opens
+    // does nothing useful: initialisation applies the saved ptEnabled_ a few
+    // dozen lines later and overwrites it, and the render-mode menu can change
+    // it mid-session too. setRenderMode returns immediately when the mode
+    // already matches, so holding it here is free.
+    //
+    // Why raster at all: the path tracer is progressive. It accumulates at a
+    // fixed camera and resets the moment the camera moves, dropping the
+    // denoised frame with it. In VR the camera moves every frame and the two
+    // eyes are different cameras besides, so it never gets past one sample and
+    // the denoiser never validates -- functionally a broken denoiser, which is
+    // what the grain looks like. PCBVIEW_VR_PT=1 path-traces anyway.
+    static const bool allowPt = qEnvironmentVariableIsSet("PCBVIEW_VR_PT");
+    if (!allowPt) {
+        renderer_->setRenderMode(vk::RenderMode::Raster);
+        renderer_->setRayTracing(rtAvailable());
+    }
+
     // Where the board sits in the room. Refreshed each frame so loading a
     // different board re-places it rather than leaving it the old size.
     const auto& b = mesh_->bounds;
@@ -198,8 +216,13 @@ void VulkanWindow::stepVr() {
         // headset off -- and leaving the mode forced would strand the user in
         // a renderer they never picked.
         renderer_->setOffscreenOnly(false);
-        if (!qEnvironmentVariableIsSet("PCBVIEW_VR_PT"))
-            renderer_->setRenderMode(vrPrevMode_);
+        // Back to the user's own settings rather than a mode snapshot:
+        // ptEnabled_/rtEnabled_ are the source of truth everywhere else, and a
+        // value captured at session start would be the pre-restore one anyway.
+        renderer_->setRenderMode(ptEnabled_ && ptAvailable()
+                                     ? vk::RenderMode::PathTraced
+                                     : vk::RenderMode::Raster);
+        renderer_->setRayTracing(rtEnabled_ && rtAvailable());
         renderer_->setUncappedPresent(false);
         requestUpdate();
         return;
@@ -622,29 +645,11 @@ void VulkanWindow::createDeviceAndRenderer() {
             // vsync throttling the headset down to the monitor's refresh.
             renderer_->setUncappedPresent(true);
 
-            // Real-time ray-traced raster, not the path tracer.
-            //
-            // The path tracer is PROGRESSIVE: it accumulates samples at a fixed
-            // camera and resets the moment the camera moves, dropping the
-            // denoised frame with it so the image does not freeze on a stale
-            // one. In VR the camera moves every single frame, and the two eyes
-            // are different cameras besides, so accumulation can never get past
-            // one sample and the denoiser never validates. The result is a
-            // permanently raw, grainy image -- which is exactly what a broken
-            // denoiser looks like, because functionally it is one.
-            //
-            // Raster with ray-queried shadows and AO is single-pass: no
-            // accumulation, nothing to reset, clean at 90 Hz per eye. Set
-            // PCBVIEW_VR_PT=1 to path-trace anyway and accept the noise.
-            if (!qEnvironmentVariableIsSet("PCBVIEW_VR_PT")) {
-                vrPrevMode_ = renderer_->renderMode();
-                renderer_->setRenderMode(vk::RenderMode::Raster);
-                renderer_->setRayTracing(rtAvailable());
-                std::printf("vr: using ray-traced raster (the path tracer "
-                            "cannot converge while the head moves; "
-                            "PCBVIEW_VR_PT=1 overrides)\n");
-                std::fflush(stdout);
-            }
+            // The render mode is forced per frame in stepVr, NOT here. Setting
+            // it at this point does nothing: initialisation goes on to apply
+            // the saved ptEnabled_ setting a few dozen lines below, which
+            // overwrites whatever is chosen here. That is exactly what happened
+            // -- VR announced it was using raster and then path-traced anyway.
             vrTimer_ = new QTimer(this);
             vrTimer_->setInterval(1);  // the runtime does the real pacing
             connect(vrTimer_, &QTimer::timeout, this, &VulkanWindow::stepVr);

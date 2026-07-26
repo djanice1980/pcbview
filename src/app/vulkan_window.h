@@ -353,10 +353,6 @@ private:
     // blocks until the headset wants one) and will not wait for a mouse move.
     std::unique_ptr<xr::VrSession> vr_;
     QTimer* vrTimer_ = nullptr;
-    // The render mode in use before VR forced ray-traced raster, so quitting
-    // the headset does not silently leave the desktop in a mode the user never
-    // chose.
-    vk::RenderMode vrPrevMode_ = vk::RenderMode::Raster;
     void stepVr();
 
     // Showcase routing: the orientation actually rendered from while active,
