@@ -71,6 +71,14 @@ struct PtPush {
     // x = first translucent-film triangle (global index) -- the shader re-bases
     // BLAS geometry 1's geometry-local primitive indices with this.
     uint32_t counts[4];
+    // WORLD->BOARD rotation as a quaternion (xyzw). Everything here is drawn in
+    // board space, so a world-fixed sun has to be carried IN rather than being
+    // a shader constant: a constant would sit still in BOARD space and turn
+    // with the board, which is what makes a turning board look like a rigid
+    // picture being spun. One quaternion is enough for both the sun direction
+    // and the sky's up axis, and keeps this block at 128 bytes -- exactly the
+    // Vulkan minimum guarantee, with nothing to spare.
+    float boardRotInv[4];
 };
 struct TonemapPush {
     uint32_t dim[2];
@@ -558,6 +566,21 @@ void Renderer::setRenderMode(RenderMode m) {
     if (m == mode_) return;
     mode_ = m;
     resetAccumulation();
+}
+
+void Renderer::setBoardRotationInverse(const float q[4]) {
+    if (std::abs(q[0] - boardRotInv_[0]) + std::abs(q[1] - boardRotInv_[1]) +
+            std::abs(q[2] - boardRotInv_[2]) +
+            std::abs(q[3] - boardRotInv_[3]) <
+        1e-6f) {
+        return;
+    }
+    for (int i = 0; i < 4; ++i) boardRotInv_[i] = q[i];
+    // The lighting genuinely changed, so anything accumulated is stale. Same
+    // reasoning as a camera move -- and drop the denoised frame too, or the
+    // tonemap keeps showing the old one while the board turns.
+    resetAccumulation();
+    ptDenoisedValid_ = false;
 }
 
 void Renderer::setRayCamera(const float eye[3], const float fwd[3],
@@ -1133,6 +1156,10 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             p.counts[1] = static_cast<uint32_t>(highlightNets_.empty() ? -1 : 1);
             p.counts[2] = static_cast<uint32_t>(netGlow_ * 100.0f);
             p.counts[3] = netLightCount_;  // sampleable net triangles
+            p.boardRotInv[0] = boardRotInv_[0];
+            p.boardRotInv[1] = boardRotInv_[1];
+            p.boardRotInv[2] = boardRotInv_[2];
+            p.boardRotInv[3] = boardRotInv_[3];
             vkCmdPushConstants(cmd, ptLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(p), &p);
             vkCmdDispatch(cmd, (sceneExtent_.width + 7) / 8,

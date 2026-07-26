@@ -1154,6 +1154,12 @@ void VulkanWindow::render() {
         }
         renderer_->setRayCamera(&rayEye[0], &fwd[0], &right[0], &up[0],
                                 camera_.orthographic);
+        // The sun and sky live in the WORLD; the tracer works in board space.
+        // Hand it the world->board rotation so a turning board sweeps the light
+        // across itself instead of carrying the lighting around with it.
+        const glm::quat inv = glm::inverse(board_.rotation);
+        const float q[4] = {inv.x, inv.y, inv.z, inv.w};
+        renderer_->setBoardRotationInverse(q);
     }
 
     // The raster shaders need the projection kind: a parallel projection has

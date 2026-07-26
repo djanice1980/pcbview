@@ -222,6 +222,11 @@ public:
     // toggle works in the traced modes too.
     void setRayCamera(const float eye[3], const float fwd[3],
                       const float right[3], const float up[3], bool ortho);
+    // WORLD->BOARD rotation as a quaternion (xyzw). The scene is drawn in board
+    // space, so this is how a world-fixed sun and sky reach the tracer; without
+    // it the lighting would be pinned to the board and turn with it. Resets
+    // accumulation when it changes, since the lighting genuinely differs.
+    void setBoardRotationInverse(const float quatXyzw[4]);
     int accumulatedSamples() const {
         return cpuMode_ && cpuTracer_ ? cpuTracer_->samples() : ptSampleCount_;
     }
@@ -617,6 +622,8 @@ private:
     int ptSampleCount_ = 0;     // samples accumulated at the current camera
     int ptMaxSamples_ = 512;    // stop accumulating past this
     bool rayOrtho_ = false;
+    // Identity quaternion until the board is turned.
+    float boardRotInv_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     float rayEye_[3] = {0, 0, 0};
     float rayFwd_[3] = {0, 0, 1};
     float rayRight_[3] = {1, 0, 0};
