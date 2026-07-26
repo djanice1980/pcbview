@@ -332,9 +332,12 @@ void VulkanWindow::stepGamepad() {
         padObjectMode_ = !padObjectMode_;
         emit objectModeChanged(padObjectMode_);
     }
+    // Start recentres -- the way out of having slid or spun the board somewhere
+    // unhelpful without reaching for the keyboard.
+    if (g.pressedStart) recenterAll();
     const bool acted = g.pressedSouth || g.pressedEast || g.pressedWest ||
                        g.pressedNorth || g.pressedLeftStick ||
-                       g.pressedRightStick;
+                       g.pressedRightStick || g.pressedStart;
 
     // Assigned, not OR'd into the gyro block's earlier write, because that
     // write would otherwise be clobbered here.
@@ -758,6 +761,45 @@ glm::quat cameraOrientation(const Basis& b) {
 }
 }  // namespace
 
+void VulkanWindow::setRotationRoutedToBoard(bool on) {
+    if (on == routeToBoard_) return;
+    if (on) {
+        routeAnchor_ = camera_;
+        routePrev_ = camera_;
+    } else {
+        // Hand the camera back the orientation it was actually being rendered
+        // from. Without this the picture would jump the instant routing ends,
+        // and a later view-mode drag would start from a pose nobody had seen.
+        camera_.yaw = routeAnchor_.yaw;
+        camera_.pitch = routeAnchor_.pitch;
+        camera_.roll = routeAnchor_.roll;
+    }
+    routeToBoard_ = on;
+    requestUpdate();
+}
+
+void VulkanWindow::recenterAll() {
+    board_ = BoardPose{};
+    Camera dest = camera_;
+    const Camera fresh;  // the opening orientation
+    dest.yaw = fresh.yaw;
+    dest.pitch = fresh.pitch;
+    dest.roll = fresh.roll;
+    if (mesh_) {
+        const auto& b = mesh_->bounds;
+        dest.targetX = static_cast<float>((b.min[0] + b.max[0]) * 0.5);
+        dest.targetY = static_cast<float>((b.min[1] + b.max[1]) * 0.5);
+        dest.targetZ = static_cast<float>((b.min[2] + b.max[2]) * 0.5);
+        dest.distance = framedDistance();
+    }
+    setViewTarget(dest, /*snap=*/true);
+    // Re-anchor, or a showcase mid-flight would immediately hand the board the
+    // difference between the old anchor and the recentred camera.
+    routeAnchor_ = camera_;
+    routePrev_ = camera_;
+    requestUpdate();
+}
+
 void VulkanWindow::adoptCameraDeltaIntoBoard(const Camera& before,
                                              const Camera& after) {
     const glm::quat qb = cameraOrientation(cameraBasis(before));
@@ -1060,7 +1102,21 @@ void VulkanWindow::render() {
     // An earlier attempt had both modes turning the board and differing only in
     // sign, which is why they felt identical -- the mechanism is the difference,
     // not the direction. Gestures pick their sink; render() just draws.
-    Basis basis = cameraBasis(camera_);
+    // Showcase "move the board": convert whatever the steppers just did to
+    // camera_ into board rotation, and render from the frozen anchor.
+    Camera renderCam = camera_;
+    if (routeToBoard_) {
+        if (camera_.yaw != routePrev_.yaw ||
+            camera_.pitch != routePrev_.pitch ||
+            camera_.roll != routePrev_.roll) {
+            adoptCameraDeltaIntoBoard(routePrev_, camera_);
+            routePrev_ = camera_;
+        }
+        renderCam.yaw = routeAnchor_.yaw;
+        renderCam.pitch = routeAnchor_.pitch;
+        renderCam.roll = routeAnchor_.roll;
+    }
+    Basis basis = cameraBasis(renderCam);
 
     // MOVE THE CAMERA INTO THE BOARD'S FRAME, rather than moving the board's
     // geometry into the world. The two are equivalent, and this direction is
@@ -2172,6 +2228,9 @@ void VulkanWindow::keyPressEvent(QKeyEvent* e) {
             case Qt::Key_B: setViewBottom(); return;
             case Qt::Key_I: setViewIso(); return;
             case Qt::Key_F: frameBoard(); return;
+            // Handled here as well as on the View menu action: QAction
+            // shortcuts never fire while this native QWindow has focus.
+            case Qt::Key_Home: recenterAll(); return;
             case Qt::Key_O:
                 camera_.orthographic = !camera_.orthographic;
                 emit orthoChanged(camera_.orthographic);

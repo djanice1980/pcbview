@@ -1374,6 +1374,14 @@ void MainWindow::buildMenus() {
     view->addSeparator();
     view->addAction("&Fit to board", QKeySequence(Qt::Key_F), this,
                     [this] { viewport_->frameBoard(); });
+    // Undoes whichever mode moved things -- a board turned or slid away in
+    // object mode, or a camera flown somewhere awkward in view mode.
+    view->addAction("&Recentre board and view", QKeySequence(Qt::Key_Home),
+                    this, [this] {
+                        viewport_->recenterAll();
+                        statusBar()->showMessage(
+                            "Recentred: board square-on, view framed", 3000);
+                    });
     orthoAction_ = view->addAction("&Orthographic");
     orthoAction_->setCheckable(true);
     orthoAction_->setShortcut(QKeySequence(Qt::Key_O));
@@ -2245,6 +2253,16 @@ void MainWindow::buildShowcaseDock() {
     showcaseLoops_->setRange(1, 999);
     showcaseLoops_->setValue(1);
     playRow->addWidget(showcaseLoops_);
+    showcaseObject_ = new QCheckBox("Move board");
+    showcaseObject_->setToolTip(
+        "Play the same moves as OBJECT motion: the board turns under a fixed\n"
+        "sun, so light sweeps across it and the sky stays put. Unchecked, the\n"
+        "camera flies around a fixed board instead -- its shading holds and\n"
+        "the sky sweeps past. Only the mechanism changes; the moves, the\n"
+        "recorded paths and the saved templates are identical either way.");
+    connect(showcaseObject_, &QCheckBox::toggled, this,
+            [this] { saveShowcase(); });
+    playRow->addWidget(showcaseObject_);
     showcaseForever_ = new QCheckBox("Repeat");
     showcaseForever_->setToolTip("Loop until stopped");
     connect(showcaseForever_, &QCheckBox::toggled, this,
@@ -2422,6 +2440,11 @@ void MainWindow::applyShowcaseStep(const ShowcaseStep& step) {
 
 void MainWindow::startShowcase() {
     if (showcaseSteps_.empty() || !loaded_) return;
+    // Same moves either way; the toggle only decides whether the BOARD turns
+    // under a fixed sun (light sweeping across it) or the CAMERA flies around
+    // a fixed board (its shading holding, the sky sweeping past).
+    viewport_->setRotationRoutedToBoard(showcaseObject_ &&
+                                        showcaseObject_->isChecked());
     showcaseIndex_ = 0;
     showcaseLoopsDone_ = 0;
     showcasePlay_->setText("Stop");
@@ -2433,6 +2456,9 @@ void MainWindow::stopShowcase(const QString& reason) {
     showcaseIndex_ = -1;
     showcaseTimer_->stop();
     showcaseTimer_->disconnect();
+    // Hands the camera back the orientation it was rendered from, so stopping
+    // never jumps the picture.
+    viewport_->setRotationRoutedToBoard(false);
     if (showcasePlay_) showcasePlay_->setText("Play");
     if (!reason.isEmpty())
         statusBar()->showMessage("Showcase " + reason, 3000);
@@ -2964,6 +2990,8 @@ void MainWindow::saveShowcase() {
     if (showcaseLoops_) s.setValue("showcaseLoops", showcaseLoops_->value());
     if (showcaseForever_)
         s.setValue("showcaseRepeat", showcaseForever_->isChecked());
+    if (showcaseObject_)
+        s.setValue("showcaseMovesBoard", showcaseObject_->isChecked());
     s.setValue("showcasePathData", packShowcasePaths(false));
     s.setValue("showcasePathNextId", nextPathId_);
 }
@@ -2981,6 +3009,11 @@ void MainWindow::loadShowcase() {
         const QSignalBlocker block(showcaseForever_);
         showcaseForever_->setChecked(s.value("showcaseRepeat", false).toBool());
         showcaseLoops_->setEnabled(!showcaseForever_->isChecked());
+    }
+    if (showcaseObject_) {
+        const QSignalBlocker block(showcaseObject_);
+        showcaseObject_->setChecked(
+            s.value("showcaseMovesBoard", false).toBool());
     }
     unpackShowcasePaths(s.value("showcasePathData").toString());
     nextPathId_ =

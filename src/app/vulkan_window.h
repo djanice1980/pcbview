@@ -342,6 +342,11 @@ private:
     // stick click you must keep held while pushing that same stick is unusable.
     bool objectDrag_ = false;
     bool padObjectMode_ = false;
+    // Showcase routing: the orientation actually rendered from while active,
+    // and the last camera orientation already handed to the board.
+    bool routeToBoard_ = false;
+    Camera routeAnchor_;
+    Camera routePrev_;
 
 public:
     // Turn the board itself about a WORLD-space axis (the rotation is composed
@@ -362,6 +367,24 @@ public:
     // resulting orientation change is handed over wholesale. The on-screen
     // result is identical to the old camera-orbit code BY CONSTRUCTION.
     void adoptCameraDeltaIntoBoard(const Camera& before, const Camera& after);
+
+    // Send every camera-authored rotation to the BOARD instead, until turned
+    // off again. This is how the showcase plays its existing moves as object
+    // motion: the spin/path/preset steppers keep animating camera_ exactly as
+    // they always have -- so nothing persisted changes and a PathKey still
+    // means the same picture -- while the scene renders from a frozen anchor
+    // and the accumulated change lands on the board.
+    //
+    // Deliberately NOT done by resetting camera_ each frame: the steppers ease
+    // TOWARD a target, so rewinding them mid-flight means they never converge
+    // and re-apply the same delta forever.
+    void setRotationRoutedToBoard(bool on);
+    bool rotationRoutedToBoard() const { return routeToBoard_; }
+
+    // Undo whichever mode moved things: the board goes square-on and back to
+    // the origin, and the camera returns to its opening orientation, framed.
+    // Snaps rather than glides -- a recentre is a command, not a move.
+    void recenterAll();
     const BoardPose& boardPose() const { return board_; }
     // Board -> world. Rotation happens about the bounds centre so the centre
     // holds still and the camera's orbit target stays meaningful.

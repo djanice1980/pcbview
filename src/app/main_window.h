@@ -237,6 +237,7 @@ private:
     QDoubleSpinBox* showcaseHold_ = nullptr;
     QSpinBox* showcaseLoops_ = nullptr;
     QCheckBox* showcaseForever_ = nullptr;
+    QCheckBox* showcaseObject_ = nullptr;
     QPushButton* showcasePlay_ = nullptr;
     std::vector<ShowcaseStep> showcaseSteps_;
     int showcaseIndex_ = -1;   // -1 = idle; else the step being shown
