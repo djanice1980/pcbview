@@ -195,20 +195,26 @@ void VulkanWindow::stepVr() {
         vr_.reset();
         return;
     }
-    // PCBVIEW_VR_ONE_EYE=0|1 renders ONLY that eye and leaves the other's
-    // swapchain untouched. Whichever eye you then see the board in identifies
-    // the chain-to-eye mapping outright -- no reasoning about matrices, no
-    // ambiguity. Four attempts have now been made from the outside; this
-    // settles the one question they all depended on.
-    static const int oneEye = [] {
-        const char* v = std::getenv("PCBVIEW_VR_ONE_EYE");
-        return (v && v[0]) ? std::atoi(v) : -1;
+    // PCBVIEW_VR_MONO=1 renders eye 0 ONCE and sends those identical pixels to
+    // BOTH eyes. It halves what is left: if the board still reads left/right
+    // exchanged while both eyes are seeing the SAME image, then nothing is
+    // swapped BETWEEN the eyes and the board itself is turned the wrong way
+    // round; if it reads correctly, the fault really is per-eye.
+    //
+    // This replaces PCBVIEW_VR_ONE_EYE, which could never have worked: endFrame
+    // always submits a two-view projection layer, but OpenXR requires every
+    // swapchain a layer references to have had an image acquired AND released
+    // that frame. Skipping an eye left its chain untouched, so xrEndFrame
+    // rejected the whole layer and the headset went black -- which is exactly
+    // what happened. Rendering once and blitting twice keeps both chains fed.
+    static const bool mono = [] {
+        const char* v = std::getenv("PCBVIEW_VR_MONO");
+        return v && v[0] && v[0] != '0';
     }();
 
     if (render) {
         for (size_t i = 0; i < eyes.size(); ++i) {
-            if (oneEye >= 0 && static_cast<int>(i) != oneEye) continue;
-            const xr::VrSession::Eye& e = eyes[i];
+            const xr::VrSession::Eye& e = eyes[mono ? 0 : i];
             // The ordinary render path, at this eye's size. setCaptureExtent
             // already decouples the scene target from the window -- it was
             // built for 4K video capture and does exactly what is needed here.

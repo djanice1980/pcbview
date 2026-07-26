@@ -546,24 +546,21 @@ void projectionFromFov(const XrFovf& fov, float zNear, float out[16]) {
     // because it has no offset, would shear the image off-centre.
     p[5] = -p[5];
     p[9] = -p[9];
-    // NO X mirror. An earlier version negated p[0] and p[8] on the theory that
-    // pcbview's view basis was left-handed -- that was a misreading of
-    // board.frag's camRight (built from the surface-to-eye vector, not the
-    // camera's forward). cameraBasis/viewFromBasis are a textbook right-handed
-    // lookAt, so a mirror here is simply wrong.
+    // NO X mirror, and NO negation of p[8]. Both were added while chasing the
+    // flipped-eye report and both were wrong; this is back to the original.
     //
-    // p[8] IS negated, and only p[8]. It is the sole term in this matrix that
-    // differs between the two eyes -- the frustum's outward skew -- so it is
-    // the only thing that can make each eye see a DIFFERENT PART of the board
-    // rather than the same board from a slightly different place, which is
-    // exactly the reported symptom. Getting its sign backwards points the two
-    // frustums away from each other instead of toward the convergence point.
-    // PCBVIEW_VR_OFFSET_POS=1 restores the other sign.
-    static const bool offsetPositive = [] {
-        const char* v = std::getenv("PCBVIEW_VR_OFFSET_POS");
-        return v && v[0] && v[0] != '0';
-    }();
-    if (!offsetPositive) p[8] = -p[8];
+    // Negating p[8] is not a coin flip between two plausible conventions -- it
+    // is precisely an eye swap, which is why it looked like a candidate and why
+    // it had to go. Check it against this headset's own numbers. Solving
+    // clip.x/clip.w = -1 and +1 for the rendered angular span gives
+    // atan(p[8] +/- 1) / (2/w) ... in plain terms, with eye 0's real FOV
+    // (L -61.5 deg, R +43.4 deg) the correct matrix renders -61.5..+43.4, and
+    // negating p[8] renders -43.4..+61.6 -- exactly eye 1's frustum. So the
+    // negated form hands each eye the OTHER eye's view of the world.
+    //
+    // Verify, don't trust the sign: at the left frustum edge x = tanL*d, z = -d,
+    //   clip.x = (2/w)(tanL*d) - ((tanR+tanL)/w)*d = (d/w)(tanL - tanR) = -d
+    // and clip.w = -z = d, so NDC x = -1. The unnegated term is correct.
     for (int i = 0; i < 16; ++i) out[i] = p[i];
 }
 
