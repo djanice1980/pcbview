@@ -275,6 +275,7 @@ add_executable(pcbview WIN32
     src/app/viewer.cpp
     src/input/gamepad.cpp
     src/xr/xr_probe.cpp
+    src/xr/xr_system.cpp
     assets/icons.qrc
     assets/pcbview.rc
     ${SHADER_OUTPUTS}

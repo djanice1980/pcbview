@@ -37,6 +37,10 @@ uint32_t findGraphicsQueue(VkPhysicalDevice gpu) {
     return UINT32_MAX;
 }
 
+// Installed only while OpenXR is driving; see device.h.
+const VulkanCreationHooks* g_hooks = nullptr;
+VkPhysicalDevice g_requiredGpu = VK_NULL_HANDLE;
+
 void check(VkResult r, const char* what) {
     if (r != VK_SUCCESS) {
         throw std::runtime_error(std::string(what) + " failed: VkResult " +
@@ -152,7 +156,14 @@ VkInstance createInstance(bool enableValidation,
     info.ppEnabledExtensionNames = exts.data();
 
     VkInstance instance = VK_NULL_HANDLE;
-    check(vkCreateInstance(&info, nullptr, &instance), "vkCreateInstance");
+    // Through the OpenXR runtime when VR is driving, so it can add the instance
+    // extensions a session requires; straight to Vulkan otherwise.
+    if (g_hooks && g_hooks->createInstance) {
+        check(g_hooks->createInstance(g_hooks->user, &info, &instance),
+              "xrCreateVulkanInstanceKHR");
+    } else {
+        check(vkCreateInstance(&info, nullptr, &instance), "vkCreateInstance");
+    }
     return instance;
 }
 
@@ -223,8 +234,22 @@ const GpuInfo* pickBestGpu(const std::vector<GpuInfo>& gpus) {
     return best;
 }
 
+void setVulkanCreationHooks(const VulkanCreationHooks* hooks) {
+    g_hooks = hooks;
+}
+
+void setRequiredGpu(VkPhysicalDevice gpu) { g_requiredGpu = gpu; }
+VkPhysicalDevice requiredGpu() { return g_requiredGpu; }
+
 const GpuInfo* selectGpu(const std::vector<GpuInfo>& gpus,
                          const std::string& preferNameSubstring) {
+    // An OpenXR runtime names the GPU its session must run on, and outranks the
+    // user's preference -- not to override them, but because a session against
+    // any other device simply cannot be created.
+    if (g_requiredGpu != VK_NULL_HANDLE) {
+        for (const GpuInfo& gpu : gpus)
+            if (gpu.handle == g_requiredGpu) return &gpu;
+    }
     if (!preferNameSubstring.empty()) {
         std::string want = preferNameSubstring;
         std::transform(want.begin(), want.end(), want.begin(), ::tolower);
@@ -347,8 +372,16 @@ Device createDevice(const GpuInfo& gpu,
     device.gpu = gpu;
     device.rayTracingEnabled = wantRt;
     device.rayQueryEnabled = wantRq;
-    check(vkCreateDevice(gpu.handle, &info, nullptr, &device.handle),
-          "vkCreateDevice");
+    // Same reasoning as the instance: the runtime injects the device extensions
+    // a session needs, so VR has to create the device through it.
+    if (g_hooks && g_hooks->createDevice) {
+        check(g_hooks->createDevice(g_hooks->user, gpu.handle, &info,
+                                    &device.handle),
+              "xrCreateVulkanDeviceKHR");
+    } else {
+        check(vkCreateDevice(gpu.handle, &info, nullptr, &device.handle),
+              "vkCreateDevice");
+    }
     vkGetDeviceQueue(device.handle, gpu.graphicsQueueFamily, 0,
                      &device.graphicsQueue);
     return device;

@@ -59,6 +59,36 @@ struct Device {
     bool rayQueryEnabled = false;
 };
 
+// ---- OpenXR takes over Vulkan creation --------------------------------------
+//
+// An OpenXR session does not accept an arbitrary Vulkan setup. The runtime WRAPS
+// instance and device creation so it can inject the extensions it needs, and it
+// NAMES the physical device -- a session against any other GPU fails. So when VR
+// is in play these calls have to go through the runtime rather than straight to
+// Vulkan.
+//
+// Done as hooks rather than by rewriting the creation path so that the ordinary
+// case is untouched: with nothing installed, createInstance/createDevice/
+// selectGpu behave exactly as they always did, which keeps the desktop renderer
+// out of the blast radius of the VR work.
+struct VulkanCreationHooks {
+    // Each returns VK_SUCCESS and fills the out-param, or a failure code.
+    VkResult (*createInstance)(void* user, const VkInstanceCreateInfo* info,
+                               VkInstance* out) = nullptr;
+    VkResult (*createDevice)(void* user, VkPhysicalDevice gpu,
+                             const VkDeviceCreateInfo* info,
+                             VkDevice* out) = nullptr;
+    void* user = nullptr;
+};
+// Pass nullptr to clear. Not owned; must outlive the creation calls.
+void setVulkanCreationHooks(const VulkanCreationHooks* hooks);
+
+// The GPU the runtime insists on. VK_NULL_HANDLE means "no constraint", which is
+// the normal desktop case. selectGpu() honours this above any user preference,
+// because a user preference that disagrees simply cannot produce a session.
+void setRequiredGpu(VkPhysicalDevice gpu);
+VkPhysicalDevice requiredGpu();
+
 // `extensions` lets the window layer add its surface extensions (GLFW supplies
 // them); pass none for a headless instance.
 VkInstance createInstance(bool enableValidation,
