@@ -195,8 +195,19 @@ void VulkanWindow::stepVr() {
         vr_.reset();
         return;
     }
+    // PCBVIEW_VR_ONE_EYE=0|1 renders ONLY that eye and leaves the other's
+    // swapchain untouched. Whichever eye you then see the board in identifies
+    // the chain-to-eye mapping outright -- no reasoning about matrices, no
+    // ambiguity. Four attempts have now been made from the outside; this
+    // settles the one question they all depended on.
+    static const int oneEye = [] {
+        const char* v = std::getenv("PCBVIEW_VR_ONE_EYE");
+        return (v && v[0]) ? std::atoi(v) : -1;
+    }();
+
     if (render) {
         for (size_t i = 0; i < eyes.size(); ++i) {
+            if (oneEye >= 0 && static_cast<int>(i) != oneEye) continue;
             const xr::VrSession::Eye& e = eyes[i];
             // The ordinary render path, at this eye's size. setCaptureExtent
             // already decouples the scene target from the window -- it was
