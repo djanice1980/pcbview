@@ -1210,6 +1210,35 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     // Keep the poses actually rendered with. endFrame used to re-locate, which
     // is wrong on principle -- the layer must describe the frame that was
     // drawn, not a fresh prediction -- and wasteful.
+    // One-shot dump of what the two eyes actually got. Divergent views and a
+    // bad placement look identical through the lenses, and the numbers tell
+    // them apart instantly: healthy stereo is ~65mm of X separation and near
+    // identical FOV, with the board a sane size in front of the viewer.
+    static bool dumped = false;
+    if (!dumped && got >= 2) {
+        dumped = true;
+        std::printf("vr-diag: placement scale=%.6f (board span -> %.3f m), "
+                    "fwd=%.2f up=%.2f\n",
+                    placeScale_, 1.0f / (placeScale_ > 0 ? 1.0f / 0.35f : 1.0f),
+                    placeFwd_, placeUp_);
+        for (uint32_t i = 0; i < got; ++i) {
+            std::printf("vr-diag: eye %u room-pos(%+.4f %+.4f %+.4f) "
+                        "fov L%+.3f R%+.3f U%+.3f D%+.3f\n",
+                        i, views[i].pose.position.x, views[i].pose.position.y,
+                        views[i].pose.position.z, views[i].fov.angleLeft,
+                        views[i].fov.angleRight, views[i].fov.angleUp,
+                        views[i].fov.angleDown);
+        }
+        const float dx = views[1].pose.position.x - views[0].pose.position.x;
+        const float dy = views[1].pose.position.y - views[0].pose.position.y;
+        const float dz = views[1].pose.position.z - views[0].pose.position.z;
+        std::printf("vr-diag: eye separation %.1f mm (expect ~60-70)\n",
+                    std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.0f);
+        std::printf("vr-diag: board centre mm(%.1f %.1f %.1f)\n",
+                    placeCentre_[0], placeCentre_[1], placeCentre_[2]);
+        std::fflush(stdout);
+    }
+
     lastViews_.clear();
     for (uint32_t i = 0; i < got; ++i) {
         ViewPose vp;
