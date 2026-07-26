@@ -177,23 +177,7 @@ VulkanWindow::VulkanWindow(const geom::BoardMesh* mesh) : mesh_(mesh) {
 void VulkanWindow::stepVr() {
     if (!vr_ || !renderer_ || !mesh_) return;
 
-    // Forced EVERY FRAME, deliberately. Setting it once when the session opens
-    // does nothing useful: initialisation applies the saved ptEnabled_ a few
-    // dozen lines later and overwrites it, and the render-mode menu can change
-    // it mid-session too. setRenderMode returns immediately when the mode
-    // already matches, so holding it here is free.
-    //
-    // Why raster at all: the path tracer is progressive. It accumulates at a
-    // fixed camera and resets the moment the camera moves, dropping the
-    // denoised frame with it. In VR the camera moves every frame and the two
-    // eyes are different cameras besides, so it never gets past one sample and
-    // the denoiser never validates -- functionally a broken denoiser, which is
-    // what the grain looks like. PCBVIEW_VR_PT=1 path-traces anyway.
     static const bool allowPt = qEnvironmentVariableIsSet("PCBVIEW_VR_PT");
-    if (!allowPt) {
-        renderer_->setRenderMode(vk::RenderMode::Raster);
-        renderer_->setRayTracing(rtAvailable());
-    }
 
     // Where the board sits in the room. Refreshed each frame so loading a
     // different board re-places it rather than leaving it the old size.
@@ -244,6 +228,41 @@ void VulkanWindow::stepVr() {
         return v && v[0] && v[0] != '0';
     }();
 
+    // Who owns the renderer this frame.
+    //
+    // `render` is false whenever the runtime is not asking for frames -- most
+    // often because the headset has been taken off and its proximity sensor
+    // dropped the session out of FOCUSED. The window was gated on a session
+    // merely EXISTING, so in that state nothing drew at all: stepVr rendered
+    // nothing and render() had already returned early. The window froze.
+    //
+    // So ownership follows whether VR is actually rendering, and handing back
+    // is a real handover -- the offscreen flag has to be cleared or the window
+    // still cannot present, and the render mode has to go back to the user's
+    // own settings rather than the raster VR forces.
+    vrRendering_ = render;
+    if (!render) {
+        if (vrOwnsRenderer_) {
+            vrOwnsRenderer_ = false;
+            renderer_->setOffscreenOnly(false);
+            renderer_->setRenderMode(ptEnabled_ && ptAvailable()
+                                         ? vk::RenderMode::PathTraced
+                                         : vk::RenderMode::Raster);
+            renderer_->setRayTracing(rtEnabled_ && rtAvailable());
+            requestUpdate();
+        }
+    } else {
+        vrOwnsRenderer_ = true;
+        // Held every frame: initialisation applies the saved ptEnabled_ after
+        // the session is created and would otherwise overwrite this, and the
+        // render-mode menu can change it mid-session. setRenderMode returns
+        // immediately when the mode already matches, so this is free.
+        if (!allowPt) {
+            renderer_->setRenderMode(vk::RenderMode::Raster);
+            renderer_->setRayTracing(rtAvailable());
+        }
+    }
+
     if (render) {
         for (size_t i = 0; i < eyes.size(); ++i) {
             const xr::VrSession::Eye& e = eyes[mono ? 0 : i];
@@ -253,7 +272,22 @@ void VulkanWindow::stepVr() {
             // No aspect override: the runtime's viewProj already carries this
             // eye's asymmetric frustum, aspect included. That override exists
             // for the desktop projection path, which is bypassed here.
-            renderer_->setCaptureExtent(e.width, e.height);
+            // Supersample, then let the eye blit resolve it down.
+            //
+            // The swapchain is already about the panel's native resolution, so
+            // there is no headroom left for edges: geometry against the sky
+            // aliased visibly. captureExtent overrides renderScale outright, so
+            // asking for a larger scene here is the whole change --
+            // blitSceneToImage maps the full source onto the full destination
+            // with a LINEAR filter, which is the downsample.
+            static const float ss = [] {
+                bool ok = false;
+                const float f = qgetenv("PCBVIEW_VR_SS").toFloat(&ok);
+                return (ok && f >= 1.0f && f <= 2.0f) ? f : 1.5f;
+            }();
+            renderer_->setCaptureExtent(
+                static_cast<uint32_t>(std::lround(e.width * ss)),
+                static_cast<uint32_t>(std::lround(e.height * ss)));
             // The path tracer ignores viewProj entirely -- it traces from a ray
             // basis, and the only place that basis was ever set is the desktop
             // render path. So traced VR was rendering the DESKTOP camera's
@@ -1216,13 +1250,17 @@ bool VulkanWindow::stepSpinAnimation() {
 
 void VulkanWindow::render() {
     if (!initialised_ || !renderer_) return;
-    // While the headset is running, stepVr owns the renderer. Both paths call
-    // setRayCamera, and the path tracer keys accumulation off the camera, so
-    // the two of them alternating meant every VR frame reset the accumulator
-    // to a desktop viewpoint and back -- the window flickering between two
-    // cameras, and the headset stuck at one noisy sample. The window is fed by
-    // eye 0's present instead.
-    if (vr_ && vr_->active()) return;
+    // While the headset is actually being rendered to, stepVr owns the
+    // renderer. Both paths call setRayCamera, and the path tracer keys
+    // accumulation off the camera, so the two alternating meant every VR frame
+    // reset the accumulator to a desktop viewpoint and back -- the window
+    // flickering between two cameras, and the headset stuck at one sample. The
+    // window is fed by eye 0's present instead.
+    //
+    // Gated on RENDERING, not on the session existing: take the headset off and
+    // the runtime stops asking for frames, at which point nobody was drawing
+    // and the window froze.
+    if (vr_ && vr_->active() && vrRendering_) return;
 
     // The peel eases toward its target here rather than on a QTimer: rendering
     // is on demand, so the animation drives the frames and the frames drive the

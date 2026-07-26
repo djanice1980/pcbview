@@ -353,6 +353,13 @@ private:
     // blocks until the headset wants one) and will not wait for a mouse move.
     std::unique_ptr<xr::VrSession> vr_;
     QTimer* vrTimer_ = nullptr;
+    // Whether the runtime asked for a frame on the last stepVr. False with the
+    // headset off (proximity sensor drops the session out of FOCUSED), which is
+    // what lets the desktop window take the renderer back instead of freezing.
+    bool vrRendering_ = false;
+    // Set while VR holds the renderer, so handing back to the window happens
+    // once on the transition rather than every idle frame.
+    bool vrOwnsRenderer_ = false;
     void stepVr();
 
     // Showcase routing: the orientation actually rendered from while active,
