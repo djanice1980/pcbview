@@ -360,6 +360,9 @@ private:
     // Set while VR holds the renderer, so handing back to the window happens
     // once on the transition rather than every idle frame.
     bool vrOwnsRenderer_ = false;
+    // Counts frames the runtime asked for, so rendering can run at a divisor
+    // of the headset's rate with the compositor reprojecting the gaps.
+    unsigned long long vrFrameCount_ = 0;
     void stepVr();
 
     // Showcase routing: the orientation actually rendered from while active,

@@ -263,7 +263,26 @@ void VulkanWindow::stepVr() {
         }
     }
 
-    if (render) {
+    // Render at a fraction of the headset's rate and let the COMPOSITOR fill
+    // the gaps. On a skipped frame nothing is drawn and no swapchain image is
+    // touched; endFrame resubmits the previous images still labelled with the
+    // poses they were drawn at, and the runtime reprojects them to wherever the
+    // head is at scanout. That is the safe form of reusing a frame -- simply
+    // showing an old one again pins the world to your head for a beat, which
+    // reads as the scene sliding and gets sickening quickly.
+    //
+    // Default 1 (every frame): ray-traced raster keeps up, and halving the rate
+    // when it is not needed only adds latency. Path tracing is another matter,
+    // so it defaults to 2. PCBVIEW_VR_RATE_DIV overrides either way.
+    static const int rateDiv = [] {
+        bool ok = false;
+        const int n = qgetenv("PCBVIEW_VR_RATE_DIV").toInt(&ok);
+        if (ok && n >= 1 && n <= 4) return n;
+        return allowPt ? 2 : 1;
+    }();
+    const bool drawThisFrame = render && (++vrFrameCount_ % rateDiv) == 0;
+
+    if (drawThisFrame) {
         for (size_t i = 0; i < eyes.size(); ++i) {
             const xr::VrSession::Eye& e = eyes[mono ? 0 : i];
             // The ordinary render path, at this eye's size. setCaptureExtent

@@ -1458,6 +1458,9 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
 void VrSession::submitEye(int index, vk::Renderer& renderer) {
     if (!chains_ || index < 0 || index >= static_cast<int>(chains_->size()))
         return;
+    // Eye 0 opens a rendered frame: from here the images hold THESE poses, and
+    // that is what the layer must advertise until they are redrawn.
+    if (index == 0) submitViews_ = lastViews_;
     Chain& c = (*chains_)[index];
     uint32_t idx = 0;
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -1478,11 +1481,18 @@ void VrSession::endFrame() {
     std::vector<XrCompositionLayerProjectionView> pv;
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 
-    if (shouldRender_ && chains_ && !lastViews_.empty()) {
-        for (size_t i = 0; i < lastViews_.size() && i < chains_->size(); ++i) {
+    // submitViews_, not lastViews_: on a frame that was NOT redrawn the images
+    // still hold the previous frame's content, so the layer has to keep
+    // describing it. The runtime then reprojects those pixels to the current
+    // head pose itself -- which is the whole point of skipping the render, and
+    // is safe in a way that simply showing an old frame is not.
+    const std::vector<ViewPose>& views =
+        submitViews_.empty() ? lastViews_ : submitViews_;
+    if (shouldRender_ && chains_ && !views.empty()) {
+        for (size_t i = 0; i < views.size() && i < chains_->size(); ++i) {
             XrCompositionLayerProjectionView v{
                 XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-            const ViewPose& lv = lastViews_[i];
+            const ViewPose& lv = views[i];
             v.pose.position = {lv.pos[0], lv.pos[1], lv.pos[2]};
             v.pose.orientation = {lv.quat[0], lv.quat[1], lv.quat[2],
                                   lv.quat[3]};

@@ -169,6 +169,13 @@ private:
         float fov[4];    // left, right, up, down, radians
     };
     std::vector<ViewPose> lastViews_;
+    // The poses the swapchain images were actually RENDERED with, which is not
+    // the same thing as the latest prediction once frames are skipped. A
+    // submitted layer describes the content of its images, and the compositor
+    // reprojects from that pose to wherever the head is at scanout -- hand it
+    // fresh poses for stale pixels and it warps from the wrong origin, which
+    // shows up as the world sliding under head motion.
+    std::vector<ViewPose> submitViews_;
     bool swapEyes_ = false;
     float placeCentre_[3] = {0, 0, 0};
     float placeScale_ = 0.001f;   // mm -> m
