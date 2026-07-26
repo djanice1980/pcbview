@@ -245,11 +245,8 @@ void VulkanWindow::stepVr() {
         if (vrOwnsRenderer_) {
             vrOwnsRenderer_ = false;
             renderer_->setOffscreenOnly(false);
-            // Back to a single accumulator: the desktop has one viewpoint, and
-            // this also lets the denoiser run again.
-            renderer_->setAccumulationSlots(1);
-            // The desktop camera is exact again; only a head needs slack.
-            renderer_->setCameraTolerance(1e-5f, 1e-5f);
+            // Back to the interactive sample ramp for a mouse camera.
+            renderer_->setPathTraceBatch(0);
             renderer_->setRenderMode(ptEnabled_ && ptAvailable()
                                          ? vk::RenderMode::PathTraced
                                          : vk::RenderMode::Raster);
@@ -267,25 +264,23 @@ void VulkanWindow::stepVr() {
         if (!vrOwnsRenderer_) vr_->reanchor();
         vrOwnsRenderer_ = true;
 
-        // Let a tracked head count as still.
+        // Every frame stands alone: trace a whole budget of samples now, show
+        // it, start over.
         //
-        // The units here are board millimetres, and the board is scaled to
-        // 0.35 m, so ONE board mm is about 7 mm of real head movement. The
-        // first attempt at 0.2% of span worked out to roughly 0.7 mm of head
-        // movement -- tighter than breathing, so accumulation restarted almost
-        // every frame anyway.
+        // Accumulating across frames cannot work against a tracked head. It
+        // never holds still enough for the camera to count as unchanged, so the
+        // accumulator restarts anyway and every frame ends up showing a single
+        // sample -- which is what all the per-eye buffering and tolerance
+        // widening was chasing, and why none of it worked. Tracing the whole
+        // budget in one frame sidesteps the question entirely.
         //
-        // 2% of span is about 7 mm of sway, which is a fair definition of
-        // holding still, and the cost of being wrong is mild softening rather
-        // than a wrong image: samples from 2% of a board-width away still see
-        // very nearly the same thing. PCBVIEW_VR_STILL tunes it -- raise it if
-        // the image never settles, lower it if holding still leaves a smear.
-        static const float stillFrac = [] {
+        // PCBVIEW_VR_SPP sets the budget.
+        static const int spp = [] {
             bool ok = false;
-            const float f = qgetenv("PCBVIEW_VR_STILL").toFloat(&ok);
-            return (ok && f > 0.0f && f <= 0.5f) ? f : 0.02f;
+            const int n = qgetenv("PCBVIEW_VR_SPP").toInt(&ok);
+            return (ok && n >= 1 && n <= 256) ? n : 16;
         }();
-        renderer_->setCameraTolerance(span * stillFrac, 0.004f);
+        renderer_->setPathTraceBatch(allowPt ? spp : 0);
         // Held every frame: initialisation applies the saved ptEnabled_ after
         // the session is created and would otherwise overwrite this, and the
         // render-mode menu can change it mid-session. setRenderMode returns
@@ -294,10 +289,6 @@ void VulkanWindow::stepVr() {
             renderer_->setRenderMode(vk::RenderMode::Raster);
             renderer_->setRayTracing(rtAvailable());
         }
-        // One accumulation buffer per eye, and only while path tracing needs
-        // them -- raster accumulates nothing, so a second set of full-resolution
-        // RGBA32F images would be pure waste.
-        renderer_->setAccumulationSlots(allowPt ? 2 : 1);
     }
 
     // Render at a fraction of the headset's rate and let the COMPOSITOR fill
@@ -350,10 +341,6 @@ void VulkanWindow::stepVr() {
             // direction and zoom into both eyes, with no head tracking, while
             // the matrices this loop hands over were used by the raster path
             // alone. Set it per eye, from that eye's own frustum.
-            // This eye's own accumulator. Without it the two eyes share one and
-            // reset each other every frame -- neither ever gets past a single
-            // sample, however still you hold your head.
-            renderer_->setAccumulationSlot(static_cast<int>(i));
             renderer_->setRayCamera(e.eye, e.fwd, e.right, e.up, false);
             // Eye 0 presents, so the desktop window becomes a mirror of the
             // left eye; eye 1 renders offscreen. Presenting both made the

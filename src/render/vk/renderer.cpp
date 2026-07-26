@@ -586,23 +586,12 @@ void Renderer::setBoardRotationInverse(const float q[4]) {
 void Renderer::setRayCamera(const float eye[3], const float fwd[3],
                             const float right[3], const float up[3],
                             bool ortho) {
-    // A camera change beyond the tolerance restarts accumulation.
-    //
-    // The default is effectively exact, which is right for a mouse: the camera
-    // is either being dragged or it is perfectly still. A HEAD is never
-    // perfectly still. Tracking jitter is orders of magnitude above 1e-5, so on
-    // a headset this reset fired every single frame and accumulation could
-    // never begin -- per-eye buffers included, since each was being wiped just
-    // as reliably as the shared one had been. VR sets a tolerance sized to the
-    // board so that holding still actually counts as still.
-    auto diff = [](const float a[3], const float b[3], float eps) {
-        return std::abs(a[0] - b[0]) + std::abs(a[1] - b[1]) +
-                   std::abs(a[2] - b[2]) >
-               eps;
+    // Any camera change restarts accumulation.
+    auto diff = [](const float a[3], const float b[3]) {
+        return std::abs(a[0]-b[0]) + std::abs(a[1]-b[1]) + std::abs(a[2]-b[2]) > 1e-5f;
     };
-    if (diff(eye, rayEye_, rayPosEps_) || diff(fwd, rayFwd_, rayDirEps_) ||
-        diff(right, rayRight_, rayDirEps_) || diff(up, rayUp_, rayDirEps_) ||
-        ortho != rayOrtho_) {
+    if (diff(eye, rayEye_) || diff(fwd, rayFwd_) || diff(right, rayRight_) ||
+        diff(up, rayUp_) || ortho != rayOrtho_) {
         resetAccumulation();
         // Crucial: also drop the denoised frame. Otherwise the tonemap keeps
         // showing the last (now stale) denoised image while the camera moves --
@@ -677,15 +666,12 @@ void Renderer::createPathTracer() {
                                       &tonemapSetLayout_),
           "tonemap set layout");
 
-    // Doubled: stereo path tracing needs a second accumulation slot, with its
-    // own pt and tonemap sets pointing at its own images. Allocating the room
-    // up front is a handful of descriptors and avoids rebuilding the pool later.
     VkDescriptorPoolSize sizes[] = {
-        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16},  // + netColour, netSpan
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 14}};  // (4 pt + 3 tonemap) x 2
+        {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},  // + netColour, netSpan
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7}};  // 4 pt + 3 tonemap
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-    pi.maxSets = 4;
+    pi.maxSets = 2;
     pi.poolSizeCount = 3;
     pi.pPoolSizes = sizes;
     check(vkCreateDescriptorPool(device_.handle, &pi, nullptr, &ptPool_), "pt pool");
@@ -860,15 +846,6 @@ void Renderer::destroyPathTracer() {
     destroyImage(ptNormal_);
     destroyImage(ptNetPhase_);
     destroyImage(ptDenoised_);
-    // The second accumulation slot, if stereo ever brought one into being. The
-    // pool is gone by now, so its descriptor sets need no freeing.
-    destroyImage(ptStash_[1].accum);
-    destroyImage(ptStash_[1].albedo);
-    destroyImage(ptStash_[1].normal);
-    destroyImage(ptStash_[1].netPhase);
-    destroyImage(ptStash_[1].denoised);
-    ptStash_[1].ptSet = ptStash_[1].tonemapSet = VK_NULL_HANDLE;
-    ptMultiSlot_ = false;
 }
 
 void Renderer::updatePathTraceDescriptors() {
@@ -1130,8 +1107,17 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
         // instead of once per sample. While interacting (accumulation just
         // restarted) the batch stays at 1 so the view keeps full frame rate.
         // Same samples either way -- pure wall-clock, zero quality change.
+        //
+        // A fixed override replaces that ramp when the camera is tracked: a
+        // head never settles, so accumulation never carries across frames and
+        // the ramp would leave every frame at a single sample forever. Then the
+        // model is one self-contained frame at a time -- trace the whole budget
+        // now, show it, start again.
         const int remaining = ptMaxSamples_ - ptSampleCount_;
-        const int batch = std::min(remaining, ptSampleCount_ < 4 ? 1 : 4);
+        const int batch =
+            ptBatchOverride_ > 0
+                ? std::min(remaining, ptBatchOverride_)
+                : std::min(remaining, ptSampleCount_ < 4 ? 1 : 4);
 
         for (int s = 0; s < batch; ++s) {
             if (s > 0) {
@@ -1468,13 +1454,6 @@ bool Renderer::denoiseTick() {
         ptAccum_.handle == VK_NULL_HANDLE) {
         return false;
     }
-    // Not while stereo is running. A pass spans several frames -- readback,
-    // worker, write-back -- and the live slot changes between every one of
-    // them, so its output would land in whichever eye happened to be current
-    // when it finished. OIDN also costs tens of milliseconds at eye
-    // resolution, so it could not keep pace with a headset even if the
-    // bookkeeping were free. Accumulation alone is what cleans stereo up.
-    if (ptMultiSlot_) return false;
 
     switch (dnState_) {
         case DenoiseState::Idle: {
@@ -1938,24 +1917,8 @@ void Renderer::createSceneTargets() {
         // The async denoise's fenced readback references these images; drain it
         // before they go away.
         abortDenoise();
-        // Slot 0 is always the live one here, so the stash and the live members
-        // cannot be confused while images are being rebuilt.
-        setAccumulationSlot(0);
         recreatePtImagesLive();
         if (ptSet_) updatePathTraceDescriptors();
-
-        // The second slot gets the same treatment by briefly making it live and
-        // reusing the very same code -- there is no second copy of the creation
-        // or descriptor logic to drift out of step with this one.
-        if (ptMultiSlot_ && ptStash_[1].ptSet) {
-            PtSlotState live;
-            stashPtSlot(live);
-            loadPtSlot(ptStash_[1]);
-            recreatePtImagesLive();
-            updatePathTraceDescriptors();
-            stashPtSlot(ptStash_[1]);
-            loadPtSlot(live);
-        }
     }
 }
 
@@ -1987,114 +1950,6 @@ void Renderer::recreatePtImagesLive() {
     ptImagesInitialised_ = false;  // need the UNDEFINED->GENERAL transition
     ptDenoisedValid_ = false;
     resetAccumulation();           // resolution changed; restart accumulation
-}
-
-void Renderer::stashPtSlot(PtSlotState& s) const {
-    s.accum = ptAccum_;
-    s.albedo = ptAlbedo_;
-    s.normal = ptNormal_;
-    s.netPhase = ptNetPhase_;
-    s.denoised = ptDenoised_;
-    s.ptSet = ptSet_;
-    s.tonemapSet = tonemapSet_;
-    s.sampleCount = ptSampleCount_;
-    s.imagesInitialised = ptImagesInitialised_;
-    s.denoisedValid = ptDenoisedValid_;
-    s.dnDisplayed = dnDisplayed_;
-    s.generation = ptGeneration_;
-    for (int i = 0; i < 3; ++i) {
-        s.eye[i] = rayEye_[i];
-        s.fwd[i] = rayFwd_[i];
-        s.right[i] = rayRight_[i];
-        s.up[i] = rayUp_[i];
-    }
-    s.ortho = rayOrtho_;
-}
-
-void Renderer::loadPtSlot(const PtSlotState& s) {
-    ptAccum_ = s.accum;
-    ptAlbedo_ = s.albedo;
-    ptNormal_ = s.normal;
-    ptNetPhase_ = s.netPhase;
-    ptDenoised_ = s.denoised;
-    ptSet_ = s.ptSet;
-    tonemapSet_ = s.tonemapSet;
-    ptSampleCount_ = s.sampleCount;
-    ptImagesInitialised_ = s.imagesInitialised;
-    ptDenoisedValid_ = s.denoisedValid;
-    dnDisplayed_ = s.dnDisplayed;
-    ptGeneration_ = s.generation;
-    for (int i = 0; i < 3; ++i) {
-        rayEye_[i] = s.eye[i];
-        rayFwd_[i] = s.fwd[i];
-        rayRight_[i] = s.right[i];
-        rayUp_[i] = s.up[i];
-    }
-    rayOrtho_ = s.ortho;
-}
-
-void Renderer::setAccumulationSlots(int count) {
-    const bool want = count >= 2;
-    if (want == ptMultiSlot_) return;
-    if (!rtSupported_) return;
-
-    if (want) {
-        // Park on slot 0 so the live members are unambiguously slot 0's.
-        setAccumulationSlot(0);
-        if (ptStash_[1].ptSet == VK_NULL_HANDLE && ptPool_) {
-            VkDescriptorSetAllocateInfo ai{
-                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-            ai.descriptorPool = ptPool_;
-            ai.descriptorSetCount = 1;
-            ai.pSetLayouts = &ptSetLayout_;
-            check(vkAllocateDescriptorSets(device_.handle, &ai,
-                                           &ptStash_[1].ptSet),
-                  "pt set (slot 1)");
-            ai.pSetLayouts = &tonemapSetLayout_;
-            check(vkAllocateDescriptorSets(device_.handle, &ai,
-                                           &ptStash_[1].tonemapSet),
-                  "tonemap set (slot 1)");
-        }
-        ptMultiSlot_ = true;
-        // Build slot 1's images at the current resolution, through the same
-        // path createSceneTargets uses.
-        if (sceneExtent_.width > 0 && sceneExtent_.height > 0) {
-            PtSlotState live;
-            stashPtSlot(live);
-            loadPtSlot(ptStash_[1]);
-            recreatePtImagesLive();
-            updatePathTraceDescriptors();
-            stashPtSlot(ptStash_[1]);
-            loadPtSlot(live);
-        }
-    } else {
-        setAccumulationSlot(0);
-        abortDenoise();
-        vkDeviceWaitIdle(device_.handle);
-        // The descriptor sets stay allocated -- cheap, and re-entering stereo
-        // then costs nothing. Only the images are given back.
-        destroyImage(ptStash_[1].accum);
-        destroyImage(ptStash_[1].albedo);
-        destroyImage(ptStash_[1].normal);
-        destroyImage(ptStash_[1].netPhase);
-        destroyImage(ptStash_[1].denoised);
-        ptStash_[1].imagesInitialised = false;
-        ptStash_[1].sampleCount = 0;
-        ptMultiSlot_ = false;
-    }
-}
-
-void Renderer::setAccumulationSlot(int slot) {
-    slot = std::clamp(slot, 0, 1);
-    if (slot == ptSlot_) return;
-    if (slot == 1 && (!ptMultiSlot_ || ptStash_[1].ptSet == VK_NULL_HANDLE))
-        return;
-    // An in-flight denoise reads THIS slot's images and writes THIS slot's
-    // output, so it must not straddle a swap.
-    abortDenoise();
-    stashPtSlot(ptStash_[ptSlot_]);
-    ptSlot_ = slot;
-    loadPtSlot(ptStash_[ptSlot_]);
 }
 
 void Renderer::destroySceneTargets() {

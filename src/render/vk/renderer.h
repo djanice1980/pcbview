@@ -314,26 +314,15 @@ public:
     // renders offscreen.
     void setOffscreenOnly(bool on) { offscreenOnly_ = on; }
 
-    // Which accumulation buffer the path tracer builds into. Stereo needs one
-    // per eye: sharing a single accumulator means each eye's camera resets the
-    // other's progress every frame, pinning both at one sample forever. Slot 0
-    // is the only one used until something asks for another, so the desktop
-    // path is untouched. `count` sizes the pool (1 = desktop, 2 = stereo).
-    void setAccumulationSlots(int count);
-    void setAccumulationSlot(int slot);
-
-    // How far the camera may drift before accumulation restarts. `pos` is in
-    // world units (board mm), `dir` is on the ray basis vectors.
+    // Samples to trace per frame, overriding the interactive heuristic (which
+    // ramps 1 -> 4 as the camera settles, on the assumption that accumulation
+    // will continue across frames).
     //
-    // The default is effectively exact and correct for a mouse -- the camera is
-    // either being dragged or it is perfectly still. A head is never perfectly
-    // still, so on a headset the exact test fires every frame and nothing ever
-    // accumulates. Set this to something sized to the scene before path tracing
-    // from a tracked pose.
-    void setCameraTolerance(float pos, float dir) {
-        rayPosEps_ = pos;
-        rayDirEps_ = dir;
-    }
+    // A tracked head never settles, so nothing accumulates across frames and
+    // that heuristic leaves every frame at a single sample. Rendering a fixed
+    // budget in ONE frame and showing the result is the model that fits: each
+    // frame stands alone. 0 restores the heuristic.
+    void setPathTraceBatch(int samples) { ptBatchOverride_ = samples; }
 
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
@@ -669,10 +658,7 @@ private:
     // Identity quaternion until the board is turned.
     float boardRotInv_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     bool offscreenOnly_ = false;
-    // Effectively exact by default: a mouse camera is either moving or it is
-    // not. Only tracked (head) cameras need slack.
-    float rayPosEps_ = 1e-5f;
-    float rayDirEps_ = 1e-5f;
+    int ptBatchOverride_ = 0;   // 0 = interactive heuristic
     float rayEye_[3] = {0, 0, 0};
     float rayFwd_[3] = {0, 0, 1};
     float rayRight_[3] = {1, 0, 0};
@@ -735,48 +721,7 @@ private:
         dnDisplayed_ = 0;
         ++ptGeneration_;
     }
-    // --- Per-eye accumulation ----------------------------------------------
-    // Stereo path tracing needs TWO accumulators. With one, the eyes take turns
-    // wiping each other: eye 0 accumulates, eye 1's camera resets it, eye 0
-    // resets it back, forever at one sample. Nothing ever converges no matter
-    // how still you hold your head.
-    //
-    // Rather than index every use of ptAccum_ and friends, the live members ARE
-    // the active slot and setAccumulationSlot swaps them out to a stash and the
-    // other slot's in. These are handles and counters, so a swap is a few dozen
-    // bytes; the images themselves never move. That keeps the change contained
-    // here instead of spread across every path-tracing site.
-    struct PtSlotState {
-        Image accum, albedo, normal, netPhase, denoised;
-        VkDescriptorSet ptSet = VK_NULL_HANDLE;
-        VkDescriptorSet tonemapSet = VK_NULL_HANDLE;
-        int sampleCount = 0;
-        bool imagesInitialised = false;
-        bool denoisedValid = false;
-        int dnDisplayed = 0;
-        uint32_t generation = 0;
-        // The camera this slot last accumulated at, and it MUST live here.
-        // setRayCamera restarts accumulation when the camera differs from the
-        // stored one, so a shared camera means slot 0 is compared against eye
-        // 1's viewpoint and slot 1 against eye 0's -- 63 mm apart, far past any
-        // tolerance. Every swap then reset the slot it had just switched to,
-        // and per-eye buffers bought nothing at all.
-        float eye[3] = {0, 0, 0};
-        float fwd[3] = {0, 0, 1};
-        float right[3] = {1, 0, 0};
-        float up[3] = {0, 1, 0};
-        bool ortho = false;
-    };
-    PtSlotState ptStash_[2];
-    int ptSlot_ = 0;
-    // True once a second slot is live. The async denoiser is deliberately held
-    // off while it is: OIDN takes tens of milliseconds at eye resolution, so it
-    // could never keep up with a headset anyway, and a pass that started
-    // against one slot must not land its output in another.
-    bool ptMultiSlot_ = false;
-    void stashPtSlot(PtSlotState& s) const;
-    void loadPtSlot(const PtSlotState& s);
-    // Rebuild the path-tracer images for whichever slot is currently live.
+    // Rebuild the path-tracer images at the current scene extent.
     void recreatePtImagesLive();
 
     VkDescriptorSetLayout ptSetLayout_ = VK_NULL_HANDLE;
