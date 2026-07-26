@@ -121,11 +121,25 @@ here.
 | cgltf | MIT |
 | pugixml | MIT |
 | Microsoft compoundfilereader | MIT |
+| SDL3 | zlib |
+| Gamepad Asset Pack (documentation artwork) | MIT |
 | KiCad (Altium importer record layouts) | GPL-3.0 |
 | Intel Open Image Denoise | Apache-2.0 |
 | Intel Embree | Apache-2.0 |
 | Mesa (lavapipe) | MIT |
 | Vulkan SDK | Apache-2.0 |
+
+**SDL3** (zlib) is statically linked, and provides the gamepad layer only — no
+video, audio, render or GPU subsystem is built, since Qt owns the window and the
+event loop. The zlib licence is permissive and GPL-3-compatible; it requires
+only that the origin not be misrepresented and that modified sources be marked,
+and pcbview links it unmodified.
+
+The DualSense artwork in `docs/assets/` comes from the **Gamepad Asset Pack** by
+AL2009man (MIT), used unmodified as artwork with pcbview's own callouts drawn
+around it; it is documentation only and is not part of the shipped binary. The
+full licence text travels with it in
+`docs/assets/LICENSE-gamepad-asset-pack.txt`, which is what MIT requires.
 
 The `OpenImageDenoise*.dll` and `tbb12.dll` files staged beside the executable are
 the Intel Open Image Denoise runtime (Apache-2.0), used for neural denoising of the

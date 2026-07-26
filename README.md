@@ -218,6 +218,7 @@ highlight**.
 | Exploded view | `Ctrl` + scroll |
 | Top / Bottom / Isometric | `T` / `B` / `I` |
 | Fit to board | `F` |
+| Recentre board and view | `Home` (board square-on at the origin, view framed) |
 | Orthographic toggle | `O` |
 | Measure distance | `M` (click two points; `Esc` clears) |
 | Open board / gerbers | `Ctrl`+`O` |
@@ -239,7 +240,10 @@ under it — which is visible, not just conceptual:
   sweeps across the board as it turns: you are handling the object. Only in
   this mode can the board be slid through space, and `F` brings it back.
 
-The gesture is identical in both; only the mechanism changes.
+The gesture is identical in both; only the mechanism changes. The showcase has a
+**Move board** checkbox that plays the very same playlist either way — checked,
+the board turns and light travels across it, which is usually the better look
+for a recorded video.
 
 ### Controller
 
@@ -247,6 +251,8 @@ A DualSense or Xbox pad is picked up automatically when connected, and hot-plug
 works mid-session. Buttons are read by POSITION, so one mapping serves both:
 south/east/west/north is cross/circle/square/triangle on a DualSense and A/B/X/Y
 on an Xbox pad. The pad only steers while pcbview is the active application.
+
+![pcbview controller map](docs/assets/controller-map.svg)
 
 | Action | Control |
 |---|---|
@@ -256,7 +262,8 @@ on an Xbox pad. The pad only steers while pcbview is the active application.
 | Collapse / explode | `L2` / `R2` (analog — press harder to peel faster) |
 | Fit / Iso / Top / Bottom | South / East / West / North (`✕ ○ □ △`, `A B X Y`) |
 | Level the roll | `L3` |
-| Switch turn sense | `R3` (toggles between turning the board with your hand and swinging around it) |
+| Object / view mode | `R3` |
+| Recentre board and view | `Options` / `Start` |
 | Hold and turn | Hold the DualSense touchpad and move the pad — 1:1, so a 30° motion turns the board 30° |
 
 Hold-and-turn maps the pad's three motions to the three useful board motions:
@@ -266,9 +273,15 @@ deliberately not driven — it only tips the horizon and is disorienting to stee
 by hand.
 
 Hold-and-turn calibrates out the gyro's zero-rate offset while the touchpad is
-not held, so the board stays still until the pad actually moves. Set
+not held, so the board stays still until the pad actually moves — a DualSense at
+rest reads about 0.011 rad/s, which would otherwise rotate the board some 38° a
+minute on its own. It needs a pad with a gyro; an Xbox pad has none. Set
 `PCBVIEW_PAD_DEBUG=1` to dump live stick, trigger and gyro values if a control
 misbehaves.
+
+Controller artwork in the map above is from the
+[Gamepad Asset Pack](https://github.com/AL2009man/Gamepad-Asset-Pack) by
+AL2009man, MIT licensed — see `docs/assets/LICENSE-gamepad-asset-pack.txt`.
 
 Layer visibility, appearance (thickness / substrate / mask), and the print modes
 live in the menus. Each side panel has a **pin** and a **hide** button — hide tucks
