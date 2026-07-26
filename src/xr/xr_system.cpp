@@ -1316,6 +1316,25 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         lastViews_.push_back(vp);
     }
 
+    // One-shot: push the board's own extremities through each finished matrix
+    // and report where they land. This answers, without anybody having to look
+    // through a lens and judge what "correct" means, the two questions the
+    // reported symptom actually turns on:
+    //
+    //   Does the board FIT? At 0.35 m across and 0.6 m away it subtends about
+    //   32 degrees inside a 105-degree frustum, so every corner must come back
+    //   comfortably inside NDC -1..+1 in BOTH eyes. If corners are off-screen
+    //   the board overflows the view, and each eye showing a different PART of
+    //   it stops being mysterious -- it becomes arithmetic.
+    //
+    //   Which part is in which eye? The board sits straight ahead while eye 0's
+    //   frustum is centred about 9 degrees to the LEFT, so the board should
+    //   land RIGHT of centre in eye 0 and LEFT of centre in eye 1, by equal and
+    //   opposite amounts. That is correct and expected in the raw images -- the
+    //   lenses undo it. Anything else, and the numbers say where to look.
+    static bool projDumped = false;
+    const float halfSpan = 0.5f * (0.35f / placeScale_);
+
     for (uint32_t i = 0; i < got; ++i) {
         Eye e;
         e.width = (*chains_)[i].width;
@@ -1328,6 +1347,32 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         // World(mm) -> room -> eye -> clip, in one matrix, so the renderer is
         // handed exactly what it always takes.
         const glm::mat4 vp = P * V * place;
+
+        if (!projDumped) {
+            const glm::vec3 c(placeCentre_[0], placeCentre_[1], placeCentre_[2]);
+            const struct { const char* name; glm::vec3 p; } pts[] = {
+                {"centre", c},
+                {"-X    ", c + glm::vec3(-halfSpan, 0.0f, 0.0f)},
+                {"+X    ", c + glm::vec3(+halfSpan, 0.0f, 0.0f)},
+                {"-Y    ", c + glm::vec3(0.0f, -halfSpan, 0.0f)},
+                {"+Y    ", c + glm::vec3(0.0f, +halfSpan, 0.0f)},
+            };
+            for (const auto& q : pts) {
+                const glm::vec4 clip = vp * glm::vec4(q.p, 1.0f);
+                if (clip.w <= 1e-6f) {
+                    std::printf("vr-proj: eye %u %s -> BEHIND VIEWER (w=%.4f)\n",
+                                i, q.name, clip.w);
+                    continue;
+                }
+                const float nx = clip.x / clip.w, ny = clip.y / clip.w;
+                std::printf("vr-proj: eye %u %s -> ndc(%+.3f %+.3f)%s\n", i,
+                            q.name, nx, ny,
+                            (std::fabs(nx) > 1.0f || std::fabs(ny) > 1.0f)
+                                ? "   OFF-SCREEN"
+                                : "");
+            }
+            std::fflush(stdout);
+        }
         std::memcpy(e.viewProj, glm::value_ptr(vp), sizeof(e.viewProj));
         // The lighting rig wants the viewpoint in board millimetres.
         const glm::vec4 eyeMm =
@@ -1339,6 +1384,7 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         e.eye[2] = eyeMm.z;
         eyes->push_back(e);
     }
+    projDumped = true;
     return !eyes->empty();
 }
 
