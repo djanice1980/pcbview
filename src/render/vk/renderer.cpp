@@ -586,12 +586,23 @@ void Renderer::setBoardRotationInverse(const float q[4]) {
 void Renderer::setRayCamera(const float eye[3], const float fwd[3],
                             const float right[3], const float up[3],
                             bool ortho) {
-    // Any camera change restarts accumulation.
-    auto diff = [](const float a[3], const float b[3]) {
-        return std::abs(a[0]-b[0]) + std::abs(a[1]-b[1]) + std::abs(a[2]-b[2]) > 1e-5f;
+    // A camera change beyond the tolerance restarts accumulation.
+    //
+    // The default is effectively exact, which is right for a mouse: the camera
+    // is either being dragged or it is perfectly still. A HEAD is never
+    // perfectly still. Tracking jitter is orders of magnitude above 1e-5, so on
+    // a headset this reset fired every single frame and accumulation could
+    // never begin -- per-eye buffers included, since each was being wiped just
+    // as reliably as the shared one had been. VR sets a tolerance sized to the
+    // board so that holding still actually counts as still.
+    auto diff = [](const float a[3], const float b[3], float eps) {
+        return std::abs(a[0] - b[0]) + std::abs(a[1] - b[1]) +
+                   std::abs(a[2] - b[2]) >
+               eps;
     };
-    if (diff(eye, rayEye_) || diff(fwd, rayFwd_) || diff(right, rayRight_) ||
-        diff(up, rayUp_) || ortho != rayOrtho_) {
+    if (diff(eye, rayEye_, rayPosEps_) || diff(fwd, rayFwd_, rayDirEps_) ||
+        diff(right, rayRight_, rayDirEps_) || diff(up, rayUp_, rayDirEps_) ||
+        ortho != rayOrtho_) {
         resetAccumulation();
         // Crucial: also drop the denoised frame. Otherwise the tonemap keeps
         // showing the last (now stale) denoised image while the camera moves --

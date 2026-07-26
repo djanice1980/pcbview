@@ -248,6 +248,8 @@ void VulkanWindow::stepVr() {
             // Back to a single accumulator: the desktop has one viewpoint, and
             // this also lets the denoiser run again.
             renderer_->setAccumulationSlots(1);
+            // The desktop camera is exact again; only a head needs slack.
+            renderer_->setCameraTolerance(1e-5f, 1e-5f);
             renderer_->setRenderMode(ptEnabled_ && ptAvailable()
                                          ? vk::RenderMode::PathTraced
                                          : vk::RenderMode::Raster);
@@ -255,7 +257,21 @@ void VulkanWindow::stepVr() {
             requestUpdate();
         }
     } else {
+        // Taking over: put the board in front of wherever the viewer is NOW.
+        //
+        // The anchor is otherwise captured once, at the instant the session
+        // opens -- which is while you are still at the keyboard looking at the
+        // monitor. Turn to face the room afterwards and the board is off to one
+        // side, seen edge-on. Re-anchoring on every handover means putting the
+        // headset on always presents the board in front of you.
+        if (!vrOwnsRenderer_) vr_->reanchor();
         vrOwnsRenderer_ = true;
+
+        // Let a tracked head count as still. Sized to the board: 0.2% of its
+        // span in position (a tenth of a millimetre on a 50 mm board) and about
+        // a twentieth of a degree in orientation -- well above tracking jitter,
+        // well below any movement worth restarting for.
+        renderer_->setCameraTolerance(span * 0.002f, 0.001f);
         // Held every frame: initialisation applies the saved ptEnabled_ after
         // the session is created and would otherwise overwrite this, and the
         // render-mode menu can change it mid-session. setRenderMode returns
@@ -997,6 +1013,10 @@ void VulkanWindow::setRotationRoutedToBoard(bool on) {
 }
 
 void VulkanWindow::recenterAll() {
+    // Recentring means the same thing in the headset: bring the board back in
+    // front of the viewer. Reachable from the menu and Home, so the board can
+    // be retrieved after turning without taking the headset off.
+    if (vr_) vr_->reanchor();
     board_ = BoardPose{};
     Camera dest = camera_;
     const Camera fresh;  // the opening orientation

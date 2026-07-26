@@ -322,6 +322,19 @@ public:
     void setAccumulationSlots(int count);
     void setAccumulationSlot(int slot);
 
+    // How far the camera may drift before accumulation restarts. `pos` is in
+    // world units (board mm), `dir` is on the ray basis vectors.
+    //
+    // The default is effectively exact and correct for a mouse -- the camera is
+    // either being dragged or it is perfectly still. A head is never perfectly
+    // still, so on a headset the exact test fires every frame and nothing ever
+    // accumulates. Set this to something sized to the scene before path tracing
+    // from a tracked pose.
+    void setCameraTolerance(float pos, float dir) {
+        rayPosEps_ = pos;
+        rayDirEps_ = dir;
+    }
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the
@@ -656,6 +669,10 @@ private:
     // Identity quaternion until the board is turned.
     float boardRotInv_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     bool offscreenOnly_ = false;
+    // Effectively exact by default: a mouse camera is either moving or it is
+    // not. Only tracked (head) cameras need slack.
+    float rayPosEps_ = 1e-5f;
+    float rayDirEps_ = 1e-5f;
     float rayEye_[3] = {0, 0, 0};
     float rayFwd_[3] = {0, 0, 1};
     float rayRight_[3] = {1, 0, 0};

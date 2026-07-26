@@ -137,6 +137,16 @@ public:
     // big across. Millimetres in, metres out.
     void setBoardPlacement(const float centreMm[3], float spanMm);
 
+    // Put the board back in front of the viewer on the next frame.
+    //
+    // The anchor is captured once and then left alone, so the board stays put
+    // in the room instead of following your head. That is right, but it means
+    // the board lands wherever you happened to be facing at the instant the
+    // session opened -- typically at the monitor, since that is where you were
+    // when you launched it. Turn around afterwards and the board is off to your
+    // side, edge-on.
+    void reanchor() { anchored_ = false; }
+
     // The grip pose of a controller, in pcbview world millimetres, when one is
     // tracked. Index 0 = left, 1 = right.
     bool gripPose(int hand, float outPosMm[3], float outQuat[4]) const;
