@@ -546,27 +546,24 @@ void projectionFromFov(const XrFovf& fov, float zNear, float out[16]) {
     // because it has no offset, would shear the image off-centre.
     p[5] = -p[5];
     p[9] = -p[9];
-    // X is mirrored too, and this is NOT cosmetic -- it is a handedness
-    // mismatch. pcbview's own view basis builds right = cross(viewDir, +Z),
-    // which for a camera looking from -Y comes out pointing -X: its convention
-    // is mirrored relative to the standard right-handed inverse-pose view used
-    // for the OpenXR eye. The desktop never notices because its projection and
-    // its basis are self-consistent; feeding a standard view into that
-    // projection is what flips left and right in the headset.
+    // NO X mirror. An earlier version negated p[0] and p[8] on the theory that
+    // pcbview's view basis was left-handed -- that was a misreading of
+    // board.frag's camRight (built from the surface-to-eye vector, not the
+    // camera's forward). cameraBasis/viewFromBasis are a textbook right-handed
+    // lookAt, so a mirror here is simply wrong.
     //
-    // Confirmed by elimination, not assumed: eye separation measured 63mm and
-    // the FOVs were correctly handed, so the stereo was right; and SWAPPING the
-    // two eye images did not help, which rules out delivery order and leaves a
-    // mirror inside each image as the only consistent explanation.
-    // PCBVIEW_VR_NO_MIRROR=1 disables this if it ever turns out backwards.
-    static const bool noMirror = [] {
-        const char* v = std::getenv("PCBVIEW_VR_NO_MIRROR");
+    // p[8] IS negated, and only p[8]. It is the sole term in this matrix that
+    // differs between the two eyes -- the frustum's outward skew -- so it is
+    // the only thing that can make each eye see a DIFFERENT PART of the board
+    // rather than the same board from a slightly different place, which is
+    // exactly the reported symptom. Getting its sign backwards points the two
+    // frustums away from each other instead of toward the convergence point.
+    // PCBVIEW_VR_OFFSET_POS=1 restores the other sign.
+    static const bool offsetPositive = [] {
+        const char* v = std::getenv("PCBVIEW_VR_OFFSET_POS");
         return v && v[0] && v[0] != '0';
     }();
-    if (!noMirror) {
-        p[0] = -p[0];
-        p[8] = -p[8];
-    }
+    if (!offsetPositive) p[8] = -p[8];
     for (int i = 0; i < 16; ++i) out[i] = p[i];
 }
 
