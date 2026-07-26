@@ -299,14 +299,22 @@ void VulkanWindow::stepVr() {
     // showing an old one again pins the world to your head for a beat, which
     // reads as the scene sliding and gets sickening quickly.
     //
-    // Default 1 (every frame): ray-traced raster keeps up, and halving the rate
-    // when it is not needed only adds latency. Path tracing is another matter,
-    // so it defaults to 2. PCBVIEW_VR_RATE_DIV overrides either way.
+    // Defaults to 1 -- every frame rendered, nothing reprojected.
+    //
+    // Skipping frames looked like free smoothness and is not. The layer we
+    // submit carries no depth buffer, so the runtime can only warp it RIGIDLY,
+    // and a rigid warp cannot reproduce parallax: things at different depths
+    // slide against each other as the head moves. The error grows the closer
+    // the subject is, and a board at 0.6 m is very close, so it reads as parts
+    // of the image shifting about.
+    //
+    // Worth revisiting via XR_KHR_composition_layer_depth, which hands the
+    // runtime a depth buffer and lets it warp per pixel. Until then, render
+    // every frame. PCBVIEW_VR_RATE_DIV still forces a divisor for testing.
     static const int rateDiv = [] {
         bool ok = false;
         const int n = qgetenv("PCBVIEW_VR_RATE_DIV").toInt(&ok);
-        if (ok && n >= 1 && n <= 4) return n;
-        return allowPt ? 2 : 1;
+        return (ok && n >= 1 && n <= 4) ? n : 1;
     }();
     const bool drawThisFrame = render && (++vrFrameCount_ % rateDiv) == 0;
 
