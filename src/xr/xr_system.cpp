@@ -960,9 +960,24 @@ namespace {
 // Board (millimetres) -> room (metres). Everything the renderer is handed goes
 // through this, so the board arrives in front of the viewer at a sane size
 // instead of being a 50-metre slab centred on their head.
-glm::mat4 placement(const float centre[3], float scale, float fwd, float up) {
+glm::mat4 placement(const float centre[3], float scale,
+                    const glm::vec3& anchorPos, const glm::quat& anchorRot) {
+    // Anchored to WHERE THE VIEWER ACTUALLY IS, not to a fixed offset in LOCAL
+    // space. LOCAL's origin is wherever the headset happened to be when the
+    // session started, so a constant offset parks the board in some corner of
+    // the room -- measured at 1.3 m away and 0.7 m above eye level, which is
+    // exactly the sliver-through-a-wide-frustum view that was being reported.
+    //
+    // Yaw only: taking the full head rotation would tilt the board with every
+    // glance, and rolling a PCB because you tipped your head is nauseating.
+    const glm::vec3 fwd = anchorRot * glm::vec3(0.0f, 0.0f, -1.0f);
+    const float yaw = std::atan2(fwd.x, -fwd.z);
+    const glm::quat flat = glm::angleAxis(yaw, glm::vec3(0.0f, 1.0f, 0.0f));
+
     glm::mat4 m(1.0f);
-    m = glm::translate(m, glm::vec3(0.0f, up, fwd));
+    m = glm::translate(m, anchorPos);
+    m = m * glm::mat4_cast(flat);
+    m = glm::translate(m, glm::vec3(0.0f, 0.0f, -0.6f));  // 60cm in front
     m = glm::scale(m, glm::vec3(scale));
     m = glm::translate(m, -glm::vec3(centre[0], centre[1], centre[2]));
     return m;
@@ -1166,8 +1181,10 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     sync.activeActionSets = &active;
     xrSyncActions(s, &sync);
 
-    const glm::mat4 place =
-        placement(placeCentre_, placeScale_, placeFwd_, placeUp_);
+    const glm::mat4 place = placement(
+        placeCentre_, placeScale_,
+        glm::vec3(anchorPos_[0], anchorPos_[1], anchorPos_[2]),
+        glm::quat(anchorRot_[3], anchorRot_[0], anchorRot_[1], anchorRot_[2]));
     const glm::mat4 invPlace = glm::inverse(place);
 
     for (int i = 0; i < 2; ++i) {
@@ -1210,6 +1227,26 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     // Keep the poses actually rendered with. endFrame used to re-locate, which
     // is wrong on principle -- the layer must describe the frame that was
     // drawn, not a fresh prediction -- and wasteful.
+    // Anchor the board to the viewer on the first focused frame, and never
+    // again -- an anchor that updates every frame would drag the board along
+    // with your head, which is the opposite of an object sitting in a room.
+    if (!anchored_ && got >= 2) {
+        anchored_ = true;
+        anchorPos_[0] =
+            (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
+        anchorPos_[1] =
+            (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
+        anchorPos_[2] =
+            (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
+        anchorRot_[0] = views[0].pose.orientation.x;
+        anchorRot_[1] = views[0].pose.orientation.y;
+        anchorRot_[2] = views[0].pose.orientation.z;
+        anchorRot_[3] = views[0].pose.orientation.w;
+        std::printf("vr: board anchored at head (%.2f %.2f %.2f)\n",
+                    anchorPos_[0], anchorPos_[1], anchorPos_[2]);
+        std::fflush(stdout);
+    }
+
     // One-shot dump of what the two eyes actually got. Divergent views and a
     // bad placement look identical through the lenses, and the numbers tell
     // them apart instantly: healthy stereo is ~65mm of X separation and near
@@ -1217,10 +1254,9 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     static bool dumped = false;
     if (!dumped && got >= 2) {
         dumped = true;
-        std::printf("vr-diag: placement scale=%.6f (board span -> %.3f m), "
-                    "fwd=%.2f up=%.2f\n",
-                    placeScale_, 1.0f / (placeScale_ > 0 ? 1.0f / 0.35f : 1.0f),
-                    placeFwd_, placeUp_);
+        std::printf("vr-diag: placement scale=%.6f (board span -> 0.35 m), "
+                    "anchored at head (%.2f %.2f %.2f)\n",
+                    placeScale_, anchorPos_[0], anchorPos_[1], anchorPos_[2]);
         for (uint32_t i = 0; i < got; ++i) {
             std::printf("vr-diag: eye %u room-pos(%+.4f %+.4f %+.4f) "
                         "fov L%+.3f R%+.3f U%+.3f D%+.3f\n",

@@ -160,8 +160,11 @@ private:
     bool swapEyes_ = false;
     float placeCentre_[3] = {0, 0, 0};
     float placeScale_ = 0.001f;   // mm -> m
-    float placeFwd_ = -0.6f;      // metres in front of the origin
-    float placeUp_ = 1.1f;
+    // Where the viewer was when the board was last anchored. Captured once, so
+    // the board stays put in the room instead of following your head around.
+    float anchorPos_[3] = {0.0f, 0.0f, 0.0f};
+    float anchorRot_[4] = {0.0f, 0.0f, 0.0f, 1.0f};  // xyzw
+    bool anchored_ = false;
     float gripPosMm_[2][3] = {};
     float gripQuat_[2][4] = {};
     bool gripTracked_[2] = {false, false};
