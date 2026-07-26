@@ -204,6 +204,14 @@ void VulkanWindow::stepVr() {
         const int n = qgetenv("PCBVIEW_VR_RATE_DIV").toInt(&ok);
         return (ok && n >= 1 && n <= 4) ? n : 1;
     }();
+    // How far back temporal reuse averages. This is the quality/latency dial:
+    // higher is cleaner and slower to react to a change in the picture, and it
+    // is what lets a handful of samples a frame look like a great many.
+    static const int histFrames = [] {
+        bool ok = false;
+        const int n = qgetenv("PCBVIEW_VR_HISTORY").toInt(&ok);
+        return (ok && n >= 1 && n <= 128) ? n : 32;
+    }();
 
     // Where the board sits in the room. Refreshed each frame so loading a
     // different board re-places it rather than leaving it the old size.
@@ -404,6 +412,10 @@ void VulkanWindow::stepVr() {
             // direction and zoom into both eyes, with no head tracking, while
             // the matrices this loop hands over were used by the raster path
             // alone. Set it per eye, from that eye's own frustum.
+            // This eye's own history. Sharing one between the eyes would blend
+            // two viewpoints together every frame.
+            renderer_->setTemporalSlot(allowPt ? static_cast<int>(i) : -1,
+                                       histFrames);
             renderer_->setRayCamera(e.eye, e.fwd, e.right, e.up, false);
             // Eye 0 presents, so the desktop window becomes a mirror of the
             // left eye; eye 1 renders offscreen. Presenting both made the

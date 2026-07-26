@@ -350,6 +350,22 @@ public:
     // this never leaves the GPU.
     void setGpuDenoisePasses(int passes) { gpuDenoisePasses_ = passes; }
 
+    // Temporal reprojection: reuse the previous frame's result where a pixel
+    // still shows the same world point. `slot` picks the history (one per eye);
+    // pass -1 to disable. `maxFrames` caps how far back the running average
+    // reaches -- higher is cleaner and slower to respond to change.
+    //
+    // This is what makes path tracing viable at a headset's frame rate: a few
+    // samples a frame against a long history give the effective count that
+    // tracing outright cannot afford. Call setHistoryReset when the scene or
+    // the board pose changes, so stale history is dropped rather than smeared
+    // over the new arrangement.
+    void setTemporalSlot(int slot, int maxFrames) {
+        temporalSlot_ = slot;
+        temporalMaxFrames_ = maxFrames;
+    }
+    void setHistoryReset() { temporalReset_ = true; }
+
     // Light the raster path from a world-fixed sun instead of the
     // camera-relative key.
     //
@@ -714,6 +730,12 @@ private:
     // can be applied at DISPLAY time -- animating the accumulated radiance
     // itself would reset convergence every frame and never resolve.
     Image ptNetPhase_;
+    // First-hit world position (xyz) and a hit flag (w). Written on sample 0
+    // only -- averaging positions across samples that landed on different
+    // surfaces would place the result in the gap between them. This is what
+    // temporal reuse anchors on: to reuse last frame's result for a pixel you
+    // have to know which world point it shows.
+    Image ptPosition_;
     Image ptDenoised_;          // OIDN output, shown when valid
     bool ptImagesInitialised_ = false;  // GENERAL-layout transition done
     bool denoisingEnabled_ = false;
@@ -783,6 +805,37 @@ private:
     void createGpuDenoise();
     void updateGpuDenoiseDescriptors();
     void recordGpuDenoise(VkCommandBuffer cmd);
+
+    // --- Temporal reprojection ---------------------------------------------
+    // One history per eye, because the two eyes see different images and each
+    // must reuse only its own past. The blended result goes to ptTemporal_,
+    // which is then what the a-trous chain filters and what feeds back as next
+    // frame's history.
+    static constexpr int kTemporalSlots = 2;
+    Image ptTemporal_;
+    Image histColour_[kTemporalSlots];
+    Image histPos_[kTemporalSlots];
+    // The view-projection each eye was rendered with last frame, and whether it
+    // has been set at all yet.
+    float prevViewProj_[kTemporalSlots][16] = {};
+    bool prevViewProjValid_[kTemporalSlots] = {false, false};
+    VkDescriptorSetLayout rpSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout rpPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline rpPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool rpPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet rpSets_[kTemporalSlots] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    // The a-trous chain normally starts at ptAccum_; with temporal reuse on it
+    // starts at ptTemporal_ instead, so it needs its own entry set.
+    VkDescriptorSet dnTemporalSet_ = VK_NULL_HANDLE;
+    // This frame's view-projection, captured in drawFrame so recordTemporal can
+    // store it as next frame's "previous".
+    float curViewProj_[16] = {};
+    int temporalSlot_ = -1;
+    int temporalMaxFrames_ = 32;
+    bool temporalReset_ = false;
+    void createTemporal();
+    void updateTemporalDescriptors();
+    void recordTemporal(VkCommandBuffer cmd, const float viewProj[16]);
 
     VkDescriptorSetLayout ptSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout tonemapSetLayout_ = VK_NULL_HANDLE;

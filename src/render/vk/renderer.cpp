@@ -33,6 +33,9 @@ const uint32_t kPathTrace[] =
 const uint32_t kDenoiseComp[] =
 #include "shaders/denoise.comp.inc"
     ;
+const uint32_t kReprojectComp[] =
+#include "shaders/reproject.comp.inc"
+    ;
 const uint32_t kFullscreenVert[] =
 #include "shaders/fullscreen.vert.inc"
     ;
@@ -630,8 +633,8 @@ void Renderer::createPathTracer() {
     // estimation), so it actually illuminates its surroundings.
     // 11 = first-hit net phase, written as an AOV so the chase animation can
     // run as a display-time modulation without disturbing accumulation.
-    VkDescriptorSetLayoutBinding b[13]{};
-    for (uint32_t i = 0; i < 13; ++i) {
+    VkDescriptorSetLayoutBinding b[14]{};
+    for (uint32_t i = 0; i < 14; ++i) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -645,9 +648,11 @@ void Renderer::createPathTracer() {
     b[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // 12 = per-net origin + inverse span, for the per-fragment chase phase.
     b[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    // 13 = first-hit world position, the anchor for temporal reuse.
+    b[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     VkDescriptorSetLayoutCreateInfo li{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 13;
+    li.bindingCount = 14;
     li.pBindings = b;
     check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr, &ptSetLayout_),
           "pt set layout");
@@ -785,6 +790,7 @@ void Renderer::createPathTracer() {
     vkDestroyShaderModule(device_.handle, fs, nullptr);
 
     createGpuDenoise();
+    createTemporal();
 
     // OIDN device for denoising. DEFAULT picks the fastest available -- a GPU
     // (CUDA on NVIDIA, HIP on AMD) when its device DLL + driver are present, else
@@ -851,7 +857,24 @@ void Renderer::destroyPathTracer() {
     destroyImage(ptNormal_);
     destroyImage(ptNetPhase_);
     destroyImage(ptDenoised_);
+    destroyImage(ptPosition_);
     destroyImage(ptDenoiseTmp_);
+    destroyImage(ptTemporal_);
+    for (int i = 0; i < kTemporalSlots; ++i) {
+        destroyImage(histColour_[i]);
+        destroyImage(histPos_[i]);
+    }
+    if (rpPipeline_) vkDestroyPipeline(device_.handle, rpPipeline_, nullptr);
+    if (rpPipelineLayout_)
+        vkDestroyPipelineLayout(device_.handle, rpPipelineLayout_, nullptr);
+    if (rpPool_) vkDestroyDescriptorPool(device_.handle, rpPool_, nullptr);
+    if (rpSetLayout_)
+        vkDestroyDescriptorSetLayout(device_.handle, rpSetLayout_, nullptr);
+    rpPipeline_ = VK_NULL_HANDLE;
+    rpPipelineLayout_ = VK_NULL_HANDLE;
+    rpPool_ = VK_NULL_HANDLE;
+    rpSetLayout_ = VK_NULL_HANDLE;
+    dnTemporalSet_ = VK_NULL_HANDLE;
     if (dnPipeline_) vkDestroyPipeline(device_.handle, dnPipeline_, nullptr);
     if (dnPipelineLayout_)
         vkDestroyPipelineLayout(device_.handle, dnPipelineLayout_, nullptr);
@@ -881,8 +904,8 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    VkWriteDescriptorSet w[13]{};
-    for (int i = 0; i < 13; ++i) {
+    VkWriteDescriptorSet w[14]{};
+    for (int i = 0; i < 14; ++i) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = ptSet_;
         w[i].dstBinding = i;
@@ -916,7 +939,10 @@ void Renderer::updatePathTraceDescriptors() {
                                                 : triNetBuffer_.handle,
         0, VK_WHOLE_SIZE};
     w[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[12].pBufferInfo = &nspan;
-    vkUpdateDescriptorSets(device_.handle, 13, w, 0, nullptr);
+    VkDescriptorImageInfo posi{VK_NULL_HANDLE, ptPosition_.view,
+                               VK_IMAGE_LAYOUT_GENERAL};
+    w[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[13].pImageInfo = &posi;
+    vkUpdateDescriptorSets(device_.handle, 14, w, 0, nullptr);
 
     VkDescriptorImageInfo den{VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet tw[3]{};
@@ -1089,8 +1115,10 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
 
     // First use: UNDEFINED -> GENERAL for the storage images.
     if (!ptImagesInitialised_) {
-        Image* imgs[] = {&ptAccum_,    &ptAlbedo_,     &ptNormal_,
-                         &ptNetPhase_, &ptDenoised_,   &ptDenoiseTmp_};
+        Image* imgs[] = {&ptAccum_,        &ptAlbedo_,       &ptNormal_,
+                         &ptNetPhase_,     &ptDenoised_,     &ptDenoiseTmp_,
+                         &ptPosition_,     &ptTemporal_,     &histColour_[0],
+                         &histColour_[1],  &histPos_[0],     &histPos_[1]};
         // Counts derived from the array, never written twice: adding an image
         // here while a hand-written count stayed behind silently dropped the
         // LAST entry from the transition, leaving it UNDEFINED for the tonemap
@@ -1203,6 +1231,13 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         barrier(&b, 1);
     }
+
+    // Blend against the previous frame BEFORE filtering. Order matters: the
+    // spatial filter should clean up an image that already carries its history,
+    // not filter this frame's raw samples and then have the history applied to
+    // the result.
+    if (temporalSlot_ >= 0 && ptSampleCount_ > 0)
+        recordTemporal(cmd, curViewProj_);
 
     // Clean up this frame's samples on the GPU, before the tonemap reads them.
     // The result lands in ptDenoised_ already averaged, which is exactly what
@@ -1954,6 +1989,7 @@ void Renderer::recreatePtImagesLive() {
     destroyImage(ptNormal_);
     destroyImage(ptNetPhase_);
     destroyImage(ptDenoised_);
+    destroyImage(ptPosition_);
     // STORAGE for compute R/W, TRANSFER_SRC/DST for the denoise readback and
     // write-back copies.
     const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT |
@@ -1976,10 +2012,32 @@ void Renderer::recreatePtImagesLive() {
     destroyImage(ptDenoiseTmp_);
     ptDenoiseTmp_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
                                 VK_IMAGE_ASPECT_COLOR_BIT);
+    // First-hit world position: what temporal reuse anchors on.
+    destroyImage(ptPosition_);
+    ptPosition_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                              VK_IMAGE_ASPECT_COLOR_BIT);
+    // Temporal: the blended result, plus one colour and one position history
+    // per eye. The histories cannot be shared -- each eye must only ever reuse
+    // its own past, or every frame would blend the two viewpoints together.
+    destroyImage(ptTemporal_);
+    ptTemporal_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                              VK_IMAGE_ASPECT_COLOR_BIT);
+    for (int i = 0; i < kTemporalSlots; ++i) {
+        destroyImage(histColour_[i]);
+        destroyImage(histPos_[i]);
+        histColour_[i] = createImage(sceneExtent_,
+                                     VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                                     VK_IMAGE_ASPECT_COLOR_BIT);
+        histPos_[i] = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT,
+                                  u, VK_IMAGE_ASPECT_COLOR_BIT);
+        // A new resolution means the old history describes nothing.
+        prevViewProjValid_[i] = false;
+    }
     ptImagesInitialised_ = false;  // need the UNDEFINED->GENERAL transition
     ptDenoisedValid_ = false;
     resetAccumulation();           // resolution changed; restart accumulation
     updateGpuDenoiseDescriptors();
+    updateTemporalDescriptors();
 }
 
 namespace {
@@ -2000,6 +2058,220 @@ float envFloat(const char* name, float fallback) {
     return (end && end != v && f > 0.0f) ? f : fallback;
 }
 }  // namespace
+
+namespace {
+// Matches the push block in reproject.comp.
+struct RpPush {
+    float prevViewProj[16];
+    uint32_t dim[4];    // w, h, reset, pad
+    float params[4];    // 1/samples, tolerance fraction, max frames, pad
+    float eye[4];       // viewpoint (xyz), pad
+};
+}  // namespace
+
+void Renderer::createTemporal() {
+    if (!rtSupported_) return;
+
+    VkDescriptorSetLayoutBinding b[6]{};
+    for (uint32_t i = 0; i < 6; ++i) {
+        b[i].binding = i;
+        b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo li{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = 6;
+    li.pBindings = b;
+    check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr,
+                                      &rpSetLayout_),
+          "reproject set layout");
+
+    // One set per eye, six images each, plus the a-trous entry set (four).
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                            6 * kTemporalSlots + 4};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = kTemporalSlots + 1;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &ps;
+    check(vkCreateDescriptorPool(device_.handle, &pi, nullptr, &rpPool_),
+          "reproject pool");
+
+    const VkDescriptorSetLayout layouts[kTemporalSlots] = {rpSetLayout_,
+                                                           rpSetLayout_};
+    VkDescriptorSetAllocateInfo ai{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = rpPool_;
+    ai.descriptorSetCount = kTemporalSlots;
+    ai.pSetLayouts = layouts;
+    check(vkAllocateDescriptorSets(device_.handle, &ai, rpSets_),
+          "reproject sets");
+
+    // The a-trous chain's alternative entry point, reading ptTemporal_ instead
+    // of the raw accumulation. Allocated from this pool because the denoise
+    // pool was sized for exactly three sets.
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &dnSetLayout_;
+    check(vkAllocateDescriptorSets(device_.handle, &ai, &dnTemporalSet_),
+          "denoise temporal entry set");
+
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(RpPush)};
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &rpSetLayout_;
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
+    check(vkCreatePipelineLayout(device_.handle, &pl, nullptr,
+                                 &rpPipelineLayout_),
+          "reproject pipeline layout");
+
+    VkShaderModule cs =
+        makeModule(device_.handle, kReprojectComp, sizeof(kReprojectComp));
+    VkComputePipelineCreateInfo cpi{
+        VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = cs;
+    cpi.stage.pName = "main";
+    cpi.layout = rpPipelineLayout_;
+    check(vkCreateComputePipelines(device_.handle, VK_NULL_HANDLE, 1, &cpi,
+                                   nullptr, &rpPipeline_),
+          "reproject pipeline");
+    vkDestroyShaderModule(device_.handle, cs, nullptr);
+
+    updateTemporalDescriptors();
+}
+
+void Renderer::updateTemporalDescriptors() {
+    if (!rpSets_[0] || ptTemporal_.view == VK_NULL_HANDLE) return;
+
+    for (int s = 0; s < kTemporalSlots; ++s) {
+        if (histColour_[s].view == VK_NULL_HANDLE) continue;
+        VkDescriptorImageInfo info[6] = {
+            {VK_NULL_HANDLE, ptAccum_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptPosition_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, histColour_[s].view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, histPos_[s].view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptTemporal_.view, VK_IMAGE_LAYOUT_GENERAL},
+        };
+        VkWriteDescriptorSet w[6]{};
+        for (int i = 0; i < 6; ++i) {
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[i].dstSet = rpSets_[s];
+            w[i].dstBinding = static_cast<uint32_t>(i);
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[i].pImageInfo = &info[i];
+        }
+        vkUpdateDescriptorSets(device_.handle, 6, w, 0, nullptr);
+    }
+
+    // A-trous entry reading the temporally blended image.
+    if (dnTemporalSet_ && ptDenoised_.view != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo info[4] = {
+            {VK_NULL_HANDLE, ptTemporal_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
+        };
+        VkWriteDescriptorSet w[4]{};
+        for (int i = 0; i < 4; ++i) {
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[i].dstSet = dnTemporalSet_;
+            w[i].dstBinding = static_cast<uint32_t>(i);
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[i].pImageInfo = &info[i];
+        }
+        vkUpdateDescriptorSets(device_.handle, 4, w, 0, nullptr);
+    }
+}
+
+void Renderer::recordTemporal(VkCommandBuffer cmd, const float viewProj[16]) {
+    const int s = temporalSlot_;
+    if (s < 0 || s >= kTemporalSlots || !rpPipeline_ || !rpSets_[s]) return;
+    if (ptTemporal_.handle == VK_NULL_HANDLE) return;
+
+    // The tracer wrote colour, position and normal in compute; this reads them
+    // in compute.
+    {
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.memoryBarrierCount = 1;
+        d.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &d);
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rpPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            rpPipelineLayout_, 0, 1, &rpSets_[s], 0, nullptr);
+
+    RpPush push{};
+    std::memcpy(push.prevViewProj, prevViewProj_[s], sizeof(push.prevViewProj));
+    push.dim[0] = sceneExtent_.width;
+    push.dim[1] = sceneExtent_.height;
+    // No usable previous frame, or something invalidated the history: take this
+    // frame's samples as they are rather than blending against nonsense.
+    push.dim[2] = (!prevViewProjValid_[s] || temporalReset_) ? 1u : 0u;
+    push.params[0] = 1.0f / static_cast<float>(std::max(ptSampleCount_, 1));
+    // Tolerance as a FRACTION of view distance rather than an absolute one:
+    // too tight and every pixel fails the test so nothing is ever reused; too
+    // loose and a chip's history bleeds onto the board behind it. Relative
+    // keeps that balance at any board size and any zoom.
+    push.params[1] = 0.01f;
+    push.params[2] = static_cast<float>(std::max(temporalMaxFrames_, 1));
+    for (int i = 0; i < 3; ++i) push.eye[i] = rayEye_[i];
+    vkCmdPushConstants(cmd, rpPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof(push), &push);
+    vkCmdDispatch(cmd, (sceneExtent_.width + 7) / 8,
+                  (sceneExtent_.height + 7) / 8, 1);
+
+    // Feed this frame back as next frame's history. A copy rather than a
+    // ping-pong: reading and writing one image in a single dispatch is a
+    // hazard, and at this size the copy is a fraction of a millisecond.
+    {
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT |
+                           VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.memoryBarrierCount = 1;
+        d.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &d);
+    }
+
+    VkImageCopy region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.extent = {sceneExtent_.width, sceneExtent_.height, 1};
+    vkCmdCopyImage(cmd, ptTemporal_.handle, VK_IMAGE_LAYOUT_GENERAL,
+                   histColour_[s].handle, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    vkCmdCopyImage(cmd, ptPosition_.handle, VK_IMAGE_LAYOUT_GENERAL,
+                   histPos_[s].handle, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+
+    {
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.memoryBarrierCount = 1;
+        d.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &d);
+    }
+
+    std::memcpy(prevViewProj_[s], viewProj, sizeof(prevViewProj_[s]));
+    prevViewProjValid_[s] = true;
+    temporalReset_ = false;
+}
 
 void Renderer::createGpuDenoise() {
     if (!rtSupported_) return;
@@ -2131,13 +2403,21 @@ void Renderer::recordGpuDenoise(VkCommandBuffer cmd) {
     int passes = std::clamp(gpuDenoisePasses_, 1, 5);
     if (passes % 2 == 0) ++passes;
 
+    // With temporal reuse on, the chain starts from the BLENDED image rather
+    // than this frame's raw accumulation -- that is the whole point, and
+    // filtering the raw samples instead would throw the history away.
+    const bool fromTemporal =
+        temporalSlot_ >= 0 && dnTemporalSet_ != VK_NULL_HANDLE &&
+        ptTemporal_.handle != VK_NULL_HANDLE;
+
     for (int p = 0; p < passes; ++p) {
         // Set 0 first, then alternate 1 and 2. p=0 -> 0, 1 -> 1, 2 -> 2,
         // 3 -> 1, 4 -> 2: always finishing on a set that writes ptDenoised_.
         const int set = p == 0 ? 0 : (p % 2 == 1 ? 1 : 2);
+        const VkDescriptorSet bound =
+            (p == 0 && fromTemporal) ? dnTemporalSet_ : dnSets_[set];
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                dnPipelineLayout_, 0, 1, &dnSets_[set], 0,
-                                nullptr);
+                                dnPipelineLayout_, 0, 1, &bound, 0, nullptr);
 
         DnPush push{};
         push.dim[0] = sceneExtent_.width;
@@ -2165,7 +2445,8 @@ void Renderer::recordGpuDenoise(VkCommandBuffer cmd) {
         // Only the first pass sees the raw accumulation sum.
         const float invSamples =
             1.0f / static_cast<float>(std::max(ptSampleCount_, 1));
-        push.sigma[3] = p == 0 ? invSamples : 1.0f;
+        // ptTemporal_ already holds an average, so it needs no divide either.
+        push.sigma[3] = (p == 0 && !fromTemporal) ? invSamples : 1.0f;
         // The guides are sums on EVERY pass -- unlike the colour, which is only
         // a sum on the first, since later passes read an already-averaged
         // image. So this divide does not turn off after pass 0.
@@ -3848,6 +4129,7 @@ void Renderer::blitSceneToImage(VkImage dst, uint32_t dstWidth,
 bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
                          const std::function<void(VkCommandBuffer)>& drawUi) {
     vkWaitForFences(device_.handle, 1, &inFlight_[frame_], VK_TRUE, UINT64_MAX);
+    std::memcpy(curViewProj_, viewProj, sizeof(curViewProj_));
 
     // Offscreen: render the scene and stop. No swapchain image is acquired,
     // nothing is blitted to the window, nothing is presented. VR uses this for

@@ -1,0 +1,100 @@
+#version 450
+
+// Temporal reprojection: reuse the previous frame's result for pixels that
+// still show the same point in the world.
+//
+// This is the piece that makes path tracing possible on a headset. Tracing 128
+// samples a frame is a slideshow; tracing a handful and REUSING what was
+// already computed gets the same effective count for a fraction of the cost.
+// The desktop achieves it by holding the camera still and accumulating in
+// screen space, which is only valid while the camera does not move. A head
+// always moves. So instead of assuming a pixel still means the same thing,
+// this works out where its world point WAS on screen last frame and fetches
+// the history from there -- correct however far you have moved.
+//
+// It also fixes the crawling. Independent frames each carry a different random
+// noise pattern, so whatever the spatial filter cannot remove changes shape
+// every frame and the image appears to swim. Reusing history makes the noise
+// itself stop changing, which is what actually settles the picture.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D curColour;
+layout(set = 0, binding = 1, rgba32f) uniform readonly image2D curPos;
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D curNormal;
+layout(set = 0, binding = 3, rgba32f) uniform readonly image2D histColour;
+layout(set = 0, binding = 4, rgba32f) uniform readonly image2D histPos;
+layout(set = 0, binding = 5, rgba32f) uniform writeonly image2D outColour;
+
+layout(push_constant) uniform Push {
+    mat4 prevViewProj;  // world(mm) -> clip, as it was LAST frame
+    uvec4 dim;          // x width, y height, z reset (1 = ignore history)
+    // x = 1/samples (curColour and curNormal are running sums)
+    // y = position tolerance as a FRACTION of view distance
+    // z = max history frames
+    vec4 params;
+    vec3 eye;           // viewpoint, same space as the position AOV
+} pc;
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.dim.x) || px.y >= int(pc.dim.y)) return;
+
+    const float invSamples = pc.params.x;
+    const vec3 cur = imageLoad(curColour, px).rgb * invSamples;
+    const vec4 pos = imageLoad(curPos, px);
+
+    // Sky, or the history has been invalidated wholesale (the board moved, the
+    // scene changed). Nothing to reuse.
+    if (pos.w < 0.5 || pc.dim.z != 0u) {
+        imageStore(outColour, px, vec4(cur, 1.0));
+        return;
+    }
+
+    // Where this world point sat on screen last frame.
+    const vec4 clip = pc.prevViewProj * vec4(pos.xyz, 1.0);
+    if (clip.w <= 0.0) {                      // behind the previous viewpoint
+        imageStore(outColour, px, vec4(cur, 1.0));
+        return;
+    }
+    const vec2 ndc = clip.xy / clip.w;
+    const vec2 uv = ndc * 0.5 + 0.5;
+    const ivec2 prev = ivec2(uv * vec2(pc.dim.xy));
+    if (prev.x < 0 || prev.y < 0 || prev.x >= int(pc.dim.x) ||
+        prev.y >= int(pc.dim.y)) {            // moved off screen
+        imageStore(outColour, px, vec4(cur, 1.0));
+        return;
+    }
+
+    // DISOCCLUSION TEST, and everything rests on it.
+    //
+    // A pixel can reproject to a perfectly valid screen position that shows a
+    // DIFFERENT surface -- the board behind a chip, revealed as you move. Its
+    // history belongs to the chip, and blending it in drags the chip's colour
+    // across the newly-visible board: a smear trailing every object. So the
+    // history is only trusted when the point stored there really is the point
+    // being shaded now, within a tolerance scaled to the board.
+    // Tolerance scales with how far away the point is, rather than being a
+    // fixed distance. One pixel covers more world at range, so a fixed
+    // threshold would be far too strict close up and far too slack out at the
+    // edges -- and it would need retuning for every board size.
+    const vec4 hp = imageLoad(histPos, prev);
+    const float tol = pc.params.y * max(distance(pos.xyz, pc.eye), 1.0e-3);
+    const bool sameSurface = hp.w > 0.5 && distance(hp.xyz, pos.xyz) < tol;
+
+    if (!sameSurface) {
+        // No usable history: this pixel starts again from one frame's samples.
+        // It will be noisy for a few frames, and that is correct -- inventing
+        // history here is exactly what produces trails.
+        imageStore(outColour, px, vec4(cur, 1.0));
+        return;
+    }
+
+    const vec4 hist = imageLoad(histColour, prev);
+    // .a counts how many frames this pixel has been accumulating. Capping it
+    // bounds how far back the average reaches: an unbounded average would take
+    // a second to respond to a lighting change, and a short one would barely
+    // denoise. The cap IS the quality/latency dial.
+    const float n = min(hist.a + 1.0, pc.params.z);
+    const vec3 blended = mix(hist.rgb, cur, 1.0 / n);
+    imageStore(outColour, px, vec4(blended, n));
+}

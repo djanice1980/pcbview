@@ -44,6 +44,16 @@ layout(std430, set = 0, binding = 4) readonly buffer Mats { Mat mats[]; };
 layout(rgba32f, set = 0, binding = 5) uniform image2D accumImg;
 layout(rgba32f, set = 0, binding = 6) uniform image2D albedoImg;
 layout(rgba32f, set = 0, binding = 7) uniform image2D normalImg;
+// First-hit WORLD POSITION AOV. xyz = where the camera ray landed, w = 1 when
+// it hit anything at all and 0 for sky.
+//
+// This is what temporal reuse is built on: to reuse the previous frame's
+// result for a pixel you must know which point in the world that pixel shows,
+// so you can work out where the same point sat on screen last frame. Unlike
+// the colour and the other guides this is NOT accumulated -- averaging the
+// positions of samples that landed on different surfaces would place the
+// result in the empty space between them.
+layout(rgba32f, set = 0, binding = 13) uniform image2D positionImg;
 
 layout(push_constant) uniform Push {
     vec4 eye;    // xyz eye,      w = sampleIndex (0 overwrites the accum buffer)
@@ -346,7 +356,14 @@ void main() {
         if (rayQueryGetIntersectionTypeEXT(rq, true) ==
             gl_RayQueryCommittedIntersectionNoneEXT) {
             radiance += throughput * sky(dir);
-            if (depth == 0) { firstAlbedo = sky(dir); firstNormal = -dir; }
+            if (depth == 0) {
+                firstAlbedo = sky(dir);
+                firstNormal = -dir;
+                // Sky: no world point to reuse, so mark it as a miss. Anything
+                // reprojecting into this pixel has to start fresh.
+                if (sampleIndex == 0u)
+                    imageStore(positionImg, ivec2(px), vec4(0.0));
+            }
             break;
         }
 
@@ -452,6 +469,10 @@ void main() {
             if (coatT < tHit - 1.0e-4) ga = mix(ga, coatAlbedo, coatAlpha);
             firstAlbedo = ga;
             firstNormal = n;
+            // Sample 0 only: this is a POSITION, and the mean of two points on
+            // different surfaces is a point on neither.
+            if (sampleIndex == 0u)
+                imageStore(positionImg, ivec2(px), vec4(p, 1.0));
         }
 
         // Next-event estimation: direct sun, diffuse PLUS a specular glint. The
