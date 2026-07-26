@@ -1419,6 +1419,36 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         e.eye[0] = eyeMm.x;
         e.eye[1] = eyeMm.y;
         e.eye[2] = eyeMm.z;
+
+        // The same frustum again, as a ray basis for the path tracer. invPlace
+        // is rotation times a uniform scale, so rotating the eye's axes through
+        // it and renormalising gives the board-space directions.
+        const glm::mat3 toBoard(invPlace);
+        const glm::quat q(views[i].pose.orientation.w, views[i].pose.orientation.x,
+                          views[i].pose.orientation.y, views[i].pose.orientation.z);
+        const glm::vec3 f =
+            glm::normalize(toBoard * (q * glm::vec3(0.0f, 0.0f, -1.0f)));
+        const glm::vec3 r =
+            glm::normalize(toBoard * (q * glm::vec3(1.0f, 0.0f, 0.0f)));
+        const glm::vec3 u =
+            glm::normalize(toBoard * (q * glm::vec3(0.0f, 1.0f, 0.0f)));
+
+        const float tL = std::tan(views[i].fov.angleLeft);
+        const float tR = std::tan(views[i].fov.angleRight);
+        const float tU = std::tan(views[i].fov.angleUp);
+        const float tD = std::tan(views[i].fov.angleDown);
+        // Centre of the frustum, which is NOT the eye's forward axis: these
+        // lenses sit off the panel centres, so eye 0's cone points about 9
+        // degrees left of straight ahead and eye 1's the same to the right.
+        const glm::vec3 centre =
+            f + r * ((tR + tL) * 0.5f) + u * ((tU + tD) * 0.5f);
+        const glm::vec3 halfR = r * ((tR - tL) * 0.5f);
+        const glm::vec3 halfU = u * ((tU - tD) * 0.5f);
+        for (int k = 0; k < 3; ++k) {
+            e.fwd[k] = centre[k];
+            e.right[k] = halfR[k];
+            e.up[k] = halfU[k];
+        }
         eyes->push_back(e);
     }
     projDumped = true;

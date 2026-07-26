@@ -222,6 +222,13 @@ void VulkanWindow::stepVr() {
             // eye's asymmetric frustum, aspect included. That override exists
             // for the desktop projection path, which is bypassed here.
             renderer_->setCaptureExtent(e.width, e.height);
+            // The path tracer ignores viewProj entirely -- it traces from a ray
+            // basis, and the only place that basis was ever set is the desktop
+            // render path. So traced VR was rendering the DESKTOP camera's
+            // direction and zoom into both eyes, with no head tracking, while
+            // the matrices this loop hands over were used by the raster path
+            // alone. Set it per eye, from that eye's own frustum.
+            renderer_->setRayCamera(e.eye, e.fwd, e.right, e.up, false);
             renderer_->drawFrame(e.viewProj, e.eye);
             vr_->submitEye(static_cast<int>(i), *renderer_);
         }

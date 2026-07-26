@@ -108,9 +108,21 @@ public:
     // straight to clip space, so the renderer needs no special case; `eye` is
     // the viewpoint back in those same millimetres, which is what the lighting
     // rig wants.
+    // What one eye needs. `viewProj` serves the raster path; `fwd`/`right`/`up`
+    // serve the PATH TRACER, which never looks at a matrix -- it builds rays as
+    // fwd + ndc.x*right - ndc.y*up and so needs the frustum as a basis instead.
+    //
+    // That ray model is symmetric about fwd, and a VR frustum is not, so the
+    // frustum's centre offset is folded into fwd and right/up carry only the
+    // half-extents. Without this the tracer falls back on whatever camera the
+    // desktop window last set -- which is how path-traced VR ended up showing
+    // the desktop's zoom, with no head tracking at all.
     struct Eye {
         float viewProj[16];
         float eye[3];
+        float fwd[3];
+        float right[3];
+        float up[3];
         uint32_t width = 0, height = 0;
     };
 
