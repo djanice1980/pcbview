@@ -3498,6 +3498,22 @@ void Renderer::blitSceneToImage(VkImage dst, uint32_t dstWidth,
     barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
             VK_ACCESS_TRANSFER_WRITE_BIT);
 
+    // One shot: the blit maps the WHOLE source onto the WHOLE destination, so
+    // any disagreement between sceneExtent_ and the eye is a silent rescale --
+    // and a scene still sized to the desktop window would be stretched to the
+    // eye's shape, which reads as magnification through the lenses.
+    static bool blitDumped = false;
+    if (!blitDumped) {
+        blitDumped = true;
+        std::printf("vr-blit: scene %ux%u -> eye %ux%u  (equal: %s)\n",
+                    sceneExtent_.width, sceneExtent_.height, dstWidth, dstHeight,
+                    (sceneExtent_.width == dstWidth &&
+                     sceneExtent_.height == dstHeight)
+                        ? "yes"
+                        : "NO -- rescaled");
+        std::fflush(stdout);
+    }
+
     VkImageBlit region{};
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.srcOffsets[1] = {static_cast<int32_t>(sceneExtent_.width),
