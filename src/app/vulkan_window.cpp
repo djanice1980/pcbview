@@ -245,8 +245,10 @@ void VulkanWindow::stepVr() {
         if (vrOwnsRenderer_) {
             vrOwnsRenderer_ = false;
             renderer_->setOffscreenOnly(false);
-            // Back to the interactive sample ramp for a mouse camera.
+            // Back to the interactive sample ramp and OIDN for a mouse camera:
+            // the desktop can afford the round trip and gets the better result.
             renderer_->setPathTraceBatch(0);
+            renderer_->setGpuDenoisePasses(0);
             renderer_->setRenderMode(ptEnabled_ && ptAvailable()
                                          ? vk::RenderMode::PathTraced
                                          : vk::RenderMode::Raster);
@@ -281,6 +283,18 @@ void VulkanWindow::stepVr() {
             return (ok && n >= 1 && n <= 256) ? n : 16;
         }();
         renderer_->setPathTraceBatch(allowPt ? spp : 0);
+
+        // GPU a-trous cleanup on top, so a modest sample count can look like a
+        // large one. OIDN is not an option here: it round-trips through host
+        // memory, about 200 MB per eye per frame at this resolution, which is
+        // why it is asynchronous and why it can never serve a headset.
+        // PCBVIEW_VR_DENOISE=0 disables it for comparison.
+        static const int dnPasses = [] {
+            bool ok = false;
+            const int n = qgetenv("PCBVIEW_VR_DENOISE").toInt(&ok);
+            return (ok && n >= 0 && n <= 5) ? n : 5;
+        }();
+        renderer_->setGpuDenoisePasses(allowPt ? dnPasses : 0);
         // Held every frame: initialisation applies the saved ptEnabled_ after
         // the session is created and would otherwise overwrite this, and the
         // render-mode menu can change it mid-session. setRenderMode returns

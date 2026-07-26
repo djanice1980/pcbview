@@ -324,6 +324,15 @@ public:
     // frame stands alone. 0 restores the heuristic.
     void setPathTraceBatch(int samples) { ptBatchOverride_ = samples; }
 
+    // A-trous wavelet passes run on the GPU after tracing. 0 disables it.
+    //
+    // Each pass doubles its tap spacing, so N passes reach a 2^N neighbourhood
+    // for N*25 taps. Four or five is the usual sweet spot. This exists because
+    // OIDN cannot serve a headset at any sample count -- it round-trips through
+    // host memory, roughly 200 MB per eye per frame at eye resolution -- while
+    // this never leaves the GPU.
+    void setGpuDenoisePasses(int passes) { gpuDenoisePasses_ = passes; }
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the
@@ -723,6 +732,23 @@ private:
     }
     // Rebuild the path-tracer images at the current scene extent.
     void recreatePtImagesLive();
+
+    // --- GPU a-trous denoise ------------------------------------------------
+    // Ping-pong scratch, plus three descriptor sets wiring the images in the
+    // three ways the passes need: first reads the accumulation SUM (and scales
+    // by 1/samples), then alternate between the two scratch targets. An odd
+    // number of passes therefore always finishes in ptDenoised_, which is what
+    // the tonemap already knows how to show.
+    Image ptDenoiseTmp_;
+    VkDescriptorSetLayout dnSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout dnPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline dnPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool dnPool_ = VK_NULL_HANDLE;
+    VkDescriptorSet dnSets_[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    int gpuDenoisePasses_ = 0;
+    void createGpuDenoise();
+    void updateGpuDenoiseDescriptors();
+    void recordGpuDenoise(VkCommandBuffer cmd);
 
     VkDescriptorSetLayout ptSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout tonemapSetLayout_ = VK_NULL_HANDLE;

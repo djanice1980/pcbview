@@ -30,6 +30,9 @@ const uint32_t kBoardFragRt[] =
 const uint32_t kPathTrace[] =
 #include "shaders/pathtrace.comp.inc"
     ;
+const uint32_t kDenoiseComp[] =
+#include "shaders/denoise.comp.inc"
+    ;
 const uint32_t kFullscreenVert[] =
 #include "shaders/fullscreen.vert.inc"
     ;
@@ -781,6 +784,8 @@ void Renderer::createPathTracer() {
     vkDestroyShaderModule(device_.handle, vs, nullptr);
     vkDestroyShaderModule(device_.handle, fs, nullptr);
 
+    createGpuDenoise();
+
     // OIDN device for denoising. DEFAULT picks the fastest available -- a GPU
     // (CUDA on NVIDIA, HIP on AMD) when its device DLL + driver are present, else
     // the CPU. If a GPU device fails to commit, fall back to CPU so denoising
@@ -846,6 +851,17 @@ void Renderer::destroyPathTracer() {
     destroyImage(ptNormal_);
     destroyImage(ptNetPhase_);
     destroyImage(ptDenoised_);
+    destroyImage(ptDenoiseTmp_);
+    if (dnPipeline_) vkDestroyPipeline(device_.handle, dnPipeline_, nullptr);
+    if (dnPipelineLayout_)
+        vkDestroyPipelineLayout(device_.handle, dnPipelineLayout_, nullptr);
+    if (dnPool_) vkDestroyDescriptorPool(device_.handle, dnPool_, nullptr);
+    if (dnSetLayout_)
+        vkDestroyDescriptorSetLayout(device_.handle, dnSetLayout_, nullptr);
+    dnPipeline_ = VK_NULL_HANDLE;
+    dnPipelineLayout_ = VK_NULL_HANDLE;
+    dnPool_ = VK_NULL_HANDLE;
+    dnSetLayout_ = VK_NULL_HANDLE;
 }
 
 void Renderer::updatePathTraceDescriptors() {
@@ -1073,8 +1089,8 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
 
     // First use: UNDEFINED -> GENERAL for the storage images.
     if (!ptImagesInitialised_) {
-        Image* imgs[] = {&ptAccum_, &ptAlbedo_, &ptNormal_, &ptNetPhase_,
-                         &ptDenoised_};
+        Image* imgs[] = {&ptAccum_,    &ptAlbedo_,     &ptNormal_,
+                         &ptNetPhase_, &ptDenoised_,   &ptDenoiseTmp_};
         // Counts derived from the array, never written twice: adding an image
         // here while a hand-written count stayed behind silently dropped the
         // LAST entry from the transition, leaving it UNDEFINED for the tonemap
@@ -1186,6 +1202,15 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
         b.image = ptAccum_.handle;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         barrier(&b, 1);
+    }
+
+    // Clean up this frame's samples on the GPU, before the tonemap reads them.
+    // The result lands in ptDenoised_ already averaged, which is exactly what
+    // the tonemap's denoised path expects, so marking it valid is all that is
+    // needed to display it.
+    if (gpuDenoisePasses_ > 0 && ptSampleCount_ > 0) {
+        recordGpuDenoise(cmd);
+        ptDenoisedValid_ = true;
     }
 
     // Tonemap into sceneColor_ (an SRGB attachment -> gamma on store).
@@ -1947,9 +1972,167 @@ void Renderer::recreatePtImagesLive() {
                               VK_IMAGE_ASPECT_COLOR_BIT);
     ptDenoised_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
                               VK_IMAGE_ASPECT_COLOR_BIT);
+    // A-trous ping-pong scratch.
+    destroyImage(ptDenoiseTmp_);
+    ptDenoiseTmp_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
     ptImagesInitialised_ = false;  // need the UNDEFINED->GENERAL transition
     ptDenoisedValid_ = false;
     resetAccumulation();           // resolution changed; restart accumulation
+    updateGpuDenoiseDescriptors();
+}
+
+namespace {
+// Matches the push block in denoise.comp.
+struct DnPush {
+    uint32_t dim[4];   // w, h, step width, pass index
+    float sigma[4];    // normal power, luminance, albedo, input scale
+};
+}  // namespace
+
+void Renderer::createGpuDenoise() {
+    if (!rtSupported_) return;
+
+    VkDescriptorSetLayoutBinding b[4]{};
+    for (uint32_t i = 0; i < 4; ++i) {
+        b[i].binding = i;
+        b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo li{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.bindingCount = 4;
+    li.pBindings = b;
+    check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr,
+                                      &dnSetLayout_),
+          "denoise set layout");
+
+    // Three sets, four storage images each.
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12};
+    VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pi.maxSets = 3;
+    pi.poolSizeCount = 1;
+    pi.pPoolSizes = &ps;
+    check(vkCreateDescriptorPool(device_.handle, &pi, nullptr, &dnPool_),
+          "denoise pool");
+
+    const VkDescriptorSetLayout layouts[3] = {dnSetLayout_, dnSetLayout_,
+                                              dnSetLayout_};
+    VkDescriptorSetAllocateInfo ai{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = dnPool_;
+    ai.descriptorSetCount = 3;
+    ai.pSetLayouts = layouts;
+    check(vkAllocateDescriptorSets(device_.handle, &ai, dnSets_),
+          "denoise sets");
+
+    VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DnPush)};
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pl.setLayoutCount = 1;
+    pl.pSetLayouts = &dnSetLayout_;
+    pl.pushConstantRangeCount = 1;
+    pl.pPushConstantRanges = &pcr;
+    check(vkCreatePipelineLayout(device_.handle, &pl, nullptr,
+                                 &dnPipelineLayout_),
+          "denoise pipeline layout");
+
+    VkShaderModule cs =
+        makeModule(device_.handle, kDenoiseComp, sizeof(kDenoiseComp));
+    VkComputePipelineCreateInfo cpi{
+        VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = cs;
+    cpi.stage.pName = "main";
+    cpi.layout = dnPipelineLayout_;
+    check(vkCreateComputePipelines(device_.handle, VK_NULL_HANDLE, 1, &cpi,
+                                   nullptr, &dnPipeline_),
+          "denoise pipeline");
+    vkDestroyShaderModule(device_.handle, cs, nullptr);
+}
+
+void Renderer::updateGpuDenoiseDescriptors() {
+    if (!dnSets_[0] || ptAccum_.view == VK_NULL_HANDLE ||
+        ptDenoiseTmp_.view == VK_NULL_HANDLE)
+        return;
+
+    // Pass 0 reads the accumulation SUM; the rest alternate between the two
+    // scratch images. Ending on set 2 always leaves the result in ptDenoised_.
+    const VkImageView chain[3][2] = {
+        {ptAccum_.view, ptDenoised_.view},
+        {ptDenoised_.view, ptDenoiseTmp_.view},
+        {ptDenoiseTmp_.view, ptDenoised_.view},
+    };
+
+    for (int s = 0; s < 3; ++s) {
+        VkDescriptorImageInfo info[4] = {
+            {VK_NULL_HANDLE, chain[s][0], VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, chain[s][1], VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
+        };
+        VkWriteDescriptorSet w[4]{};
+        for (int i = 0; i < 4; ++i) {
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[i].dstSet = dnSets_[s];
+            w[i].dstBinding = static_cast<uint32_t>(i);
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            w[i].pImageInfo = &info[i];
+        }
+        vkUpdateDescriptorSets(device_.handle, 4, w, 0, nullptr);
+    }
+}
+
+void Renderer::recordGpuDenoise(VkCommandBuffer cmd) {
+    if (gpuDenoisePasses_ <= 0 || !dnPipeline_ || ptSampleCount_ <= 0) return;
+    if (ptDenoiseTmp_.handle == VK_NULL_HANDLE) return;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dnPipeline_);
+
+    const uint32_t gx = (sceneExtent_.width + 7) / 8;
+    const uint32_t gy = (sceneExtent_.height + 7) / 8;
+    // Odd count so the last pass writes ptDenoised_ (sets 0 and 2 both do).
+    int passes = std::clamp(gpuDenoisePasses_, 1, 5);
+    if (passes % 2 == 0) ++passes;
+
+    for (int p = 0; p < passes; ++p) {
+        // Set 0 first, then alternate 1 and 2. p=0 -> 0, 1 -> 1, 2 -> 2,
+        // 3 -> 1, 4 -> 2: always finishing on a set that writes ptDenoised_.
+        const int set = p == 0 ? 0 : (p % 2 == 1 ? 1 : 2);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                dnPipelineLayout_, 0, 1, &dnSets_[set], 0,
+                                nullptr);
+
+        DnPush push{};
+        push.dim[0] = sceneExtent_.width;
+        push.dim[1] = sceneExtent_.height;
+        push.dim[2] = 1u << p;   // tap spacing doubles each pass
+        push.dim[3] = static_cast<uint32_t>(p);
+        push.sigma[0] = 64.0f;   // normal power: sharp rejection across edges
+        push.sigma[1] = 4.0f;    // luminance
+        push.sigma[2] = 0.20f;   // albedo
+        // Only the first pass sees the raw accumulation sum.
+        push.sigma[3] =
+            p == 0 ? 1.0f / static_cast<float>(std::max(ptSampleCount_, 1))
+                   : 1.0f;
+        vkCmdPushConstants(cmd, dnPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(push), &push);
+        vkCmdDispatch(cmd, gx, gy, 1);
+
+        // Each pass reads what the previous wrote.
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                          VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.memoryBarrierCount = 1;
+        d.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &d);
+    }
 }
 
 void Renderer::destroySceneTargets() {

@@ -1,0 +1,90 @@
+#version 450
+
+// Edge-aware a-trous wavelet denoise, run entirely on the GPU.
+//
+// Why this and not OIDN. The existing OIDN path is a HOST round trip: the
+// accumulation and its two guide images are copied to mapped buffers, filtered
+// on the CPU side, and copied back. At eye resolution that is roughly 200 MB
+// across PCIe per eye per frame before the network does any work, which is why
+// it runs asynchronously over several frames and why it can never serve a
+// headset. This never leaves the GPU and costs well under a millisecond a pass.
+//
+// The filter is Dammertz et al.'s a-trous edge-avoiding wavelet: a 5x5 B-spline
+// kernel applied repeatedly with the tap spacing DOUBLING each pass, so N passes
+// reach a 2^N-wide neighbourhood for N*25 taps rather than 4^N. Taps are
+// rejected when they disagree with the centre pixel about which surface they
+// are on, using the first-hit normal and albedo the tracer already writes as
+// AOVs -- that is what keeps component edges and silkscreen sharp while the
+// noise between them averages away.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D srcImg;
+layout(set = 0, binding = 1, rgba32f) uniform writeonly image2D dstImg;
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D albedoImg;
+layout(set = 0, binding = 3, rgba32f) uniform readonly image2D normalImg;
+
+layout(push_constant) uniform Push {
+    uvec4 dim;      // x width, y height, z step width, w pass index
+    vec4 sigma;     // x normal power, y luminance, z albedo, w input scale
+} pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.dim.x) || px.y >= int(pc.dim.y)) return;
+
+    // `scale` folds the accumulation divide into the first pass: pass 0 reads
+    // the running radiance SUM and needs 1/samples, later passes read an
+    // already-averaged image and pass 1.0.
+    const vec3 centre = imageLoad(srcImg, px).rgb * pc.sigma.w;
+    const vec3 nC = imageLoad(normalImg, px).xyz;
+    const vec3 aC = imageLoad(albedoImg, px).rgb;
+    const float lC = luma(centre);
+
+    // Background (no geometry hit) has a zero normal. Filtering it against the
+    // board would drag the sky into silhouettes, so leave it alone.
+    if (dot(nC, nC) < 1e-6) {
+        imageStore(dstImg, px, vec4(centre, 1.0));
+        return;
+    }
+
+    const float kernel[5] = float[](0.0625, 0.25, 0.375, 0.25, 0.0625);
+    const int step = int(pc.dim.z);
+
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            const ivec2 q = px + ivec2(dx, dy) * step;
+            if (q.x < 0 || q.y < 0 || q.x >= int(pc.dim.x) ||
+                q.y >= int(pc.dim.y))
+                continue;
+
+            const vec3 cQ = imageLoad(srcImg, q).rgb * pc.sigma.w;
+            const vec3 nQ = imageLoad(normalImg, q).xyz;
+            if (dot(nQ, nQ) < 1e-6) continue;  // never pull sky into geometry
+            const vec3 aQ = imageLoad(albedoImg, q).rgb;
+
+            // Orientation: a high power makes this fall off sharply, so a tap
+            // across a component's edge contributes almost nothing.
+            const float wn = pow(max(dot(nC, nQ), 0.0), pc.sigma.x);
+            // Material: separates copper from mask from silkscreen even where
+            // they are coplanar and share a normal.
+            const float wa = exp(-length(aC - aQ) / pc.sigma.z);
+            // Brightness: preserves genuine lighting detail -- a shadow edge is
+            // a real feature, not noise to be smoothed over.
+            const float wl = exp(-abs(lC - luma(cQ)) / pc.sigma.y);
+
+            const float w = kernel[dx + 2] * kernel[dy + 2] * wn * wa * wl;
+            sum += cQ * w;
+            wsum += w;
+        }
+    }
+
+    // wsum can only reach zero if every tap was rejected, including the centre;
+    // fall back to the centre rather than emitting a black pixel.
+    const vec3 outC = wsum > 1e-8 ? sum / wsum : centre;
+    imageStore(dstImg, px, vec4(outC, 1.0));
+}
