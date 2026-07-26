@@ -1205,6 +1205,50 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     sync.activeActionSets = &active;
     xrSyncActions(s, &sync);
 
+    // Views first, then the anchor, and only THEN the placement matrix.
+    //
+    // This used to run the other way round: `place` was built from anchorPos_
+    // at the top of the function, but anchorPos_ was not captured until after
+    // xrLocateViews further down. So the FIRST frame placed the board 0.6 m in
+    // front of LOCAL's origin rather than in front of the viewer, and every
+    // later frame used an anchor one frame stale. Measured on a real session,
+    // that put the board low and off to one side -- eye 0's centre landed at
+    // ndc +0.002 and eye 1's at -0.678, where the frustum skew alone predicts a
+    // symmetric +/-0.324. The eye-to-eye DIFFERENCE was right (0.680 against a
+    // predicted 0.648), so stereo was never the problem; both eyes were simply
+    // looking at a board that had been parked in the wrong place.
+    uint32_t got = 0;
+    std::vector<XrView> views(chains_->size(), {XR_TYPE_VIEW});
+    {
+        XrViewState vs{XR_TYPE_VIEW_STATE};
+        XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
+        vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        vli.displayTime = displayTime_;
+        vli.space = static_cast<XrSpace>(appSpace_);
+        xrLocateViews(s, &vli, &vs, static_cast<uint32_t>(views.size()), &got,
+                      views.data());
+    }
+
+    // Anchor the board to the viewer on the first located frame, and never
+    // again -- an anchor that updates every frame would drag the board along
+    // with your head, which is the opposite of an object sitting in a room.
+    if (!anchored_ && got >= 2) {
+        anchored_ = true;
+        anchorPos_[0] =
+            (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
+        anchorPos_[1] =
+            (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
+        anchorPos_[2] =
+            (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
+        anchorRot_[0] = views[0].pose.orientation.x;
+        anchorRot_[1] = views[0].pose.orientation.y;
+        anchorRot_[2] = views[0].pose.orientation.z;
+        anchorRot_[3] = views[0].pose.orientation.w;
+        std::printf("vr: board anchored at head (%.2f %.2f %.2f)\n",
+                    anchorPos_[0], anchorPos_[1], anchorPos_[2]);
+        std::fflush(stdout);
+    }
+
     const glm::mat4 place = placement(
         placeCentre_, placeScale_,
         glm::vec3(anchorPos_[0], anchorPos_[1], anchorPos_[2]),
@@ -1235,41 +1279,11 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     }
 
     eyes->clear();
-    if (!shouldRender_) return false;
-
-    uint32_t got = 0;
-    std::vector<XrView> views(chains_->size(), {XR_TYPE_VIEW});
-    XrViewState vs{XR_TYPE_VIEW_STATE};
-    XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
-    vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-    vli.displayTime = displayTime_;
-    vli.space = static_cast<XrSpace>(appSpace_);
-    if (XR_FAILED(xrLocateViews(s, &vli, &vs, static_cast<uint32_t>(views.size()),
-                                &got, views.data())))
-        return false;
+    if (!shouldRender_ || got < 2) return false;
 
     // Keep the poses actually rendered with. endFrame used to re-locate, which
     // is wrong on principle -- the layer must describe the frame that was
     // drawn, not a fresh prediction -- and wasteful.
-    // Anchor the board to the viewer on the first focused frame, and never
-    // again -- an anchor that updates every frame would drag the board along
-    // with your head, which is the opposite of an object sitting in a room.
-    if (!anchored_ && got >= 2) {
-        anchored_ = true;
-        anchorPos_[0] =
-            (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
-        anchorPos_[1] =
-            (views[0].pose.position.y + views[1].pose.position.y) * 0.5f;
-        anchorPos_[2] =
-            (views[0].pose.position.z + views[1].pose.position.z) * 0.5f;
-        anchorRot_[0] = views[0].pose.orientation.x;
-        anchorRot_[1] = views[0].pose.orientation.y;
-        anchorRot_[2] = views[0].pose.orientation.z;
-        anchorRot_[3] = views[0].pose.orientation.w;
-        std::printf("vr: board anchored at head (%.2f %.2f %.2f)\n",
-                    anchorPos_[0], anchorPos_[1], anchorPos_[2]);
-        std::fflush(stdout);
-    }
 
     // One-shot dump of what the two eyes actually got. Divergent views and a
     // bad placement look identical through the lenses, and the numbers tell
