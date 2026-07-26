@@ -27,6 +27,7 @@
 
 #include "geom/tessellate.h"
 #include "input/gamepad.h"
+#include "xr/xr_system.h"
 #include "render/common/device.h"
 #include "render/vk/renderer.h"
 
@@ -342,6 +343,12 @@ private:
     // stick click you must keep held while pushing that same stick is unusable.
     bool objectDrag_ = false;
     bool padObjectMode_ = false;
+    // VR. Non-null only when PCBVIEW_VR was set AND a headset answered; it is
+    // created before the Vulkan instance because the runtime has to wrap that
+    // creation. Absent, everything below behaves as an ordinary desktop
+    // session.
+    std::unique_ptr<xr::System> xrSystem_;
+
     // Showcase routing: the orientation actually rendered from while active,
     // and the last camera orientation already handed to the board.
     bool routeToBoard_ = false;

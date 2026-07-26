@@ -413,6 +413,24 @@ void VulkanWindow::initialise() {
     // The instance is created ONCE and kept for the window's lifetime; a device
     // switch may recreate the platform surface (see setPreferredGpu) and re-enter
     // initialise(), but must not build a second instance.
+    // VR has to be brought up BEFORE the Vulkan instance exists: the runtime
+    // wraps instance and device creation to inject its own extensions, and it
+    // names the physical device. See xr_system.h -- the ordering is forced by
+    // OpenXR, not chosen. Failing to find a headset is an ordinary outcome, not
+    // an error: the app simply carries on as a desktop session.
+    if (qEnvironmentVariableIsSet("PCBVIEW_VR") && !xrSystem_ &&
+        instance_ == VK_NULL_HANDLE) {
+        xrSystem_ = std::make_unique<xr::System>();
+        if (xrSystem_->start()) {
+            xrSystem_->installHooks();
+            std::printf("vr: %s -- Vulkan will be created through the runtime\n",
+                        xrSystem_->headsetName());
+            std::fflush(stdout);
+        } else {
+            xrSystem_.reset();
+        }
+    }
+
     if (instance_ == VK_NULL_HANDLE) {
         // Surface extensions for this platform. Qt will create the surface, but
         // the instance is ours, so we must enable them ourselves.
@@ -480,6 +498,11 @@ void VulkanWindow::initialise() {
 }
 
 void VulkanWindow::createDeviceAndRenderer() {
+    // In VR the runtime names the GPU, and a session against any other one
+    // cannot be created. Asking BEFORE selectGpu is what lets that outrank the
+    // saved preference -- see setRequiredGpu.
+    if (xrSystem_) xrSystem_->adoptRuntimeGpu(instance_);
+
     // Enumerate every usable GPU (for the picker) and choose one by preference,
     // falling back to discrete + RT-ready.
     const auto gpus = enumerateGpus(instance_);
@@ -499,6 +522,14 @@ void VulkanWindow::createDeviceAndRenderer() {
     }
 
     device_ = createDevice(*pick, {VK_KHR_SWAPCHAIN_EXTENSION_NAME});
+    // The hooks have done their job; leaving them installed would silently
+    // route a later GPU switch through the runtime too.
+    if (xrSystem_) {
+        xrSystem_->removeHooks();
+        std::printf("vr: vulkan device created through the runtime on %s\n",
+                    pick->name.c_str());
+        std::fflush(stdout);
+    }
 
     const qreal dpr = devicePixelRatio();
     renderer_ = std::make_unique<vk::Renderer>(
