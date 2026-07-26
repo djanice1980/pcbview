@@ -174,6 +174,45 @@ VulkanWindow::VulkanWindow(const geom::BoardMesh* mesh) : mesh_(mesh) {
     }
 }
 
+void VulkanWindow::stepVr() {
+    if (!vr_ || !renderer_ || !mesh_) return;
+
+    // Where the board sits in the room. Refreshed each frame so loading a
+    // different board re-places it rather than leaving it the old size.
+    const auto& b = mesh_->bounds;
+    const float centre[3] = {
+        static_cast<float>((b.min[0] + b.max[0]) * 0.5),
+        static_cast<float>((b.min[1] + b.max[1]) * 0.5),
+        static_cast<float>((b.min[2] + b.max[2]) * 0.5)};
+    const float span = static_cast<float>(
+        std::max(b.max[0] - b.min[0], b.max[1] - b.min[1]));
+    vr_->setBoardPlacement(centre, span);
+
+    std::vector<xr::VrSession::Eye> eyes;
+    const bool render = vr_->beginFrame(&eyes);
+    if (!vr_->active()) {  // the runtime ended the session
+        if (vrTimer_) vrTimer_->stop();
+        vr_.reset();
+        return;
+    }
+    if (render) {
+        for (size_t i = 0; i < eyes.size(); ++i) {
+            const xr::VrSession::Eye& e = eyes[i];
+            // The ordinary render path, at this eye's size. setCaptureExtent
+            // already decouples the scene target from the window -- it was
+            // built for 4K video capture and does exactly what is needed here.
+            // No aspect override: the runtime's viewProj already carries this
+            // eye's asymmetric frustum, aspect included. That override exists
+            // for the desktop projection path, which is bypassed here.
+            renderer_->setCaptureExtent(e.width, e.height);
+            renderer_->drawFrame(e.viewProj, e.eye);
+            vr_->submitEye(static_cast<int>(i), *renderer_);
+        }
+    }
+    // Always: xrBeginFrame is owed an xrEndFrame even on a frame we skipped.
+    vr_->endFrame();
+}
+
 void VulkanWindow::stepGamepad() {
     // The video recorder owns the clock while paused; a stray stick must not
     // be able to shift the camera midway through a render.
@@ -536,6 +575,25 @@ void VulkanWindow::createDeviceAndRenderer() {
         device_, surface_, static_cast<uint32_t>(width() * dpr),
         static_cast<uint32_t>(height() * dpr));
     renderer_->setRayTracing(rtEnabled_ && rtAvailable());
+
+    if (xrSystem_) {
+        vr_ = std::make_unique<xr::VrSession>();
+        if (vr_->begin(*xrSystem_, instance_, device_.handle,
+                       device_.gpu.handle, device_.gpu.graphicsQueueFamily,
+                       device_.graphicsQueue)) {
+            // Each eye also presents to the desktop window as a side effect of
+            // going through drawFrame; uncapping stops vsync throttling the
+            // headset down to the monitor's refresh.
+            renderer_->setUncappedPresent(true);
+            vrTimer_ = new QTimer(this);
+            vrTimer_->setInterval(1);  // the runtime does the real pacing
+            connect(vrTimer_, &QTimer::timeout, this, &VulkanWindow::stepVr);
+            vrTimer_->start();
+        } else {
+            vr_.reset();
+        }
+    }
+
     if (qEnvironmentVariableIsSet("PCBVIEW_PT_SPP"))
         renderer_->setMaxSamples(qgetenv("PCBVIEW_PT_SPP").toInt());
     // Headless hook for the internal-resolution slider -- exists because some

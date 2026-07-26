@@ -2,7 +2,13 @@
 
 #include <vulkan/vulkan.h>
 
+#include <vector>
+
 #include "render/common/device.h"
+
+namespace pcbview::vk {
+class Renderer;
+}
 
 namespace pcbview::xr {
 
@@ -83,5 +89,71 @@ int inputTest();
 // directly is a legitimate frame and keeps the test to the XR plumbing rather
 // than dragging the board renderer in.
 int presentTest();
+
+// A live VR session that renders pcbview's board through the ordinary
+// renderer, one eye at a time.
+//
+// Kept separate from System so the device hand-over (which must happen before
+// Vulkan exists) stays independent of the frame loop (which cannot start until
+// the renderer does).
+class VrSession {
+public:
+    ~VrSession();
+    bool begin(System& sys, VkInstance vkInstance, VkDevice device,
+               VkPhysicalDevice gpu, uint32_t queueFamily, VkQueue queue);
+    void end();
+    bool active() const { return session_ != nullptr; }
+
+    // What one eye needs. `viewProj` maps pcbview's WORLD (millimetres)
+    // straight to clip space, so the renderer needs no special case; `eye` is
+    // the viewpoint back in those same millimetres, which is what the lighting
+    // rig wants.
+    struct Eye {
+        float viewProj[16];
+        float eye[3];
+        uint32_t width = 0, height = 0;
+    };
+
+    // Pumps events and waits on the runtime's frame pacing. False means do not
+    // render this frame (not focused, or the session ended -- check active()).
+    bool beginFrame(std::vector<Eye>* eyes);
+    // Hands the renderer's finished scene to the runtime for eye `index`.
+    void submitEye(int index, vk::Renderer& renderer);
+    void endFrame();
+
+    // Where the board sits in the room: how far in front, how high, and how
+    // big across. Millimetres in, metres out.
+    void setBoardPlacement(const float centreMm[3], float spanMm);
+
+    // The grip pose of a controller, in pcbview world millimetres, when one is
+    // tracked. Index 0 = left, 1 = right.
+    bool gripPose(int hand, float outPosMm[3], float outQuat[4]) const;
+
+private:
+    void* session_ = nullptr;
+    void* appSpace_ = nullptr;
+    void* actionSet_ = nullptr;
+    void* gripAction_ = nullptr;
+    void* handSpace_[2] = {nullptr, nullptr};
+    unsigned long long handPath_[2] = {0, 0};
+    void* inst_ = nullptr;
+    unsigned long long sysId_ = 0;
+    struct Chain;
+    std::vector<Chain>* chains_ = nullptr;
+    std::vector<uint32_t> acquired_;
+    long long displayTime_ = 0;
+    bool running_ = false;
+    bool focused_ = false;
+    bool shouldRender_ = false;
+    // xrBeginFrame was called and xrEndFrame is still owed.
+    bool frameOpen_ = false;
+    float placeCentre_[3] = {0, 0, 0};
+    float placeScale_ = 0.001f;   // mm -> m
+    float placeFwd_ = -0.6f;      // metres in front of the origin
+    float placeUp_ = 1.1f;
+    float gripPosMm_[2][3] = {};
+    float gripQuat_[2][4] = {};
+    bool gripTracked_[2] = {false, false};
+};
 
 }  // namespace pcbview::xr

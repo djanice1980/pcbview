@@ -348,6 +348,12 @@ private:
     // creation. Absent, everything below behaves as an ordinary desktop
     // session.
     std::unique_ptr<xr::System> xrSystem_;
+    // The live session and its frame loop. Driven by its own timer rather than
+    // the on-demand render path, because the runtime paces frames (xrWaitFrame
+    // blocks until the headset wants one) and will not wait for a mouse move.
+    std::unique_ptr<xr::VrSession> vr_;
+    QTimer* vrTimer_ = nullptr;
+    void stepVr();
 
     // Showcase routing: the orientation actually rendered from while active,
     // and the last camera orientation already handed to the board.

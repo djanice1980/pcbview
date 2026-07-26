@@ -7,6 +7,13 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <glm/gtc/type_ptr.hpp>
+
+#include "render/vk/renderer.h"
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -489,7 +496,52 @@ int inputTest() {
     return 0;
 }
 
+// ---- VrSession --------------------------------------------------------------
+
+struct VrSession::Chain {
+    XrSwapchain chain = XR_NULL_HANDLE;
+    std::vector<VkImage> images;
+    uint32_t width = 0, height = 0;
+};
+
 namespace {
+
+XrSession asSession(void* p) { return static_cast<XrSession>(p); }
+
+// pcbview's projection convention, made ASYMMETRIC.
+//
+// The desktop path builds an infinite reverse-Z frustum (see
+// infiniteReverseZPerspective): p[0][0]=f/aspect, p[1][1]=f, p[2][3]=-1,
+// p[3][2]=zNear, then flips Y for Vulkan. OpenXR hands back four separate FOV
+// half-angles per eye instead of one symmetric fovY -- VR lenses are not
+// centred -- so the scale terms gain matching OFFSETS. Matching the existing
+// convention exactly matters: a frustum that merely looks reasonable renders
+// plausibly and reads as wrong depth through the lenses.
+//
+// glm is column-major, so p[col][row].
+void projectionFromFov(const XrFovf& fov, float zNear, float out[16]) {
+    const float tanL = std::tan(fov.angleLeft);
+    const float tanR = std::tan(fov.angleRight);
+    const float tanU = std::tan(fov.angleUp);
+    const float tanD = std::tan(fov.angleDown);
+    const float w = tanR - tanL;
+    const float h = tanU - tanD;
+
+    float p[16] = {};  // column-major, all zero
+    p[0] = 2.0f / w;                 // p[0][0]
+    p[5] = 2.0f / h;                 // p[1][1]
+    p[8] = (tanR + tanL) / w;        // p[2][0]  x offset
+    p[9] = (tanU + tanD) / h;        // p[2][1]  y offset
+    p[10] = 0.0f;                    // p[2][2]  infinite far
+    p[11] = -1.0f;                   // p[2][3]
+    p[14] = zNear;                   // p[3][2]  reverse-Z
+    // Vulkan's Y is flipped. clip.y is p[1][1]*y + p[2][1]*z, so BOTH terms
+    // flip -- negating only the scale, as the symmetric path can get away with
+    // because it has no offset, would shear the image off-centre.
+    p[5] = -p[5];
+    p[9] = -p[9];
+    for (int i = 0; i < 16; ++i) out[i] = p[i];
+}
 
 // One eye's swapchain and the Vulkan images behind it.
 struct EyeChain {
@@ -894,6 +946,376 @@ int presentTest() {
     std::printf("\npresent test done (final state %d)\n",
                 static_cast<int>(state));
     return 0;
+}
+
+// ---- VrSession implementation ----------------------------------------------
+
+namespace {
+// Board (millimetres) -> room (metres). Everything the renderer is handed goes
+// through this, so the board arrives in front of the viewer at a sane size
+// instead of being a 50-metre slab centred on their head.
+glm::mat4 placement(const float centre[3], float scale, float fwd, float up) {
+    glm::mat4 m(1.0f);
+    m = glm::translate(m, glm::vec3(0.0f, up, fwd));
+    m = glm::scale(m, glm::vec3(scale));
+    m = glm::translate(m, -glm::vec3(centre[0], centre[1], centre[2]));
+    return m;
+}
+glm::mat4 poseMatrix(const XrPosef& p) {
+    const glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y,
+                      p.orientation.z);
+    return glm::translate(glm::mat4(1.0f),
+                          glm::vec3(p.position.x, p.position.y, p.position.z)) *
+           glm::mat4_cast(q);
+}
+}  // namespace
+
+VrSession::~VrSession() { end(); }
+
+void VrSession::setBoardPlacement(const float centreMm[3], float spanMm) {
+    for (int i = 0; i < 3; ++i) placeCentre_[i] = centreMm[i];
+    // ~35 cm across, whatever the board actually measures.
+    placeScale_ = spanMm > 1.0f ? 0.35f / spanMm : 0.001f;
+}
+
+bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
+                      VkPhysicalDevice gpu, uint32_t queueFamily,
+                      VkQueue /*queue*/) {
+    if (!sys.ready()) return false;
+    inst_ = sys.rawInstance();
+    sysId_ = sys.rawSystem();
+    XrInstance inst = static_cast<XrInstance>(inst_);
+
+    XrGraphicsBindingVulkan2KHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
+    binding.instance = vkInstance;
+    binding.physicalDevice = gpu;
+    binding.device = device;
+    binding.queueFamilyIndex = queueFamily;
+    binding.queueIndex = 0;
+    XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
+    sci.next = &binding;
+    sci.systemId = static_cast<XrSystemId>(sysId_);
+    XrSession s = XR_NULL_HANDLE;
+    if (!ok(xrCreateSession(inst, &sci, &s), "xrCreateSession")) return false;
+    session_ = s;
+
+    XrReferenceSpaceCreateInfo rsci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    rsci.poseInReferenceSpace.orientation.w = 1.0f;
+    XrSpace sp = XR_NULL_HANDLE;
+    ok(xrCreateReferenceSpace(s, &rsci, &sp), "reference space");
+    appSpace_ = sp;
+
+    // Swapchains at half the runtime's recommendation -- see presentTest.
+    uint32_t viewCount = 0;
+    xrEnumerateViewConfigurationViews(
+        inst, static_cast<XrSystemId>(sysId_),
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr);
+    std::vector<XrViewConfigurationView> cfg(
+        viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    xrEnumerateViewConfigurationViews(
+        inst, static_cast<XrSystemId>(sysId_),
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount,
+        cfg.data());
+
+    uint32_t fmtCount = 0;
+    xrEnumerateSwapchainFormats(s, 0, &fmtCount, nullptr);
+    std::vector<int64_t> formats(fmtCount);
+    xrEnumerateSwapchainFormats(s, fmtCount, &fmtCount, formats.data());
+    int64_t format = formats.empty() ? VK_FORMAT_R8G8B8A8_SRGB : formats[0];
+    for (int64_t f : formats)
+        if (f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB) {
+            format = f;
+            break;
+        }
+
+    chains_ = new std::vector<Chain>(viewCount);
+    for (uint32_t i = 0; i < viewCount; ++i) {
+        Chain& c = (*chains_)[i];
+        c.width = static_cast<uint32_t>(cfg[i].recommendedImageRectWidth * 0.5f);
+        c.height =
+            static_cast<uint32_t>(cfg[i].recommendedImageRectHeight * 0.5f);
+        XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                        XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        ci.format = format;
+        ci.sampleCount = 1;
+        ci.width = c.width;
+        ci.height = c.height;
+        ci.faceCount = 1;
+        ci.arraySize = 1;
+        ci.mipCount = 1;
+        if (!ok(xrCreateSwapchain(s, &ci, &c.chain), "swapchain")) return false;
+        uint32_t n = 0;
+        xrEnumerateSwapchainImages(c.chain, 0, &n, nullptr);
+        std::vector<XrSwapchainImageVulkanKHR> imgs(
+            n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        xrEnumerateSwapchainImages(
+            c.chain, n, &n,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+        for (const auto& im : imgs) c.images.push_back(im.image);
+    }
+    acquired_.assign(viewCount, 0);
+
+    // Grip poses, bound through the simple-controller profile -- SteamVR
+    // re-targets it onto the Sense controllers.
+    XrActionSetCreateInfo asci{XR_TYPE_ACTION_SET_CREATE_INFO};
+    std::snprintf(asci.actionSetName, sizeof(asci.actionSetName), "board");
+    std::snprintf(asci.localizedActionSetName,
+                  sizeof(asci.localizedActionSetName), "Board handling");
+    XrActionSet as = XR_NULL_HANDLE;
+    xrCreateActionSet(inst, &asci, &as);
+    actionSet_ = as;
+    handPath_[0] = path(inst, "/user/hand/left");
+    handPath_[1] = path(inst, "/user/hand/right");
+    XrPath hands[2] = {static_cast<XrPath>(handPath_[0]),
+                       static_cast<XrPath>(handPath_[1])};
+    XrActionCreateInfo aci{XR_TYPE_ACTION_CREATE_INFO};
+    std::snprintf(aci.actionName, sizeof(aci.actionName), "grip_pose");
+    std::snprintf(aci.localizedActionName, sizeof(aci.localizedActionName),
+                  "Grip pose");
+    aci.actionType = XR_ACTION_TYPE_POSE_INPUT;
+    aci.countSubactionPaths = 2;
+    aci.subactionPaths = hands;
+    XrAction ga = XR_NULL_HANDLE;
+    xrCreateAction(as, &aci, &ga);
+    gripAction_ = ga;
+    const XrActionSuggestedBinding binds[] = {
+        {ga, path(inst, "/user/hand/left/input/grip/pose")},
+        {ga, path(inst, "/user/hand/right/input/grip/pose")},
+    };
+    XrInteractionProfileSuggestedBinding prof{
+        XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+    prof.interactionProfile =
+        path(inst, "/interaction_profiles/khr/simple_controller");
+    prof.suggestedBindings = binds;
+    prof.countSuggestedBindings = 2;
+    xrSuggestInteractionProfileBindings(inst, &prof);
+    XrSessionActionSetsAttachInfo attach{
+        XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+    attach.countActionSets = 1;
+    attach.actionSets = &as;
+    xrAttachSessionActionSets(s, &attach);
+    for (int i = 0; i < 2; ++i) {
+        XrActionSpaceCreateInfo asp{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        asp.action = ga;
+        asp.subactionPath = hands[i];
+        asp.poseInActionSpace.orientation.w = 1.0f;
+        XrSpace hs = XR_NULL_HANDLE;
+        xrCreateActionSpace(s, &asp, &hs);
+        handSpace_[i] = hs;
+    }
+    std::printf("vr: session up, %u eyes at %u x %u\n", viewCount,
+                (*chains_)[0].width, (*chains_)[0].height);
+    std::fflush(stdout);
+    return true;
+}
+
+bool VrSession::beginFrame(std::vector<Eye>* eyes) {
+    if (!session_) return false;
+    XrSession s = asSession(session_);
+    XrInstance inst = static_cast<XrInstance>(inst_);
+
+    XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
+    while (xrPollEvent(inst, &ev) == XR_SUCCESS) {
+        if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+            const XrSessionState st =
+                reinterpret_cast<XrEventDataSessionStateChanged*>(&ev)->state;
+            focused_ = (st == XR_SESSION_STATE_FOCUSED);
+            if (st == XR_SESSION_STATE_READY) {
+                XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
+                bi.primaryViewConfigurationType =
+                    XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                running_ = XR_SUCCEEDED(xrBeginSession(s, &bi));
+            } else if (st == XR_SESSION_STATE_STOPPING) {
+                xrEndSession(s);
+                running_ = false;
+            } else if (st == XR_SESSION_STATE_EXITING ||
+                       st == XR_SESSION_STATE_LOSS_PENDING) {
+                running_ = false;
+                end();
+                return false;
+            }
+        }
+        ev = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+    if (!running_) return false;
+
+    XrFrameWaitInfo fwi{XR_TYPE_FRAME_WAIT_INFO};
+    XrFrameState fs{XR_TYPE_FRAME_STATE};
+    if (XR_FAILED(xrWaitFrame(s, &fwi, &fs))) return false;
+    XrFrameBeginInfo fbi{XR_TYPE_FRAME_BEGIN_INFO};
+    xrBeginFrame(s, &fbi);
+    // From here on the frame MUST be ended, whatever else happens -- the
+    // returns below mean "do not render", not "do not finish". endFrame() keys
+    // off this so the caller can simply always call it.
+    frameOpen_ = true;
+    displayTime_ = fs.predictedDisplayTime;
+    shouldRender_ = fs.shouldRender != 0;
+
+    XrActiveActionSet active{static_cast<XrActionSet>(actionSet_), XR_NULL_PATH};
+    XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+    sync.countActiveActionSets = 1;
+    sync.activeActionSets = &active;
+    xrSyncActions(s, &sync);
+
+    const glm::mat4 place =
+        placement(placeCentre_, placeScale_, placeFwd_, placeUp_);
+    const glm::mat4 invPlace = glm::inverse(place);
+
+    for (int i = 0; i < 2; ++i) {
+        gripTracked_[i] = false;
+        if (!handSpace_[i]) continue;
+        XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+        if (XR_FAILED(xrLocateSpace(static_cast<XrSpace>(handSpace_[i]),
+                                    static_cast<XrSpace>(appSpace_),
+                                    displayTime_, &loc)))
+            continue;
+        if (!(loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+            continue;
+        const glm::vec4 mm =
+            invPlace * glm::vec4(loc.pose.position.x, loc.pose.position.y,
+                                 loc.pose.position.z, 1.0f);
+        gripPosMm_[i][0] = mm.x;
+        gripPosMm_[i][1] = mm.y;
+        gripPosMm_[i][2] = mm.z;
+        gripQuat_[i][0] = loc.pose.orientation.x;
+        gripQuat_[i][1] = loc.pose.orientation.y;
+        gripQuat_[i][2] = loc.pose.orientation.z;
+        gripQuat_[i][3] = loc.pose.orientation.w;
+        gripTracked_[i] = true;
+    }
+
+    eyes->clear();
+    if (!shouldRender_) return false;
+
+    uint32_t got = 0;
+    std::vector<XrView> views(chains_->size(), {XR_TYPE_VIEW});
+    XrViewState vs{XR_TYPE_VIEW_STATE};
+    XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
+    vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    vli.displayTime = displayTime_;
+    vli.space = static_cast<XrSpace>(appSpace_);
+    if (XR_FAILED(xrLocateViews(s, &vli, &vs, static_cast<uint32_t>(views.size()),
+                                &got, views.data())))
+        return false;
+
+    for (uint32_t i = 0; i < got; ++i) {
+        Eye e;
+        e.width = (*chains_)[i].width;
+        e.height = (*chains_)[i].height;
+        float proj[16];
+        // 1mm near plane in ROOM metres, then scaled with everything else.
+        projectionFromFov(views[i].fov, 0.01f, proj);
+        const glm::mat4 P = glm::make_mat4(proj);
+        const glm::mat4 V = glm::inverse(poseMatrix(views[i].pose));
+        // World(mm) -> room -> eye -> clip, in one matrix, so the renderer is
+        // handed exactly what it always takes.
+        const glm::mat4 vp = P * V * place;
+        std::memcpy(e.viewProj, glm::value_ptr(vp), sizeof(e.viewProj));
+        // The lighting rig wants the viewpoint in board millimetres.
+        const glm::vec4 eyeMm =
+            invPlace * glm::vec4(views[i].pose.position.x,
+                                 views[i].pose.position.y,
+                                 views[i].pose.position.z, 1.0f);
+        e.eye[0] = eyeMm.x;
+        e.eye[1] = eyeMm.y;
+        e.eye[2] = eyeMm.z;
+        eyes->push_back(e);
+    }
+    return !eyes->empty();
+}
+
+void VrSession::submitEye(int index, vk::Renderer& renderer) {
+    if (!chains_ || index < 0 || index >= static_cast<int>(chains_->size()))
+        return;
+    Chain& c = (*chains_)[index];
+    uint32_t idx = 0;
+    XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (XR_FAILED(xrAcquireSwapchainImage(c.chain, &ai, &idx))) return;
+    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(c.chain, &wi);
+    acquired_[index] = idx;
+    renderer.blitSceneToImage(c.images[idx], c.width, c.height);
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(c.chain, &ri);
+}
+
+void VrSession::endFrame() {
+    if (!session_ || !frameOpen_) return;
+    frameOpen_ = false;
+    XrSession s = asSession(session_);
+    std::vector<XrCompositionLayerProjectionView> pv;
+    XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+
+    if (shouldRender_ && chains_) {
+        uint32_t got = 0;
+        std::vector<XrView> views(chains_->size(), {XR_TYPE_VIEW});
+        XrViewState vs{XR_TYPE_VIEW_STATE};
+        XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
+        vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        vli.displayTime = displayTime_;
+        vli.space = static_cast<XrSpace>(appSpace_);
+        xrLocateViews(s, &vli, &vs, static_cast<uint32_t>(views.size()), &got,
+                      views.data());
+        for (uint32_t i = 0; i < got && i < chains_->size(); ++i) {
+            XrCompositionLayerProjectionView v{
+                XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+            v.pose = views[i].pose;
+            v.fov = views[i].fov;
+            v.subImage.swapchain = (*chains_)[i].chain;
+            v.subImage.imageRect.offset = {0, 0};
+            v.subImage.imageRect.extent = {
+                static_cast<int32_t>((*chains_)[i].width),
+                static_cast<int32_t>((*chains_)[i].height)};
+            v.subImage.imageArrayIndex = 0;
+            pv.push_back(v);
+        }
+        layer.space = static_cast<XrSpace>(appSpace_);
+        layer.viewCount = static_cast<uint32_t>(pv.size());
+        layer.views = pv.data();
+    }
+
+    const XrCompositionLayerBaseHeader* layers[] = {
+        reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+    XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
+    fei.displayTime = displayTime_;
+    fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    fei.layerCount = pv.empty() ? 0 : 1;
+    fei.layers = pv.empty() ? nullptr : layers;
+    xrEndFrame(s, &fei);
+}
+
+bool VrSession::gripPose(int hand, float outPosMm[3], float outQuat[4]) const {
+    if (hand < 0 || hand > 1 || !gripTracked_[hand]) return false;
+    for (int i = 0; i < 3; ++i) outPosMm[i] = gripPosMm_[hand][i];
+    for (int i = 0; i < 4; ++i) outQuat[i] = gripQuat_[hand][i];
+    return true;
+}
+
+void VrSession::end() {
+    if (chains_) {
+        for (Chain& c : *chains_)
+            if (c.chain) xrDestroySwapchain(c.chain);
+        delete chains_;
+        chains_ = nullptr;
+    }
+    for (void*& h : handSpace_) {
+        if (h) xrDestroySpace(static_cast<XrSpace>(h));
+        h = nullptr;
+    }
+    if (appSpace_) xrDestroySpace(static_cast<XrSpace>(appSpace_));
+    appSpace_ = nullptr;
+    if (actionSet_) xrDestroyActionSet(static_cast<XrActionSet>(actionSet_));
+    actionSet_ = nullptr;
+    if (session_) {
+        if (running_) xrEndSession(asSession(session_));
+        xrDestroySession(asSession(session_));
+    }
+    session_ = nullptr;
+    running_ = false;
+    focused_ = false;
 }
 
 }  // namespace pcbview::xr
