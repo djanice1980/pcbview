@@ -291,6 +291,19 @@ public:
     // CAPTURE is exact. (0,0) returns to window x scale.
     void setCaptureExtent(uint32_t w, uint32_t h);
 
+    // Copy the scene, as last drawn, into an image this renderer does not own.
+    // This is how VR gets a frame: each eye is rendered through the ordinary
+    // path at that eye's extent (setCaptureExtent already makes the scene
+    // target any size -- it was built for 4K video capture), and the result is
+    // handed to the runtime's swapchain image.
+    //
+    // A GPU blit rather than requestCaptureToBuffer: that one round-trips
+    // through host memory, which is fine for encoding a video and hopeless at
+    // 90Hz. `dst` is left in COLOR_ATTACHMENT_OPTIMAL, which is what an OpenXR
+    // runtime expects its swapchain images back in. Call after drawFrame(),
+    // where sceneColor_ is already sitting in TRANSFER_SRC_OPTIMAL.
+    void blitSceneToImage(VkImage dst, uint32_t dstWidth, uint32_t dstHeight);
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the

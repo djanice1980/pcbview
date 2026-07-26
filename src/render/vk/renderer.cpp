@@ -3450,6 +3450,81 @@ void Renderer::setSubstrateAppearance(float r, float g, float b, float opacity) 
     ptDenoisedValid_ = false;
 }
 
+void Renderer::blitSceneToImage(VkImage dst, uint32_t dstWidth,
+                                uint32_t dstHeight) {
+    if (dst == VK_NULL_HANDLE || sceneColor_.handle == VK_NULL_HANDLE) return;
+
+    // drawFrame() leaves sceneColor_ in TRANSFER_SRC_OPTIMAL after its own blit
+    // to the swapchain, so the source needs no transition here -- and must NOT
+    // be transitioned from UNDEFINED, which would discard the frame we came for.
+    //
+    // Ordering: drawFrame's work is submitted to the same queue but batches may
+    // overlap without a barrier, so this waits for the device rather than
+    // racing the frame it is trying to copy. A stall per eye, and the honest
+    // starting point; semaphores can replace it once the loop is proven.
+    vkDeviceWaitIdle(device_.handle);
+
+    VkCommandBufferAllocateInfo a{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    a.commandPool = commandPool_;
+    a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    a.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device_.handle, &a, &cmd) != VK_SUCCESS)
+        return;
+
+    VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &b);
+
+    auto barrier = [&](VkImageLayout from, VkImageLayout to,
+                       VkAccessFlags srcAccess, VkAccessFlags dstAccess) {
+        VkImageMemoryBarrier m{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        m.oldLayout = from;
+        m.newLayout = to;
+        m.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        m.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        m.image = dst;
+        m.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        m.srcAccessMask = srcAccess;
+        m.dstAccessMask = dstAccess;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
+                             0, nullptr, 1, &m);
+    };
+
+    // The runtime's image contents are undefined on acquire, so discarding is
+    // correct here -- every pixel is about to be written by the blit.
+    barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
+
+    VkImageBlit region{};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.srcOffsets[1] = {static_cast<int32_t>(sceneExtent_.width),
+                            static_cast<int32_t>(sceneExtent_.height), 1};
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.dstOffsets[1] = {static_cast<int32_t>(dstWidth),
+                            static_cast<int32_t>(dstHeight), 1};
+    // LINEAR so a scene rendered at a different scale than the eye still
+    // resolves cleanly rather than aliasing.
+    vkCmdBlitImage(cmd, sceneColor_.handle,
+                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                   VK_FILTER_LINEAR);
+
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    s.commandBufferCount = 1;
+    s.pCommandBuffers = &cmd;
+    vkQueueSubmit(device_.graphicsQueue, 1, &s, VK_NULL_HANDLE);
+    vkQueueWaitIdle(device_.graphicsQueue);
+    vkFreeCommandBuffers(device_.handle, commandPool_, 1, &cmd);
+}
+
 bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
                          const std::function<void(VkCommandBuffer)>& drawUi) {
     vkWaitForFences(device_.handle, 1, &inFlight_[frame_], VK_TRUE, UINT64_MAX);
