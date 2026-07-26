@@ -16,6 +16,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -507,6 +508,11 @@ struct VrSession::Chain {
 namespace {
 
 XrSession asSession(void* p) { return static_cast<XrSession>(p); }
+
+bool qEnvSwapEyes() {
+    const char* v = std::getenv("PCBVIEW_VR_SWAP_EYES");
+    return v && v[0] && v[0] != '0';
+}
 
 // pcbview's projection convention, made ASYMMETRIC.
 //
@@ -1056,6 +1062,7 @@ bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
         for (const auto& im : imgs) c.images.push_back(im.image);
     }
     acquired_.assign(viewCount, 0);
+    swapEyes_ = qEnvSwapEyes();
 
     // Grip poses, bound through the simple-controller profile -- SteamVR
     // re-targets it onto the Sense controllers.
@@ -1200,6 +1207,26 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
                                 &got, views.data())))
         return false;
 
+    // Keep the poses actually rendered with. endFrame used to re-locate, which
+    // is wrong on principle -- the layer must describe the frame that was
+    // drawn, not a fresh prediction -- and wasteful.
+    lastViews_.clear();
+    for (uint32_t i = 0; i < got; ++i) {
+        ViewPose vp;
+        vp.pos[0] = views[i].pose.position.x;
+        vp.pos[1] = views[i].pose.position.y;
+        vp.pos[2] = views[i].pose.position.z;
+        vp.quat[0] = views[i].pose.orientation.x;
+        vp.quat[1] = views[i].pose.orientation.y;
+        vp.quat[2] = views[i].pose.orientation.z;
+        vp.quat[3] = views[i].pose.orientation.w;
+        vp.fov[0] = views[i].fov.angleLeft;
+        vp.fov[1] = views[i].fov.angleRight;
+        vp.fov[2] = views[i].fov.angleUp;
+        vp.fov[3] = views[i].fov.angleDown;
+        lastViews_.push_back(vp);
+    }
+
     for (uint32_t i = 0; i < got; ++i) {
         Eye e;
         e.width = (*chains_)[i].width;
@@ -1249,22 +1276,20 @@ void VrSession::endFrame() {
     std::vector<XrCompositionLayerProjectionView> pv;
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
 
-    if (shouldRender_ && chains_) {
-        uint32_t got = 0;
-        std::vector<XrView> views(chains_->size(), {XR_TYPE_VIEW});
-        XrViewState vs{XR_TYPE_VIEW_STATE};
-        XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
-        vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-        vli.displayTime = displayTime_;
-        vli.space = static_cast<XrSpace>(appSpace_);
-        xrLocateViews(s, &vli, &vs, static_cast<uint32_t>(views.size()), &got,
-                      views.data());
-        for (uint32_t i = 0; i < got && i < chains_->size(); ++i) {
+    if (shouldRender_ && chains_ && !lastViews_.empty()) {
+        for (size_t i = 0; i < lastViews_.size() && i < chains_->size(); ++i) {
             XrCompositionLayerProjectionView v{
                 XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
-            v.pose = views[i].pose;
-            v.fov = views[i].fov;
-            v.subImage.swapchain = (*chains_)[i].chain;
+            const ViewPose& lv = lastViews_[i];
+            v.pose.position = {lv.pos[0], lv.pos[1], lv.pos[2]};
+            v.pose.orientation = {lv.quat[0], lv.quat[1], lv.quat[2],
+                                  lv.quat[3]};
+            v.fov = {lv.fov[0], lv.fov[1], lv.fov[2], lv.fov[3]};
+            // PCBVIEW_VR_SWAP_EYES=1 hands each eye the other's image. Present
+            // because "right eye shows the left side" is the signature of a
+            // swap, and one run with this set settles whether the ordering is
+            // the fault far faster than reasoning about sign conventions.
+            v.subImage.swapchain = (*chains_)[swapEyes_ ? (1 - i) : i].chain;
             v.subImage.imageRect.offset = {0, 0};
             v.subImage.imageRect.extent = {
                 static_cast<int32_t>((*chains_)[i].width),

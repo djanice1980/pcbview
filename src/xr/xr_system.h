@@ -147,6 +147,17 @@ private:
     bool shouldRender_ = false;
     // xrBeginFrame was called and xrEndFrame is still owed.
     bool frameOpen_ = false;
+    // The poses actually rendered with, so the submitted layer describes the
+    // frame that was drawn rather than a fresh prediction. Kept as a plain POD
+    // because this header is included by the app and render layers, which have
+    // no business seeing OpenXR types.
+    struct ViewPose {
+        float pos[3];
+        float quat[4];   // xyzw
+        float fov[4];    // left, right, up, down, radians
+    };
+    std::vector<ViewPose> lastViews_;
+    bool swapEyes_ = false;
     float placeCentre_[3] = {0, 0, 0};
     float placeScale_ = 0.001f;   // mm -> m
     float placeFwd_ = -0.6f;      // metres in front of the origin
