@@ -363,6 +363,11 @@ private:
     // Counts frames the runtime asked for, so rendering can run at a divisor
     // of the headset's rate with the compositor reprojecting the gaps.
     unsigned long long vrFrameCount_ = 0;
+    // Path-trace samples standing in each eye's accumulator, reported
+    // periodically. Climbing means accumulation works and only needs longer;
+    // pinned near 1 means something resets it every frame. The two are
+    // indistinguishable through the lenses.
+    int vrSamples_[2] = {0, 0};
     void stepVr();
 
     // Showcase routing: the orientation actually rendered from while active,

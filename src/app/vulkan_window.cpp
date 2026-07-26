@@ -346,9 +346,20 @@ void VulkanWindow::stepVr() {
             // window flip between two viewpoints every frame.
             renderer_->setOffscreenOnly(i != 0);
             renderer_->drawFrame(e.viewProj, e.eye);
+            if (i < 2) vrSamples_[i] = renderer_->accumulatedSamples();
             vr_->submitEye(static_cast<int>(i), *renderer_);
         }
     }
+    // Per-eye convergence, about once a second while path tracing. Whether
+    // these numbers CLIMB is the difference between "accumulation is working
+    // and the image needs longer" and "something is resetting it every frame",
+    // which look identical through the lenses.
+    if (allowPt && drawThisFrame && (vrFrameCount_ % 90) == 0) {
+        std::printf("vr-pt: samples eye0=%d eye1=%d\n", vrSamples_[0],
+                    vrSamples_[1]);
+        std::fflush(stdout);
+    }
+
     // Always: xrBeginFrame is owed an xrEndFrame even on a frame we skipped.
     vr_->endFrame();
 }

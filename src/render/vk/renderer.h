@@ -755,6 +755,17 @@ private:
         bool denoisedValid = false;
         int dnDisplayed = 0;
         uint32_t generation = 0;
+        // The camera this slot last accumulated at, and it MUST live here.
+        // setRayCamera restarts accumulation when the camera differs from the
+        // stored one, so a shared camera means slot 0 is compared against eye
+        // 1's viewpoint and slot 1 against eye 0's -- 63 mm apart, far past any
+        // tolerance. Every swap then reset the slot it had just switched to,
+        // and per-eye buffers bought nothing at all.
+        float eye[3] = {0, 0, 0};
+        float fwd[3] = {0, 0, 1};
+        float right[3] = {1, 0, 0};
+        float up[3] = {0, 1, 0};
+        bool ortho = false;
     };
     PtSlotState ptStash_[2];
     int ptSlot_ = 0;

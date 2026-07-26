@@ -2002,6 +2002,13 @@ void Renderer::stashPtSlot(PtSlotState& s) const {
     s.denoisedValid = ptDenoisedValid_;
     s.dnDisplayed = dnDisplayed_;
     s.generation = ptGeneration_;
+    for (int i = 0; i < 3; ++i) {
+        s.eye[i] = rayEye_[i];
+        s.fwd[i] = rayFwd_[i];
+        s.right[i] = rayRight_[i];
+        s.up[i] = rayUp_[i];
+    }
+    s.ortho = rayOrtho_;
 }
 
 void Renderer::loadPtSlot(const PtSlotState& s) {
@@ -2017,6 +2024,13 @@ void Renderer::loadPtSlot(const PtSlotState& s) {
     ptDenoisedValid_ = s.denoisedValid;
     dnDisplayed_ = s.dnDisplayed;
     ptGeneration_ = s.generation;
+    for (int i = 0; i < 3; ++i) {
+        rayEye_[i] = s.eye[i];
+        rayFwd_[i] = s.fwd[i];
+        rayRight_[i] = s.right[i];
+        rayUp_[i] = s.up[i];
+    }
+    rayOrtho_ = s.ortho;
 }
 
 void Renderer::setAccumulationSlots(int count) {
