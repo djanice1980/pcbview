@@ -92,7 +92,14 @@ void main() {
             const float wa = exp(-length(aC - aQ) / pc.sigma.z);
             // Brightness: preserves genuine lighting detail -- a shadow edge is
             // a real feature, not noise to be smoothed over.
-            const float wl = exp(-abs(lC - luma(cQ)) / pc.sigma.y);
+            //
+            // RELATIVE, not absolute. These are HDR values with no fixed range,
+            // so a constant divisor is meaningless: at sigma 4 a typical
+            // difference of well under 1 gave exp(-0.2) and this term rejected
+            // nothing whatsoever. Scaling by the centre's own brightness makes
+            // it behave the same in a bright region as a dark one.
+            const float wl =
+                exp(-abs(lC - luma(cQ)) / (pc.sigma.y * max(lC, 0.05)));
 
             const float w = kernel[dx + 2] * kernel[dy + 2] * wn * wa * wl;
             sum += cQ * w;

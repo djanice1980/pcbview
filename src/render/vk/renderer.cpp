@@ -1989,6 +1989,16 @@ struct DnPush {
     float sigma[4];    // normal power, luminance, albedo, input scale
     float misc[4];     // x = 1/samples for the guide AOVs
 };
+
+// Edge-stopping sigmas are a by-eye tuning job, so let them be tried without a
+// rebuild. Read once per name.
+float envFloat(const char* name, float fallback) {
+    const char* v = std::getenv(name);
+    if (!v || !v[0]) return fallback;
+    char* end = nullptr;
+    const float f = std::strtof(v, &end);
+    return (end && end != v && f > 0.0f) ? f : fallback;
+}
 }  // namespace
 
 void Renderer::createGpuDenoise() {
@@ -2134,9 +2144,24 @@ void Renderer::recordGpuDenoise(VkCommandBuffer cmd) {
         push.dim[1] = sceneExtent_.height;
         push.dim[2] = 1u << p;   // tap spacing doubles each pass
         push.dim[3] = static_cast<uint32_t>(p);
-        push.sigma[0] = 64.0f;   // normal power: sharp rejection across edges
-        push.sigma[1] = 4.0f;    // luminance
-        push.sigma[2] = 0.20f;   // albedo
+        // Tuned tight, because this filter reaches 32 pixels by the last pass
+        // and anything it lets through travels that far.
+        //
+        // Albedo is the only thing separating materials that share a plane and
+        // therefore share a normal -- mask from pad from silkscreen. Green mask
+        // sits near 0.2, a black package near 0.05, a gold pad near 0.8, so at
+        // sigma 0.2 a mask-to-pad tap still scored exp(-3), and five passes
+        // turned that into visible colour bleeding across every edge. At 0.05
+        // the same tap scores exp(-12) and is gone.
+        //
+        // These are the knobs most likely to want adjusting by eye, so they are
+        // readable from the environment rather than requiring a rebuild.
+        static const float sigN = envFloat("PCBVIEW_VR_DN_NORMAL", 64.0f);
+        static const float sigL = envFloat("PCBVIEW_VR_DN_LUMA", 0.8f);
+        static const float sigA = envFloat("PCBVIEW_VR_DN_ALBEDO", 0.05f);
+        push.sigma[0] = sigN;    // normal power: sharp rejection across edges
+        push.sigma[1] = sigL;    // luminance, relative to centre brightness
+        push.sigma[2] = sigA;    // albedo (material)
         // Only the first pass sees the raw accumulation sum.
         const float invSamples =
             1.0f / static_cast<float>(std::max(ptSampleCount_, 1));
