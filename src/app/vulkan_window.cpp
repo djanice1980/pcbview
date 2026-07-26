@@ -267,11 +267,25 @@ void VulkanWindow::stepVr() {
         if (!vrOwnsRenderer_) vr_->reanchor();
         vrOwnsRenderer_ = true;
 
-        // Let a tracked head count as still. Sized to the board: 0.2% of its
-        // span in position (a tenth of a millimetre on a 50 mm board) and about
-        // a twentieth of a degree in orientation -- well above tracking jitter,
-        // well below any movement worth restarting for.
-        renderer_->setCameraTolerance(span * 0.002f, 0.001f);
+        // Let a tracked head count as still.
+        //
+        // The units here are board millimetres, and the board is scaled to
+        // 0.35 m, so ONE board mm is about 7 mm of real head movement. The
+        // first attempt at 0.2% of span worked out to roughly 0.7 mm of head
+        // movement -- tighter than breathing, so accumulation restarted almost
+        // every frame anyway.
+        //
+        // 2% of span is about 7 mm of sway, which is a fair definition of
+        // holding still, and the cost of being wrong is mild softening rather
+        // than a wrong image: samples from 2% of a board-width away still see
+        // very nearly the same thing. PCBVIEW_VR_STILL tunes it -- raise it if
+        // the image never settles, lower it if holding still leaves a smear.
+        static const float stillFrac = [] {
+            bool ok = false;
+            const float f = qgetenv("PCBVIEW_VR_STILL").toFloat(&ok);
+            return (ok && f > 0.0f && f <= 0.5f) ? f : 0.02f;
+        }();
+        renderer_->setCameraTolerance(span * stillFrac, 0.004f);
         // Held every frame: initialisation applies the saved ptEnabled_ after
         // the session is created and would otherwise overwrite this, and the
         // render-mode menu can change it mid-session. setRenderMode returns
