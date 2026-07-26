@@ -513,6 +513,8 @@ int main(int argc, char** argv) {
             return pcbview::xr::deviceTest();
         if (std::string(argv[1]) == "--xr-input-test")
             return pcbview::xr::inputTest();
+        if (std::string(argv[1]) == "--xr-present-test")
+            return pcbview::xr::presentTest();
         if (std::string(argv[1]) == "--cpu-trace" && argc >= 4)
             return cpuTrace(argv[2], argv[3]);
         if (std::string(argv[1]) == "--gerber-probe" && argc >= 3)

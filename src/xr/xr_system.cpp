@@ -7,6 +7,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -484,6 +485,413 @@ int inputTest() {
     vkDestroyInstance(vkInstance, nullptr);
     xr.stop();
     std::printf("\ninput test done (session state %d)\n",
+                static_cast<int>(state));
+    return 0;
+}
+
+namespace {
+
+// One eye's swapchain and the Vulkan images behind it.
+struct EyeChain {
+    XrSwapchain chain = XR_NULL_HANDLE;
+    std::vector<VkImage> images;
+    uint32_t width = 0, height = 0;
+};
+
+// The runtime hands back images in an undefined layout and expects them back as
+// colour attachments. Clearing needs TRANSFER_DST in between, so every frame
+// walks UNDEFINED -> TRANSFER_DST -> COLOR_ATTACHMENT.
+void barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
+             VkImageLayout to, VkAccessFlags srcAccess,
+             VkAccessFlags dstAccess) {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.srcAccessMask = srcAccess;
+    b.dstAccessMask = dstAccess;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+}
+
+}  // namespace
+
+int presentTest() {
+    std::printf("OpenXR presentation test\n========================\n\n");
+    System xr;
+    if (!xr.start()) return 1;
+    std::printf("headset: %s\n", xr.headsetName());
+
+    xr.installHooks();
+    VkInstance vkInstance = VK_NULL_HANDLE;
+    Device dev{};
+    try {
+        vkInstance = createInstance(false, {"VK_KHR_surface",
+                                            "VK_KHR_win32_surface"});
+        if (xr.adoptRuntimeGpu(vkInstance) == VK_NULL_HANDLE) {
+            std::printf("the runtime named no GPU\n");
+            return 2;
+        }
+        const std::vector<GpuInfo> gpus = enumerateGpus(vkInstance);
+        const GpuInfo* chosen = selectGpu(gpus, "");
+        if (!chosen) { std::printf("no usable GPU\n"); return 3; }
+        dev = createDevice(*chosen, {"VK_KHR_swapchain"});
+    } catch (const std::exception& e) {
+        std::printf("vulkan setup failed: %s\n", e.what());
+        return 4;
+    }
+    xr.removeHooks();
+
+    XrInstance inst = static_cast<XrInstance>(xr.rawInstance());
+    const XrSystemId sysId = static_cast<XrSystemId>(xr.rawSystem());
+
+    XrGraphicsBindingVulkan2KHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
+    binding.instance = vkInstance;
+    binding.physicalDevice = dev.gpu.handle;
+    binding.device = dev.handle;
+    binding.queueFamilyIndex = dev.gpu.graphicsQueueFamily;
+    binding.queueIndex = 0;
+    XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
+    sci.next = &binding;
+    sci.systemId = sysId;
+    XrSession session = XR_NULL_HANDLE;
+    if (!ok(xrCreateSession(inst, &sci, &session), "xrCreateSession")) return 5;
+
+    XrReferenceSpaceCreateInfo rsci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    rsci.poseInReferenceSpace.orientation.w = 1.0f;
+    XrSpace appSpace = XR_NULL_HANDLE;
+    ok(xrCreateReferenceSpace(session, &rsci, &appSpace), "reference space");
+
+    // --- Swapchains --------------------------------------------------------
+    uint32_t fmtCount = 0;
+    xrEnumerateSwapchainFormats(session, 0, &fmtCount, nullptr);
+    std::vector<int64_t> formats(fmtCount);
+    xrEnumerateSwapchainFormats(session, fmtCount, &fmtCount, formats.data());
+    int64_t format = formats.empty() ? 0 : formats[0];
+    for (int64_t f : formats) {  // prefer a plain sRGB colour target
+        if (f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB) {
+            format = f;
+            break;
+        }
+    }
+    std::printf("swapchain format: %lld\n", static_cast<long long>(format));
+
+    uint32_t viewCount = 0;
+    xrEnumerateViewConfigurationViews(
+        inst, sysId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount,
+        nullptr);
+    std::vector<XrViewConfigurationView> cfg(
+        viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    xrEnumerateViewConfigurationViews(
+        inst, sysId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount,
+        &viewCount, cfg.data());
+
+    // Half the runtime's recommendation. SteamVR asks for 4164x4244 per eye on
+    // this headset -- ~35 MP a frame at 90Hz across both -- which no renderer
+    // is going to hold. A scale factor is what real VR apps expose, so the
+    // plumbing may as well assume one from the start.
+    constexpr float kScale = 0.5f;
+    std::vector<EyeChain> eyes(viewCount);
+    for (uint32_t i = 0; i < viewCount; ++i) {
+        eyes[i].width =
+            static_cast<uint32_t>(cfg[i].recommendedImageRectWidth * kScale);
+        eyes[i].height =
+            static_cast<uint32_t>(cfg[i].recommendedImageRectHeight * kScale);
+        XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                        XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        ci.format = format;
+        ci.sampleCount = 1;
+        ci.width = eyes[i].width;
+        ci.height = eyes[i].height;
+        ci.faceCount = 1;
+        ci.arraySize = 1;
+        ci.mipCount = 1;
+        if (!ok(xrCreateSwapchain(session, &ci, &eyes[i].chain), "swapchain"))
+            return 6;
+
+        uint32_t n = 0;
+        xrEnumerateSwapchainImages(eyes[i].chain, 0, &n, nullptr);
+        std::vector<XrSwapchainImageVulkanKHR> imgs(
+            n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        xrEnumerateSwapchainImages(
+            eyes[i].chain, n, &n,
+            reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
+        for (const auto& im : imgs) eyes[i].images.push_back(im.image);
+        std::printf("eye %u: %u x %u, %u images\n", i, eyes[i].width,
+                    eyes[i].height, n);
+    }
+
+    // --- Vulkan command recording -----------------------------------------
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = dev.gpu.graphicsQueueFamily;
+    vkCreateCommandPool(dev.handle, &pci, nullptr, &pool);
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cbi{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbi.commandPool = pool;
+    cbi.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbi.commandBufferCount = 1;
+    vkAllocateCommandBuffers(dev.handle, &cbi, &cmd);
+    VkFence fence = VK_NULL_HANDLE;
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    vkCreateFence(dev.handle, &fci, nullptr, &fence);
+
+    // --- Actions (identical to the input test) -----------------------------
+    XrActionSetCreateInfo asci{XR_TYPE_ACTION_SET_CREATE_INFO};
+    std::snprintf(asci.actionSetName, sizeof(asci.actionSetName), "board");
+    std::snprintf(asci.localizedActionSetName,
+                  sizeof(asci.localizedActionSetName), "Board handling");
+    XrActionSet actionSet = XR_NULL_HANDLE;
+    xrCreateActionSet(inst, &asci, &actionSet);
+    XrPath hands[2] = {path(inst, "/user/hand/left"),
+                       path(inst, "/user/hand/right")};
+    XrActionCreateInfo aci{XR_TYPE_ACTION_CREATE_INFO};
+    std::snprintf(aci.actionName, sizeof(aci.actionName), "grip_pose");
+    std::snprintf(aci.localizedActionName, sizeof(aci.localizedActionName),
+                  "Grip pose");
+    aci.actionType = XR_ACTION_TYPE_POSE_INPUT;
+    aci.countSubactionPaths = 2;
+    aci.subactionPaths = hands;
+    XrAction gripPose = XR_NULL_HANDLE;
+    xrCreateAction(actionSet, &aci, &gripPose);
+    const XrActionSuggestedBinding binds[] = {
+        {gripPose, path(inst, "/user/hand/left/input/grip/pose")},
+        {gripPose, path(inst, "/user/hand/right/input/grip/pose")},
+    };
+    XrInteractionProfileSuggestedBinding prof{
+        XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+    prof.interactionProfile =
+        path(inst, "/interaction_profiles/khr/simple_controller");
+    prof.suggestedBindings = binds;
+    prof.countSuggestedBindings = 2;
+    xrSuggestInteractionProfileBindings(inst, &prof);
+    XrSessionActionSetsAttachInfo attach{
+        XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+    attach.countActionSets = 1;
+    attach.actionSets = &actionSet;
+    xrAttachSessionActionSets(session, &attach);
+    XrSpace handSpace[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+    for (int i = 0; i < 2; ++i) {
+        XrActionSpaceCreateInfo asp{XR_TYPE_ACTION_SPACE_CREATE_INFO};
+        asp.action = gripPose;
+        asp.subactionPath = hands[i];
+        asp.poseInActionSpace.orientation.w = 1.0f;
+        xrCreateActionSpace(session, &asp, &handSpace[i]);
+    }
+
+    // --- Frame loop --------------------------------------------------------
+    static const char* kStates[] = {"UNKNOWN",      "IDLE",    "READY",
+                                    "SYNCHRONIZED", "VISIBLE", "FOCUSED",
+                                    "STOPPING",     "LOSS_PENDING", "EXITING"};
+    // Runs long enough to actually put the headset on. The runtime holds an app
+    // at SYNCHRONIZED while the HMD is off the head -- a proximity standby --
+    // and only promotes to VISIBLE/FOCUSED once it is worn, so a test that
+    // finishes before you can pick the thing up proves nothing.
+    std::printf("\nPUT THE HEADSET ON NOW -- waiting up to 60s for the runtime\n"
+                "to grant focus. You should see a slowly pulsing colour, and\n"
+                "the controllers should start reporting.\n\n");
+    XrSessionState state = XR_SESSION_STATE_UNKNOWN;
+    bool running = false;
+    int reports = 0;
+    for (int frame = 0; frame < 5400 && reports < 12; ++frame) {
+        if ((frame % 270) == 0 && state != XR_SESSION_STATE_FOCUSED) {
+            std::printf("  ... waiting, still %s\n",
+                        (static_cast<int>(state) >= 0 &&
+                         static_cast<int>(state) < 9)
+                            ? kStates[static_cast<int>(state)]
+                            : "?");
+            std::fflush(stdout);
+        }
+        XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
+        while (xrPollEvent(inst, &ev) == XR_SUCCESS) {
+            if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+                state = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev)
+                            ->state;
+                const int si = static_cast<int>(state);
+                std::printf("  [state] %s\n",
+                            (si >= 0 && si < 9) ? kStates[si] : "?");
+                std::fflush(stdout);
+                if (state == XR_SESSION_STATE_READY) {
+                    XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
+                    bi.primaryViewConfigurationType =
+                        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                    running = ok(xrBeginSession(session, &bi), "beginSession");
+                } else if (state == XR_SESSION_STATE_STOPPING) {
+                    xrEndSession(session);
+                    running = false;
+                }
+            }
+            ev = {XR_TYPE_EVENT_DATA_BUFFER};
+        }
+        if (!running) continue;
+
+        XrFrameWaitInfo fwi{XR_TYPE_FRAME_WAIT_INFO};
+        XrFrameState fs{XR_TYPE_FRAME_STATE};
+        if (XR_FAILED(xrWaitFrame(session, &fwi, &fs))) break;
+        XrFrameBeginInfo fbi{XR_TYPE_FRAME_BEGIN_INFO};
+        xrBeginFrame(session, &fbi);
+
+        XrActiveActionSet active{actionSet, XR_NULL_PATH};
+        XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
+        sync.countActiveActionSets = 1;
+        sync.activeActionSets = &active;
+        xrSyncActions(session, &sync);
+
+        std::vector<XrCompositionLayerProjectionView> projViews;
+        XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+
+        if (fs.shouldRender) {
+            XrViewState vs{XR_TYPE_VIEW_STATE};
+            uint32_t got = 0;
+            std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
+            XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
+            vli.viewConfigurationType =
+                XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+            vli.displayTime = fs.predictedDisplayTime;
+            vli.space = appSpace;
+            xrLocateViews(session, &vli, &vs, viewCount, &got, views.data());
+
+            const float t = static_cast<float>(frame) * 0.02f;
+            const float pulse = 0.25f + 0.2f * (0.5f + 0.5f * std::sin(t));
+
+            for (uint32_t i = 0; i < got; ++i) {
+                uint32_t idx = 0;
+                XrSwapchainImageAcquireInfo ai{
+                    XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+                if (XR_FAILED(xrAcquireSwapchainImage(eyes[i].chain, &ai, &idx)))
+                    continue;
+                XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                wi.timeout = XR_INFINITE_DURATION;
+                xrWaitSwapchainImage(eyes[i].chain, &wi);
+
+                vkResetCommandBuffer(cmd, 0);
+                VkCommandBufferBeginInfo bi{
+                    VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd, &bi);
+                VkImage img = eyes[i].images[idx];
+                barrier(cmd, img, VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                        VK_ACCESS_TRANSFER_WRITE_BIT);
+                // Eyes tinted differently so a wrong-eye mix-up would be
+                // obvious rather than subtle.
+                VkClearColorValue col{};
+                col.float32[0] = i == 0 ? pulse : pulse * 0.35f;
+                col.float32[1] = pulse * 0.55f;
+                col.float32[2] = i == 0 ? pulse * 0.35f : pulse;
+                col.float32[3] = 1.0f;
+                VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+                                              0, 1};
+                vkCmdClearColorImage(cmd, img,
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &col,
+                                     1, &range);
+                barrier(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+                vkEndCommandBuffer(cmd);
+
+                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &cmd;
+                vkQueueSubmit(dev.graphicsQueue, 1, &si, fence);
+                vkWaitForFences(dev.handle, 1, &fence, VK_TRUE, UINT64_MAX);
+                vkResetFences(dev.handle, 1, &fence);
+
+                XrSwapchainImageReleaseInfo ri{
+                    XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                xrReleaseSwapchainImage(eyes[i].chain, &ri);
+
+                XrCompositionLayerProjectionView pv{
+                    XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+                pv.pose = views[i].pose;
+                pv.fov = views[i].fov;
+                pv.subImage.swapchain = eyes[i].chain;
+                pv.subImage.imageRect.offset = {0, 0};
+                pv.subImage.imageRect.extent = {
+                    static_cast<int32_t>(eyes[i].width),
+                    static_cast<int32_t>(eyes[i].height)};
+                pv.subImage.imageArrayIndex = 0;
+                projViews.push_back(pv);
+            }
+            layer.space = appSpace;
+            layer.viewCount = static_cast<uint32_t>(projViews.size());
+            layer.views = projViews.data();
+        }
+
+        if ((frame % 120) == 0 && state == XR_SESSION_STATE_FOCUSED) {
+            for (int i = 0; i < 2; ++i) {
+                // WHICH profile the runtime actually bound is the thing worth
+                // knowing: XR_NULL_PATH means no live controller on that hand
+                // (asleep, or off), whereas a profile name with an inactive
+                // action means the controller is there but our bindings did not
+                // take. Those look identical from the pose alone.
+                XrInteractionProfileState ips{
+                    XR_TYPE_INTERACTION_PROFILE_STATE};
+                char profName[XR_MAX_PATH_LENGTH] = "none";
+                if (XR_SUCCEEDED(
+                        xrGetCurrentInteractionProfile(session, hands[i], &ips)) &&
+                    ips.interactionProfile != XR_NULL_PATH) {
+                    uint32_t len = 0;
+                    xrPathToString(inst, ips.interactionProfile,
+                                   sizeof(profName), &len, profName);
+                }
+
+                XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+                gi.action = gripPose;
+                gi.subactionPath = hands[i];
+                XrActionStatePose ps{XR_TYPE_ACTION_STATE_POSE};
+                xrGetActionStatePose(session, &gi, &ps);
+
+                XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+                xrLocateSpace(handSpace[i], appSpace, fs.predictedDisplayTime,
+                              &loc);
+                const bool tracked =
+                    (loc.locationFlags &
+                     XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+                std::printf("  %-5s %s action=%s pos(%+6.3f %+6.3f %+6.3f) "
+                            "profile=%s\n",
+                            i == 0 ? "left" : "right",
+                            tracked ? "TRACKED" : "  ---  ",
+                            ps.isActive ? "active" : "INACTIVE",
+                            loc.pose.position.x, loc.pose.position.y,
+                            loc.pose.position.z, profName);
+            }
+            std::fflush(stdout);
+            ++reports;
+        }
+
+        const XrCompositionLayerBaseHeader* layers[] = {
+            reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+        XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
+        fei.displayTime = fs.predictedDisplayTime;
+        fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+        fei.layerCount = projViews.empty() ? 0 : 1;
+        fei.layers = projViews.empty() ? nullptr : layers;
+        xrEndFrame(session, &fei);
+    }
+
+    vkDeviceWaitIdle(dev.handle);
+    vkDestroyFence(dev.handle, fence, nullptr);
+    vkDestroyCommandPool(dev.handle, pool, nullptr);
+    for (auto& e : eyes) if (e.chain) xrDestroySwapchain(e.chain);
+    for (XrSpace s : handSpace) if (s) xrDestroySpace(s);
+    if (appSpace) xrDestroySpace(appSpace);
+    xrDestroyActionSet(actionSet);
+    if (running) xrEndSession(session);
+    xrDestroySession(session);
+    destroyDevice(dev);
+    vkDestroyInstance(vkInstance, nullptr);
+    xr.stop();
+    std::printf("\npresent test done (final state %d)\n",
                 static_cast<int>(state));
     return 0;
 }

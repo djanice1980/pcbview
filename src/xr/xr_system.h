@@ -75,4 +75,13 @@ int deviceTest();
 // layers, which is legal and is what lets the poses come alive.
 int inputTest();
 
+// `pcbview --xr-present-test`: the same session, but actually PRESENTING --
+// per-eye swapchains, a cleared image submitted as a projection layer every
+// frame. That is what takes the runtime to VISIBLE/FOCUSED, which is in turn
+// what makes the Sense controllers report poses, so this test reports those
+// too. No render pass is needed to prove it: clearing the swapchain image
+// directly is a legitimate frame and keeps the test to the XR plumbing rather
+// than dragging the board renderer in.
+int presentTest();
+
 }  // namespace pcbview::xr
