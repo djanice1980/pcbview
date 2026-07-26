@@ -38,16 +38,22 @@ void main() {
     // the running radiance SUM and needs 1/samples, later passes read an
     // already-averaged image and pass 1.0.
     const vec3 centre = imageLoad(srcImg, px).rgb * pc.sigma.w;
-    const vec3 nC = imageLoad(normalImg, px).xyz;
+    const vec3 nRaw = imageLoad(normalImg, px).xyz;
     const vec3 aC = imageLoad(albedoImg, px).rgb;
     const float lC = luma(centre);
 
     // Background (no geometry hit) has a zero normal. Filtering it against the
-    // board would drag the sky into silhouettes, so leave it alone.
-    if (dot(nC, nC) < 1e-6) {
+    // board would drag the sky into silhouettes, so leave it alone. This also
+    // guards the normalize below against a zero vector.
+    if (dot(nRaw, nRaw) < 1e-6) {
         imageStore(dstImg, px, vec4(centre, 1.0));
         return;
     }
+    // Normalised before use, deliberately: the orientation weight raises the
+    // dot product to a high power, so a stored normal even slightly longer
+    // than unit would explode rather than fall off, and a slightly shorter one
+    // would drive every weight to zero.
+    const vec3 nC = normalize(nRaw);
 
     const float kernel[5] = float[](0.0625, 0.25, 0.375, 0.25, 0.0625);
     const int step = int(pc.dim.z);
@@ -63,8 +69,9 @@ void main() {
                 continue;
 
             const vec3 cQ = imageLoad(srcImg, q).rgb * pc.sigma.w;
-            const vec3 nQ = imageLoad(normalImg, q).xyz;
-            if (dot(nQ, nQ) < 1e-6) continue;  // never pull sky into geometry
+            const vec3 nQraw = imageLoad(normalImg, q).xyz;
+            if (dot(nQraw, nQraw) < 1e-6) continue;  // never pull sky in
+            const vec3 nQ = normalize(nQraw);
             const vec3 aQ = imageLoad(albedoImg, q).rgb;
 
             // Orientation: a high power makes this fall off sharply, so a tap

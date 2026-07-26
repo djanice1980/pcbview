@@ -2050,6 +2050,13 @@ void Renderer::createGpuDenoise() {
                                    nullptr, &dnPipeline_),
           "denoise pipeline");
     vkDestroyShaderModule(device_.handle, cs, nullptr);
+
+    // The images usually exist by now -- scene targets are built before the
+    // pipelines -- and updateGpuDenoiseDescriptors bails out when the sets do
+    // not exist yet, so that earlier attempt was a no-op. Without this call the
+    // sets stay unwritten for the life of the renderer and the passes sample
+    // undefined storage images, which renders as black.
+    updateGpuDenoiseDescriptors();
 }
 
 void Renderer::updateGpuDenoiseDescriptors() {
@@ -2088,6 +2095,22 @@ void Renderer::updateGpuDenoiseDescriptors() {
 void Renderer::recordGpuDenoise(VkCommandBuffer cmd) {
     if (gpuDenoisePasses_ <= 0 || !dnPipeline_ || ptSampleCount_ <= 0) return;
     if (ptDenoiseTmp_.handle == VK_NULL_HANDLE) return;
+
+    // The tracer's writes have to be visible to THIS compute pass. The barrier
+    // the trace loop leaves behind covers ptAccum_ only, and only for the
+    // fragment stage, because until now the tonemap was the only reader. This
+    // pass reads the albedo and normal AOVs as well, and reads them in compute.
+    {
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.memoryBarrierCount = 1;
+        d.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &d);
+    }
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, dnPipeline_);
 
