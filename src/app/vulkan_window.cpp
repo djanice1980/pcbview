@@ -706,8 +706,24 @@ void VulkanWindow::initialise() {
         extensions.push_back("VK_KHR_xcb_surface");
 #endif
 
-        instance_ = createInstance(/*enableValidation=*/true, extensions);
-        messenger_ = createDebugMessenger(instance_);
+        // Validation is a DEBUG tool and was being enabled unconditionally,
+        // including in release builds. It is not free: the layer intercepts
+        // every Vulkan call, and a ray-traced frame makes a great many, so it
+        // was taxing the frame rate as well as burying every useful line of
+        // output under screenfuls of spec text -- most of it about images the
+        // OpenXR runtime creates, which we neither own nor can fix.
+        //
+        // Debug builds keep it. Release builds ask for it with
+        // PCBVIEW_VALIDATION=1; debug builds opt out with PCBVIEW_NO_VALIDATION.
+#ifdef NDEBUG
+        const bool wantValidation =
+            qEnvironmentVariableIsSet("PCBVIEW_VALIDATION");
+#else
+        const bool wantValidation =
+            !qEnvironmentVariableIsSet("PCBVIEW_NO_VALIDATION");
+#endif
+        instance_ = createInstance(wantValidation, extensions);
+        if (wantValidation) messenger_ = createDebugMessenger(instance_);
 
         // Hand Qt OUR instance rather than letting it make one. This is what
         // keeps the RT extension setup ours.
