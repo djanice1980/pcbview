@@ -561,6 +561,29 @@ void projectionFromFov(const XrFovf& fov, float zNear, float out[16]) {
     // Verify, don't trust the sign: at the left frustum edge x = tanL*d, z = -d,
     //   clip.x = (2/w)(tanL*d) - ((tanR+tanL)/w)*d = (d/w)(tanL - tanR) = -d
     // and clip.w = -z = d, so NDC x = -1. The unnegated term is correct.
+
+    // PCBVIEW_VR_NO_CANT=1 zeroes the frustum skew, centring both eyes' views
+    // straight ahead. This is deliberately NOT physically correct -- the
+    // rendered frustum stops matching the fov we declare in the layer -- but it
+    // isolates one thing cleanly.
+    //
+    // Measured on hardware, the two eyes' images are separated by 0.718 in NDC:
+    // 0.648 of that is this skew, which exists because the lens centres are
+    // offset from the panel centres and which the optics are supposed to undo,
+    // and only 0.070 is the real parallax of a board 0.6 m away seen from eyes
+    // 63 mm apart. If the skew is NOT being undone downstream, the eyes are
+    // asked to diverge past infinity and the image cannot fuse -- which is what
+    // "each eye has the wrong image" feels like from the inside.
+    //
+    // With this set the board lands near centre in both eyes and the remaining
+    // disparity is just that 0.070. If it suddenly fuses into one solid board,
+    // the fault is in how the skew reaches the panels, not in our geometry.
+    static const bool noCant = [] {
+        const char* v = std::getenv("PCBVIEW_VR_NO_CANT");
+        return v && v[0] && v[0] != '0';
+    }();
+    if (noCant) p[8] = 0.0f;
+
     for (int i = 0; i < 16; ++i) out[i] = p[i];
 }
 
