@@ -164,9 +164,36 @@ bool System::start() {
     depthLayerSupported_ = haveDepthExt;
     visibilityMaskSupported_ = haveMaskExt;
 
+    // Retry, because "no" from the runtime often means "not yet".
+    //
+    // Toggling into VR while SteamVR is showing its own environment makes it
+    // quit that scene app and hand the headset over, and during the swap it
+    // refuses new instances -- its log says so plainly, "Refusing because app
+    // start error VRInitError_Init_Retry", at the same instant ours said the
+    // runtime had not answered. Treating that as final meant the toggle
+    // reported no headset while a headset was sitting there tracking.
+    //
+    // Roughly three seconds of patience. Long enough to cover the handover,
+    // short enough that a genuinely absent runtime still fails promptly, and
+    // the result code is printed so the next failure names itself instead of
+    // being guessed at again.
     XrInstance inst = XR_NULL_HANDLE;
-    if (XR_FAILED(xrCreateInstance(&ici, &inst))) {
-        std::printf("xr: no runtime answered (is SteamVR installed?)\n");
+    XrResult ir = XR_SUCCESS;
+    for (int attempt = 0; attempt < 12; ++attempt) {
+        ir = xrCreateInstance(&ici, &inst);
+        if (XR_SUCCEEDED(ir)) break;
+        if (attempt == 0) {
+            std::printf("xr: runtime busy (result %d) -- it is most likely "
+                        "swapping scene apps; retrying for 3 s\n",
+                        static_cast<int>(ir));
+            std::fflush(stdout);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    if (XR_FAILED(ir)) {
+        std::printf("xr: no runtime answered after retrying (result %d). Is "
+                    "SteamVR running and the headset awake?\n",
+                    static_cast<int>(ir));
         return false;
     }
 
