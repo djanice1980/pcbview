@@ -196,6 +196,8 @@ std::vector<GpuInfo> enumerateGpus(VkInstance instance) {
         info.hasDeferredHostOperations =
             hasExtension(exts, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         info.hasRayQuery = hasExtension(exts, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+        info.hasFragmentShadingRate =
+            hasExtension(exts, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
 
         // Core since 1.2, but confirm the features are actually on -- an
         // extension being listed is not the same as the feature being enabled.

@@ -26,6 +26,11 @@ struct GpuInfo {
     bool hasBufferDeviceAddress = false;
     bool hasDescriptorIndexing = false;
     bool hasRayQuery = false;
+    // Variable-rate shading. The route to foveation that needs no eye tracker:
+    // an attachment says how coarsely to shade each tile, so the periphery can
+    // shade one fragment per 2x2 or 4x4 pixels. Ours is a fragment-shading
+    // cost -- rays per fragment -- so this cuts the rays directly.
+    bool hasFragmentShadingRate = false;
 
     // True only when every prerequisite for the RT-pipeline path is present.
     bool rayTracingReady() const {

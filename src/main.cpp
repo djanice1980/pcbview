@@ -118,6 +118,9 @@ void printGpu(const pcbview::GpuInfo& gpu, bool selected) {
     std::printf("       descriptor_indexing     %s   (RT rule 3)\n",
                 mark(gpu.hasDescriptorIndexing));
     std::printf("       ray_query               %s\n", mark(gpu.hasRayQuery));
+    std::printf("       fragment_shading_rate   %s   (foveation without an "
+                "eye tracker)\n",
+                mark(gpu.hasFragmentShadingRate));
     std::printf("       => ray-query ready:     %s   (pcbview RT path)\n",
                 gpu.rayQueryReady() ? "YES" : "no");
     std::printf("       => rt-pipeline ready:   %s\n",

@@ -106,6 +106,8 @@ bool System::start() {
     // the aliasing.
     bool haveDepthExt = false;
     bool haveMaskExt = false;
+    bool haveGazeExt = false;
+    bool haveFoveationExt = false;
     {
         uint32_t n = 0;
         xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr);
@@ -118,7 +120,23 @@ bool System::start() {
             if (std::strcmp(e.extensionName,
                             XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0)
                 haveMaskExt = true;
+            // Not enabled here -- only reported. Whether eye-tracked foveation
+            // is even POSSIBLE on this headset and this connection is a
+            // question to answer before designing around it, and the runtime's
+            // own extension list is the only authority worth trusting for it.
+            if (std::strcmp(e.extensionName, "XR_EXT_eye_gaze_interaction") == 0)
+                haveGazeExt = true;
+            if (std::strcmp(e.extensionName, "XR_FB_foveation") == 0 ||
+                std::strcmp(e.extensionName, "XR_VARJO_foveated_rendering") ==
+                    0 ||
+                std::strcmp(e.extensionName,
+                            "XR_META_foveation_eye_tracked") == 0)
+                haveFoveationExt = true;
         }
+        std::printf("vr-caps: eye gaze %s, runtime foveation %s\n",
+                    haveGazeExt ? "AVAILABLE" : "not offered",
+                    haveFoveationExt ? "AVAILABLE" : "not offered");
+        std::fflush(stdout);
     }
 
     // The visibility mask is the shape of what the LENSES can actually show.
