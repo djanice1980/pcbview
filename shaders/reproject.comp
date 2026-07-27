@@ -25,6 +25,8 @@ layout(set = 0, binding = 3, rgba32f) uniform readonly image2D histColour;
 layout(set = 0, binding = 4, rgba32f) uniform readonly image2D histPos;
 layout(set = 0, binding = 5, rgba32f) uniform writeonly image2D outColour;
 
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
 layout(push_constant) uniform Push {
     mat4 prevViewProj;  // world(mm) -> clip, as it was LAST frame
     uvec4 dim;          // x width, y height, z reset (1 = ignore history)
@@ -40,8 +42,39 @@ void main() {
     if (px.x >= int(pc.dim.x) || px.y >= int(pc.dim.y)) return;
 
     const float invSamples = pc.params.x;
-    const vec3 cur = imageLoad(curColour, px).rgb * invSamples;
+    vec3 cur = imageLoad(curColour, px).rgb * invSamples;
     const vec4 pos = imageLoad(curPos, px);
+
+    // FIREFLY CLAMP, and temporal reuse is what makes it necessary.
+    //
+    // At a handful of samples a frame, one path occasionally finds a very
+    // bright route -- a glancing specular, a lucky bounce off gold -- and lands
+    // a single pixel orders of magnitude above its neighbours. Without history
+    // that flickers for one frame and is gone. WITH history it gets averaged in
+    // and then decays slowly over the whole history length, so a momentary
+    // flicker becomes a lingering dot on the board.
+    //
+    // A real highlight covers several pixels; a firefly is one pixel that
+    // disagrees with everything around it. So clamp against the local mean
+    // rather than a fixed ceiling, which would flatten genuine bright detail.
+    {
+        vec3 mean = vec3(0.0);
+        float cnt = 0.0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const ivec2 q = px + ivec2(dx, dy);
+                if (q.x < 0 || q.y < 0 || q.x >= int(pc.dim.x) ||
+                    q.y >= int(pc.dim.y))
+                    continue;
+                mean += imageLoad(curColour, q).rgb * invSamples;
+                cnt += 1.0;
+            }
+        }
+        mean /= max(cnt, 1.0);
+        const float lc = luma(cur);
+        const float limit = luma(mean) * 4.0 + 0.05;
+        if (lc > limit && lc > 1.0e-6) cur *= limit / lc;
+    }
 
     // Sky, or the history has been invalidated wholesale (the board moved, the
     // scene changed). Nothing to reuse.

@@ -2219,11 +2219,17 @@ void Renderer::recordTemporal(VkCommandBuffer cmd, const float viewProj[16]) {
     // frame's samples as they are rather than blending against nonsense.
     push.dim[2] = (!prevViewProjValid_[s] || temporalReset_) ? 1u : 0u;
     push.params[0] = 1.0f / static_cast<float>(std::max(ptSampleCount_, 1));
-    // Tolerance as a FRACTION of view distance rather than an absolute one:
-    // too tight and every pixel fails the test so nothing is ever reused; too
-    // loose and a chip's history bleeds onto the board behind it. Relative
-    // keeps that balance at any board size and any zoom.
-    push.params[1] = 0.01f;
+    // Tolerance as a FRACTION of view distance rather than an absolute one --
+    // relative keeps the balance at any board size and any zoom.
+    //
+    // 0.25%, not the 1% it started at. On a board viewed from about 86 mm, 1%
+    // is 0.86 mm, and a chip is roughly a millimetre TALL: the top of a package
+    // and the board beside it both fell inside tolerance and traded history.
+    // That shows up twice over -- as colour bleeding between them, and as edges
+    // that never settle, since which of the two a pixel picks up changes every
+    // frame. At 0.25% the same pair is comfortably separated.
+    static const float tolFrac = envFloat("PCBVIEW_VR_TOL", 0.0025f);
+    push.params[1] = tolFrac;
     push.params[2] = static_cast<float>(std::max(temporalMaxFrames_, 1));
     for (int i = 0; i < 3; ++i) push.eye[i] = rayEye_[i];
     vkCmdPushConstants(cmd, rpPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
