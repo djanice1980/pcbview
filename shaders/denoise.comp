@@ -47,7 +47,21 @@ void main() {
     // `scale` folds the accumulation divide into the first pass: pass 0 reads
     // the running radiance SUM and needs 1/samples, later passes read an
     // already-averaged image and pass 1.0.
-    const vec3 centre = imageLoad(srcImg, px).rgb * pc.sigma.w;
+    const vec4 srcC = imageLoad(srcImg, px);
+    const vec3 centre = srcC.rgb * pc.sigma.w;
+
+    // How many frames of history this pixel carries, written by the temporal
+    // pass into alpha and forwarded by every pass below. 0 when temporal reuse
+    // is off, which simply leaves the scaling at 1.
+    //
+    // Filter strength follows it. A pixel with a long history is already an
+    // average of many samples and needs almost no spatial help -- blurring it
+    // only destroys detail. A freshly disoccluded pixel has one frame's worth
+    // of samples and needs all the help it can get. Those are exactly the
+    // pixels along a silhouette, which is why edges crawl when every pixel is
+    // filtered the same amount regardless of what it actually knows.
+    const float hist = max(srcC.a, 1.0);
+    const float boost = clamp(8.0 / sqrt(hist), 1.0, 8.0);
     const vec3 nRaw = imageLoad(normalImg, px).xyz;
     const vec3 aC = imageLoad(albedoImg, px).rgb * pc.misc.x;
     const float lC = luma(centre);
@@ -99,7 +113,7 @@ void main() {
             // nothing whatsoever. Scaling by the centre's own brightness makes
             // it behave the same in a bright region as a dark one.
             const float wl =
-                exp(-abs(lC - luma(cQ)) / (pc.sigma.y * max(lC, 0.05)));
+                exp(-abs(lC - luma(cQ)) / (pc.sigma.y * boost * max(lC, 0.05)));
 
             const float w = kernel[dx + 2] * kernel[dy + 2] * wn * wa * wl;
             sum += cQ * w;
@@ -110,5 +124,9 @@ void main() {
     // wsum can only reach zero if every tap was rejected, including the centre;
     // fall back to the centre rather than emitting a black pixel.
     const vec3 outC = wsum > 1e-8 ? sum / wsum : centre;
-    imageStore(dstImg, px, vec4(outC, 1.0));
+    // Alpha carries the history length through the chain, so later passes scale
+    // their strength the same way this one did. Dropping it here would leave
+    // every pass after the first treating a converged pixel and a brand new one
+    // identically.
+    imageStore(dstImg, px, vec4(outC, srcC.a));
 }

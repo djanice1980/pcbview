@@ -58,43 +58,72 @@ void main() {
     }
     const vec2 ndc = clip.xy / clip.w;
     const vec2 uv = ndc * 0.5 + 0.5;
-    const ivec2 prev = ivec2(uv * vec2(pc.dim.xy));
-    if (prev.x < 0 || prev.y < 0 || prev.x >= int(pc.dim.x) ||
-        prev.y >= int(pc.dim.y)) {            // moved off screen
-        imageStore(outColour, px, vec4(cur, 1.0));
-        return;
-    }
+
+    // BILINEAR history fetch, with every tap validated separately.
+    //
+    // A single nearest-neighbour lookup is what makes silhouettes crawl. The
+    // reprojected position almost never lands on a pixel centre, so as the head
+    // drifts by a fraction of a pixel the chosen texel flips between the chip
+    // and the board behind it. Along an edge that happens constantly: history
+    // is thrown away, the pixel falls back to a few raw samples, and since the
+    // noise is different every frame the whole outline boils.
+    //
+    // Taking the four surrounding texels and testing each one on its own means
+    // an edge pixel keeps whichever of its neighbours genuinely belong to the
+    // same surface, instead of losing everything because the nearest one did
+    // not.
+    const vec2 prevF = uv * vec2(pc.dim.xy) - 0.5;
+    const ivec2 base = ivec2(floor(prevF));
+    const vec2 f = prevF - vec2(base);
+    const float bw[4] = float[](
+        (1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y),
+        (1.0 - f.x) * f.y,         f.x * f.y);
+    const ivec2 off[4] =
+        ivec2[](ivec2(0, 0), ivec2(1, 0), ivec2(0, 1), ivec2(1, 1));
 
     // DISOCCLUSION TEST, and everything rests on it.
     //
     // A pixel can reproject to a perfectly valid screen position that shows a
     // DIFFERENT surface -- the board behind a chip, revealed as you move. Its
     // history belongs to the chip, and blending it in drags the chip's colour
-    // across the newly-visible board: a smear trailing every object. So the
-    // history is only trusted when the point stored there really is the point
-    // being shaded now, within a tolerance scaled to the board.
-    // Tolerance scales with how far away the point is, rather than being a
-    // fixed distance. One pixel covers more world at range, so a fixed
-    // threshold would be far too strict close up and far too slack out at the
-    // edges -- and it would need retuning for every board size.
-    const vec4 hp = imageLoad(histPos, prev);
+    // across the newly-visible board: a smear trailing every object.
+    //
+    // The tolerance scales with distance rather than being a fixed span. One
+    // pixel covers more world at range, so a constant threshold would be far
+    // too strict close up and far too slack out at the edges, and would want
+    // retuning for every board size.
     const float tol = pc.params.y * max(distance(pos.xyz, pc.eye), 1.0e-3);
-    const bool sameSurface = hp.w > 0.5 && distance(hp.xyz, pos.xyz) < tol;
 
-    if (!sameSurface) {
-        // No usable history: this pixel starts again from one frame's samples.
-        // It will be noisy for a few frames, and that is correct -- inventing
-        // history here is exactly what produces trails.
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    float nsum = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        const ivec2 q = base + off[i];
+        if (q.x < 0 || q.y < 0 || q.x >= int(pc.dim.x) ||
+            q.y >= int(pc.dim.y))
+            continue;
+        const vec4 hp = imageLoad(histPos, q);
+        if (hp.w < 0.5 || distance(hp.xyz, pos.xyz) >= tol) continue;
+        const vec4 hc = imageLoad(histColour, q);
+        sum += hc.rgb * bw[i];
+        nsum += hc.a * bw[i];
+        wsum += bw[i];
+    }
+
+    if (wsum <= 1.0e-6) {
+        // Genuinely nothing to reuse -- newly revealed surface. Start again
+        // from this frame's samples: noisy for a few frames, which is correct.
+        // Inventing history here is exactly what produces trails.
         imageStore(outColour, px, vec4(cur, 1.0));
         return;
     }
 
-    const vec4 hist = imageLoad(histColour, prev);
-    // .a counts how many frames this pixel has been accumulating. Capping it
-    // bounds how far back the average reaches: an unbounded average would take
-    // a second to respond to a lighting change, and a short one would barely
-    // denoise. The cap IS the quality/latency dial.
-    const float n = min(hist.a + 1.0, pc.params.z);
-    const vec3 blended = mix(hist.rgb, cur, 1.0 / n);
+    const vec3 histRgb = sum / wsum;
+    // How many frames this pixel has been accumulating. Capping it bounds how
+    // far back the average reaches: unbounded takes a second to respond to a
+    // change, too short barely denoises. The cap IS the quality/latency dial.
+    // Carried on into the filter, which leans harder on pixels with little.
+    const float n = min(nsum / wsum + 1.0, pc.params.z);
+    const vec3 blended = mix(histRgb, cur, 1.0 / n);
     imageStore(outColour, px, vec4(blended, n));
 }
