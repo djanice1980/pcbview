@@ -1601,6 +1601,16 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     // and how far off to the side and above/below the current gaze it sits.
     // Bearing is signed -- positive is to the right -- so "off to my left" has
     // a number attached instead of being a description.
+    if (got >= 2) {
+        const glm::vec3 h(
+            (views[0].pose.position.x + views[1].pose.position.x) * 0.5f,
+            (views[0].pose.position.y + views[1].pose.position.y) * 0.5f,
+            (views[0].pose.position.z + views[1].pose.position.z) * 0.5f);
+        boardDist_ = glm::length(
+            glm::vec3(place * glm::vec4(placeCentre_[0], placeCentre_[1],
+                                        placeCentre_[2], 1.0f)) -
+            h);
+    }
     if (got >= 2 && (++diagFrames_ % 120) == 1) {
         const glm::vec3 head(
             (views[0].pose.position.x + views[1].pose.position.x) * 0.5f,

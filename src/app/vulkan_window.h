@@ -413,6 +413,10 @@ public:
     // the origin, and the camera returns to its opening orientation, framed.
     // Snaps rather than glides -- a recentre is a command, not a move.
     void recenterAll();
+    // Accumulators for the VR configuration sweep's current window.
+    double sweepGpuMs_ = 0.0;
+    double sweepDist_ = 0.0;
+    int sweepSamples_ = 0;
     const BoardPose& boardPose() const { return board_; }
     // Board -> world. Rotation happens about the bounds centre so the centre
     // holds still and the camera's orbit target stays meaningful.

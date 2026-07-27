@@ -431,10 +431,13 @@ void VulkanWindow::stepVr() {
                 vr_->setRateAutoReport(false);
                 std::printf(
                     "\nvr-sweep: %zu configurations, about 7 s each. Keep the "
-                    "board in view and hold still.\n"
-                    "vr-sweep: %-28s %7s %7s %8s %10s\n",
-                    std::size(kSweep), "configuration", "Hz", "late", "lost",
-                    "frame ms");
+                    "board in view.\n"
+                    "vr-sweep: GPU ms is the measurement. 'dist' is the mean "
+                    "board distance over the window --\nvr-sweep: rows at "
+                    "different distances are not comparable, because fill "
+                    "cost follows coverage.\n"
+                    "vr-sweep: %-28s %8s %7s %7s\n",
+                    std::size(kSweep), "configuration", "GPU ms", "dist", "Hz");
                 std::fflush(stdout);
             }
             return on;
@@ -468,13 +471,25 @@ void VulkanWindow::stepVr() {
             const int kSettle = 120, kMeasure = 480;
             if (++sweepFrame == kSettle) {
                 vr_->takeRate();
-            } else if (sweepFrame >= kSettle + kMeasure) {
+                sweepGpuMs_ = 0.0;
+                sweepDist_ = 0.0;
+                sweepSamples_ = 0;
+            } else if (sweepFrame > kSettle) {
+                // Accumulate the GPU's own timestamp delta, and the distance
+                // the measurement was taken at.
+                const double g = renderer_->lastGpuMs();
+                if (g > 0.0) {
+                    sweepGpuMs_ += g;
+                    sweepDist_ += vr_->boardDistance();
+                    ++sweepSamples_;
+                }
+            }
+            if (sweepFrame >= kSettle + kMeasure) {
                 const auto st = vr_->takeRate();
-                const double frames = st.frames ? st.frames : 1;
-                std::printf("vr-sweep: %-28s %6.0f %6.1f%% %8u %9.2f\n",
-                            kSweep[sweepStep].name, st.hz,
-                            100.0 * st.late / frames, st.periodsLost,
-                            st.frameMs / frames);
+                const double n = sweepSamples_ ? sweepSamples_ : 1;
+                std::printf("vr-sweep: %-28s %7.2f %6.2fm %6.0f\n",
+                            kSweep[sweepStep].name, sweepGpuMs_ / n,
+                            sweepDist_ / n, st.hz);
                 std::fflush(stdout);
                 sweepFrame = 0;
                 if (++sweepStep >= std::size(kSweep)) {

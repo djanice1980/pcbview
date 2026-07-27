@@ -244,6 +244,7 @@ Renderer::~Renderer() {
     if (pipelineOpaque_) vkDestroyPipeline(device_.handle, pipelineOpaque_, nullptr);
     if (pipelineBlend_) vkDestroyPipeline(device_.handle, pipelineBlend_, nullptr);
     destroyBloom();
+    if (timePool_) vkDestroyQueryPool(device_.handle, timePool_, nullptr);
     if (maskPipeline_) vkDestroyPipeline(device_.handle, maskPipeline_, nullptr);
     if (maskLayout_)
         vkDestroyPipelineLayout(device_.handle, maskLayout_, nullptr);
@@ -3474,6 +3475,35 @@ void Renderer::createSyncAndCommands() {
     check(vkAllocateCommandBuffers(device_.handle, &alloc, commandBuffers_.data()),
           "vkAllocateCommandBuffers");
 
+    // Timestamps around each frame's command buffer, so the GPU can be priced
+    // directly rather than inferred. timestampPeriod is nanoseconds per tick;
+    // a queue family reporting zero valid bits cannot do this at all, so the
+    // whole thing stays optional.
+    {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(device_.gpu.handle, &props);
+        uint32_t famCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(device_.gpu.handle, &famCount,
+                                                 nullptr);
+        std::vector<VkQueueFamilyProperties> fams(famCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(device_.gpu.handle, &famCount,
+                                                 fams.data());
+        const bool canTime =
+            props.limits.timestampComputeAndGraphics ||
+            (device_.gpu.graphicsQueueFamily < famCount &&
+             fams[device_.gpu.graphicsQueueFamily].timestampValidBits > 0);
+        if (canTime && props.limits.timestampPeriod > 0.0f) {
+            VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            q.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            q.queryCount = kFramesInFlight * 2;
+            if (vkCreateQueryPool(device_.handle, &q, nullptr, &timePool_) ==
+                VK_SUCCESS) {
+                timestampPeriod_ = props.limits.timestampPeriod;
+                timeArmed_.assign(kFramesInFlight, false);
+            }
+        }
+    }
+
     imageAvailable_.resize(kFramesInFlight);
     inFlight_.resize(kFramesInFlight);
     // One render-finished semaphore per swapchain image, not per frame in
@@ -4494,6 +4524,25 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkBeginCommandBuffer(cmd, &begin);
 
+    // Collect this slot's previous pair before overwriting it. The fence was
+    // waited on at the top of drawFrame, so that submission has completed and
+    // the results are there -- no WAIT bit, and no stall.
+    if (timePool_ && timeArmed_[frame_]) {
+        uint64_t ts[2] = {0, 0};
+        if (vkGetQueryPoolResults(device_.handle, timePool_, frame_ * 2, 2,
+                                  sizeof(ts), ts, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+            ts[1] > ts[0]) {
+            gpuMs_ = double(ts[1] - ts[0]) * double(timestampPeriod_) * 1.0e-6;
+        }
+    }
+    if (timePool_) {
+        vkCmdResetQueryPool(cmd, timePool_, frame_ * 2, 2);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                             timePool_, frame_ * 2);
+        timeArmed_[frame_] = true;
+    }
+
     // Shared by the scene pass and the later blit/UI barriers.
     VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
 
@@ -4880,6 +4929,11 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     recordVrBlit(cmd);
 
     if (offscreenOnly_) {
+    // Close the frame's timestamp pair. BOTTOM_OF_PIPE so it is written only
+    // once everything recorded above has finished executing.
+    if (timePool_)
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                             timePool_, frame_ * 2 + 1);
         vkEndCommandBuffer(cmd);
         VkSubmitInfo solo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         solo.commandBufferCount = 1;
@@ -4976,6 +5030,11 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     dep.pImageMemoryBarriers = &toPresent;
     vkCmdPipelineBarrier2(cmd, &dep);
 
+    // Close the frame's timestamp pair. BOTTOM_OF_PIPE so it is written only
+    // once everything recorded above has finished executing.
+    if (timePool_)
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                             timePool_, frame_ * 2 + 1);
     vkEndCommandBuffer(cmd);
 
     VkPipelineStageFlags wait = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;

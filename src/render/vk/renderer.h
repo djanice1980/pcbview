@@ -431,6 +431,18 @@ public:
         rayQuality_ = level < 0 ? 0 : (level > 2 ? 2 : level);
     }
 
+    // GPU milliseconds for the last completed frame, from timestamps written
+    // around its command buffer. 0 if the device cannot timestamp.
+    //
+    // This is the only honest way to price a rendering change here. Wall time
+    // on the CPU measures submission, not work -- the GPU runs on behind it.
+    // And the rate the runtime paces us at is a control loop with hysteresis,
+    // not a measurement: it ratchets down readily and recovers slowly, so a
+    // sweep reading it back gets an answer that depends on the order the
+    // configurations were tried. A timestamp delta depends on nothing but the
+    // work.
+    double lastGpuMs() const { return gpuMs_; }
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the
@@ -790,6 +802,12 @@ private:
     bool offscreenOnly_ = false;
     bool rasterWorldSun_ = false;
     int rayQuality_ = 0;
+    // Two timestamps per frame in flight, read back when that slot's fence has
+    // signalled and the results are therefore available.
+    VkQueryPool timePool_ = VK_NULL_HANDLE;
+    float timestampPeriod_ = 0.0f;  // ns per tick; 0 = unsupported
+    std::vector<bool> timeArmed_;
+    double gpuMs_ = 0.0;
     VkImage vrTarget_ = VK_NULL_HANDLE;
     uint32_t vrTargetW_ = 0, vrTargetH_ = 0;
     VkImageView vrDepthView_ = VK_NULL_HANDLE;

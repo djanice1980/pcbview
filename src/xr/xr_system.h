@@ -202,6 +202,10 @@ public:
     };
     // Read and reset. Used to attribute a measured window to one configuration.
     RateStats takeRate();
+    // Metres from the head to the board centre, as of the last located frame.
+    // Fill cost follows how much of the eye the board covers, so any timing
+    // comparison has to say what distance it was taken at.
+    float boardDistance() const { return boardDist_; }
     // The periodic vr-rate line. Off while sweeping, so the sweep owns the
     // output and its rows are not interleaved with unrelated ones.
     void setRateAutoReport(bool on) { rateAuto_ = on; }
@@ -276,6 +280,7 @@ private:
     unsigned missedTotal_ = 0;
     double frameCpuMs_ = 0.0;
     long long lastPeriodNs_ = 0;
+    float boardDist_ = 0.0f;
     bool rateAuto_ = true;
     std::chrono::steady_clock::time_point frameStart_{};
     float gripPosMm_[2][3] = {};
