@@ -398,6 +398,34 @@ void Renderer::buildAccelerationStructures(uint32_t vertexCount,
     addGeometry(0, opaqueTris, filmTris);
     if (geomCount == 0) return;
 
+    // How much of what every shadow and AO ray traverses is geometry that
+    // cannot be seen?
+    //
+    // hideWhenCollapsed marks the buried inner copper -- not drawn at rest,
+    // because at rest it is inside the laminate and only shows as z-fighting
+    // at the cut edge. Ray tracing runs ONLY at rest (the gate is
+    // explodeProgress_ < 0.01). So during the exact window the rays are cast,
+    // that geometry is both invisible and enclosed by an opaque substrate, and
+    // yet it is in the acceleration structure being traversed.
+    //
+    // Reported rather than acted on: whether removing it is worth the index
+    // reordering it needs depends on how much of the board it actually is, and
+    // that varies by layer count and zone fill. A number decides it.
+    {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            uint32_t buried = 0;
+            for (const DrawItem& d : draws_)
+                if (d.hideWhenCollapsed) buried += d.indexCount / 3;
+            std::printf("rt-blas: %u triangles traced, %u of them buried inner "
+                        "copper (%.1f%%) -- invisible while rays are cast\n",
+                        totalTris, buried,
+                        totalTris ? 100.0 * buried / totalTris : 0.0);
+            std::fflush(stdout);
+        }
+    }
+
     VkAccelerationStructureBuildGeometryInfoKHR blasBuild{
         VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
     blasBuild.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
