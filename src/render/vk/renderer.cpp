@@ -169,6 +169,37 @@ Renderer::Renderer(Device& device, VkSurfaceKHR surface, uint32_t width,
     cpuMode_ = device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_CPU;
     if (cpuMode_) cpuTracer_ = std::make_unique<cpu::CpuTracer>();
 
+    // MSAA, decided HERE because it is baked into every pipeline built below
+    // and cannot change afterwards without rebuilding them.
+    //
+    // Never on the CPU device: llvmpipe shades every sample in software, so the
+    // cost is real there rather than the near-free coverage trick it is on a
+    // GPU. PCBVIEW_MSAA sets the count (1, 2, 4, 8); 4 is the usual sweet spot
+    // and anything the device cannot do is clamped down to what it can.
+    if (!cpuMode_) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(device_.gpu.handle, &props);
+        const VkSampleCountFlags supported =
+            props.limits.framebufferColorSampleCounts &
+            props.limits.framebufferDepthSampleCounts;
+
+        int want = 4;
+        if (const char* v = std::getenv("PCBVIEW_MSAA")) {
+            if (v[0]) want = std::atoi(v);
+        }
+        const struct { int n; VkSampleCountFlagBits bit; } kTiers[] = {
+            {8, VK_SAMPLE_COUNT_8_BIT},
+            {4, VK_SAMPLE_COUNT_4_BIT},
+            {2, VK_SAMPLE_COUNT_2_BIT},
+        };
+        for (const auto& t : kTiers) {
+            if (want >= t.n && (supported & t.bit)) {
+                msaaSamples_ = t.bit;
+                break;
+            }
+        }
+    }
+
     createSwapchain(width, height);
     createSceneTargets();
     createDescriptors();
@@ -1907,7 +1938,8 @@ void Renderer::destroySwapchain() {
 
 Renderer::Image Renderer::createImage(VkExtent2D extent, VkFormat format,
                                       VkImageUsageFlags usage,
-                                      VkImageAspectFlags aspect) {
+                                      VkImageAspectFlags aspect,
+                                      VkSampleCountFlagBits samples) {
     Image image;
 
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1916,7 +1948,7 @@ Renderer::Image Renderer::createImage(VkExtent2D extent, VkFormat format,
     info.extent = {extent.width, extent.height, 1};
     info.mipLevels = 1;
     info.arrayLayers = 1;
-    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.samples = samples;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = usage;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1982,6 +2014,24 @@ void Renderer::createSceneTargets() {
     sceneDepth_ = createImage(sceneExtent_, depthFormat_,
                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                               VK_IMAGE_ASPECT_DEPTH_BIT);
+
+    // Multisampled pair, resolved into the two above on the way out of the
+    // pass. TRANSIENT is deliberate: these are written and resolved inside a
+    // single render pass and never read afterwards, so a tiler can keep them
+    // entirely on-chip and a desktop driver may still place them lazily.
+    destroyImage(sceneColorMs_);
+    destroyImage(sceneDepthMs_);
+    if (msaaActive()) {
+        sceneColorMs_ = createImage(sceneExtent_, colorFormat_,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                        VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT, msaaSamples_);
+        sceneDepthMs_ = createImage(
+            sceneExtent_, depthFormat_,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+            VK_IMAGE_ASPECT_DEPTH_BIT, msaaSamples_);
+    }
 
     // Host-visible staging for the Embree tracer's BGRA output, copied into
     // sceneColor_ each CPU-traced frame. One buffer per frame in flight -- the
@@ -2730,9 +2780,12 @@ void Renderer::createPipeline() {
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.lineWidth = 1.0f;
 
+    // The board pipelines are the only ones drawing into the multisampled
+    // pass, so they are the only ones whose sample count changes. Overlay,
+    // bloom and tonemap all work on the RESOLVED image and stay at one.
     VkPipelineMultisampleStateCreateInfo ms{
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = msaaSamples_;
 
     // REVERSED-Z. Depth 1.0 at the near plane, 0.0 at infinity, cleared to 0,
     // compared with GREATER.
@@ -4315,23 +4368,43 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
     barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     barriers[1].newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-    barriers[1].image = sceneDepth_.handle;
+    barriers[1].image = msaaActive() ? sceneDepthMs_.handle : sceneDepth_.handle;
     barriers[1].subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
 
-    dep.imageMemoryBarrierCount = 2;
-    dep.pImageMemoryBarriers = barriers;
+    // With MSAA the pass writes the multisampled colour AND resolves into
+    // sceneColor_, so BOTH need to be attachment-ready. barriers[0] already
+    // covers sceneColor_ as the resolve destination; this adds the
+    // multisampled one it is resolved from.
+    VkImageMemoryBarrier2 msColor{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    if (msaaActive()) {
+        msColor = barriers[0];
+        msColor.image = sceneColorMs_.handle;
+    }
+    VkImageMemoryBarrier2 all[3] = {barriers[0], barriers[1], msColor};
+    dep.imageMemoryBarrierCount = msaaActive() ? 3u : 2u;
+    dep.pImageMemoryBarriers = all;
     vkCmdPipelineBarrier2(cmd, &dep);
 
     VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    color.imageView = sceneColor_.view;
+    color.imageView = msaaActive() ? sceneColorMs_.view : sceneColor_.view;
     color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     color.clearValue.color = {{0.118f, 0.118f, 0.118f, 1.0f}};
+    if (msaaActive()) {
+        // Averaging the samples down into sceneColor_ is part of ENDING the
+        // pass, so nothing downstream has to know multisampling happened --
+        // bloom, the tonemap and the eye blit all read the resolved image
+        // exactly as before. The multisampled colour itself is never stored.
+        color.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+        color.resolveImageView = sceneColor_.view;
+        color.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    }
 
     VkRenderingAttachmentInfo depthAttach{
         VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-    depthAttach.imageView = sceneDepth_.view;
+    depthAttach.imageView = msaaActive() ? sceneDepthMs_.view : sceneDepth_.view;
     depthAttach.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;

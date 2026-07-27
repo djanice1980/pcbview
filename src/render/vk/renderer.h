@@ -497,7 +497,8 @@ private:
     void createDescriptors();
 
     Image createImage(VkExtent2D extent, VkFormat format,
-                      VkImageUsageFlags usage, VkImageAspectFlags aspect);
+                      VkImageUsageFlags usage, VkImageAspectFlags aspect,
+                      VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT);
     void destroyImage(Image& image);
 
     Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
@@ -525,6 +526,28 @@ private:
     // UI is drawn afterwards straight onto the swapchain at native size.
     Image sceneColor_;
     Image sceneDepth_;
+    // --- MSAA ---------------------------------------------------------------
+    // The board is drawn into these and RESOLVED into sceneColor_ on the way
+    // out of the pass, so everything downstream -- bloom, tonemap, the eye blit
+    // -- keeps reading an ordinary single-sample image and needs no changes.
+    //
+    // This exists for one specific failure: a chip's legs are a row of parallel
+    // features about a pixel wide, and with one sample per pixel each leg is
+    // either hit or missed outright. Sub-pixel head movement flips them
+    // independently, and because the row is PERIODIC the result is moire --
+    // bands that slide across the package rather than a gentle shimmer. That is
+    // the "underwater" motion, and it is why supersampling barely helped:
+    // sampling a repeating pattern slightly above its own frequency does not
+    // resolve it, and going far enough above costs more than the frame has.
+    //
+    // MSAA answers it directly. Coverage is sampled several times per pixel but
+    // shading still runs ONCE, so a leg covering a third of a pixel comes out a
+    // third shaded instead of blinking -- at a fraction of supersampling's cost
+    // and with extra memory only on these two images.
+    Image sceneColorMs_;
+    Image sceneDepthMs_;
+    VkSampleCountFlagBits msaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
+    bool msaaActive() const { return msaaSamples_ != VK_SAMPLE_COUNT_1_BIT; }
     VkExtent2D sceneExtent_{};
     float renderScale_ = 1.0f;
     // Camera forward + ortho orbit distance (0 = perspective) for the raster
