@@ -515,6 +515,7 @@ void VulkanWindow::stepVr() {
             bool rt;
             int rayQ;
             int fov;
+            float ss;
             const char* name;
         };
         // The bottom rung keeps its shadows.
@@ -544,12 +545,25 @@ void VulkanWindow::stepVr() {
         // if you go looking. Foveation is applied throughout instead, since
         // that is what bought the close range back without losing shadows.
         static const Tier kTiers[] = {
-            {true, 0, 1, "11 rays, foveated"},
-            {true, 1, 1, "7 rays, foveated"},
-            {true, 2, 1, "4 rays, foveated"},
-            {true, 2, 2, "4 rays, foveated hard"},
+            {true, 0, 1, 1.00f, "11 rays, foveated"},
+            {true, 1, 1, 1.00f, "7 rays, foveated"},
+            {true, 2, 1, 1.00f, "4 rays, foveated"},
+            {true, 2, 2, 1.00f, "4 rays, foveated hard"},
+            // Below here the rays are already as cheap as they get, so the
+            // remaining lever is RESOLUTION -- the scene target shrinks and the
+            // eye blit scales it back up.
+            //
+            // These exist because a denser board runs out of budget where the
+            // first one did not: four rays foveated hard measured 5.4 ms at
+            // 0.30 m on one board and 8.9 to 11.8 ms on another, and at 11.8
+            // the runtime paced us to 45 Hz with the ladder already at its
+            // bottom rung and nowhere left to go. Dropping shadows would fix
+            // that too, and is exactly the thing that was worth removing.
+            // Softer pixels are the better trade.
+            {true, 2, 2, 0.80f, "4 rays, 0.80x"},
+            {true, 2, 2, 0.65f, "4 rays, 0.65x"},
         };
-        static const Tier kNoFoveation = {false, 2, 0, "plain raster"};
+        static const Tier kNoFoveation = {false, 2, 0, 1.00f, "plain raster"};
         static const int kLast = static_cast<int>(std::size(kTiers)) - 1;
         // Explicitly asking for a ray budget pins it -- an override that a
         // controller quietly walks away from is not an override.
@@ -611,8 +625,18 @@ void VulkanWindow::stepVr() {
             // native proves nothing on its own once throttled, since we hit a
             // slower target easily -- that asymmetry is why the counters
             // differ by a factor of four.
+            //
+            // Two step-down signals, not one. Being throttled is the ground
+            // truth but it ARRIVES LATE -- by then the viewer has already
+            // watched the image swim. Our own GPU time exceeding the entire
+            // frame budget is a safe leading indicator: the compositor's share
+            // is invisible to us, but it is never negative, so if we alone
+            // have spent the whole budget we are certainly too slow. That is
+            // the case a denser board hits, and it is worth catching before
+            // the runtime reacts rather than after.
             const bool throttled = vr_->pacedFrameMs() > budget * 1.5;
-            if (throttled) {
+            const bool overBudget = frameGpuMs > budget;
+            if (throttled || overBudget) {
                 ++over;
                 under = 0;
             } else if (frameGpuMs > 0.0 && frameGpuMs < budget * 0.5) {
@@ -661,6 +685,7 @@ void VulkanWindow::stepVr() {
             rtEff = t.rt;
             rayQEff = t.rayQ;
             fovEff = t.fov;
+            ssEff = ss * t.ss;
         }
 
         // --- Measured sweep -------------------------------------------------
