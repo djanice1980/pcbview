@@ -398,33 +398,7 @@ void Renderer::buildAccelerationStructures(uint32_t vertexCount,
     addGeometry(0, opaqueTris, filmTris);
     if (geomCount == 0) return;
 
-    // How much of what every shadow and AO ray traverses is geometry that
-    // cannot be seen?
-    //
-    // hideWhenCollapsed marks the buried inner copper -- not drawn at rest,
-    // because at rest it is inside the laminate and only shows as z-fighting
-    // at the cut edge. Ray tracing runs ONLY at rest (the gate is
-    // explodeProgress_ < 0.01). So during the exact window the rays are cast,
-    // that geometry is both invisible and enclosed by an opaque substrate, and
-    // yet it is in the acceleration structure being traversed.
-    //
-    // Reported rather than acted on: whether removing it is worth the index
-    // reordering it needs depends on how much of the board it actually is, and
-    // that varies by layer count and zone fill. A number decides it.
-    {
-        static bool once = false;
-        if (!once) {
-            once = true;
-            uint32_t buried = 0;
-            for (const DrawItem& d : draws_)
-                if (d.hideWhenCollapsed) buried += d.indexCount / 3;
-            std::printf("rt-blas: %u triangles traced, %u of them buried inner "
-                        "copper (%.1f%%) -- invisible while rays are cast\n",
-                        totalTris, buried,
-                        totalTris ? 100.0 * buried / totalTris : 0.0);
-            std::fflush(stdout);
-        }
-    }
+    (void)filmTris;
 
     VkAccelerationStructureBuildGeometryInfoKHR blasBuild{
         VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR};
@@ -569,10 +543,12 @@ void Renderer::bakeExplode(float progress) {
     // therefore the primitive re-basing) stay exactly as uploadBoard laid them.
     const float kHide = std::numeric_limits<float>::quiet_NaN();
     std::vector<geom::Vertex> exploded = restVertices_;
+    size_t hidden = 0;
     for (size_t i = 0; i < exploded.size(); ++i) {
         const uint32_t part = vertexPart_[i];
         if (part < vis.size() && !vis[part]) {
             exploded[i].position[0] = kHide;
+            ++hidden;
             continue;
         }
         const float rank = vertexRank_[i];
@@ -581,6 +557,26 @@ void Renderer::bakeExplode(float progress) {
             std::max(progress - (maxRank_ - ring), 0.0f) * explodeStep_;
         const float sign = rank > 0.0f ? 1.0f : (rank < 0.0f ? -1.0f : 0.0f);
         exploded[i].position[2] += sign * travel;
+    }
+    // What the acceleration structure will actually traverse.
+    //
+    // Reported because the obvious measurement is the wrong one: counting
+    // hideWhenCollapsed triangles in draws_ says what was SUBMITTED, and a
+    // NaN'd vertex makes its triangle inactive, so the builder drops it. Those
+    // two numbers differ by everything that matters, and the first one reads
+    // like a large optimisation still waiting to be done.
+    {
+        static size_t lastHidden = SIZE_MAX;
+        if (hidden != lastHidden) {
+            lastHidden = hidden;
+            std::printf("rt-blas: %zu of %zu vertices dropped before the build "
+                        "(%.1f%%) -- hidden parts and buried inner copper\n",
+                        hidden, exploded.size(),
+                        exploded.empty()
+                            ? 0.0
+                            : 100.0 * double(hidden) / double(exploded.size()));
+            std::fflush(stdout);
+        }
     }
     uploadViaStaging(tracedVertexBuffer_, exploded.data(),
                      exploded.size() * sizeof(geom::Vertex));
