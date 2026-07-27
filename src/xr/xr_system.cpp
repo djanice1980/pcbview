@@ -687,11 +687,31 @@ int presentTest() {
         inst, sysId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount,
         &viewCount, cfg.data());
 
-    // Half the runtime's recommendation. SteamVR asks for 4164x4244 per eye on
-    // this headset -- ~35 MP a frame at 90Hz across both -- which no renderer
-    // is going to hold. A scale factor is what real VR apps expose, so the
-    // plumbing may as well assume one from the start.
-    constexpr float kScale = 0.5f;
+    // The runtime's recommendation, in full, by default.
+    //
+    // This was fixed at HALF, on the reasoning that 4164x4244 per eye is ~35 MP
+    // a frame across both and no renderer holds that at 90 Hz. True of a path
+    // tracer at a hundred samples; badly wrong for ray-traced raster, and it
+    // was never revisited.
+    //
+    // Halving the swapchain does not merely soften the image -- it caps what
+    // can be DELIVERED. Every frame was downscaled into a quarter-resolution
+    // buffer, handed to the compositor, and stretched back up to the panel.
+    // Which is why supersampling barely helped: at 2x the scene was already
+    // being rendered at 4164x4244 and then thrown away at this line, paying
+    // full price for the pixels and delivering a quarter of them. On a headset
+    // already about three times short of visual acuity, that is the difference
+    // between "aliased mess" and merely "aliased".
+    //
+    // PCBVIEW_VR_RES scales it: 0.5 restores the old behaviour if a frame
+    // budget needs the room back.
+    static const float kScale = [] {
+        const char* v = std::getenv("PCBVIEW_VR_RES");
+        if (!v || !v[0]) return 1.0f;
+        char* end = nullptr;
+        const float f = std::strtof(v, &end);
+        return (end && end != v && f >= 0.25f && f <= 1.0f) ? f : 1.0f;
+    }();
     std::vector<EyeChain> eyes(viewCount);
     for (uint32_t i = 0; i < viewCount; ++i) {
         eyes[i].width =
