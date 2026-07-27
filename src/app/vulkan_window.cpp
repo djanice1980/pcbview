@@ -194,10 +194,20 @@ void VulkanWindow::stepVr() {
         const int n = qgetenv("PCBVIEW_VR_DENOISE").toInt(&ok);
         return (ok && n >= 0 && n <= 5) ? n : 5;
     }();
+    // Render above the eye's resolution and resolve down. THE fix for coverage
+    // being binary: with one sample per pixel a trace narrower than a pixel is
+    // either fully hit or fully missed, so a fraction of a pixel of head
+    // movement flips it, and every thin feature on the board flickers at once.
+    // Extra samples give partial coverage, which is what lets an edge fade
+    // rather than blink.
+    //
+    // Note this now sits on top of the runtime's FULL recommendation, so 1.5x
+    // here is genuine supersampling. Previously the swapchain was half size, so
+    // supersampling merely undid that and delivered nothing extra.
     static const float ss = [] {
         bool ok = false;
         const float f = qgetenv("PCBVIEW_VR_SS").toFloat(&ok);
-        return (ok && f >= 1.0f && f <= 2.0f) ? f : 1.0f;
+        return (ok && f >= 1.0f && f <= 2.0f) ? f : 1.5f;
     }();
     static const int rateDiv = [] {
         bool ok = false;
@@ -325,6 +335,12 @@ void VulkanWindow::stepVr() {
         // than to the screen, so neither changes character as you walk up to it
         // or step back.
         renderer_->setWorldScale(span);
+        // Raster needs none of the path tracer's buffers, and at a
+        // supersampled resolution they are thirteen RGBA32F images of well over
+        // half a gigabyte each. Allocating them regardless is what put a
+        // ceiling on how far supersampling could go before it simply ran out of
+        // memory.
+        renderer_->setPathTraceResourcesEnabled(allowPt);
 
         // Say what is actually running, once.
         //

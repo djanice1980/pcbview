@@ -2003,7 +2003,7 @@ void Renderer::createSceneTargets() {
 
     // Path-tracer targets, at the same resolution. HDR accumulation + the two
     // denoiser guides, all storage images kept in GENERAL layout.
-    if (rtSupported_) {
+    if (rtSupported_ && ptResourcesWanted_) {
         // The async denoise's fenced readback references these images; drain it
         // before they go away.
         abortDenoise();
@@ -2103,6 +2103,44 @@ struct RpPush {
     float eye[4];       // viewpoint (xyz), pad
 };
 }  // namespace
+
+void Renderer::setPathTraceResourcesEnabled(bool on) {
+    if (on == ptResourcesWanted_) return;
+    ptResourcesWanted_ = on;
+    if (!rtSupported_) return;
+    vkDeviceWaitIdle(device_.handle);
+    abortDenoise();
+    if (on) {
+        // Bring them back at the current resolution.
+        if (sceneExtent_.width > 0 && sceneExtent_.height > 0) {
+            recreatePtImagesLive();
+            if (ptSet_) updatePathTraceDescriptors();
+            updateGpuDenoiseDescriptors();
+            updateTemporalDescriptors();
+        }
+    } else {
+        // Thirteen full-resolution RGBA32F buffers handed back. At a
+        // supersampled 6000-pixel-wide scene that is over eight gigabytes,
+        // which raster mode had no use for and which put a hard ceiling on how
+        // far supersampling could be pushed before allocation simply failed.
+        destroyImage(ptAccum_);
+        destroyImage(ptAlbedo_);
+        destroyImage(ptNormal_);
+        destroyImage(ptNetPhase_);
+        destroyImage(ptDenoised_);
+        destroyImage(ptDenoiseTmp_);
+        destroyImage(ptPosition_);
+        destroyImage(ptGeoNormal_);
+        destroyImage(ptTemporal_);
+        for (int i = 0; i < kTemporalSlots; ++i) {
+            destroyImage(histColour_[i]);
+            destroyImage(histPos_[i]);
+            prevViewProjValid_[i] = false;
+        }
+        ptImagesInitialised_ = false;
+        ptDenoisedValid_ = false;
+    }
+}
 
 void Renderer::createTemporal() {
     if (!rtSupported_) return;

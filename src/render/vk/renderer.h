@@ -377,6 +377,16 @@ public:
     // board wherever you are.
     void setWorldScale(float spanMm) { worldSpan_ = spanMm; }
 
+    // Whether the path tracer's buffers are needed at all.
+    //
+    // There are thirteen of them and every one is RGBA32F at full scene
+    // resolution -- roughly 640 MB EACH once supersampling pushes the scene
+    // past 6000 pixels wide. They were allocated whenever the hardware could
+    // ray trace, so raster mode paid over eight gigabytes for buffers it never
+    // touched, and turning supersampling up far enough simply ran out of
+    // memory. Set false to skip them.
+    void setPathTraceResourcesEnabled(bool on);
+
     // Light the raster path from a world-fixed sun instead of the
     // camera-relative key.
     //
@@ -853,6 +863,7 @@ private:
     int temporalSlot_ = -1;
     int temporalMaxFrames_ = 32;
     float worldSpan_ = 0.0f;   // board width; 0 = unknown, world limits off
+    bool ptResourcesWanted_ = true;
     bool temporalReset_ = false;
     void createTemporal();
     void updateTemporalDescriptors();
