@@ -1497,6 +1497,52 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         glm::quat(anchorRot_[3], anchorRot_[0], anchorRot_[1], anchorRot_[2]));
     const glm::mat4 invPlace = glm::inverse(place);
 
+    // WHERE IS THE BOARD, from where the head is RIGHT NOW.
+    //
+    // Every diagnostic so far described the moment of anchoring, which is no
+    // help when the complaint is about what is visible some seconds later. This
+    // measures the thing actually being reported: how far away the board is,
+    // and how far off to the side and above/below the current gaze it sits.
+    // Bearing is signed -- positive is to the right -- so "off to my left" has
+    // a number attached instead of being a description.
+    if (got >= 2 && (++diagFrames_ % 120) == 1) {
+        const glm::vec3 head(
+            (views[0].pose.position.x + views[1].pose.position.x) * 0.5f,
+            (views[0].pose.position.y + views[1].pose.position.y) * 0.5f,
+            (views[0].pose.position.z + views[1].pose.position.z) * 0.5f);
+        const glm::quat hq(views[0].pose.orientation.w, views[0].pose.orientation.x,
+                           views[0].pose.orientation.y, views[0].pose.orientation.z);
+        const glm::vec3 fwd = hq * glm::vec3(0.0f, 0.0f, -1.0f);
+        const glm::vec3 boardRoom =
+            glm::vec3(place * glm::vec4(placeCentre_[0], placeCentre_[1],
+                                        placeCentre_[2], 1.0f));
+        const glm::vec3 d = boardRoom - head;
+        const float dist = glm::length(d);
+        // Horizontal bearing: both flattened to the room's floor plane, so a
+        // glance up or down does not read as being off to the side.
+        const glm::vec2 fh = glm::vec2(fwd.x, fwd.z);
+        const glm::vec2 dh = glm::vec2(d.x, d.z);
+        float bearing = 0.0f;
+        if (glm::length(fh) > 1e-4f && glm::length(dh) > 1e-4f) {
+            const glm::vec2 f = glm::normalize(fh), t = glm::normalize(dh);
+            // atan2 of the 2D cross and dot: signed, and right-handed about the
+            // room's up axis, so positive comes out to the viewer's right.
+            bearing = glm::degrees(std::atan2(f.x * t.y - f.y * t.x,
+                                              f.x * t.x + f.y * t.y));
+        }
+        const float elev =
+            dist > 1e-4f ? glm::degrees(std::asin(d.y / dist)) : 0.0f;
+        std::printf("vr-where: board %.2f m away, bearing %+.0f deg (%s), "
+                    "elevation %+.0f deg | head(%.2f %.2f %.2f) "
+                    "board(%.2f %.2f %.2f)\n",
+                    dist, bearing,
+                    std::fabs(bearing) < 15.0f ? "ahead"
+                                               : (bearing > 0 ? "RIGHT" : "LEFT"),
+                    elev, head.x, head.y, head.z, boardRoom.x, boardRoom.y,
+                    boardRoom.z);
+        std::fflush(stdout);
+    }
+
     for (int i = 0; i < 2; ++i) {
         gripTracked_[i] = false;
         if (!handSpace_[i]) continue;

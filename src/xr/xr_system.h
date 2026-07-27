@@ -249,6 +249,8 @@ private:
     // reanchor. Capped so a genuinely stuck session says so twice rather than
     // once per frame forever.
     int anchorWaited_ = 0;
+    // Frame counter, only so the where-is-the-board line is throttled.
+    unsigned diagFrames_ = 0;
     float gripPosMm_[2][3] = {};
     float gripQuat_[2][4] = {};
     bool gripTracked_[2] = {false, false};
