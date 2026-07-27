@@ -2783,6 +2783,14 @@ void Renderer::recordGpuDenoise(VkCommandBuffer cmd) {
 void Renderer::destroySceneTargets() {
     destroyImage(sceneColor_);
     destroyImage(sceneDepth_);
+    // The multisampled pair too. createSceneTargets destroys and rebuilds these
+    // itself, so the resize and rescale paths were never leaking -- but the
+    // destructor calls this with no matching create, and those two images, their
+    // memory and their views survived the device. Validation reported exactly
+    // that: two VkImage, two VkDeviceMemory, two VkImageView still alive at
+    // vkDestroyDevice.
+    destroyImage(sceneColorMs_);
+    destroyImage(sceneDepthMs_);
     destroyImage(bloomTex_);  // sized from sceneExtent_, so it dies with it
     for (Buffer& b : cpuStaging_) destroyBuffer(b);
     cpuStaging_.clear();
@@ -4676,6 +4684,28 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
                       .count())
             : 0;
     push.highlight[3] = netAnimate_ ? 1 : 0;
+    // Pass 0: the hidden-area mesh. Stamps the near plane over the corners the
+    // lenses bend away, so everything drawn afterwards fails the depth test
+    // there and is never shaded -- around 22% of each eye on this headset.
+    //
+    // FIRST, before any of the board's state is set, and the ordering is the
+    // whole point. This draw binds its own pipeline, vertex buffer and index
+    // buffer, and all three are command-buffer state rather than something a
+    // pipeline carries with it:
+    //
+    //   - Run after the board's vertex/index binds and every board draw reads
+    //     the mask's 36 triangles of vec2 through the board's index counts and
+    //     offsets. That is what turned the board into a few spikes around an
+    //     empty middle: reads far off the end of a 288-byte buffer.
+    //   - Run after the descriptor set and push constants and it is no better.
+    //     maskLayout_ declares no sets and no push range, so it is incompatible
+    //     with layout_ from set 0 up, and binding the mask pipeline disturbs
+    //     both -- leaving the board drawing with no material table.
+    //
+    // Everything below re-establishes the board's state, so nothing the mask
+    // touches survives into the board passes.
+    recordVisibilityMask(cmd);
+
     vkCmdPushConstants(cmd, layout_,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(push), &push);
@@ -4719,11 +4749,6 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
         if (i.hideWhenCollapsed && !peeling && substrateOpaque) return false;
         return true;
     };
-
-    // Pass 0: the hidden-area mesh. Stamps the near plane over the corners the
-    // lenses bend away, so everything drawn afterwards fails the depth test
-    // there and is never shaded -- around 22% of each eye on this headset.
-    recordVisibilityMask(cmd);
 
     // Pass 1: opaque. Writes depth, so it establishes occlusion for everything.
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineOpaque_);
