@@ -423,10 +423,25 @@ void VulkanWindow::stepVr() {
         }();
         static size_t sweepStep = 0;
         static int sweepFrame = 0;
+        static int sweepIdle = 0;
         static bool sweepDone = false;
         if (sweeping && !sweepDone) {
             ssEff = kSweep[sweepStep].ss;
             rtEff = kSweep[sweepStep].rt;
+        }
+        // Count only frames the runtime actually asked us to render, so an
+        // idle headset stalls the sweep instead of walking through every
+        // configuration measuring nothing and reporting tidy zeroes.
+        if (sweeping && !sweepDone && !render) {
+            if ((++sweepIdle % 300) == 1) {
+                std::printf("vr-sweep: waiting -- the runtime is not asking "
+                            "for frames. Put the headset ON and look at the "
+                            "board; nothing is being measured until then.\n");
+                std::fflush(stdout);
+            }
+        }
+        if (sweeping && !sweepDone && render) {
+            sweepIdle = 0;
             // Settle first and throw those frames away. A configuration change
             // costs a scene-target rebuild and the runtime needs a moment to
             // settle on a pacing decision; measuring across that would report
@@ -446,9 +461,14 @@ void VulkanWindow::stepVr() {
                 if (++sweepStep >= std::size(kSweep)) {
                     sweepDone = true;
                     std::printf(
-                        "vr-sweep: done. Lower 'late' and 'lost' is better; "
-                        "Hz is what the runtime paced us at.\nvr-sweep: "
-                        "holding the last configuration.\n\n");
+                        "vr-sweep: done. READ THE Hz COLUMN -- it is the "
+                        "rate the runtime decided we can sustain, and it is "
+                        "the result.\nvr-sweep: 'late' and 'frame ms' are "
+                        "near-meaningless here: once the runtime has paced a "
+                        "configuration down we comfortably hit that slower "
+                        "target, so late falls to zero, and frame ms is CPU "
+                        "submission time while the GPU runs on behind it.\n"
+                        "vr-sweep: holding the last configuration.\n\n");
                     std::fflush(stdout);
                     vr_->setRateAutoReport(true);
                 }
