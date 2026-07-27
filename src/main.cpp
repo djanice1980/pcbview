@@ -520,6 +520,15 @@ int main(int argc, char** argv) {
         // rather than being mistaken for a board filename.
         if (std::string(argv[1]) == "--view" && argc == 2)
             return pcbview::app::runViewer("");
+        // Bare --vr, with no board: the empty viewer, in the headset.
+        if (std::string(argv[1]) == "--vr" && argc == 2) {
+#ifdef _WIN32
+            _putenv_s("PCBVIEW_VR", "1");
+#else
+            setenv("PCBVIEW_VR", "1", 1);
+#endif
+            return pcbview::app::runViewer("");
+        }
         if (std::string(argv[1]) == "--gpu-info") return gpuReport();
         if (std::string(argv[1]) == "--xr-probe") return pcbview::xr::probe();
         if (std::string(argv[1]) == "--xr-device-test")
@@ -570,6 +579,20 @@ int main(int argc, char** argv) {
                 noMirror = true;
             } else if (arg == "--view") {
                 view = true;
+            } else if (arg == "--vr") {
+                // Sets the same switch the viewer already reads, because the
+                // decision genuinely has to be made this early: OpenXR WRAPS
+                // Vulkan instance and device creation, so the runtime has to be
+                // up before either exists. That is also why there is no button
+                // for this inside the running app -- turning VR on later would
+                // mean destroying and rebuilding the device and every resource
+                // on it. A flag is the honest form for a launch-time choice.
+                view = true;
+#ifdef _WIN32
+                _putenv_s("PCBVIEW_VR", "1");
+#else
+                setenv("PCBVIEW_VR", "1", 1);
+#endif
             } else {
                 std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
                 return 2;
