@@ -243,12 +243,24 @@ bool System::viewSize(uint32_t* width, uint32_t* height) const {
 // hardcoded at half in the renderer's own path, so the setting appeared to have
 // no effect at all while the diagnostic dutifully honoured it.
 float eyeResolutionScale() {
+    // 0.5 of what the runtime recommends, and that is not a compromise on
+    // quality -- it is the difference between ray-traced VR working and not.
+    //
+    // SteamVR's recommendation for this headset is 4164x4244 an eye against a
+    // 2000x2040 panel: it has already applied its own 1.5x supersampling
+    // before we see the number. Measured across the ray budget, at full
+    // recommendation only plain raster sustained 90 Hz and everything traced
+    // was paced down to 45 or 23; at 0.5 every rung of the ladder held 90.
+    // 0.5 still lands slightly ABOVE the panel's own resolution, so the
+    // headset is not being undersampled -- SteamVR's extra supersampling is
+    // simply not affordable alongside shadow and AO rays, and rays are worth
+    // far more here than the supersample was.
     static const float scale = [] {
         const char* v = std::getenv("PCBVIEW_VR_RES");
-        if (!v || !v[0]) return 1.0f;
+        if (!v || !v[0]) return 0.5f;
         char* end = nullptr;
         const float f = std::strtof(v, &end);
-        return (end && end != v && f >= 0.25f && f <= 1.0f) ? f : 1.0f;
+        return (end && end != v && f >= 0.25f && f <= 1.0f) ? f : 0.5f;
     }();
     return scale;
 }

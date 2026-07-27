@@ -436,18 +436,34 @@ void VulkanWindow::stepVr() {
         static int tierNow = 0;
         static int pacingTier = 0;
         static int over = 0, under = 0, dwell = 0;
+        static float distSmooth = 0.0f;
+        static int tierHold = 0;
         if (adapt && !allowPt) {
             const double budget = vr_->nativeFrameMs();
-            const float d = vr_->boardDistance();
+
+            // Smoothed distance, because the input is a head and heads are
+            // never still. The raw value swings several centimetres frame to
+            // frame just from breathing and micro-motion, and a threshold
+            // reads every one of those as an intention to move.
+            const float raw = vr_->boardDistance();
+            distSmooth = distSmooth <= 0.0f ? raw
+                                            : distSmooth * 0.94f + raw * 0.06f;
+            const float d = distSmooth;
 
             // Coarser as soon as the board crosses a threshold; finer only
-            // once it is 15% clear of it again. Without that margin, hovering
-            // on a boundary flips the shadows back and forth every few frames,
-            // which is far more distracting than either setting.
+            // once it is well clear of it again.
+            //
+            // 15% was not nearly enough. At the 0.30 m step that is a 4.5 cm
+            // band, and leaning gently in and out crossed it about twenty
+            // times in one session -- and the 4-rays-to-plain-raster step
+            // removes every shadow in the scene, so that is the most visible
+            // transition of the lot, flickering. 40%, smoothing, and a hold
+            // after each change together make a move mean the viewer actually
+            // went somewhere.
             const float kStep[3] = {1.00f, 0.60f, 0.30f};
             int distTier = 0;
             for (int i = 0; i < 3; ++i) {
-                const float t = (tierNow > i) ? kStep[i] * 1.15f : kStep[i];
+                const float t = (tierNow > i) ? kStep[i] * 1.40f : kStep[i];
                 if (d < t) distTier = i + 1;
             }
 
@@ -491,8 +507,15 @@ void VulkanWindow::stepVr() {
             // it acts before the frames are missed. Pacing is the corrective
             // one, and it only ever makes things cheaper than distance alone
             // would, never richer.
+            //
+            // A minimum hold between changes, whichever input asked for it.
+            // Dropping a rung is allowed to jump straight to wherever it needs
+            // to be, so walking right up to the board is not a staircase of
+            // visible steps -- but having moved, it stays put for a moment.
+            if (tierHold > 0) --tierHold;
             const int want = std::max(distTier, pacingTier);
-            if (want != tierNow) {
+            if (want != tierNow && tierHold == 0) {
+                tierHold = 90;
                 std::printf("vr-adapt: %s -> %s  (%.2f m, %.1f ms of %.1f, "
                             "paced %.0f Hz)\n",
                             kTiers[tierNow].name, kTiers[want].name, d,
