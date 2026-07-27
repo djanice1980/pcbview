@@ -193,6 +193,23 @@ bool System::viewSize(uint32_t* width, uint32_t* height) const {
     return true;
 }
 
+// How much of the runtime's recommended eye resolution to actually allocate.
+//
+// Shared, because it is needed in two places and having two copies is exactly
+// how this went wrong: the scale was made adjustable in presentTest and left
+// hardcoded at half in the renderer's own path, so the setting appeared to have
+// no effect at all while the diagnostic dutifully honoured it.
+float eyeResolutionScale() {
+    static const float scale = [] {
+        const char* v = std::getenv("PCBVIEW_VR_RES");
+        if (!v || !v[0]) return 1.0f;
+        char* end = nullptr;
+        const float f = std::strtof(v, &end);
+        return (end && end != v && f >= 0.25f && f <= 1.0f) ? f : 1.0f;
+    }();
+    return scale;
+}
+
 int deviceTest() {
     std::printf("OpenXR -> Vulkan hand-over test\n"
                 "===============================\n\n");
@@ -705,13 +722,7 @@ int presentTest() {
     //
     // PCBVIEW_VR_RES scales it: 0.5 restores the old behaviour if a frame
     // budget needs the room back.
-    static const float kScale = [] {
-        const char* v = std::getenv("PCBVIEW_VR_RES");
-        if (!v || !v[0]) return 1.0f;
-        char* end = nullptr;
-        const float f = std::strtof(v, &end);
-        return (end && end != v && f >= 0.25f && f <= 1.0f) ? f : 1.0f;
-    }();
+    const float kScale = eyeResolutionScale();
     std::vector<EyeChain> eyes(viewCount);
     for (uint32_t i = 0; i < viewCount; ++i) {
         eyes[i].width =
@@ -1143,9 +1154,14 @@ bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
     chains_ = new std::vector<Chain>(viewCount);
     for (uint32_t i = 0; i < viewCount; ++i) {
         Chain& c = (*chains_)[i];
-        c.width = static_cast<uint32_t>(cfg[i].recommendedImageRectWidth * 0.5f);
-        c.height =
-            static_cast<uint32_t>(cfg[i].recommendedImageRectHeight * 0.5f);
+        // THE live path. presentTest has its own copy of this sizing, and the
+        // scale factor was only fixed there first -- so the setting appeared to
+        // do nothing, because the diagnostic honoured it and the renderer did
+        // not. Both read the same helper now.
+        c.width = static_cast<uint32_t>(cfg[i].recommendedImageRectWidth *
+                                        eyeResolutionScale());
+        c.height = static_cast<uint32_t>(cfg[i].recommendedImageRectHeight *
+                                         eyeResolutionScale());
         XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
         ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
                         XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
