@@ -236,10 +236,14 @@ void VulkanWindow::stepVr() {
         return (ok && n >= 0 && n <= 2) ? n : 0;
     }();
     // What this frame actually uses. Identical to the settings above unless
-    // the sweep below is driving them.
+    // the adaptive ladder or the sweep is driving them.
     float ssEff = ss;
     bool rtEff = wantRt;
     int rayQEff = rayQ;
+
+    // Both eyes' GPU time for the frame just completed. Taken once, here, so
+    // the ladder below and the sweep see the same number.
+    const double frameGpuMs = renderer_->takeGpuMs();
     // How far back temporal reuse averages. This is the quality/latency dial:
     // higher is cleaner and slower to react to a change in the picture, and it
     // is what lets a handful of samples a frame look like a great many.
@@ -391,6 +395,115 @@ void VulkanWindow::stepVr() {
         // eye those buffers are over eight gigabytes. PCBVIEW_VR_RES is the
         // release valve until this is understood properly.
 
+        // --- Adaptive quality -----------------------------------------------
+        //
+        // The wobble is a frame-rate symptom and frame cost is fill cost, so
+        // the two things that decide it are how much of the eye the board
+        // covers and whether we are actually keeping up. Steer on both.
+        //
+        // Distance thresholds are the ones that came out of testing rather
+        // than a guess: at 0.5x resolution every rung held 90 Hz until the
+        // board came inside about a quarter of a metre, where even four rays
+        // stopped fitting.
+        //
+        // Pacing is the backstop, because distance alone cannot know what the
+        // GPU is doing -- a denser board, a bigger one, or a slower machine
+        // all move the line. Measured GPU time against the headset's own frame
+        // budget catches those.
+        struct Tier {
+            bool rt;
+            int rayQ;
+            const char* name;
+        };
+        static const Tier kTiers[] = {
+            {true, 0, "11 rays"},
+            {true, 1, "7 rays"},
+            {true, 2, "4 rays"},
+            {false, 2, "plain raster"},
+        };
+        static const int kLast = static_cast<int>(std::size(kTiers)) - 1;
+        // Explicitly asking for a ray budget pins it -- an override that a
+        // controller quietly walks away from is not an override.
+        static const bool adapt = [] {
+            const QByteArray a = qgetenv("PCBVIEW_VR_ADAPT");
+            if (a == "0" || a == "false") return false;
+            // The sweep drives quality itself; two controllers on one dial
+            // would each be measuring the other.
+            const QByteArray sw = qgetenv("PCBVIEW_VR_SWEEP");
+            if (!sw.isEmpty() && sw != "0") return false;
+            return qgetenv("PCBVIEW_VR_RAYQ").isEmpty();
+        }();
+        static int tierNow = 0;
+        static int pacingTier = 0;
+        static int over = 0, under = 0, dwell = 0;
+        if (adapt && !allowPt) {
+            const double budget = vr_->nativeFrameMs();
+            const float d = vr_->boardDistance();
+
+            // Coarser as soon as the board crosses a threshold; finer only
+            // once it is 15% clear of it again. Without that margin, hovering
+            // on a boundary flips the shadows back and forth every few frames,
+            // which is far more distracting than either setting.
+            const float kStep[3] = {1.00f, 0.60f, 0.30f};
+            int distTier = 0;
+            for (int i = 0; i < 3; ++i) {
+                const float t = (tierNow > i) ? kStep[i] * 1.15f : kStep[i];
+                if (d < t) distTier = i + 1;
+            }
+
+            // Pacing, steered on what the runtime actually decided rather
+            // than on a cost model.
+            //
+            // A budget threshold on our own GPU time cannot work on its own:
+            // 8.88 ms at full resolution was paced down to 45 Hz while 8.62 ms
+            // at half resolution held 90. Nearly identical app cost, opposite
+            // outcomes -- because the compositor's share of the frame grows
+            // with the swapchain, and we cannot see that number. Being
+            // throttled is the ground truth, so use it.
+            //
+            // Stepping back up needs the opposite evidence and much more of
+            // it: at native pace AND comfortably inside budget. Being paced at
+            // native proves nothing on its own once throttled, since we hit a
+            // slower target easily -- that asymmetry is why the counters
+            // differ by a factor of four.
+            const bool throttled = vr_->pacedFrameMs() > budget * 1.5;
+            if (throttled) {
+                ++over;
+                under = 0;
+            } else if (frameGpuMs > 0.0 && frameGpuMs < budget * 0.5) {
+                ++under;
+                over = 0;
+            } else {
+                over = under = 0;
+            }
+            if (dwell > 0) --dwell;
+            if (!dwell && over >= 45 && pacingTier < kLast) {
+                ++pacingTier;
+                over = 0;
+                dwell = 120;
+            } else if (!dwell && under >= 240 && pacingTier > 0) {
+                --pacingTier;
+                under = 0;
+                dwell = 120;
+            }
+
+            // The coarser of the two. Distance is the fast, predictive one --
+            // it acts before the frames are missed. Pacing is the corrective
+            // one, and it only ever makes things cheaper than distance alone
+            // would, never richer.
+            const int want = std::max(distTier, pacingTier);
+            if (want != tierNow) {
+                std::printf("vr-adapt: %s -> %s  (%.2f m, %.1f ms of %.1f, "
+                            "paced %.0f Hz)\n",
+                            kTiers[tierNow].name, kTiers[want].name, d,
+                            frameGpuMs, budget, 1000.0 / vr_->pacedFrameMs());
+                std::fflush(stdout);
+                tierNow = want;
+            }
+            rtEff = kTiers[tierNow].rt;
+            rayQEff = kTiers[tierNow].rayQ;
+        }
+
         // --- Measured sweep -------------------------------------------------
         //
         // PCBVIEW_VR_SWEEP=1 walks the two fill-rate levers and reports pacing
@@ -503,15 +616,11 @@ void VulkanWindow::stepVr() {
                 sweepDist_ = 0.0;
                 sweepSamples_ = 0;
             } else if (sweepFrame > kRecover + kSettle) {
-                // Both eyes, summed. See Renderer::takeGpuMs.
-                const double g = renderer_->takeGpuMs();
-                if (g > 0.0) {
-                    sweepGpuMs_ += g;
+                if (frameGpuMs > 0.0) {
+                    sweepGpuMs_ += frameGpuMs;
                     sweepDist_ += vr_->boardDistance();
                     ++sweepSamples_;
                 }
-            } else {
-                renderer_->takeGpuMs();   // discard the settle window
             }
             // Ignore SPACE until there is something to report, so a stray
             // press cannot skip a row before it has been measured.

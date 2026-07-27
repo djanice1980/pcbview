@@ -206,6 +206,26 @@ public:
     // Fill cost follows how much of the eye the board covers, so any timing
     // comparison has to say what distance it was taken at.
     float boardDistance() const { return boardDist_; }
+
+    // The headset's own frame budget, in milliseconds.
+    //
+    // The SHORTEST display period the runtime has ever asked for, not the
+    // current one. Once it throttles us the current period doubles or trebles,
+    // and anything budgeting against that would conclude it had headroom to
+    // spare at exactly the moment it was failing -- and settle happily at a
+    // third of the rate. The shortest period seen is the rate we are trying to
+    // get back to.
+    double nativeFrameMs() const {
+        return nativePeriodNs_ > 0 ? double(nativePeriodNs_) * 1.0e-6 : 11.111;
+    }
+    // The period the runtime is pacing us at RIGHT NOW. Larger than
+    // nativeFrameMs means it has given up on us delivering every frame and is
+    // filling the gaps by reprojection -- which is the wobble, observed
+    // directly rather than predicted from a cost model.
+    double pacedFrameMs() const {
+        return lastPeriodNs_ > 0 ? double(lastPeriodNs_) * 1.0e-6
+                                 : nativeFrameMs();
+    }
     // The periodic vr-rate line. Off while sweeping, so the sweep owns the
     // output and its rows are not interleaved with unrelated ones.
     void setRateAutoReport(bool on) { rateAuto_ = on; }
@@ -280,6 +300,7 @@ private:
     unsigned missedTotal_ = 0;
     double frameCpuMs_ = 0.0;
     long long lastPeriodNs_ = 0;
+    long long nativePeriodNs_ = 0;
     float boardDist_ = 0.0f;
     bool rateAuto_ = true;
     std::chrono::steady_clock::time_point frameStart_{};

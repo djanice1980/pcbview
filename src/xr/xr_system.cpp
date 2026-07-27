@@ -1471,6 +1471,8 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         }
         lastDisplayTime_ = fs.predictedDisplayTime;
         lastPeriodNs_ = fs.predictedDisplayPeriod;
+        if (nativePeriodNs_ == 0 || fs.predictedDisplayPeriod < nativePeriodNs_)
+            nativePeriodNs_ = fs.predictedDisplayPeriod;
 
         if (rateAuto_ && timedFrames_ >= 240) {
             const double hz = 1.0e9 / static_cast<double>(fs.predictedDisplayPeriod);
