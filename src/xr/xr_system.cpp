@@ -14,10 +14,12 @@
 
 #include "render/vk/renderer.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace pcbview::xr {
@@ -1599,6 +1601,61 @@ bool VrSession::gripPose(int hand, float outPosMm[3], float outQuat[4]) const {
 }
 
 void VrSession::end() {
+    // Leave the session the way the runtime expects, or SteamVR is left holding
+    // a client that vanished mid-session and its compositor wedges -- which
+    // shows up afterwards as "a key component of SteamVR isn't working
+    // properly" and needs a restart before anything can run again.
+    //
+    // The sequence is not optional and not obvious:
+    //   1. finish any frame already begun -- xrBeginFrame owes an xrEndFrame
+    //   2. xrRequestExitSession, then PUMP EVENTS until the runtime reports
+    //      STOPPING. xrEndSession is only legal from that state; calling it
+    //      while the session is still running fails with
+    //      XR_ERROR_SESSION_NOT_STOPPING, and since nothing checked the result
+    //      the session was then destroyed while the runtime still believed it
+    //      was live.
+    //   3. only then tear down swapchains, spaces and the session itself.
+    if (session_) {
+        XrSession s = asSession(session_);
+
+        if (frameOpen_) {
+            XrFrameEndInfo fei{XR_TYPE_FRAME_END_INFO};
+            fei.displayTime = displayTime_;
+            fei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+            fei.layerCount = 0;
+            fei.layers = nullptr;
+            xrEndFrame(s, &fei);
+            frameOpen_ = false;
+        }
+
+        if (running_ && inst_) {
+            xrRequestExitSession(s);
+            // Bounded: a runtime that never answers must not hang the app on
+            // the way out. Two hundred turns at 5 ms is a second of patience,
+            // far longer than this transition takes in practice.
+            for (int spin = 0; spin < 200 && running_; ++spin) {
+                XrEventDataBuffer ev{XR_TYPE_EVENT_DATA_BUFFER};
+                while (xrPollEvent(asXr(inst_), &ev) == XR_SUCCESS) {
+                    if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+                        const auto* sc =
+                            reinterpret_cast<const XrEventDataSessionStateChanged*>(
+                                &ev);
+                        if (sc->state == XR_SESSION_STATE_STOPPING) {
+                            xrEndSession(s);
+                            running_ = false;
+                        } else if (sc->state == XR_SESSION_STATE_EXITING ||
+                                   sc->state == XR_SESSION_STATE_LOSS_PENDING) {
+                            running_ = false;
+                        }
+                    }
+                    ev = {XR_TYPE_EVENT_DATA_BUFFER};
+                }
+                if (running_)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        }
+    }
+
     if (chains_) {
         for (Chain& c : *chains_)
             if (c.chain) xrDestroySwapchain(c.chain);
@@ -1614,6 +1671,8 @@ void VrSession::end() {
     if (actionSet_) xrDestroyActionSet(static_cast<XrActionSet>(actionSet_));
     actionSet_ = nullptr;
     if (session_) {
+        // running_ is cleared above once STOPPING arrives; this is the fallback
+        // for a runtime that never sent it.
         if (running_) xrEndSession(asSession(session_));
         xrDestroySession(asSession(session_));
     }

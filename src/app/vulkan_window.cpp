@@ -726,6 +726,24 @@ VulkanWindow::~VulkanWindow() {
 }
 
 void VulkanWindow::releaseResources() {
+    // The VR session goes FIRST, before the renderer and long before the Vulkan
+    // device.
+    //
+    // The session was created against that device and holds swapchain images
+    // living in it, so destroying the device underneath it leaves the runtime
+    // referencing freed memory -- and SteamVR's compositor wedges, which is
+    // what "a key component of SteamVR isn't working properly" means. It then
+    // stays wedged until SteamVR is restarted, so every run poisoned the next.
+    //
+    // The timer has to stop too: it fires stepVr on a 1 ms interval and would
+    // happily drive a half-destroyed renderer.
+    if (vrTimer_) {
+        vrTimer_->stop();
+        vrTimer_ = nullptr;   // parented to this; Qt owns the deletion
+    }
+    vr_.reset();      // ends the session properly -- see VrSession::end
+    xrSystem_.reset();
+
     // Order matters: the swapchain must die before the surface it was made from.
     // Qt destroys the surface with the platform window, which happens before
     // ~VulkanWindow, so this is driven from QEvent::PlatformSurface too.
