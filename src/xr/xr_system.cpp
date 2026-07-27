@@ -1156,6 +1156,18 @@ bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
     inst_ = sys.rawInstance();
     sysId_ = sys.rawSystem();
     depthSupported_ = sys.depthLayerSupported();
+    // PCBVIEW_VR_DEPTH=0 submits colour alone, exactly as before the depth
+    // layer existed. A switch rather than a rebuild because the depth layer is
+    // a prime suspect for reprojection artifacts and has never been tested in
+    // isolation: with depth, the compositor warps per pixel using our buffer,
+    // so a buffer it reads wrongly warps the image wrongly. Toggling this is
+    // the one-minute experiment that tells us whether depth is helping or
+    // hurting, instead of reasoning about it.
+    if (const char* d = std::getenv("PCBVIEW_VR_DEPTH"))
+        if (d[0] == '0') {
+            depthSupported_ = false;
+            std::printf("vr: depth layer DISABLED by PCBVIEW_VR_DEPTH=0\n");
+        }
     maskSupported_ = sys.visibilityMaskSupported();
     device_ = device;
     XrInstance inst = static_cast<XrInstance>(inst_);
@@ -1398,6 +1410,51 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     frameOpen_ = true;
     displayTime_ = fs.predictedDisplayTime;
     shouldRender_ = fs.shouldRender != 0;
+
+    // Are we actually hitting the headset's rate?
+    //
+    // This matters more than it looks. Everything the wobble reports describe
+    // -- swimming that worsens as you lean in, ghosting as you move -- is what
+    // the compositor's reprojection looks like, and reprojection only engages
+    // for frames the app failed to deliver. So "is the image warping" and "are
+    // we missing frames" are the same question, and nothing here was measuring
+    // it.
+    //
+    // predictedDisplayTime advances by exactly one predictedDisplayPeriod when
+    // the app keeps up. Two periods means every other frame is being
+    // synthesised by the compositor from the last one we did deliver. That
+    // ratio is the honest missed-frame count, without needing a vendor API.
+    if (fs.predictedDisplayPeriod > 0) {
+        if (lastDisplayTime_ != 0) {
+            const long long delta = fs.predictedDisplayTime - lastDisplayTime_;
+            const long long periods =
+                (delta + fs.predictedDisplayPeriod / 2) / fs.predictedDisplayPeriod;
+            ++timedFrames_;
+            if (periods > 1) {
+                ++missedFrames_;
+                missedTotal_ += periods - 1;
+            }
+        }
+        lastDisplayTime_ = fs.predictedDisplayTime;
+
+        if (timedFrames_ >= 240) {
+            const double hz = 1.0e9 / static_cast<double>(fs.predictedDisplayPeriod);
+            std::printf("vr-rate: %.0f Hz target | %u frames, %u late "
+                        "(%.1f%%), %u display periods lost | app cpu %.2f ms "
+                        "of %.2f ms\n",
+                        hz, timedFrames_, missedFrames_,
+                        100.0 * missedFrames_ / static_cast<double>(timedFrames_),
+                        missedTotal_,
+                        frameCpuMs_ / static_cast<double>(timedFrames_),
+                        1000.0 / hz);
+            std::fflush(stdout);
+            timedFrames_ = 0;
+            missedFrames_ = 0;
+            missedTotal_ = 0;
+            frameCpuMs_ = 0.0;
+        }
+    }
+    frameStart_ = std::chrono::steady_clock::now();
 
     XrActiveActionSet active{static_cast<XrActionSet>(actionSet_), XR_NULL_PATH};
     XrActionsSyncInfo sync{XR_TYPE_ACTIONS_SYNC_INFO};
@@ -1822,6 +1879,12 @@ void VrSession::releaseEye(int index) {
 void VrSession::endFrame() {
     if (!session_ || !frameOpen_) return;
     frameOpen_ = false;
+    if (frameStart_.time_since_epoch().count() != 0) {
+        frameCpuMs_ +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - frameStart_)
+                .count();
+    }
     XrSession s = asSession(session_);
     std::vector<XrCompositionLayerProjectionView> pv;
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};

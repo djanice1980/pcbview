@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <chrono>
 #include <vector>
 
 #include "render/common/device.h"
@@ -251,6 +252,15 @@ private:
     int anchorWaited_ = 0;
     // Frame counter, only so the where-is-the-board line is throttled.
     unsigned diagFrames_ = 0;
+    // Frame pacing. predictedDisplayTime advancing by more than one display
+    // period means the compositor had to synthesise the frames in between,
+    // which is when reprojection artifacts appear.
+    long long lastDisplayTime_ = 0;
+    unsigned timedFrames_ = 0;
+    unsigned missedFrames_ = 0;
+    unsigned missedTotal_ = 0;
+    double frameCpuMs_ = 0.0;
+    std::chrono::steady_clock::time_point frameStart_{};
     float gripPosMm_[2][3] = {};
     float gripQuat_[2][4] = {};
     bool gripTracked_[2] = {false, false};
