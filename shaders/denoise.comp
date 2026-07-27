@@ -134,8 +134,8 @@ void main() {
             // pixel with one frame gets to borrow from its neighbours, which is
             // strictly better than staying raw. The world-radius test above
             // stays strict either way, so this can never reach across the board.
-            const float wn = pow(max(dot(nC, nQ), 0.0), pc.sigma.x / boost);
-            const float wa = exp(-length(aC - aQ) / (pc.sigma.z * boost));
+            const float wn = pow(max(dot(nC, nQ), 0.0), pc.sigma.x);
+            const float wa = exp(-length(aC - aQ) / pc.sigma.z);
             // Brightness: preserves genuine lighting detail -- a shadow edge is
             // a real feature, not noise to be smoothed over.
             //

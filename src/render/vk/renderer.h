@@ -747,6 +747,15 @@ private:
     // temporal reuse anchors on: to reuse last frame's result for a pixel you
     // have to know which world point it shows.
     Image ptPosition_;
+    // First-hit normal from the same deterministic centre ray, and the guide
+    // BOTH the temporal test and the spatial filter use for edge stopping.
+    //
+    // The accumulated normal is a blend of whatever the jittered samples
+    // happened to hit, so at a silhouette it belongs to neither side and
+    // matches nothing -- every tap gets rejected and the pixel is left raw.
+    // This belongs to exactly one surface, which is what an edge-stopping test
+    // needs to work at an edge.
+    Image ptGeoNormal_;
     Image ptDenoised_;          // OIDN output, shown when valid
     bool ptImagesInitialised_ = false;  // GENERAL-layout transition done
     bool denoisingEnabled_ = false;

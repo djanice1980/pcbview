@@ -54,6 +54,11 @@ layout(rgba32f, set = 0, binding = 7) uniform image2D normalImg;
 // positions of samples that landed on different surfaces would place the
 // result in the empty space between them.
 layout(rgba32f, set = 0, binding = 13) uniform image2D positionImg;
+// First-hit SHADING NORMAL from the same deterministic centre ray. The
+// accumulated normal guide is a blend of whatever the jittered samples hit, so
+// at a silhouette it belongs to neither side and matches nothing; this belongs
+// to exactly one surface, which is what an edge-stopping test needs.
+layout(rgba32f, set = 0, binding = 14) uniform image2D geoNormalImg;
 
 layout(push_constant) uniform Push {
     vec4 eye;    // xyz eye,      w = sampleIndex (0 overwrites the accum buffer)
@@ -313,8 +318,20 @@ void main() {
             gl_RayQueryCommittedIntersectionNoneEXT) {
             const float gt = rayQueryGetIntersectionTEXT(grq, true);
             imageStore(positionImg, ivec2(px), vec4(corg + cdir * gt, 1.0));
+
+            uint gp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(grq, true));
+            if (rayQueryGetIntersectionGeometryIndexEXT(grq, true) == 1)
+                gp += pc.counts.x;
+            const vec2 gb = rayQueryGetIntersectionBarycentricsEXT(grq, true);
+            const uint g0 = idx[3u * gp], g1 = idx[3u * gp + 1u],
+                       g2 = idx[3u * gp + 2u];
+            vec3 gns = normalize(vnrm(g0) * (1.0 - gb.x - gb.y) +
+                                 vnrm(g1) * gb.x + vnrm(g2) * gb.y);
+            if (dot(gns, -cdir) < 0.0) gns = -gns;
+            imageStore(geoNormalImg, ivec2(px), vec4(gns, 1.0));
         } else {
             imageStore(positionImg, ivec2(px), vec4(0.0));
+            imageStore(geoNormalImg, ivec2(px), vec4(0.0));
         }
     }
 

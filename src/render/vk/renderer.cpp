@@ -633,8 +633,8 @@ void Renderer::createPathTracer() {
     // estimation), so it actually illuminates its surroundings.
     // 11 = first-hit net phase, written as an AOV so the chase animation can
     // run as a display-time modulation without disturbing accumulation.
-    VkDescriptorSetLayoutBinding b[14]{};
-    for (uint32_t i = 0; i < 14; ++i) {
+    VkDescriptorSetLayoutBinding b[15]{};
+    for (uint32_t i = 0; i < 15; ++i) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -650,9 +650,12 @@ void Renderer::createPathTracer() {
     b[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     // 13 = first-hit world position, the anchor for temporal reuse.
     b[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    // 14 = deterministic first-hit normal, for edge-stopping that does not
+    // flicker.
+    b[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     VkDescriptorSetLayoutCreateInfo li{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 14;
+    li.bindingCount = 15;
     li.pBindings = b;
     check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr, &ptSetLayout_),
           "pt set layout");
@@ -858,6 +861,7 @@ void Renderer::destroyPathTracer() {
     destroyImage(ptNetPhase_);
     destroyImage(ptDenoised_);
     destroyImage(ptPosition_);
+    destroyImage(ptGeoNormal_);
     destroyImage(ptDenoiseTmp_);
     destroyImage(ptTemporal_);
     for (int i = 0; i < kTemporalSlots; ++i) {
@@ -904,8 +908,8 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    VkWriteDescriptorSet w[14]{};
-    for (int i = 0; i < 14; ++i) {
+    VkWriteDescriptorSet w[15]{};
+    for (int i = 0; i < 15; ++i) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = ptSet_;
         w[i].dstBinding = i;
@@ -942,7 +946,10 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorImageInfo posi{VK_NULL_HANDLE, ptPosition_.view,
                                VK_IMAGE_LAYOUT_GENERAL};
     w[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[13].pImageInfo = &posi;
-    vkUpdateDescriptorSets(device_.handle, 14, w, 0, nullptr);
+    VkDescriptorImageInfo gnrm{VK_NULL_HANDLE, ptGeoNormal_.view,
+                               VK_IMAGE_LAYOUT_GENERAL};
+    w[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[14].pImageInfo = &gnrm;
+    vkUpdateDescriptorSets(device_.handle, 15, w, 0, nullptr);
 
     VkDescriptorImageInfo den{VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet tw[3]{};
@@ -1118,7 +1125,8 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
         Image* imgs[] = {&ptAccum_,        &ptAlbedo_,       &ptNormal_,
                          &ptNetPhase_,     &ptDenoised_,     &ptDenoiseTmp_,
                          &ptPosition_,     &ptTemporal_,     &histColour_[0],
-                         &histColour_[1],  &histPos_[0],     &histPos_[1]};
+                         &histColour_[1],  &histPos_[0],     &histPos_[1],
+                         &ptGeoNormal_};
         // Counts derived from the array, never written twice: adding an image
         // here while a hand-written count stayed behind silently dropped the
         // LAST entry from the transition, leaving it UNDEFINED for the tonemap
@@ -2012,6 +2020,7 @@ void Renderer::recreatePtImagesLive() {
     destroyImage(ptNetPhase_);
     destroyImage(ptDenoised_);
     destroyImage(ptPosition_);
+    destroyImage(ptGeoNormal_);
     // STORAGE for compute R/W, TRANSFER_SRC/DST for the denoise readback and
     // write-back copies.
     const VkImageUsageFlags u = VK_IMAGE_USAGE_STORAGE_BIT |
@@ -2036,8 +2045,12 @@ void Renderer::recreatePtImagesLive() {
                                 VK_IMAGE_ASPECT_COLOR_BIT);
     // First-hit world position: what temporal reuse anchors on.
     destroyImage(ptPosition_);
+    destroyImage(ptGeoNormal_);
     ptPosition_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
                               VK_IMAGE_ASPECT_COLOR_BIT);
+    destroyImage(ptGeoNormal_);
+    ptGeoNormal_ = createImage(sceneExtent_, VK_FORMAT_R32G32B32A32_SFLOAT, u,
+                               VK_IMAGE_ASPECT_COLOR_BIT);
     // Temporal: the blended result, plus one colour and one position history
     // per eye. The histories cannot be shared -- each eye must only ever reuse
     // its own past, or every frame would blend the two viewpoints together.
@@ -2172,7 +2185,7 @@ void Renderer::updateTemporalDescriptors() {
         VkDescriptorImageInfo info[6] = {
             {VK_NULL_HANDLE, ptAccum_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptPosition_.view, VK_IMAGE_LAYOUT_GENERAL},
-            {VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptGeoNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, histColour_[s].view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, histPos_[s].view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptTemporal_.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -2195,7 +2208,7 @@ void Renderer::updateTemporalDescriptors() {
             {VK_NULL_HANDLE, ptTemporal_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL},
-            {VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptGeoNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptPosition_.view, VK_IMAGE_LAYOUT_GENERAL},
         };
         VkWriteDescriptorSet w[5]{};
@@ -2393,7 +2406,7 @@ void Renderer::updateGpuDenoiseDescriptors() {
             {VK_NULL_HANDLE, chain[s][0], VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, chain[s][1], VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL},
-            {VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptGeoNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptPosition_.view, VK_IMAGE_LAYOUT_GENERAL},
         };
         VkWriteDescriptorSet w[5]{};
