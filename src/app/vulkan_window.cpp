@@ -194,20 +194,24 @@ void VulkanWindow::stepVr() {
         const int n = qgetenv("PCBVIEW_VR_DENOISE").toInt(&ok);
         return (ok && n >= 0 && n <= 5) ? n : 5;
     }();
-    // Render above the eye's resolution and resolve down. THE fix for coverage
-    // being binary: with one sample per pixel a trace narrower than a pixel is
-    // either fully hit or fully missed, so a fraction of a pixel of head
-    // movement flips it, and every thin feature on the board flickers at once.
-    // Extra samples give partial coverage, which is what lets an edge fade
-    // rather than blink.
+    // 1.0: render EXACTLY what the runtime asks for, and nothing more.
     //
-    // Note this now sits on top of the runtime's FULL recommendation, so 1.5x
-    // here is genuine supersampling. Previously the swapchain was half size, so
-    // supersampling merely undid that and delivered nothing extra.
+    // The recommendation is not a raw panel size, it is already the answer to
+    // this question. SteamVR's log shows the working: the driver wants
+    // 3400x3468 to cover lens distortion, SteamVR applies its own resolution
+    // setting on top -- "Clamping render target scale to 1.5x total area" --
+    // and reports 4164x4244. Supersampling again here multiplies a number that
+    // has already been multiplied, and 1.5x on top came to roughly 9.7x the
+    // panel's native pixel count per eye.
+    //
+    // So the runtime is the authority and SteamVR's own resolution slider is
+    // the one place to tune this. An app-side factor is a second, invisible
+    // multiplier that makes that slider mean something different for us than
+    // for every other title.
     static const float ss = [] {
         bool ok = false;
         const float f = qgetenv("PCBVIEW_VR_SS").toFloat(&ok);
-        return (ok && f >= 1.0f && f <= 2.0f) ? f : 1.5f;
+        return (ok && f >= 0.5f && f <= 2.0f) ? f : 1.0f;
     }();
     static const int rateDiv = [] {
         bool ok = false;
