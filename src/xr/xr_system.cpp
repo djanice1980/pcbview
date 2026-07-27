@@ -1421,17 +1421,57 @@ bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
     XrAction ga = XR_NULL_HANDLE;
     xrCreateAction(as, &aci, &ga);
     gripAction_ = ga;
-    const XrActionSuggestedBinding binds[] = {
+
+    // Grab. A pose alone can say where a hand is, never that it wants
+    // something, so the board could be tracked at but not picked up.
+    XrActionCreateInfo gci{XR_TYPE_ACTION_CREATE_INFO};
+    std::snprintf(gci.actionName, sizeof(gci.actionName), "grab");
+    std::snprintf(gci.localizedActionName, sizeof(gci.localizedActionName),
+                  "Grab the board");
+    gci.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
+    gci.countSubactionPaths = 2;
+    gci.subactionPaths = hands;
+    XrAction gb = XR_NULL_HANDLE;
+    xrCreateAction(as, &gci, &gb);
+    grabAction_ = gb;
+
+    // Two profiles, because binding only the simple controller would work
+    // everywhere and feel right nowhere.
+    //
+    // simple_controller is the guaranteed fallback and has just select/menu, so
+    // grabbing lands on the trigger. The Sense controllers report as Touch
+    // controllers to SteamVR, which do have a real squeeze -- and squeezing to
+    // pick something up is the gesture the hand already knows. The runtime
+    // picks whichever profile matches the hardware.
+    const XrActionSuggestedBinding simpleBinds[] = {
         {ga, path(inst, "/user/hand/left/input/grip/pose")},
         {ga, path(inst, "/user/hand/right/input/grip/pose")},
+        {gb, path(inst, "/user/hand/left/input/select/click")},
+        {gb, path(inst, "/user/hand/right/input/select/click")},
     };
     XrInteractionProfileSuggestedBinding prof{
         XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
     prof.interactionProfile =
         path(inst, "/interaction_profiles/khr/simple_controller");
-    prof.suggestedBindings = binds;
-    prof.countSuggestedBindings = 2;
+    prof.suggestedBindings = simpleBinds;
+    prof.countSuggestedBindings = 4;
     xrSuggestInteractionProfileBindings(inst, &prof);
+
+    const XrActionSuggestedBinding touchBinds[] = {
+        {ga, path(inst, "/user/hand/left/input/grip/pose")},
+        {ga, path(inst, "/user/hand/right/input/grip/pose")},
+        {gb, path(inst, "/user/hand/left/input/squeeze/value")},
+        {gb, path(inst, "/user/hand/right/input/squeeze/value")},
+    };
+    XrInteractionProfileSuggestedBinding touchProf{
+        XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+    touchProf.interactionProfile =
+        path(inst, "/interaction_profiles/oculus/touch_controller");
+    touchProf.suggestedBindings = touchBinds;
+    touchProf.countSuggestedBindings = 4;
+    // Not fatal if the runtime does not know this profile -- the simple
+    // bindings above already cover the action.
+    xrSuggestInteractionProfileBindings(inst, &touchProf);
     XrSessionActionSetsAttachInfo attach{
         XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
     attach.countActionSets = 1;
@@ -1643,11 +1683,22 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         std::fflush(stdout);
     }
 
+    // Placement alone: where the board SITS in the room. Controller poses are
+    // reported against this rather than against the posed board, so that
+    // grabbing does not feed its own result back in -- move the board and the
+    // hand would appear to move with it.
     const glm::mat4 place = placement(
         placeCentre_, placeScale_,
         glm::vec3(anchorPos_[0], anchorPos_[1], anchorPos_[2]),
         glm::quat(anchorRot_[3], anchorRot_[0], anchorRot_[1], anchorRot_[2]));
     const glm::mat4 invPlace = glm::inverse(place);
+    // What the viewer has done to the board since -- turned it, slid it, picked
+    // it up. The desktop applies this by moving the CAMERA into board space,
+    // which VR cannot do because the camera is a head. Composing it into the
+    // placement instead means every VR path gets it for free: the eye matrices,
+    // the path tracer's ray basis, and the depth submitted to the compositor.
+    const glm::mat4 posed = place * glm::make_mat4(boardPose_);
+    const glm::mat4 invPosed = glm::inverse(posed);
 
     // WHERE IS THE BOARD, from where the head is RIGHT NOW.
     //
@@ -1663,7 +1714,7 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
             (views[0].pose.position.y + views[1].pose.position.y) * 0.5f,
             (views[0].pose.position.z + views[1].pose.position.z) * 0.5f);
         boardDist_ = glm::length(
-            glm::vec3(place * glm::vec4(placeCentre_[0], placeCentre_[1],
+            glm::vec3(posed * glm::vec4(placeCentre_[0], placeCentre_[1],
                                         placeCentre_[2], 1.0f)) -
             h);
     }
@@ -1676,7 +1727,7 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
                            views[0].pose.orientation.y, views[0].pose.orientation.z);
         const glm::vec3 fwd = hq * glm::vec3(0.0f, 0.0f, -1.0f);
         const glm::vec3 boardRoom =
-            glm::vec3(place * glm::vec4(placeCentre_[0], placeCentre_[1],
+            glm::vec3(posed * glm::vec4(placeCentre_[0], placeCentre_[1],
                                         placeCentre_[2], 1.0f));
         const glm::vec3 d = boardRoom - head;
         const float dist = glm::length(d);
@@ -1706,6 +1757,18 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     }
 
     for (int i = 0; i < 2; ++i) {
+        // Squeeze state, per hand. Read before the pose so a hand that is
+        // holding the board but momentarily untracked keeps its grab rather
+        // than dropping it.
+        if (grabAction_) {
+            XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+            gi.action = static_cast<XrAction>(grabAction_);
+            gi.subactionPath = static_cast<XrPath>(handPath_[i]);
+            XrActionStateBoolean bs{XR_TYPE_ACTION_STATE_BOOLEAN};
+            grabHeld_[i] =
+                XR_SUCCEEDED(xrGetActionStateBoolean(s, &gi, &bs)) &&
+                bs.isActive && bs.currentState;
+        }
         gripTracked_[i] = false;
         if (!handSpace_[i]) continue;
         XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
@@ -1859,7 +1922,7 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         const glm::mat4 V = glm::inverse(poseMatrix(views[i].pose));
         // World(mm) -> room -> eye -> clip, in one matrix, so the renderer is
         // handed exactly what it always takes.
-        const glm::mat4 vp = P * V * place;
+        const glm::mat4 vp = P * V * posed;
 
         if (!projDumped) {
             const glm::vec3 c(placeCentre_[0], placeCentre_[1], placeCentre_[2]);
@@ -1889,7 +1952,7 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         std::memcpy(e.viewProj, glm::value_ptr(vp), sizeof(e.viewProj));
         // The lighting rig wants the viewpoint in board millimetres.
         const glm::vec4 eyeMm =
-            invPlace * glm::vec4(views[i].pose.position.x,
+            invPosed * glm::vec4(views[i].pose.position.x,
                                  views[i].pose.position.y,
                                  views[i].pose.position.z, 1.0f);
         e.eye[0] = eyeMm.x;
@@ -1899,7 +1962,7 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         // The same frustum again, as a ray basis for the path tracer. invPlace
         // is rotation times a uniform scale, so rotating the eye's axes through
         // it and renormalising gives the board-space directions.
-        const glm::mat3 toBoard(invPlace);
+        const glm::mat3 toBoard(invPosed);
         const glm::quat q(views[i].pose.orientation.w, views[i].pose.orientation.x,
                           views[i].pose.orientation.y, views[i].pose.orientation.z);
         const glm::vec3 f =
@@ -1979,6 +2042,10 @@ void VrSession::releaseEye(int index) {
     if ((*chains_)[index].depthChain)
         xrReleaseSwapchainImage((*chains_)[index].depthChain, &ri);
     depthTarget_ = VK_NULL_HANDLE;
+}
+
+void VrSession::setBoardPose(const float m[16]) {
+    for (int i = 0; i < 16; ++i) boardPose_[i] = m[i];
 }
 
 VrSession::RateStats VrSession::takeRate() {

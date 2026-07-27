@@ -512,6 +512,14 @@ private:
 
     const geom::BoardMesh* mesh_ = nullptr;
     static bool vrRequested_;
+    // Grab state. -1 = nobody is holding the board; otherwise the hand that
+    // is, with the hand and board poses recorded at the moment it took hold so
+    // the follow is computed from the grab rather than accumulated per frame.
+    void stepVrGrab();
+    int grabHand_ = -1;
+    glm::vec3 grabHandPos0_{0.0f};
+    glm::quat grabHandRot0_{1.0f, 0.0f, 0.0f, 0.0f};
+    BoardPose grabBoard0_;
 
     QVulkanInstance qtInstance_;
     VkInstance instance_ = VK_NULL_HANDLE;

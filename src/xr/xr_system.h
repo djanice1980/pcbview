@@ -238,6 +238,22 @@ public:
     // The grip pose of a controller, in pcbview world millimetres, when one is
     // tracked. Index 0 = left, 1 = right.
     bool gripPose(int hand, float outPosMm[3], float outQuat[4]) const;
+    // Whether that hand is squeezing. Index 0 = left, 1 = right.
+    bool grabbing(int hand) const {
+        return grabHeld_[(hand == 1) ? 1 : 0];
+    }
+
+    // How the viewer has turned or moved the board, board mm -> board mm.
+    //
+    // The desktop applies this by transforming the CAMERA into board space,
+    // which has no meaning here -- the camera is a head and cannot be moved.
+    // Composed into the placement instead, so the eye matrices, the tracer's
+    // ray basis and the depth handed to the compositor all agree without any
+    // of them knowing about it.
+    //
+    // Controller poses are deliberately NOT reported through it: a hand
+    // measured against the board it is moving would chase its own tail.
+    void setBoardPose(const float m[16]);
 
 private:
     void* session_ = nullptr;
@@ -312,6 +328,11 @@ private:
     float gripPosMm_[2][3] = {};
     float gripQuat_[2][4] = {};
     bool gripTracked_[2] = {false, false};
+    bool grabHeld_[2] = {false, false};
+    void* grabAction_ = nullptr;   // XrAction
+    // Column-major, identity. Raw floats rather than a glm type so this header
+    // does not drag glm in behind it.
+    float boardPose_[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
 };
 
 }  // namespace pcbview::xr

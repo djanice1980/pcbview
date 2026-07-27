@@ -192,6 +192,67 @@ VulkanWindow::VulkanWindow(const geom::BoardMesh* mesh) : mesh_(mesh) {
     }
 }
 
+// Pick the board up and put it down.
+//
+// The follow is rigid: while a hand is squeezing, the board keeps the same
+// position and orientation RELATIVE TO THAT HAND, so it behaves like something
+// held rather than something nudged. Working it out from the pose at the
+// moment of the grab rather than accumulating per-frame deltas means no drift,
+// and letting go leaves it exactly where it was released.
+//
+// The algebra, since it is not obvious. The board's model matrix is
+//
+//     M(t,R) = T(t + c) * R * T(-c)
+//
+// with c the bounds centre, so rotation happens about the centre. A rigid
+// follow wants M_new = D * M_old for the hand's own movement
+//
+//     D = T(p) * dR * T(-p0)
+//
+// where p0 and p are the grab point then and now. Expanding and matching the
+// M(t,R) form again gives
+//
+//     R' = dR * R0
+//     t' = p + dR * (t0 + c - p0) - c
+//
+// which is what this computes. Both hands are equal; the first to squeeze
+// holds it, so it works left-handed or right-handed without a setting.
+void VulkanWindow::stepVrGrab() {
+    if (!vr_ || !mesh_) return;
+
+    const auto& b = mesh_->bounds;
+    const glm::vec3 c(static_cast<float>((b.min[0] + b.max[0]) * 0.5),
+                      static_cast<float>((b.min[1] + b.max[1]) * 0.5),
+                      static_cast<float>((b.min[2] + b.max[2]) * 0.5));
+
+    for (int h = 0; h < 2; ++h) {
+        float pos[3], quat[4];
+        const bool held = vr_->grabbing(h) && vr_->gripPose(h, pos, quat);
+        if (!held) {
+            if (grabHand_ == h) grabHand_ = -1;   // released, or lost tracking
+            continue;
+        }
+        if (grabHand_ != -1 && grabHand_ != h) continue;  // the other hand has it
+
+        const glm::vec3 p(pos[0], pos[1], pos[2]);
+        const glm::quat q(quat[3], quat[0], quat[1], quat[2]);
+        if (grabHand_ != h) {
+            // Take hold: remember where the hand and the board were.
+            grabHand_ = h;
+            grabHandPos0_ = p;
+            grabHandRot0_ = q;
+            grabBoard0_ = board_;
+            emit statusMessage("Board grabbed");
+            continue;
+        }
+
+        const glm::quat dR = glm::normalize(q * glm::inverse(grabHandRot0_));
+        board_.rotation = glm::normalize(dR * grabBoard0_.rotation);
+        board_.translation =
+            p + dR * (grabBoard0_.translation + c - grabHandPos0_) - c;
+    }
+}
+
 void VulkanWindow::stepVr() {
     if (!vr_ || !renderer_ || !mesh_) return;
 
@@ -289,8 +350,15 @@ void VulkanWindow::stepVr() {
         std::max(b.max[0] - b.min[0], b.max[1] - b.min[1]));
     vr_->setBoardPlacement(centre, span);
 
+    // Everything the pad and the mouse have done to the board, handed to the
+    // session so the eye matrices carry it. Set BEFORE beginFrame, which is
+    // where the placement is composed.
+    const glm::mat4 bm = boardMatrix();
+    vr_->setBoardPose(&bm[0][0]);
+
     std::vector<xr::VrSession::Eye> eyes;
     const bool render = vr_->beginFrame(&eyes);
+    stepVrGrab();
     if (!vr_->active()) {  // the runtime ended the session
         if (vrTimer_) vrTimer_->stop();
         vr_.reset();
@@ -927,6 +995,14 @@ void VulkanWindow::stepGamepad() {
         return;
     }
 
+    // In the headset the camera IS the head: nothing the pad does to camera_
+    // can be seen, because the eye matrices come from the runtime. So VR forces
+    // object mode -- the sticks turn and slide the BOARD, which is the only
+    // thing here that can still be moved, and is what R3 already toggles on the
+    // desktop.
+    const bool vrMode = vr_ != nullptr;
+    const bool objectMode = padObjectMode_ || vrMode;
+
     // Real elapsed time, so the response is identical at any poll rate or
     // frame rate.
     double dt = static_cast<double>(padClock_.restart()) / 1000.0;
@@ -945,7 +1021,7 @@ void VulkanWindow::stepGamepad() {
         Camera after = camera_;
         after.yaw = wrapPi(after.yaw - g.rightX * kTurnRate * fdt);
         after.pitch = wrapPi(after.pitch - g.rightY * kTurnRate * fdt);
-        if (padObjectMode_) adoptCameraDeltaIntoBoard(camera_, after);
+        if (objectMode) adoptCameraDeltaIntoBoard(camera_, after);
         else camera_ = after;
         moved = true;
     }
@@ -958,7 +1034,7 @@ void VulkanWindow::stepGamepad() {
         // the mouse's middle-drag.
         const glm::vec3 move =
             b.right * g.leftX * scale + b.up * g.leftY * scale;
-        if (padObjectMode_) {
+        if (objectMode) {
             board_.translation += board_.rotation * (-move);  // see the mouse
         } else {
             camera_.targetX += move.x;
@@ -972,11 +1048,25 @@ void VulkanWindow::stepGamepad() {
     // constant in perceived terms rather than crawling when close and
     // rocketing when far. Digital buttons, so this is a fixed rate.
     if (g.heldLeftShoulder != g.heldRightShoulder) {
-        const float rate = (g.heldLeftShoulder ? 1.0f : -1.0f) * 1.6f * fdt;
-        camera_.distance =
-            std::clamp(camera_.distance * std::exp(rate), 0.5f, 5000.0f);
-        // A wheel glide in flight would fight this.
-        zoomAnimating_ = false;
+        if (vrMode) {
+            // In the headset there is no orbit distance to change -- the
+            // camera is a head. Slide the board along the axis it faces the
+            // viewer down instead, which reads as the same thing: R1 brings it
+            // to you, L1 pushes it away. In millimetres of board, scaled by
+            // its span so a small board and a large one move at the same
+            // apparent rate.
+            const auto& bb = mesh_->bounds;
+            const float span = static_cast<float>(
+                std::max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]));
+            board_.translation.z +=
+                (g.heldRightShoulder ? 1.0f : -1.0f) * span * 0.6f * fdt;
+        } else {
+            const float rate = (g.heldLeftShoulder ? 1.0f : -1.0f) * 1.6f * fdt;
+            camera_.distance =
+                std::clamp(camera_.distance * std::exp(rate), 0.5f, 5000.0f);
+            // A wheel glide in flight would fight this.
+            zoomAnimating_ = false;
+        }
         moved = true;
     }
 
