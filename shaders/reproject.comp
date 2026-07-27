@@ -127,6 +127,25 @@ void main() {
     // retuning for every board size.
     const float tol = pc.params.y * max(distance(pos.xyz, pc.eye), 1.0e-3);
 
+    // Measured ALONG THE NORMAL, not straight-line -- and this is the whole
+    // difference between edges that settle and edges that boil.
+    //
+    // The position AOV comes from a single jittered sample, so the point it
+    // records wanders by roughly a pixel's worth of world every frame. A
+    // straight-line test cannot tell that wander apart from a genuine change of
+    // surface: at any silhouette, where one pixel of lateral movement spans a
+    // large depth step, it fails every frame. History is thrown away, the pixel
+    // drops to two raw samples, and the outline boils. The same thing happens
+    // to a via top, which is a sub-pixel feature whose sample lands on copper
+    // one frame and mask the next.
+    //
+    // Distance along the normal ignores lateral wander entirely -- two points
+    // on the same face are ~0 apart however far they slide across it -- while
+    // still separating a chip top from the board beside it by the package's
+    // full height, which is exactly the discrimination wanted.
+    const vec3 nrm = normalize(imageLoad(curNormal, px).xyz * invSamples +
+                               vec3(1.0e-9));
+
     vec3 sum = vec3(0.0);
     float wsum = 0.0;
     float nsum = 0.0;
@@ -136,7 +155,14 @@ void main() {
             q.y >= int(pc.dim.y))
             continue;
         const vec4 hp = imageLoad(histPos, q);
-        if (hp.w < 0.5 || distance(hp.xyz, pos.xyz) >= tol) continue;
+        if (hp.w < 0.5) continue;
+        const vec3 delta = hp.xyz - pos.xyz;
+        // Off the plane by more than the tolerance: a different surface.
+        if (abs(dot(delta, nrm)) >= tol) continue;
+        // Still bounded laterally, generously. Without this, a point far across
+        // the same flat plane would qualify -- these taps are adjacent pixels,
+        // so anything genuinely distant is a reprojection gone wrong.
+        if (length(delta) >= tol * 32.0) continue;
         const vec4 hc = imageLoad(histColour, q);
         sum += hc.rgb * bw[i];
         nsum += hc.a * bw[i];
