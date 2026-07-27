@@ -164,38 +164,73 @@ bool System::start() {
     depthLayerSupported_ = haveDepthExt;
     visibilityMaskSupported_ = haveMaskExt;
 
-    // Retry, because "no" from the runtime often means "not yet".
+    // Drop optional extensions and try again, rather than failing outright.
     //
-    // Toggling into VR while SteamVR is showing its own environment makes it
-    // quit that scene app and hand the headset over, and during the swap it
-    // refuses new instances -- its log says so plainly, "Refusing because app
-    // start error VRInitError_Init_Retry", at the same instant ours said the
-    // runtime had not answered. Treating that as final meant the toggle
-    // reported no headset while a headset was sitting there tracking.
+    // Everything past vulkan_enable2 is a nicety: the depth layer, the hidden
+    // area mesh, the gaze query. A runtime that refuses the whole instance
+    // because of one of them would take VR down entirely for a feature nobody
+    // asked for -- and eye gaze in particular is enabled ONLY so a capability
+    // line can be printed. Nothing consumes it.
     //
-    // Roughly three seconds of patience. Long enough to cover the handover,
-    // short enough that a genuinely absent runtime still fails promptly, and
-    // the result code is printed so the next failure names itself instead of
-    // being guessed at again.
+    // Descending tiers, so a failure names its own cause: if the full set is
+    // refused and the set without gaze is accepted, gaze was the problem, and
+    // the log says so. If even the bare required extension is refused then the
+    // runtime is genuinely unwell and no amount of retrying will help --
+    // XR_ERROR_RUNTIME_FAILURE is not a busy signal.
+    struct Tier {
+        const char* what;
+        size_t count;
+    };
+    // ext is built as: [vulkan_enable2] [depth] [mask] [gaze]
+    const Tier tiers[] = {
+        {"all extensions", ext.size()},
+        {"without eye gaze", ext.size() - (haveGazeExt ? 1 : 0)},
+        {"required only", 1},
+    };
+
     XrInstance inst = XR_NULL_HANDLE;
-    XrResult ir = XR_SUCCESS;
-    for (int attempt = 0; attempt < 12; ++attempt) {
+    XrResult ir = XR_ERROR_RUNTIME_FAILURE;
+    size_t used = 0;
+    for (const Tier& t : tiers) {
+        if (t.count == 0 || (used && t.count == used)) continue;
+        used = t.count;
+        ici.enabledExtensionCount = static_cast<uint32_t>(t.count);
         ir = xrCreateInstance(&ici, &inst);
-        if (XR_SUCCEEDED(ir)) break;
-        if (attempt == 0) {
-            std::printf("xr: runtime busy (result %d) -- it is most likely "
-                        "swapping scene apps; retrying for 3 s\n",
-                        static_cast<int>(ir));
-            std::fflush(stdout);
+        if (XR_SUCCEEDED(ir)) {
+            if (t.count != ext.size())
+                std::printf("xr: instance created with %s -- the fuller set "
+                            "was refused (result %d)\n",
+                            t.what, static_cast<int>(ir));
+            // Whatever was dropped must not be used later.
+            if (t.count < ext.size()) {
+                if (t.count <= 3) eyeGazeExtension_ = false;
+                if (t.count <= 1) {
+                    haveDepthExt = false;
+                    haveMaskExt = false;
+                }
+            }
+            break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        std::printf("xr: instance refused with %s (result %d)\n", t.what,
+                    static_cast<int>(ir));
+        std::fflush(stdout);
     }
     if (XR_FAILED(ir)) {
-        std::printf("xr: no runtime answered after retrying (result %d). Is "
-                    "SteamVR running and the headset awake?\n",
-                    static_cast<int>(ir));
+        // -2 is XR_ERROR_RUNTIME_FAILURE: the runtime itself is unwell, not
+        // busy. Restarting SteamVR is the cure, and the headset having just
+        // been through display disconnects or see-through mode is the usual
+        // reason it gets into this state.
+        std::printf("xr: the runtime refused every extension set (result %d). "
+                    "%s\n",
+                    static_cast<int>(ir),
+                    ir == XR_ERROR_RUNTIME_FAILURE
+                        ? "That is a runtime failure rather than a busy "
+                          "signal -- restart SteamVR."
+                        : "Is SteamVR running and the headset awake?");
         return false;
     }
+    depthLayerSupported_ = haveDepthExt;
+    visibilityMaskSupported_ = haveMaskExt;
 
     XrSystemGetInfo sgi{XR_TYPE_SYSTEM_GET_INFO};
     sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
