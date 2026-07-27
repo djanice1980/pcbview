@@ -256,6 +256,10 @@ private:
     // through VulkanWindow::orthoChanged. Two separate checkable actions for
     // one piece of camera state drift apart the moment either is used.
     QAction* orthoAction_ = nullptr;
+    // Checked state follows the live session rather than the request, so a
+    // failed start does not leave it ticked. Rebuilt with the viewport, hence
+    // re-connected in buildViewport.
+    QAction* vrAction_ = nullptr;
 
     QLabel* statusFile_ = nullptr;
     QLabel* statusBoard_ = nullptr;

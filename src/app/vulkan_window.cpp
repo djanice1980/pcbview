@@ -151,6 +151,24 @@ float wrapPi(float a) {
 
 }  // namespace
 
+// Seeded from the environment / --vr so a launch flag still works, then owned
+// by the menu toggle. Static: the viewport is destroyed and rebuilt to enter or
+// leave VR, so this cannot live on the window it outlives.
+bool VulkanWindow::vrRequested_ = qEnvironmentVariableIsSet("PCBVIEW_VR");
+
+void VulkanWindow::setVrMode(bool on) {
+    if (on == vrRequested_) return;
+    vrRequested_ = on;
+    // NOT persisted, deliberately. Remembering it would mean the next launch
+    // brings SteamVR up on its own -- creating an OpenXR instance starts the
+    // runtime -- so an app opened to glance at a board would haul the whole
+    // compositor in with it. The toggle is the way in, per session.
+    //
+    // Queued at the far end: this is called from a menu handler, and the
+    // rebuild deletes this window.
+    emit viewportRebuildRequired();
+}
+
 VulkanWindow::VulkanWindow(const geom::BoardMesh* mesh) : mesh_(mesh) {
     setSurfaceType(QSurface::VulkanSurface);
 
@@ -276,6 +294,11 @@ void VulkanWindow::stepVr() {
     if (!vr_->active()) {  // the runtime ended the session
         if (vrTimer_) vrTimer_->stop();
         vr_.reset();
+        // Ended from the runtime's side -- SteamVR closed, or the user quit the
+        // session there. The menu has to follow that, or it sits checked over a
+        // desktop window.
+        vrRequested_ = false;
+        emit vrActiveChanged(false);
         // Hand the window back. Leaving offscreenOnly_ set would stop the
         // desktop presenting entirely -- a dead window after taking the
         // headset off -- and leaving the mode forced would strand the user in
@@ -1148,8 +1171,7 @@ void VulkanWindow::initialise() {
     // names the physical device. See xr_system.h -- the ordering is forced by
     // OpenXR, not chosen. Failing to find a headset is an ordinary outcome, not
     // an error: the app simply carries on as a desktop session.
-    if (qEnvironmentVariableIsSet("PCBVIEW_VR") && !xrSystem_ &&
-        instance_ == VK_NULL_HANDLE) {
+    if (vrRequested_ && !xrSystem_ && instance_ == VK_NULL_HANDLE) {
         xrSystem_ = std::make_unique<xr::System>();
         if (xrSystem_->start()) {
             xrSystem_->installHooks();
@@ -1157,7 +1179,15 @@ void VulkanWindow::initialise() {
                         xrSystem_->headsetName());
             std::fflush(stdout);
         } else {
+            // Asked for and not available: SteamVR down, no headset, or the
+            // runtime refused. Carry on as a desktop session and clear the
+            // request, so the menu does not sit checked over a viewport that
+            // has no session and every later rebuild does not retry it.
             xrSystem_.reset();
+            vrRequested_ = false;
+            std::printf("vr: requested, but no runtime answered -- staying on "
+                        "the desktop\n");
+            std::fflush(stdout);
         }
     }
 
@@ -1303,6 +1333,12 @@ void VulkanWindow::createDeviceAndRenderer() {
             vrTimer_->start();
         } else {
             vr_.reset();
+        }
+        // Whether or not the session opened, say so once -- the menu check
+        // follows the session, not the request.
+        emit vrActiveChanged(vr_ != nullptr);
+        if (!vr_) {
+            vrRequested_ = false;
         }
     }
 

@@ -576,6 +576,20 @@ void MainWindow::buildViewport() {
     connect(viewport_, &VulkanWindow::viewportRebuildRequired, this,
             &MainWindow::rebuildViewport, Qt::QueuedConnection);
 
+    // The check follows the SESSION, not the request: asking for VR with
+    // SteamVR closed, no headset attached, or a runtime that refuses leaves the
+    // viewport on the desktop, and a menu item still ticked would be lying.
+    connect(viewport_, &VulkanWindow::vrActiveChanged, this, [this](bool on) {
+        if (vrAction_) {
+            QSignalBlocker block(vrAction_);
+            vrAction_->setChecked(on);
+        }
+        statusBar()->showMessage(
+            on ? "VR session running — the window mirrors the left eye"
+               : "VR unavailable — no headset or runtime answered",
+            6000);
+    });
+
     // Measurement readout in the status bar; menu checkbox follows the M key.
     connect(viewport_, &VulkanWindow::measureReadout, this,
             [this](const QString& t) {
@@ -1388,6 +1402,22 @@ void MainWindow::buildMenus() {
     connect(orthoAction_, &QAction::toggled, this, [this](bool on) {
         viewport_->camera().orthographic = on;
         viewport_->requestUpdate();
+    });
+
+    // The headset.
+    //
+    // Toggling this rebuilds the viewport, because OpenXR wraps Vulkan instance
+    // and device creation and so has to be running before either exists. The
+    // rebuild is the same one a CPU<->GPU device switch already performs, and
+    // the board, camera and explode state carry across it.
+    vrAction_ = view->addAction("&VR headset");
+    vrAction_->setCheckable(true);
+    vrAction_->setChecked(VulkanWindow::vrRequested());
+    connect(vrAction_, &QAction::triggered, this, [this](bool on) {
+        statusBar()->showMessage(on ? "Starting VR — rebuilding the viewport…"
+                                    : "Leaving VR — rebuilding the viewport…",
+                                 4000);
+        viewport_->setVrMode(on);
     });
 
     // Viewport size presets: pin the render area to an aspect for video

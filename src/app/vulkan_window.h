@@ -88,6 +88,23 @@ public:
     // pointer must outlive the window -- MainWindow owns the mesh.
     void setMesh(const geom::BoardMesh* mesh);
 
+    // Enter or leave the headset.
+    //
+    // This cannot be done in place. OpenXR WRAPS Vulkan instance and device
+    // creation -- the runtime injects its own extensions and names the physical
+    // device -- so the decision precedes the instance existing. Rather than
+    // invent a second teardown path for it, this reuses the one the CPU<->GPU
+    // device switch already needs: ask the owner to rebuild the viewport, which
+    // destroys this window along with its surface, device and instance, and
+    // constructs a fresh one that brings the runtime up first.
+    void setVrMode(bool on);
+    // What was ASKED for. Static because it has to outlive the window that the
+    // rebuild destroys, and it is a property of the session rather than of any
+    // one viewport.
+    static bool vrRequested() { return vrRequested_; }
+    // What was ACHIEVED -- a live session on this window.
+    bool vrActive() const { return vr_ != nullptr; }
+
     vk::Renderer* renderer() { return renderer_.get(); }
     Camera& camera() { return camera_; }
 
@@ -294,6 +311,12 @@ signals:
     // does exactly that; the persisted settings carry every preference across.
     void viewportRebuildRequired();
 
+    // VR came up, or did not. Emitted after initialise() has tried, so a menu
+    // check can follow what actually happened rather than what was asked for --
+    // no headset, no SteamVR, or a runtime that refused all leave the request
+    // set and the session absent.
+    void vrActiveChanged(bool active);
+
 protected:
     void exposeEvent(QExposeEvent*) override;
     void resizeEvent(QResizeEvent*) override;
@@ -488,6 +511,7 @@ private:
     void updateReadout();
 
     const geom::BoardMesh* mesh_ = nullptr;
+    static bool vrRequested_;
 
     QVulkanInstance qtInstance_;
     VkInstance instance_ = VK_NULL_HANDLE;
