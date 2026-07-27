@@ -588,6 +588,7 @@ void VulkanWindow::stepVr() {
             bool rt;
             float ss;
             int rayQ;
+            int fov;
         };
         // The ray budget, at fixed full resolution.
         //
@@ -597,11 +598,16 @@ void VulkanWindow::stepVr() {
         // it). So the cost is the rays behind each pixel rather than the pixel
         // count, and this walks that dial instead. Plain raster stays as the
         // last row: it is the ceiling everything else is measured against.
+        // The ladder's own rungs, so "is there headroom for more rays at the
+        // distance I actually work at" is answered by measurement rather than
+        // by extrapolating a cost model. The first row is the richest thing
+        // the shader can do; if it fits at working distance, the ladder can
+        // simply hand it over sooner.
         static const SweepStep kSweep[] = {
-            {"traced, 11 rays/frag (full) ", true, 1.00f, 0},
-            {"traced,  7 rays/frag        ", true, 1.00f, 1},
-            {"traced,  4 rays/frag        ", true, 1.00f, 2},
-            {"plain raster, no rays       ", false, 1.00f, 0},
+            {"11 rays, no foveation  ", true, 1.00f, 0, 0},
+            {"11 rays, foveated      ", true, 1.00f, 0, 1},
+            {"7 rays, foveated       ", true, 1.00f, 1, 1},
+            {"4 rays, foveated hard  ", true, 1.00f, 2, 2},
         };
         static const bool sweeping = [this] {
             const QByteArray v = qgetenv("PCBVIEW_VR_SWEEP");
@@ -638,6 +644,7 @@ void VulkanWindow::stepVr() {
             ssEff = kSweep[i].ss;
             rtEff = kSweep[i].rt;
             rayQEff = kSweep[i].rayQ;
+            fovEff = kSweep[i].fov;
         }
         // Count only frames the runtime actually asked us to render, so an
         // idle headset stalls the sweep instead of walking through every
@@ -670,6 +677,7 @@ void VulkanWindow::stepVr() {
                 rtEff = false;
                 rayQEff = 2;
                 ssEff = 1.0f;
+                fovEff = 0;
             } else if (sweepFrame == kRecover + 1) {
                 std::printf("\nvr-sweep: [%zu/%zu] NOW SHOWING: %s\n"
                             "vr-sweep: press SPACE when you have seen enough.\n",
