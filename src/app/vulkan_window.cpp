@@ -447,10 +447,18 @@ void VulkanWindow::stepVr() {
         static int sweepFrame = 0;
         static int sweepIdle = 0;
         static bool sweepDone = false;
-        if (sweeping && !sweepDone) {
-            ssEff = kSweep[sweepStep].ss;
-            rtEff = kSweep[sweepStep].rt;
-            rayQEff = kSweep[sweepStep].rayQ;
+        if (sweeping) {
+            // Clamped, because on the last SPACE sweepStep runs one past the
+            // end. Without this the settings fell back to the environment the
+            // moment the sweep finished -- so "holding the last configuration"
+            // was a lie, and the vr-rate lines after a sweep were reporting
+            // the env config while appearing to describe the final row.
+            const size_t i = sweepStep < std::size(kSweep)
+                                 ? sweepStep
+                                 : std::size(kSweep) - 1;
+            ssEff = kSweep[i].ss;
+            rtEff = kSweep[i].rt;
+            rayQEff = kSweep[i].rayQ;
         }
         // Count only frames the runtime actually asked us to render, so an
         // idle headset stalls the sweep instead of walking through every
