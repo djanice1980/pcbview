@@ -337,10 +337,14 @@ void VulkanWindow::stepVr() {
         static bool cfgDumped = false;
         if (!cfgDumped) {
             cfgDumped = true;
+            const bool rtOn =
+                !allowPt && renderer_->rayTracingSupported() &&
+                !(qgetenv("PCBVIEW_VR_RT") == "0");
             std::printf("vr-cfg: %s, spp=%d, supersample=%.2fx, denoise=%d, "
                         "rate=1/%d, world-sun=yes\n",
                         allowPt ? "PATH TRACED (PCBVIEW_VR_PT)"
-                                : "ray-traced raster",
+                                : (rtOn ? "ray-traced raster"
+                                        : "PLAIN RASTER (no rays)"),
                         allowPt ? spp : 0, ss, allowPt ? dnPasses : 0,
                         rateDiv);
             std::fflush(stdout);
@@ -351,7 +355,15 @@ void VulkanWindow::stepVr() {
         // immediately when the mode already matches, so this is free.
         if (!allowPt) {
             renderer_->setRenderMode(vk::RenderMode::Raster);
-            renderer_->setRayTracing(rtAvailable());
+            // PCBVIEW_VR_RT=0 drops the ray-traced shadows and AO for plain
+            // raster shading -- no rays anywhere in the frame. Worth having as
+            // a baseline: everything else is layered on top of it, so when the
+            // picture misbehaves this is the floor to compare against.
+            static const bool wantRt = [] {
+                const QByteArray v = qgetenv("PCBVIEW_VR_RT");
+                return !(v == "0" || v == "false");
+            }();
+            renderer_->setRayTracing(wantRt && rtAvailable());
         }
         // A sun that stays put in the room. The desktop's key light rides the
         // camera, which is right when you orbit with a mouse and wrong the
