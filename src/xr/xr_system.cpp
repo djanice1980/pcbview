@@ -1044,7 +1044,20 @@ glm::mat4 placement(const float centre[3], float scale,
     glm::mat4 m(1.0f);
     m = glm::translate(m, anchorPos);
     m = m * glm::mat4_cast(flat);
-    m = glm::translate(m, glm::vec3(0.0f, 0.0f, -0.6f));  // 60cm in front
+    // How far in front. PCBVIEW_VR_DIST, in metres.
+    //
+    // Closer is not only a preference: the board covers more of the view, so
+    // every feature spans more pixels and aliases less. 0.3 m is comfortably
+    // outside the range where the eyes have to strain to converge, which
+    // starts to bite below about 0.2 m.
+    static const float dist = [] {
+        const char* v = std::getenv("PCBVIEW_VR_DIST");
+        if (!v || !v[0]) return 0.30f;
+        char* end = nullptr;
+        const float f = std::strtof(v, &end);
+        return (end && end != v && f >= 0.15f && f <= 3.0f) ? f : 0.30f;
+    }();
+    m = glm::translate(m, glm::vec3(0.0f, 0.0f, -dist));
     m = glm::scale(m, glm::vec3(scale));
     m = glm::translate(m, -glm::vec3(centre[0], centre[1], centre[2]));
     return m;
@@ -1062,8 +1075,18 @@ VrSession::~VrSession() { end(); }
 
 void VrSession::setBoardPlacement(const float centreMm[3], float spanMm) {
     for (int i = 0; i < 3; ++i) placeCentre_[i] = centreMm[i];
-    // ~35 cm across, whatever the board actually measures.
-    placeScale_ = spanMm > 1.0f ? 0.35f / spanMm : 0.001f;
+    // How big across, whatever the board actually measures.
+    // PCBVIEW_VR_SIZE, in metres -- independent of distance, so the two can be
+    // traded: nearer at the same size fills more of the view, nearer at a
+    // smaller size keeps the same apparent size but improves stereo depth.
+    static const float sizeM = [] {
+        const char* v = std::getenv("PCBVIEW_VR_SIZE");
+        if (!v || !v[0]) return 0.35f;
+        char* end = nullptr;
+        const float f = std::strtof(v, &end);
+        return (end && end != v && f >= 0.05f && f <= 2.0f) ? f : 0.35f;
+    }();
+    placeScale_ = spanMm > 1.0f ? sizeM / spanMm : 0.001f;
 }
 
 bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
