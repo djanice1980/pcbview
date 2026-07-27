@@ -2271,6 +2271,10 @@ void Renderer::recordTemporal(VkCommandBuffer cmd, const float viewProj[16]) {
     static const float tolFrac = envFloat("PCBVIEW_VR_TOL", 0.004f);
     push.params[1] = worldSpan_ > 0.0f ? worldSpan_ * tolFrac : tolFrac * 50.0f;
     push.params[2] = static_cast<float>(std::max(temporalMaxFrames_, 1));
+    // Edge pixels reuse a CLAMPED history over a short window: long enough to
+    // stop the outline walking, short enough that a genuinely new surface is
+    // not held onto.
+    push.params[3] = envFloat("PCBVIEW_VR_EDGE_HISTORY", 8.0f);
     for (int i = 0; i < 3; ++i) push.eye[i] = rayEye_[i];
     vkCmdPushConstants(cmd, rpPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(push), &push);

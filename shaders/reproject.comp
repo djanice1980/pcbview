@@ -31,8 +31,10 @@ layout(push_constant) uniform Push {
     mat4 prevViewProj;  // world(mm) -> clip, as it was LAST frame
     uvec4 dim;          // x width, y height, z reset (1 = ignore history)
     // x = 1/samples (curColour and curNormal are running sums)
-    // y = position tolerance as a FRACTION of view distance
+    // y = position tolerance, absolute world distance
     // z = max history frames
+    // w = history frames for CLAMPED (edge) reuse -- deliberately short, so a
+    //     genuinely new surface resolves quickly while the edge stops walking
     vec4 params;
     vec3 eye;           // viewpoint, same space as the position AOV
 } pc;
@@ -57,6 +59,10 @@ void main() {
     // A real highlight covers several pixels; a firefly is one pixel that
     // disagrees with everything around it. So clamp against the local mean
     // rather than a fixed ceiling, which would flatten genuine bright detail.
+    // The same sweep also gives the colour BOX used further down to clamp
+    // history at edges, so it is gathered once here.
+    vec3 nbMin = vec3(1.0e30);
+    vec3 nbMax = vec3(-1.0e30);
     {
         vec3 mean = vec3(0.0);
         float cnt = 0.0;
@@ -66,7 +72,10 @@ void main() {
                 if (q.x < 0 || q.y < 0 || q.x >= int(pc.dim.x) ||
                     q.y >= int(pc.dim.y))
                     continue;
-                mean += imageLoad(curColour, q).rgb * invSamples;
+                const vec3 c = imageLoad(curColour, q).rgb * invSamples;
+                mean += c;
+                nbMin = min(nbMin, c);
+                nbMax = max(nbMax, c);
                 cnt += 1.0;
             }
         }
@@ -177,10 +186,42 @@ void main() {
     }
 
     if (wsum <= 1.0e-6) {
-        // Genuinely nothing to reuse -- newly revealed surface. Start again
-        // from this frame's samples: noisy for a few frames, which is correct.
-        // Inventing history here is exactly what produces trails.
-        imageStore(outColour, px, vec4(cur, 1.0));
+        // The geometry test says this is a different surface. Throwing the
+        // history away outright is what makes edges walk.
+        //
+        // At a silhouette a pixel is classified ALL chip or ALL board -- the
+        // geometry buffer is deterministic, so there is no partial coverage.
+        // Drift your head a fraction of a pixel, the classification flips, the
+        // history is discarded, and the pixel snaps wholesale to the other
+        // surface's colour. Stair-steps that jump between positions: an
+        // escalator rather than a staircase. And the flipping is genuine, so no
+        // amount of tightening or loosening the test removes it.
+        //
+        // So CLAMP rather than discard, which is what temporal antialiasing
+        // does for exactly this case. History is pulled into the range of
+        // colours this frame actually produced nearby, which bounds how wrong
+        // it can be -- a chip's colour cannot survive on newly revealed board,
+        // because the board's colours are what the box is made of -- while
+        // still carrying enough of the past to stop the edge snapping. Held to
+        // a short history so genuinely new surfaces still resolve quickly.
+        vec3 fb = vec3(0.0);
+        float fw = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            const ivec2 q = base + off[i];
+            if (q.x < 0 || q.y < 0 || q.x >= int(pc.dim.x) ||
+                q.y >= int(pc.dim.y))
+                continue;
+            fb += imageLoad(histColour, q).rgb * bw[i];
+            fw += bw[i];
+        }
+        if (fw <= 1.0e-6) {
+            imageStore(outColour, px, vec4(cur, 1.0));
+            return;
+        }
+        const vec3 clamped = clamp(fb / fw, nbMin, nbMax);
+        const float edgeN = min(pc.params.w, pc.params.z);
+        imageStore(outColour, px,
+                   vec4(mix(clamped, cur, 1.0 / edgeN), edgeN));
         return;
     }
 
