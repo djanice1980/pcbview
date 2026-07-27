@@ -41,6 +41,7 @@ public:
     // Whether the runtime offered XR_KHR_composition_layer_depth, so the
     // session knows whether to build depth swapchains.
     bool depthLayerSupported() const { return depthLayerSupported_; }
+    bool visibilityMaskSupported() const { return visibilityMaskSupported_; }
 
     // Route pcbview's Vulkan creation through the runtime. Must bracket the
     // createInstance/createDevice calls.
@@ -65,6 +66,7 @@ private:
     void* instance_ = nullptr;   // XrInstance
     unsigned long long system_ = 0;  // XrSystemId
     bool depthLayerSupported_ = false;
+    bool visibilityMaskSupported_ = false;
     char headsetName_[256] = {};
     VulkanCreationHooks hooks_{};
 };
@@ -152,6 +154,23 @@ public:
     // the board.
     VkImage acquiredDepthImage() const;
     VkImageView acquiredDepthView() const;
+
+    // The hidden-area mesh for an eye, already projected to screen space:
+    // pairs of floats in NDC, plus a triangle index list. Empty when the
+    // runtime has no visibility mask, or before the first located frame -- the
+    // eye's field of view is needed to project it and only arrives with a view.
+    //
+    // Drawing this into depth before the board means the rasterizer never
+    // shades the corners the lenses bend away, which on this headset is 22% of
+    // every eye.
+    struct MaskMesh {
+        std::vector<float> ndc;        // x,y pairs
+        std::vector<uint32_t> indices;
+        uint32_t version = 0;          // bumped on every successful (re)query
+    };
+    const MaskMesh& visibilityMask(int eye) const {
+        return mask_[(eye == 1) ? 1 : 0];
+    }
     void endFrame();
 
     // Where the board sits in the room: how far in front, how high, and how
@@ -209,6 +228,9 @@ private:
     std::vector<ViewPose> submitViews_;
     bool swapEyes_ = false;
     bool depthSupported_ = false;
+    bool maskSupported_ = false;
+    bool maskReady_ = false;
+    MaskMesh mask_[2];
     VkImage depthTarget_ = VK_NULL_HANDLE;
     VkImageView depthTargetView_ = VK_NULL_HANDLE;
     // Kept so the depth image views can be destroyed with the session.

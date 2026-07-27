@@ -36,6 +36,12 @@ const uint32_t kDenoiseComp[] =
 const uint32_t kReprojectComp[] =
 #include "shaders/reproject.comp.inc"
     ;
+const uint32_t kMaskVert[] =
+#include "shaders/mask.vert.inc"
+    ;
+const uint32_t kMaskFrag[] =
+#include "shaders/mask.frag.inc"
+    ;
 const uint32_t kFullscreenVert[] =
 #include "shaders/fullscreen.vert.inc"
     ;
@@ -205,6 +211,7 @@ Renderer::Renderer(Device& device, VkSurfaceKHR surface, uint32_t width,
     createDescriptors();
     createPipeline();
     createOverlayPipeline();
+    createMaskPipeline();
     createBloomPipelines();
     createBloomTargets();  // scene targets exist by now
     if (rtSupported_) createPathTracer();
@@ -237,6 +244,14 @@ Renderer::~Renderer() {
     if (pipelineOpaque_) vkDestroyPipeline(device_.handle, pipelineOpaque_, nullptr);
     if (pipelineBlend_) vkDestroyPipeline(device_.handle, pipelineBlend_, nullptr);
     destroyBloom();
+    if (maskPipeline_) vkDestroyPipeline(device_.handle, maskPipeline_, nullptr);
+    if (maskLayout_)
+        vkDestroyPipelineLayout(device_.handle, maskLayout_, nullptr);
+    for (MaskBuffers& m : maskEyes_) {
+        destroyBuffer(m.verts);
+        destroyBuffer(m.indices);
+        m.indexCount = 0;
+    }
     if (overlayPipeline_) vkDestroyPipeline(device_.handle, overlayPipeline_, nullptr);
     if (overlayLayout_) vkDestroyPipelineLayout(device_.handle, overlayLayout_, nullptr);
     for (Buffer& b : overlayVb_) destroyBuffer(b);
@@ -2411,6 +2426,157 @@ void Renderer::recordTemporal(VkCommandBuffer cmd, const float viewProj[16]) {
     temporalReset_ = false;
 }
 
+void Renderer::setVisibilityMask(int eye, const float* ndcXY,
+                                 uint32_t vertexCount, const uint32_t* indices,
+                                 uint32_t indexCount, uint32_t version) {
+    if (eye < 0 || eye > 1 || !ndcXY || !indices || !vertexCount || !indexCount)
+        return;
+    MaskBuffers& m = maskEyes_[eye];
+    // Called every frame, so this early-out is the normal path. The version
+    // catches a re-query that happens to come back the same size -- which is
+    // the likely shape of a mask change, since only the geometry moves.
+    if (m.indexCount == indexCount && m.version == version) return;
+
+    vkDeviceWaitIdle(device_.handle);
+    destroyBuffer(m.verts);
+    destroyBuffer(m.indices);
+
+    // Host-visible and written once: this is a few hundred vertices that never
+    // change, so a staging copy would cost more code than it saves.
+    const VkDeviceSize vbytes = VkDeviceSize(vertexCount) * 2 * sizeof(float);
+    const VkDeviceSize ibytes = VkDeviceSize(indexCount) * sizeof(uint32_t);
+    m.verts = createBuffer(vbytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    m.indices = createBuffer(ibytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    void* p = nullptr;
+    if (vkMapMemory(device_.handle, m.verts.memory, 0, vbytes, 0, &p) ==
+        VK_SUCCESS) {
+        std::memcpy(p, ndcXY, static_cast<size_t>(vbytes));
+        vkUnmapMemory(device_.handle, m.verts.memory);
+    }
+    if (vkMapMemory(device_.handle, m.indices.memory, 0, ibytes, 0, &p) ==
+        VK_SUCCESS) {
+        std::memcpy(p, indices, static_cast<size_t>(ibytes));
+        vkUnmapMemory(device_.handle, m.indices.memory);
+    }
+    m.indexCount = indexCount;
+    m.version = version;
+}
+
+void Renderer::createMaskPipeline() {
+    VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    check(vkCreatePipelineLayout(device_.handle, &pl, nullptr, &maskLayout_),
+          "mask pipeline layout");
+
+    VkShaderModule vs = makeModule(device_.handle, kMaskVert, sizeof(kMaskVert));
+    VkShaderModule fs = makeModule(device_.handle, kMaskFrag, sizeof(kMaskFrag));
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vs;
+    stages[0].pName = "main";
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fs;
+    stages[1].pName = "main";
+
+    VkVertexInputBindingDescription bind{0, 2 * sizeof(float),
+                                         VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription attr{0, 0, VK_FORMAT_R32G32_SFLOAT, 0};
+    VkPipelineVertexInputStateCreateInfo vi{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount = 1;
+    vi.pVertexBindingDescriptions = &bind;
+    vi.vertexAttributeDescriptionCount = 1;
+    vi.pVertexAttributeDescriptions = &attr;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    // No culling: the runtime makes no promise about winding order, and a
+    // silently back-facing mask would simply do nothing.
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = msaaSamples_;
+
+    // Depth is the entire output. ALWAYS, so it stamps the near plane over
+    // whatever the clear left, and writes enabled so the board is rejected
+    // there afterwards.
+    VkPipelineDepthStencilStateCreateInfo dsi{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    dsi.depthTestEnable = VK_TRUE;
+    dsi.depthWriteEnable = VK_TRUE;
+    dsi.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+
+    // Colour untouched -- an empty write mask, so the masked corners keep the
+    // clear colour rather than being painted.
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = 0;
+    VkPipelineColorBlendStateCreateInfo cb{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds{
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = 2;
+    ds.pDynamicStates = dyn;
+
+    VkPipelineRenderingCreateInfo rci{
+        VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rci.colorAttachmentCount = 1;
+    rci.pColorAttachmentFormats = &colorFormat_;
+    rci.depthAttachmentFormat = depthFormat_;
+
+    VkGraphicsPipelineCreateInfo gpi{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpi.pNext = &rci;
+    gpi.stageCount = 2;
+    gpi.pStages = stages;
+    gpi.pVertexInputState = &vi;
+    gpi.pInputAssemblyState = &ia;
+    gpi.pViewportState = &vp;
+    gpi.pRasterizationState = &rs;
+    gpi.pMultisampleState = &ms;
+    gpi.pDepthStencilState = &dsi;
+    gpi.pColorBlendState = &cb;
+    gpi.pDynamicState = &ds;
+    gpi.layout = maskLayout_;
+    check(vkCreateGraphicsPipelines(device_.handle, VK_NULL_HANDLE, 1, &gpi,
+                                    nullptr, &maskPipeline_),
+          "mask pipeline");
+    vkDestroyShaderModule(device_.handle, vs, nullptr);
+    vkDestroyShaderModule(device_.handle, fs, nullptr);
+}
+
+void Renderer::recordVisibilityMask(VkCommandBuffer cmd) {
+    if (maskEye_ < 0 || maskEye_ > 1 || !maskPipeline_) return;
+    const MaskBuffers& m = maskEyes_[maskEye_];
+    if (!m.indexCount || m.verts.handle == VK_NULL_HANDLE) return;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, maskPipeline_);
+    const VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &m.verts.handle, &zero);
+    vkCmdBindIndexBuffer(cmd, m.indices.handle, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(cmd, m.indexCount, 1, 0, 0, 0);
+}
+
 void Renderer::createGpuDenoise() {
     if (!rtSupported_) return;
 
@@ -4553,6 +4719,11 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
         if (i.hideWhenCollapsed && !peeling && substrateOpaque) return false;
         return true;
     };
+
+    // Pass 0: the hidden-area mesh. Stamps the near plane over the corners the
+    // lenses bend away, so everything drawn afterwards fails the depth test
+    // there and is never shaded -- around 22% of each eye on this headset.
+    recordVisibilityMask(cmd);
 
     // Pass 1: opaque. Writes depth, so it establishes occlusion for everything.
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineOpaque_);

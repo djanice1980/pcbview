@@ -105,19 +105,31 @@ bool System::start() {
     // close enough to miss a deadline, so this matters more than the last of
     // the aliasing.
     bool haveDepthExt = false;
+    bool haveMaskExt = false;
     {
         uint32_t n = 0;
         xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr);
         std::vector<XrExtensionProperties> avail(n, {XR_TYPE_EXTENSION_PROPERTIES});
         if (n) xrEnumerateInstanceExtensionProperties(nullptr, n, &n, avail.data());
-        for (const auto& e : avail)
+        for (const auto& e : avail) {
             if (std::strcmp(e.extensionName,
                             XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0)
                 haveDepthExt = true;
+            if (std::strcmp(e.extensionName,
+                            XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0)
+                haveMaskExt = true;
+        }
     }
 
-    const char* ext[] = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
-                         XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME};
+    // The visibility mask is the shape of what the LENSES can actually show.
+    // SteamVR puts it at 22% of each eye on this headset -- better than a fifth
+    // of every pixel we render is bent away by the optics and never seen. Drawn
+    // into depth before anything else, the rasterizer skips those fragments
+    // entirely, and on a fill-bound frame that is close to a fifth of the cost
+    // back for no visual change whatsoever.
+    std::vector<const char*> ext{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
+    if (haveDepthExt) ext.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+    if (haveMaskExt) ext.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
     XrInstanceCreateInfo ici{XR_TYPE_INSTANCE_CREATE_INFO};
     std::snprintf(ici.applicationInfo.applicationName,
                   sizeof(ici.applicationInfo.applicationName), "pcbview");
@@ -125,9 +137,10 @@ bool System::start() {
     std::snprintf(ici.applicationInfo.engineName,
                   sizeof(ici.applicationInfo.engineName), "pcbview");
     ici.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-    ici.enabledExtensionCount = haveDepthExt ? 2 : 1;
-    ici.enabledExtensionNames = ext;
+    ici.enabledExtensionCount = static_cast<uint32_t>(ext.size());
+    ici.enabledExtensionNames = ext.data();
     depthLayerSupported_ = haveDepthExt;
+    visibilityMaskSupported_ = haveMaskExt;
 
     XrInstance inst = XR_NULL_HANDLE;
     if (XR_FAILED(xrCreateInstance(&ici, &inst))) {
@@ -1143,6 +1156,7 @@ bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
     inst_ = sys.rawInstance();
     sysId_ = sys.rawSystem();
     depthSupported_ = sys.depthLayerSupported();
+    maskSupported_ = sys.visibilityMaskSupported();
     device_ = device;
     XrInstance inst = static_cast<XrInstance>(inst_);
 
@@ -1225,12 +1239,15 @@ bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
         // fail -- any of which just means we submit colour alone, exactly as
         // before. Nothing else depends on it.
         if (depthSupported_) {
+            // D32_SFLOAT only, and not merely as a preference: the scene
+            // pipelines are built against the renderer's own depth format, and
+            // rendering into an attachment of a different format is invalid.
+            // If the runtime cannot offer it we simply submit colour alone.
             int64_t dfmt = 0;
             for (int64_t f : formats)
-                if (f == VK_FORMAT_D32_SFLOAT || f == VK_FORMAT_D24_UNORM_S8_UINT ||
-                    f == VK_FORMAT_D16_UNORM) {
+                if (f == VK_FORMAT_D32_SFLOAT) {
                     dfmt = f;
-                    if (f == VK_FORMAT_D32_SFLOAT) break;  // prefer full float
+                    break;
                 }
             if (dfmt) {
                 XrSwapchainCreateInfo dci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -1360,6 +1377,11 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
                 end();
                 return false;
             }
+        } else if (ev.type == XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR) {
+            // The lens geometry moved -- an IPD change on headsets that can do
+            // it. Drop the cached mesh; the block below re-queries it on the
+            // next frame that has a located view.
+            maskReady_ = false;
         }
         ev = {XR_TYPE_EVENT_DATA_BUFFER};
     }
@@ -1489,6 +1511,55 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         std::printf("vr-diag: board centre mm(%.1f %.1f %.1f)\n",
                     placeCentre_[0], placeCentre_[1], placeCentre_[2]);
         std::fflush(stdout);
+    }
+
+    // The hidden-area mesh, resolved once the FOV is known.
+    //
+    // Its vertices are 2D points on the z = -1 plane of the view frustum, so
+    // they need the eye's PROJECTION to become screen positions -- and the FOV
+    // only arrives with a located view, which is why this cannot happen at
+    // session start. The projection is fixed per eye though, so it is done once
+    // and the result cached: at z = -1 the perspective divide is trivial (w
+    // comes out 1), leaving ndc.x = p0*x - p8 and ndc.y = p5*y - p9.
+    if (maskSupported_ && !maskReady_ && got >= 2) {
+        auto getMask = proc<PFN_xrGetVisibilityMaskKHR>(asXr(inst_),
+                                                        "xrGetVisibilityMaskKHR");
+        if (getMask) {
+            maskReady_ = true;   // one attempt, whatever the outcome
+            for (uint32_t i = 0; i < got && i < 2; ++i) {
+                XrVisibilityMaskKHR m{XR_TYPE_VISIBILITY_MASK_KHR};
+                if (XR_FAILED(getMask(s, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                      i, XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR,
+                                      &m)) ||
+                    m.indexCountOutput == 0 || m.vertexCountOutput == 0)
+                    continue;
+
+                std::vector<XrVector2f> verts(m.vertexCountOutput);
+                std::vector<uint32_t> idx(m.indexCountOutput);
+                m.vertexCapacityInput = m.vertexCountOutput;
+                m.indexCapacityInput = m.indexCountOutput;
+                m.vertices = verts.data();
+                m.indices = idx.data();
+                if (XR_FAILED(getMask(s, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                      i, XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR,
+                                      &m)))
+                    continue;
+
+                float proj[16];
+                projectionFromFov(views[i].fov, 0.01f, proj);
+                mask_[i].ndc.clear();
+                mask_[i].ndc.reserve(verts.size() * 2);
+                for (const XrVector2f& v : verts) {
+                    mask_[i].ndc.push_back(proj[0] * v.x - proj[8]);
+                    mask_[i].ndc.push_back(proj[5] * v.y - proj[9]);
+                }
+                mask_[i].indices = std::move(idx);
+                ++mask_[i].version;
+                std::printf("vr: hidden-area mesh eye %u: %u triangles\n", i,
+                            m.indexCountOutput / 3);
+            }
+            std::fflush(stdout);
+        }
     }
 
     lastViews_.clear();

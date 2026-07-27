@@ -332,6 +332,15 @@ public:
         vrDepthImage_ = image;
     }
 
+    // This eye's hidden-area mesh, in NDC, uploaded once per eye and then
+    // referenced by index. Drawn into depth at the head of the scene pass so
+    // the rasterizer discards the fragments the lenses cannot show -- 22% of
+    // every eye on this headset, shaded for nothing until now.
+    void setVisibilityMask(int eye, const float* ndcXY, uint32_t vertexCount,
+                           const uint32_t* indices, uint32_t indexCount,
+                           uint32_t version);
+    void selectVisibilityMask(int eye) { maskEye_ = eye; }
+
     // Render the scene and stop -- no swapchain image acquired, nothing shown
     // in the window, nothing presented. sceneColor_ is still left in
     // TRANSFER_SRC_OPTIMAL, so blitSceneToImage works exactly as before.
@@ -771,6 +780,20 @@ private:
     uint32_t vrTargetW_ = 0, vrTargetH_ = 0;
     VkImageView vrDepthView_ = VK_NULL_HANDLE;
     VkImage vrDepthImage_ = VK_NULL_HANDLE;
+
+    // --- Hidden-area mesh ---------------------------------------------------
+    struct MaskBuffers {
+        Buffer verts;
+        Buffer indices;
+        uint32_t indexCount = 0;
+        uint32_t version = 0;   // bumped by the runtime when the mask changes
+    };
+    MaskBuffers maskEyes_[2];
+    int maskEye_ = -1;                              // -1 = draw nothing
+    VkPipeline maskPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout maskLayout_ = VK_NULL_HANDLE;
+    void createMaskPipeline();
+    void recordVisibilityMask(VkCommandBuffer cmd);
     // Copy sceneColor_ into vrTarget_ using the frame's own command buffer.
     // sceneColor_ is already in TRANSFER_SRC_OPTIMAL by the time this runs.
     void recordVrBlit(VkCommandBuffer cmd);

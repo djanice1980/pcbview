@@ -304,6 +304,9 @@ void VulkanWindow::stepVr() {
             // allocated the instant the headset is set down. Both climb, and
             // the app stops responding while it tries.
             renderer_->setCaptureExtent(0, 0);
+            // The hidden-area mesh belongs to the headset's lenses. Drawing it
+            // into a desktop window would punch holes in the corners.
+            renderer_->selectVisibilityMask(-1);
             // Back to the interactive sample ramp and OIDN for a mouse camera:
             // the desktop can afford the round trip and gets the better result.
             renderer_->setPathTraceBatch(0);
@@ -492,6 +495,23 @@ void VulkanWindow::stepVr() {
             // the board's actual shape rather than slid about as a flat sheet.
             renderer_->setVrDepthTarget(vr_->acquiredDepthView(),
                                         vr_->acquiredDepthImage());
+
+            // This eye's hidden-area mesh. Uploaded on the first frame it is
+            // available -- the runtime needs a located view before it can be
+            // projected -- and a no-op on every frame after.
+            const auto& mask = vr_->visibilityMask(static_cast<int>(i));
+            if (!mask.indices.empty()) {
+                renderer_->setVisibilityMask(
+                    static_cast<int>(i), mask.ndc.data(),
+                    static_cast<uint32_t>(mask.ndc.size() / 2),
+                    mask.indices.data(),
+                    static_cast<uint32_t>(mask.indices.size()), mask.version);
+                renderer_->selectVisibilityMask(static_cast<int>(i));
+            } else {
+                // No mesh for this eye -- clear the selection rather than let
+                // the other eye's mask be drawn over it.
+                renderer_->selectVisibilityMask(-1);
+            }
             renderer_->drawFrame(e.viewProj, e.eye);
             if (i < 2) vrSamples_[i] = renderer_->accumulatedSamples();
             if (eyeImage != VK_NULL_HANDLE)
