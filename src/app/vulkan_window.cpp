@@ -437,23 +437,25 @@ void VulkanWindow::stepVr() {
         //
         // Plain raster survives only as a final fallback for a device with no
         // variable-rate shading, chosen at runtime below.
-        // Spend what foveation saves on RAYS, not on frame time.
+        // Measured, after an estimate said otherwise.
         //
-        // Measured with foveation on: 4 rays at 0.42 m costs 3.2 ms of an
-        // 11.1 ms budget, and at 0.30 m about 5.5 ms. Rays are close to linear
-        // here, so seven of them lands near 4.7 ms and eleven near 6.7 -- both
-        // comfortably inside. The first ladder was tuned before foveation
-        // existed and left most of the budget unspent, which meant sitting at
-        // four rays at ordinary working distance for no reason.
+        // Rays are NOT linear in cost, which a previous version of this ladder
+        // assumed: extrapolating from four rays put eleven at about 6.7 ms, and
+        // measured at the same distance it is 11.09 -- the whole 11.11 ms
+        // budget, with nothing left for the compositor. Eleven foveated came in
+        // at 8.84 and was still paced down to 45 Hz. Four rays foveated hard
+        // measured 5.53 and held 90 Hz solidly, and is the configuration that
+        // reads as most stable through the lenses.
         //
-        // Distance now mostly buys foveation strength rather than ray cuts, so
-        // the shadows stay through the range instead of thinning out as you
-        // lean in. The pacing backstop covers the case where this is too
-        // optimistic for a denser board or a slower machine.
+        // So the usable ceiling is around half the nominal budget, not all of
+        // it, and the extra taps buy less than they cost -- consistent with the
+        // shader's own note that nine shadow taps against five is visible only
+        // if you go looking. Foveation is applied throughout instead, since
+        // that is what bought the close range back without losing shadows.
         static const Tier kTiers[] = {
-            {true, 0, 0, "11 rays"},
             {true, 0, 1, "11 rays, foveated"},
             {true, 1, 1, "7 rays, foveated"},
+            {true, 2, 1, "4 rays, foveated"},
             {true, 2, 2, "4 rays, foveated hard"},
         };
         static const Tier kNoFoveation = {false, 2, 0, "plain raster"};
@@ -671,7 +673,12 @@ void VulkanWindow::stepVr() {
             // slower than 11. Letting it climb back to full rate first makes
             // each row independent of the order they were tried in, and gives
             // an unmistakable visual boundary between them besides.
-            const int kRecover = 150, kSettle = 90;
+            // 150 frames of recovery was not enough. Row 1 measured 11.09 ms,
+            // right at the budget, and the row after it -- cheaper at 8.84 --
+            // came back paced at 45 Hz, having inherited the throttle. Five
+            // seconds gives the runtime time to actually climb back before the
+            // next row is judged on it.
+            const int kRecover = 450, kSettle = 90;
             const int kMinFrames = kRecover + kSettle + 60;
             if (sweepFrame <= kRecover) {
                 rtEff = false;
