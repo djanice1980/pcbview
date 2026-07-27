@@ -443,6 +443,20 @@ public:
     // work.
     double lastGpuMs() const { return gpuMs_; }
 
+    // GPU milliseconds accumulated since the last call, then reset.
+    //
+    // lastGpuMs() is per drawFrame, and VR calls drawFrame ONCE PER EYE -- with
+    // two frames in flight each eye keeps its own slot, so that value is one
+    // eye's cost and the frame's is about double. Reading it directly made the
+    // headset look half as expensive as it is, and made the gap between what we
+    // spend and what fits in a frame look like some large fixed overhead
+    // elsewhere. Sum across the eyes instead.
+    double takeGpuMs() {
+        const double v = gpuMsAccum_;
+        gpuMsAccum_ = 0.0;
+        return v;
+    }
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the
@@ -808,6 +822,7 @@ private:
     float timestampPeriod_ = 0.0f;  // ns per tick; 0 = unsupported
     std::vector<bool> timeArmed_;
     double gpuMs_ = 0.0;
+    double gpuMsAccum_ = 0.0;
     VkImage vrTarget_ = VK_NULL_HANDLE;
     uint32_t vrTargetW_ = 0, vrTargetH_ = 0;
     VkImageView vrDepthView_ = VK_NULL_HANDLE;

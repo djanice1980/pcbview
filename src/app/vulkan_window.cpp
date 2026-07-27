@@ -503,12 +503,15 @@ void VulkanWindow::stepVr() {
                 sweepDist_ = 0.0;
                 sweepSamples_ = 0;
             } else if (sweepFrame > kRecover + kSettle) {
-                const double g = renderer_->lastGpuMs();
+                // Both eyes, summed. See Renderer::takeGpuMs.
+                const double g = renderer_->takeGpuMs();
                 if (g > 0.0) {
                     sweepGpuMs_ += g;
                     sweepDist_ += vr_->boardDistance();
                     ++sweepSamples_;
                 }
+            } else {
+                renderer_->takeGpuMs();   // discard the settle window
             }
             // Ignore SPACE until there is something to report, so a stray
             // press cannot skip a row before it has been measured.

@@ -4534,6 +4534,7 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
             ts[1] > ts[0]) {
             gpuMs_ = double(ts[1] - ts[0]) * double(timestampPeriod_) * 1.0e-6;
+            gpuMsAccum_ += gpuMs_;
         }
     }
     if (timePool_) {
