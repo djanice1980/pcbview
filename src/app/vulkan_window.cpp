@@ -289,6 +289,17 @@ void VulkanWindow::stepVr() {
         if (vrOwnsRenderer_) {
             vrOwnsRenderer_ = false;
             renderer_->setOffscreenOnly(false);
+            // Give the scene resolution back to the WINDOW.
+            //
+            // The capture extent is how VR asks for an eye-sized render, and
+            // leaving it set meant the desktop carried on at eye resolution
+            // after the headset came off -- 6246x6366 with supersampling, forty
+            // megapixels, while also switching path tracing back on at that
+            // size. That is thirteen RGBA32F buffers of some 636 MB each on the
+            // GPU and OIDN's readback buffers of comparable size in host RAM,
+            // allocated the instant the headset is set down. Both climb, and
+            // the app stops responding while it tries.
+            renderer_->setCaptureExtent(0, 0);
             // Back to the interactive sample ramp and OIDN for a mouse camera:
             // the desktop can afford the round trip and gets the better result.
             renderer_->setPathTraceBatch(0);
