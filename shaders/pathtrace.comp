@@ -277,6 +277,47 @@ void main() {
         origin = pc.eye.xyz;
     }
 
+    // GEOMETRY BUFFER: a separate ray through the exact pixel CENTRE, traced
+    // once per frame and carrying no shading at all.
+    //
+    // Temporal reuse decides whether to keep a pixel's history by comparing
+    // where it is in the world against where the history says it was. That
+    // comparison is only meaningful if the position is STABLE. Taking it from
+    // sample 0 -- a jittered path sample -- made it stochastic: at a silhouette
+    // that one ray lands on the chip one frame and the background the next, so
+    // the recorded position flips between two surfaces a millimetre apart and
+    // the test flips with it. History is kept, then dropped, then kept, and the
+    // outline boils no matter how good the comparison is. No metric can rescue
+    // an input that is already unstable, which is why real renderers build this
+    // buffer deterministically and never from stochastic samples.
+    //
+    // Opaque flags on purpose: this wants the front-most surface every time,
+    // not a per-sample coin flip through a translucent mask.
+    if (sampleIndex == 0u) {
+        const vec2 cuv = (vec2(px) + 0.5) / vec2(pc.dim.xy);
+        const vec2 cndc = cuv * 2.0 - 1.0;
+        vec3 cdir, corg;
+        if (pc.misc.z > 0.5) {
+            cdir = normalize(pc.fwd.xyz);
+            corg = pc.eye.xyz + cndc.x * pc.right.xyz - cndc.y * pc.up.xyz;
+        } else {
+            cdir = normalize(pc.fwd.xyz + cndc.x * pc.right.xyz -
+                             cndc.y * pc.up.xyz);
+            corg = pc.eye.xyz;
+        }
+        rayQueryEXT grq;
+        rayQueryInitializeEXT(grq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, corg,
+                              0.001, cdir, 1.0e5);
+        while (rayQueryProceedEXT(grq)) {}
+        if (rayQueryGetIntersectionTypeEXT(grq, true) !=
+            gl_RayQueryCommittedIntersectionNoneEXT) {
+            const float gt = rayQueryGetIntersectionTEXT(grq, true);
+            imageStore(positionImg, ivec2(px), vec4(corg + cdir * gt, 1.0));
+        } else {
+            imageStore(positionImg, ivec2(px), vec4(0.0));
+        }
+    }
+
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     vec3 firstAlbedo = vec3(1.0);
@@ -356,14 +397,7 @@ void main() {
         if (rayQueryGetIntersectionTypeEXT(rq, true) ==
             gl_RayQueryCommittedIntersectionNoneEXT) {
             radiance += throughput * sky(dir);
-            if (depth == 0) {
-                firstAlbedo = sky(dir);
-                firstNormal = -dir;
-                // Sky: no world point to reuse, so mark it as a miss. Anything
-                // reprojecting into this pixel has to start fresh.
-                if (sampleIndex == 0u)
-                    imageStore(positionImg, ivec2(px), vec4(0.0));
-            }
+            if (depth == 0) { firstAlbedo = sky(dir); firstNormal = -dir; }
             break;
         }
 
@@ -469,10 +503,6 @@ void main() {
             if (coatT < tHit - 1.0e-4) ga = mix(ga, coatAlbedo, coatAlpha);
             firstAlbedo = ga;
             firstNormal = n;
-            // Sample 0 only: this is a POSITION, and the mean of two points on
-            // different surfaces is a point on neither.
-            if (sampleIndex == 0u)
-                imageStore(positionImg, ivec2(px), vec4(p, 1.0));
         }
 
         // Next-event estimation: direct sun, diffuse PLUS a specular glint. The
