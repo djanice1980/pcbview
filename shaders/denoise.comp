@@ -118,12 +118,24 @@ void main() {
             }
             const vec3 aQ = imageLoad(albedoImg, q).rgb * pc.misc.x;
 
-            // Orientation: a high power makes this fall off sharply, so a tap
-            // across a component's edge contributes almost nothing.
-            const float wn = pow(max(dot(nC, nQ), 0.0), pc.sigma.x);
-            // Material: separates copper from mask from silkscreen even where
-            // they are coplanar and share a normal.
-            const float wa = exp(-length(aC - aQ) / pc.sigma.z);
+            // Orientation and material, both RELAXED for pixels with little
+            // history -- and this is the case the boost was built for.
+            //
+            // At a silhouette the guides are themselves a blend: samples jitter
+            // across the edge, so the pixel's accumulated albedo and normal
+            // match the chip on one side and the board on the other and agree
+            // with NEITHER. Every tap is then rejected, the pixel receives
+            // almost no filtering, and since it is also the kind of pixel that
+            // keeps losing its history, nothing cleans it at all. That is the
+            // crawl: not the filter flickering, the filter never running.
+            //
+            // A pixel with a long history does not need the help and keeps the
+            // strict thresholds that stop colour bleeding between materials. A
+            // pixel with one frame gets to borrow from its neighbours, which is
+            // strictly better than staying raw. The world-radius test above
+            // stays strict either way, so this can never reach across the board.
+            const float wn = pow(max(dot(nC, nQ), 0.0), pc.sigma.x / boost);
+            const float wa = exp(-length(aC - aQ) / (pc.sigma.z * boost));
             // Brightness: preserves genuine lighting detail -- a shadow edge is
             // a real feature, not noise to be smoothed over.
             //

@@ -1246,6 +1246,28 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
     if (gpuDenoisePasses_ > 0 && ptSampleCount_ > 0) {
         recordGpuDenoise(cmd);
         ptDenoisedValid_ = true;
+    } else if (temporalSlot_ >= 0 && ptSampleCount_ > 0 &&
+               ptTemporal_.handle != VK_NULL_HANDLE) {
+        // Filter off but temporal on: show the BLENDED image, not the raw
+        // accumulation. Without this, turning the denoiser off also silently
+        // discarded the temporal result and displayed this frame's handful of
+        // samples -- which made "denoise=0" look like reuse was doing nothing.
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {sceneExtent_.width, sceneExtent_.height, 1};
+        vkCmdCopyImage(cmd, ptTemporal_.handle, VK_IMAGE_LAYOUT_GENERAL,
+                       ptDenoised_.handle, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.memoryBarrierCount = 1;
+        d.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &d);
+        ptDenoisedValid_ = true;
     }
 
     // Tonemap into sceneColor_ (an SRGB attachment -> gamma on store).
