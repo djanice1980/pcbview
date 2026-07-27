@@ -227,10 +227,19 @@ void VulkanWindow::stepVr() {
         const QByteArray v = qgetenv("PCBVIEW_VR_RT");
         return !(v == "0" || v == "false");
     }();
+    // PCBVIEW_VR_RAYQ picks the ray budget: 0 full (11 rays a fragment), 1
+    // reduced (7), 2 cheap (4). Defaults to 0 so nothing changes until the
+    // sweep has said what the trade actually costs.
+    static const int rayQ = [] {
+        bool ok = false;
+        const int n = qgetenv("PCBVIEW_VR_RAYQ").toInt(&ok);
+        return (ok && n >= 0 && n <= 2) ? n : 0;
+    }();
     // What this frame actually uses. Identical to the settings above unless
     // the sweep below is driving them.
     float ssEff = ss;
     bool rtEff = wantRt;
+    int rayQEff = rayQ;
     // How far back temporal reuse averages. This is the quality/latency dial:
     // higher is cleaner and slower to react to a change in the picture, and it
     // is what lets a handful of samples a frame look like a great many.
@@ -399,12 +408,21 @@ void VulkanWindow::stepVr() {
             const char* name;
             bool rt;
             float ss;
+            int rayQ;
         };
+        // The ray budget, at fixed full resolution.
+        //
+        // The first sweep already answered the two coarse questions: ray
+        // tracing costs two thirds of the frame rate (90 Hz plain against 30 Hz
+        // traced) and render scale barely matters (0.70x recovered only half of
+        // it). So the cost is the rays behind each pixel rather than the pixel
+        // count, and this walks that dial instead. Plain raster stays as the
+        // last row: it is the ceiling everything else is measured against.
         static const SweepStep kSweep[] = {
-            {"ray-traced raster, full res", true, 1.00f},
-            {"plain raster,      full res", false, 1.00f},
-            {"ray-traced raster, 0.70x   ", true, 0.70f},
-            {"plain raster,      0.70x   ", false, 0.70f},
+            {"traced, 11 rays/frag (full) ", true, 1.00f, 0},
+            {"traced,  7 rays/frag        ", true, 1.00f, 1},
+            {"traced,  4 rays/frag        ", true, 1.00f, 2},
+            {"plain raster, no rays       ", false, 1.00f, 0},
         };
         static const bool sweeping = [this] {
             const QByteArray v = qgetenv("PCBVIEW_VR_SWEEP");
@@ -428,6 +446,7 @@ void VulkanWindow::stepVr() {
         if (sweeping && !sweepDone) {
             ssEff = kSweep[sweepStep].ss;
             rtEff = kSweep[sweepStep].rt;
+            rayQEff = kSweep[sweepStep].rayQ;
         }
         // Count only frames the runtime actually asked us to render, so an
         // idle headset stalls the sweep instead of walking through every
@@ -504,6 +523,7 @@ void VulkanWindow::stepVr() {
         if (!allowPt) {
             renderer_->setRenderMode(vk::RenderMode::Raster);
             renderer_->setRayTracing(rtEff && rtAvailable());
+            renderer_->setRayQuality(rayQEff);
         }
         // A sun that stays put in the room. The desktop's key light rides the
         // camera, which is right when you orbit with a mouse and wrong the

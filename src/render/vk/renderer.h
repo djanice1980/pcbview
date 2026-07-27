@@ -418,6 +418,19 @@ public:
     // modes agree about where the light comes from.
     void setRasterWorldSun(bool on) { rasterWorldSun_ = on; }
 
+    // How many rays each shaded fragment may spend.
+    //
+    //   0 = 4 extra shadow taps + 6 AO  (11 rays, the desktop look)
+    //   1 = 2 extra shadow taps + 4 AO  ( 7 rays)
+    //   2 = 0 extra shadow taps + 3 AO  ( 4 rays, hard-edged sun)
+    //
+    // Measured: ray-traced shading is what holds the headset at 30 Hz where
+    // plain raster sustains 90, and render scale barely moves it -- the cost
+    // is the rays behind each pixel, not the pixels. This is the dial for it.
+    void setRayQuality(int level) {
+        rayQuality_ = level < 0 ? 0 : (level > 2 ? 2 : level);
+    }
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the
@@ -776,6 +789,7 @@ private:
     float boardRotInv_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     bool offscreenOnly_ = false;
     bool rasterWorldSun_ = false;
+    int rayQuality_ = 0;
     VkImage vrTarget_ = VK_NULL_HANDLE;
     uint32_t vrTargetW_ = 0, vrTargetH_ = 0;
     VkImageView vrDepthView_ = VK_NULL_HANDLE;

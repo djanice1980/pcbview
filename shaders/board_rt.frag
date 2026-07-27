@@ -170,23 +170,28 @@ const vec3 kSunDirWorld = normalize(vec3(0.35, 0.25, 1.0));
 // A FIXED pattern, like the AO kernel: no per-pixel randomness, so no shimmer.
 // Banding instead of noise is the right trade here -- the eye forgives a soft
 // gradient and cannot forgive a boiling one, least of all in a headset.
-float sunVisibility(vec3 p, vec3 n, vec3 dir, float tmax) {
+float sunVisibility(vec3 p, vec3 n, vec3 dir, float tmax, int extra) {
     // ~1.5 degrees of angular radius, near enough the real sun.
     const float radius = 0.026;
     vec3 up = abs(dir.z) < 0.99 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
     vec3 t = normalize(cross(up, dir));
     vec3 b = cross(dir, t);
 
-    // Centre plus four, rotated 45 degrees so they straddle both axes.
+    // Centre plus up to four, rotated 45 degrees so they straddle both axes.
     //
     // Four and not eight: shadow rays are the single most expensive thing this
     // shader does, and at eye resolution across two eyes, nine taps against one
     // was enough on its own to take a headset from smooth to a slideshow. Five
     // still reads as a soft edge; the difference from nine is visible only if
     // you go looking for it, and it costs nearly half as much.
+    //
+    // `extra` trims it further for the headset, and the ORDER is chosen so
+    // that any prefix stays balanced: the first two are diametrically opposite
+    // through the centre, so stopping at two still widens the penumbra evenly
+    // instead of dragging it to one corner.
     const vec2 disc[4] = vec2[](
-        vec2( 0.71,  0.71), vec2(-0.71,  0.71),
-        vec2(-0.71, -0.71), vec2( 0.71, -0.71));
+        vec2( 0.71,  0.71), vec2(-0.71, -0.71),
+        vec2(-0.71,  0.71), vec2( 0.71, -0.71));
 
     float open = occluded(p, dir, tmax) ? 0.0 : 1.0;
     // Count the taps actually taken. Dividing by a fixed five while skipping
@@ -194,7 +199,7 @@ float sunVisibility(vec3 p, vec3 n, vec3 dir, float tmax) {
     // every grazing surface -- and the cosine falloff is already applied
     // separately, so encoding it again here would double it.
     float taps = 1.0;
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < extra; ++i) {
         vec3 d = normalize(dir + (t * disc[i].x + b * disc[i].y) * radius);
         if (dot(n, d) <= 0.0) continue;      // below the horizon: no light anyway
         taps += 1.0;
@@ -206,7 +211,11 @@ float sunVisibility(vec3 p, vec3 n, vec3 dir, float tmax) {
 // Fraction of a short hemisphere around the normal that is open. 1 = fully open,
 // 0 = fully enclosed. A fixed kernel biased toward the normal -- no per-pixel
 // randomness, so it is temporally stable (no shimmer).
-float ambientOcclusion(vec3 p, vec3 n) {
+float ambientOcclusion(vec3 p, vec3 n, int taps) {
+    // Ordered so any prefix is still spread about the normal: centre, then an
+    // opposing pair on x, then an opposing pair on y, then the diagonal. Three
+    // taps is centre plus a balanced pair rather than two samples leaning the
+    // same way, which would tilt the occlusion in one direction.
     const vec3 k[6] = vec3[](
         vec3(0.0, 0.0, 1.0),
         vec3(0.60, 0.0, 0.80),
@@ -220,12 +229,12 @@ float ambientOcclusion(vec3 p, vec3 n) {
     vec3 b = cross(n, t);
     const float radius = 2.5;  // mm; contact-shadow scale under small parts
     float open = 0.0;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < taps; ++i) {
         vec3 s = normalize(k[i]);
         vec3 dir = t * s.x + b * s.y + n * s.z;
         if (!occluded(p + n * 0.05, dir, radius)) open += 1.0;
     }
-    return open / 6.0;
+    return open / float(taps);
 }
 
 void main() {
@@ -265,7 +274,9 @@ void main() {
     // your head and every shadow swings with it, and the board never appears to
     // sit in a lit room. The world-fixed sun is the same one the path tracer
     // uses, so the two modes agree about where the light comes from.
-    const bool worldSun = CAMERAPOS.w > 1.5;
+    // The units digit of the mode word, so the quality tens digit does not
+    // read as a different lighting mode.
+    const bool worldSun = (int(CAMERAPOS.w + 0.5) % 10) == 2;
     vec3 keyDir;
     float keyDist;
     if (worldSun) {
@@ -286,11 +297,30 @@ void main() {
     float fill = max(dot(n, fillDir), 0.0);
 
     // Ray-traced shadow + AO, only when the gate is set.
+    //
+    // Ray BUDGET rides in the same float, in tens: the units digit is the
+    // lighting mode, the tens digit the quality level. The push block is
+    // already at the 128 bytes every Vulkan device is required to offer, so
+    // there is nowhere else to put it, and a float carrying a small integer
+    // has room to spare.
+    //
+    //   quality 0 = 4 extra shadow taps + 6 AO   (11 rays, the desktop look)
+    //   quality 1 = 2 extra shadow taps + 4 AO   ( 7 rays)
+    //   quality 2 = 0 extra shadow taps + 3 AO   ( 4 rays, hard sun edge)
+    //
+    // Shadow and AO rays are what put the headset at 30 Hz where plain raster
+    // holds 90, so this is the dial that matters -- 11 rays a fragment across
+    // 35 megapixels an eye pair is the whole cost.
     float shadow = 1.0;
     float ao = 1.0;
-    if (CAMERAPOS.w > 0.5) {
-        shadow = sunVisibility(inWorldPos + n * 0.05, n, keyDir, keyDist);
-        ao = ambientOcclusion(inWorldPos, n);
+    const int rtWord = int(CAMERAPOS.w + 0.5);
+    if ((rtWord % 10) > 0) {
+        const int q = rtWord / 10;
+        const int shadowExtra = q == 0 ? 4 : (q == 1 ? 2 : 0);
+        const int aoTaps = q == 0 ? 6 : (q == 1 ? 4 : 3);
+        shadow =
+            sunVisibility(inWorldPos + n * 0.05, n, keyDir, keyDist, shadowExtra);
+        ao = ambientOcclusion(inWorldPos, n, aoTaps);
     }
 
 
