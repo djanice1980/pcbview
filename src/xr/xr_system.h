@@ -38,6 +38,9 @@ public:
     bool start();
     void stop();
     bool ready() const { return system_ != 0; }
+    // Whether the runtime offered XR_KHR_composition_layer_depth, so the
+    // session knows whether to build depth swapchains.
+    bool depthLayerSupported() const { return depthLayerSupported_; }
 
     // Route pcbview's Vulkan creation through the runtime. Must bracket the
     // createInstance/createDevice calls.
@@ -61,6 +64,7 @@ public:
 private:
     void* instance_ = nullptr;   // XrInstance
     unsigned long long system_ = 0;  // XrSystemId
+    bool depthLayerSupported_ = false;
     char headsetName_[256] = {};
     VulkanCreationHooks hooks_{};
 };
@@ -140,6 +144,14 @@ public:
     // Four GPU stalls a frame, and the whole reason the headset felt choppy.
     VkImage acquireEye(int index, uint32_t* width, uint32_t* height);
     void releaseEye(int index);
+
+    // The depth image acquired alongside the last acquireEye, or null when the
+    // runtime has no depth layer. Rendering into it lets the runtime reproject
+    // a missed frame PER PIXEL using real geometry, instead of sliding the
+    // whole frame as a flat sheet and shearing anything that stands proud of
+    // the board.
+    VkImage acquiredDepthImage() const;
+    VkImageView acquiredDepthView() const;
     void endFrame();
 
     // Where the board sits in the room: how far in front, how high, and how
@@ -196,6 +208,11 @@ private:
     // shows up as the world sliding under head motion.
     std::vector<ViewPose> submitViews_;
     bool swapEyes_ = false;
+    bool depthSupported_ = false;
+    VkImage depthTarget_ = VK_NULL_HANDLE;
+    VkImageView depthTargetView_ = VK_NULL_HANDLE;
+    // Kept so the depth image views can be destroyed with the session.
+    VkDevice device_ = VK_NULL_HANDLE;
     float placeCentre_[3] = {0, 0, 0};
     float placeScale_ = 0.001f;   // mm -> m
     // Where the viewer was when the board was last anchored. Captured once, so

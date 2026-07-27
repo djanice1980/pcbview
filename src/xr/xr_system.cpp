@@ -16,6 +16,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -90,7 +91,33 @@ System::~System() { stop(); }
 bool System::start() {
     if (system_) return true;
 
-    const char* ext[] = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
+    // The depth layer extension is OPTIONAL -- ask only if the runtime lists it,
+    // because naming an unsupported extension fails instance creation outright
+    // and VR would stop working entirely rather than losing one feature.
+    //
+    // It is worth having because it changes what happens when a frame is
+    // missed. Without depth the runtime can only reproject the previous frame
+    // RIGIDLY, sliding it as a flat sheet, so anything standing proud of the
+    // board -- a chip's legs, a package edge -- shears against the background
+    // and appears to flicker between two positions. With depth it reprojects
+    // per pixel using the actual geometry, and a missed frame degrades into
+    // slight smearing instead of the scene coming apart. You can always lean in
+    // close enough to miss a deadline, so this matters more than the last of
+    // the aliasing.
+    bool haveDepthExt = false;
+    {
+        uint32_t n = 0;
+        xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr);
+        std::vector<XrExtensionProperties> avail(n, {XR_TYPE_EXTENSION_PROPERTIES});
+        if (n) xrEnumerateInstanceExtensionProperties(nullptr, n, &n, avail.data());
+        for (const auto& e : avail)
+            if (std::strcmp(e.extensionName,
+                            XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0)
+                haveDepthExt = true;
+    }
+
+    const char* ext[] = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
+                         XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME};
     XrInstanceCreateInfo ici{XR_TYPE_INSTANCE_CREATE_INFO};
     std::snprintf(ici.applicationInfo.applicationName,
                   sizeof(ici.applicationInfo.applicationName), "pcbview");
@@ -98,8 +125,9 @@ bool System::start() {
     std::snprintf(ici.applicationInfo.engineName,
                   sizeof(ici.applicationInfo.engineName), "pcbview");
     ici.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-    ici.enabledExtensionCount = 1;
+    ici.enabledExtensionCount = haveDepthExt ? 2 : 1;
     ici.enabledExtensionNames = ext;
+    depthLayerSupported_ = haveDepthExt;
 
     XrInstance inst = XR_NULL_HANDLE;
     if (XR_FAILED(xrCreateInstance(&ici, &inst))) {
@@ -522,6 +550,12 @@ struct VrSession::Chain {
     XrSwapchain chain = XR_NULL_HANDLE;
     std::vector<VkImage> images;
     uint32_t width = 0, height = 0;
+    // Matching depth swapchain, when the runtime supports the depth layer.
+    XrSwapchain depthChain = XR_NULL_HANDLE;
+    std::vector<VkImage> depthImages;
+    std::vector<VkImageView> depthViews;
+    VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+    uint32_t depthAcquired = 0;
 };
 
 namespace {
@@ -1108,6 +1142,8 @@ bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
     if (!sys.ready()) return false;
     inst_ = sys.rawInstance();
     sysId_ = sys.rawSystem();
+    depthSupported_ = sys.depthLayerSupported();
+    device_ = device;
     XrInstance inst = static_cast<XrInstance>(inst_);
 
     XrGraphicsBindingVulkan2KHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
@@ -1183,7 +1219,65 @@ bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,
             c.chain, n, &n,
             reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs.data()));
         for (const auto& im : imgs) c.images.push_back(im.image);
+
+        // Matching DEPTH swapchain. Optional in every sense: the extension may
+        // not exist, the runtime may offer no depth format, and creation may
+        // fail -- any of which just means we submit colour alone, exactly as
+        // before. Nothing else depends on it.
+        if (depthSupported_) {
+            int64_t dfmt = 0;
+            for (int64_t f : formats)
+                if (f == VK_FORMAT_D32_SFLOAT || f == VK_FORMAT_D24_UNORM_S8_UINT ||
+                    f == VK_FORMAT_D16_UNORM) {
+                    dfmt = f;
+                    if (f == VK_FORMAT_D32_SFLOAT) break;  // prefer full float
+                }
+            if (dfmt) {
+                XrSwapchainCreateInfo dci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+                dci.usageFlags =
+                    XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                    XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+                dci.format = dfmt;
+                dci.sampleCount = 1;
+                dci.width = c.width;
+                dci.height = c.height;
+                dci.faceCount = 1;
+                dci.arraySize = 1;
+                dci.mipCount = 1;
+                if (XR_SUCCEEDED(xrCreateSwapchain(s, &dci, &c.depthChain))) {
+                    c.depthFormat = static_cast<VkFormat>(dfmt);
+                    uint32_t dn = 0;
+                    xrEnumerateSwapchainImages(c.depthChain, 0, &dn, nullptr);
+                    std::vector<XrSwapchainImageVulkanKHR> dimgs(
+                        dn, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+                    xrEnumerateSwapchainImages(
+                        c.depthChain, dn, &dn,
+                        reinterpret_cast<XrSwapchainImageBaseHeader*>(
+                            dimgs.data()));
+                    // Views made ONCE here, not per frame: the runtime's images
+                    // are fixed for the session, and creating a view every
+                    // frame would be a leak in a 90 Hz loop.
+                    for (const auto& im : dimgs) {
+                        c.depthImages.push_back(im.image);
+                        VkImageViewCreateInfo vi{
+                            VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                        vi.image = im.image;
+                        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                        vi.format = c.depthFormat;
+                        vi.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1,
+                                               0, 1};
+                        VkImageView view = VK_NULL_HANDLE;
+                        vkCreateImageView(device, &vi, nullptr, &view);
+                        c.depthViews.push_back(view);
+                    }
+                } else {
+                    c.depthChain = XR_NULL_HANDLE;
+                }
+            }
+        }
     }
+    if (depthSupported_ && !(*chains_)[0].depthImages.empty())
+        std::printf("vr: submitting depth (reprojection follows geometry)\n");
     acquired_.assign(viewCount, 0);
     swapEyes_ = qEnvSwapEyes();
 
@@ -1533,14 +1627,37 @@ VkImage VrSession::acquireEye(int index, uint32_t* width, uint32_t* height) {
     acquired_[index] = idx;
     if (width) *width = c.width;
     if (height) *height = c.height;
+
+    // The depth image travels with the colour one: same frame, same eye,
+    // acquired and released together so they can never describe different
+    // moments.
+    depthTarget_ = VK_NULL_HANDLE;
+    if (c.depthChain) {
+        uint32_t didx = 0;
+        XrSwapchainImageAcquireInfo dai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if (XR_SUCCEEDED(xrAcquireSwapchainImage(c.depthChain, &dai, &didx))) {
+            XrSwapchainImageWaitInfo dwi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            dwi.timeout = XR_INFINITE_DURATION;
+            xrWaitSwapchainImage(c.depthChain, &dwi);
+            c.depthAcquired = didx;
+            depthTarget_ = c.depthImages[didx];
+            depthTargetView_ = c.depthViews[didx];
+        }
+    }
     return c.images[idx];
 }
+
+VkImage VrSession::acquiredDepthImage() const { return depthTarget_; }
+VkImageView VrSession::acquiredDepthView() const { return depthTargetView_; }
 
 void VrSession::releaseEye(int index) {
     if (!chains_ || index < 0 || index >= static_cast<int>(chains_->size()))
         return;
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage((*chains_)[index].chain, &ri);
+    if ((*chains_)[index].depthChain)
+        xrReleaseSwapchainImage((*chains_)[index].depthChain, &ri);
+    depthTarget_ = VK_NULL_HANDLE;
 }
 
 void VrSession::endFrame() {
@@ -1557,6 +1674,9 @@ void VrSession::endFrame() {
     // is safe in a way that simply showing an old frame is not.
     const std::vector<ViewPose>& views =
         submitViews_.empty() ? lastViews_ : submitViews_;
+    // Storage must outlive xrEndFrame -- the layer holds pointers into it.
+    std::vector<XrCompositionLayerDepthInfoKHR> depths;
+    depths.reserve(views.size());
     if (shouldRender_ && chains_ && !views.empty()) {
         for (size_t i = 0; i < views.size() && i < chains_->size(); ++i) {
             XrCompositionLayerProjectionView v{
@@ -1576,6 +1696,33 @@ void VrSession::endFrame() {
                 static_cast<int32_t>((*chains_)[i].width),
                 static_cast<int32_t>((*chains_)[i].height)};
             v.subImage.imageArrayIndex = 0;
+
+            // REVERSED-Z, and the mapping has to say so or the runtime will
+            // reproject the scene inside out.
+            //
+            // pcbview's projection puts the NEAR plane at depth 1 and infinity
+            // at depth 0. XrCompositionLayerDepthInfoKHR asks for the distance
+            // each end of the buffer's range corresponds to: nearZ is the
+            // distance at minDepth, farZ the distance at maxDepth. So with
+            // depth reversed, minDepth 0 is infinitely far and maxDepth 1 is
+            // the near plane -- nearZ infinite, farZ 0.01 m. The spec allows
+            // nearZ > farZ precisely to describe this.
+            if ((*chains_)[i].depthChain) {
+                XrCompositionLayerDepthInfoKHR d{
+                    XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR};
+                d.subImage.swapchain = (*chains_)[i].depthChain;
+                d.subImage.imageRect.offset = {0, 0};
+                d.subImage.imageRect.extent = {
+                    static_cast<int32_t>((*chains_)[i].width),
+                    static_cast<int32_t>((*chains_)[i].height)};
+                d.subImage.imageArrayIndex = 0;
+                d.minDepth = 0.0f;
+                d.maxDepth = 1.0f;
+                d.nearZ = std::numeric_limits<float>::infinity();
+                d.farZ = 0.01f;
+                depths.push_back(d);
+                v.next = &depths.back();
+            }
             pv.push_back(v);
         }
         layer.space = static_cast<XrSpace>(appSpace_);
@@ -1657,6 +1804,12 @@ void VrSession::end() {
     }
 
     if (chains_) {
+        for (Chain& c : *chains_) {
+            for (VkImageView v : c.depthViews)
+                if (v) vkDestroyImageView(device_, v, nullptr);
+            c.depthViews.clear();
+            if (c.depthChain) xrDestroySwapchain(c.depthChain);
+        }
         for (Chain& c : *chains_)
             if (c.chain) xrDestroySwapchain(c.chain);
         delete chains_;

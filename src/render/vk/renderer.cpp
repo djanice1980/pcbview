@@ -4380,8 +4380,22 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
         msColor = barriers[0];
         msColor.image = sceneColorMs_.handle;
     }
-    VkImageMemoryBarrier2 all[3] = {barriers[0], barriers[1], msColor};
-    dep.imageMemoryBarrierCount = msaaActive() ? 3u : 2u;
+    // The runtime's depth image also arrives in an undefined layout and has to
+    // be made attachment-ready, whether it is written directly or resolved into.
+    VkImageMemoryBarrier2 xrDepth{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    const bool needXrDepthBarrier =
+        vrDepthImage_ != VK_NULL_HANDLE && vrDepthView_ != VK_NULL_HANDLE &&
+        vrTargetW_ == sceneExtent_.width && vrTargetH_ == sceneExtent_.height;
+    if (needXrDepthBarrier) {
+        xrDepth = barriers[1];
+        xrDepth.image = vrDepthImage_;
+    }
+
+    VkImageMemoryBarrier2 all[4] = {barriers[0], barriers[1], msColor, xrDepth};
+    uint32_t count = 2;
+    if (msaaActive()) all[count++] = msColor;
+    if (needXrDepthBarrier) all[count++] = xrDepth;
+    dep.imageMemoryBarrierCount = count;
     dep.pImageMemoryBarriers = all;
     vkCmdPipelineBarrier2(cmd, &dep);
 
@@ -4408,6 +4422,33 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     depthAttach.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+    // Hand the runtime this eye's depth, so a missed frame is reprojected per
+    // pixel instead of being slid about as a flat sheet.
+    //
+    // Written straight into the runtime's image rather than copied afterwards:
+    // with MSAA as the resolve target, without it as the attachment itself.
+    // Copying depth would be the awkward route -- blitting depth is optional in
+    // Vulkan and many depth formats refuse it outright.
+    //
+    // SAMPLE_ZERO, not AVERAGE: averaging depth across samples at an edge
+    // invents a surface halfway between the near and far ones, and reprojection
+    // would then bend the image around geometry that was never there. Taking
+    // one sample's depth is the standard choice for exactly that reason.
+    const bool vrDepth =
+        vrDepthView_ != VK_NULL_HANDLE && vrTargetW_ == sceneExtent_.width &&
+        vrTargetH_ == sceneExtent_.height;
+    if (vrDepth) {
+        if (msaaActive()) {
+            depthAttach.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+            depthAttach.resolveImageView = vrDepthView_;
+            depthAttach.resolveImageLayout =
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        } else {
+            depthAttach.imageView = vrDepthView_;
+            depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        }
+    }
     // Reversed-Z: clear to 0 (the far plane), not 1.
     depthAttach.clearValue.depthStencil = {0.0f, 0};
 

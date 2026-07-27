@@ -487,6 +487,11 @@ void VulkanWindow::stepVr() {
                 vr_->acquireEye(static_cast<int>(i), &ew, &eh);
             if (eyeImage != VK_NULL_HANDLE)
                 renderer_->setVrTarget(eyeImage, ew, eh);
+            // Depth for this eye, when the runtime takes it. The scene pass
+            // writes into it directly, so a missed frame gets reprojected using
+            // the board's actual shape rather than slid about as a flat sheet.
+            renderer_->setVrDepthTarget(vr_->acquiredDepthView(),
+                                        vr_->acquiredDepthImage());
             renderer_->drawFrame(e.viewProj, e.eye);
             if (i < 2) vrSamples_[i] = renderer_->accumulatedSamples();
             if (eyeImage != VK_NULL_HANDLE)

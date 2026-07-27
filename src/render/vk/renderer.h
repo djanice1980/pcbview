@@ -321,6 +321,17 @@ public:
         vrTargetH_ = height;
     }
 
+    // The runtime's depth image for this eye, or null.
+    //
+    // Handed a VIEW rather than the image because the scene pass writes into it
+    // directly -- with MSAA as the resolve target, without it as the depth
+    // attachment. That avoids copying depth afterwards, which is awkward:
+    // depth blits are optional in Vulkan and depth formats often refuse them.
+    void setVrDepthTarget(VkImageView view, VkImage image) {
+        vrDepthView_ = view;
+        vrDepthImage_ = image;
+    }
+
     // Render the scene and stop -- no swapchain image acquired, nothing shown
     // in the window, nothing presented. sceneColor_ is still left in
     // TRANSFER_SRC_OPTIMAL, so blitSceneToImage works exactly as before.
@@ -758,6 +769,8 @@ private:
     bool rasterWorldSun_ = false;
     VkImage vrTarget_ = VK_NULL_HANDLE;
     uint32_t vrTargetW_ = 0, vrTargetH_ = 0;
+    VkImageView vrDepthView_ = VK_NULL_HANDLE;
+    VkImage vrDepthImage_ = VK_NULL_HANDLE;
     // Copy sceneColor_ into vrTarget_ using the frame's own command buffer.
     // sceneColor_ is already in TRANSFER_SRC_OPTIMAL by the time this runs.
     void recordVrBlit(VkCommandBuffer cmd);
