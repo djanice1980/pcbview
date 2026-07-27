@@ -328,7 +328,18 @@ void main() {
             vec3 gns = normalize(vnrm(g0) * (1.0 - gb.x - gb.y) +
                                  vnrm(g1) * gb.x + vnrm(g2) * gb.y);
             if (dot(gns, -cdir) < 0.0) gns = -gns;
-            imageStore(geoNormalImg, ivec2(px), vec4(gns, 1.0));
+            // MATERIAL ID in .w, and it costs nothing -- the channel was spare.
+            //
+            // Silkscreen, copper and soldermask are COPLANAR: same position,
+            // same normal. Only the albedo guide could tell them apart, and
+            // that guide is accumulated across jittered samples, so at every
+            // text or trace boundary it is a blend that matches neither side
+            // and the filter smears across it. That is why fine detail went
+            // soft. An id is exact and deterministic: two taps are either the
+            // same material or they are not, with no threshold to tune and
+            // nothing to blend.
+            imageStore(geoNormalImg, ivec2(px),
+                       vec4(gns, float(triMat[gp]) + 1.0));
         } else {
             imageStore(positionImg, ivec2(px), vec4(0.0));
             imageStore(geoNormalImg, ivec2(px), vec4(0.0));

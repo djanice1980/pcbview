@@ -75,7 +75,10 @@ void main() {
     // wherever you stand.
     const vec4 pC = imageLoad(posImg, px);
     const float worldRadius = pc.misc.y;
-    const vec3 nRaw = imageLoad(normalImg, px).xyz;
+    const vec4 nSrc = imageLoad(normalImg, px);
+    const vec3 nRaw = nSrc.xyz;
+    // Material id, written alongside the deterministic normal. 0 = no id.
+    const float matC = nSrc.w;
     const vec3 aC = imageLoad(albedoImg, px).rgb * pc.misc.x;
     const float lC = luma(centre);
 
@@ -106,9 +109,15 @@ void main() {
                 continue;
 
             const vec3 cQ = imageLoad(srcImg, q).rgb * pc.sigma.w;
-            const vec3 nQraw = imageLoad(normalImg, q).xyz;
+            const vec4 nQsrc = imageLoad(normalImg, q);
+            const vec3 nQraw = nQsrc.xyz;
             if (dot(nQraw, nQraw) < 1e-6) continue;  // never pull sky in
             const vec3 nQ = normalize(nQraw);
+            // Different material: never mix them. Silkscreen, copper and mask
+            // share a plane and a normal, so this is the ONLY thing that keeps
+            // text and traces crisp -- and unlike an albedo distance it is
+            // exact, with no threshold to tune and no blend at the boundary.
+            if (matC > 0.0 && nQsrc.w != matC) continue;
             // Too far away in the WORLD to be the same surface detail, however
             // few pixels separate them on screen.
             if (worldRadius > 0.0 && pC.w > 0.5) {
