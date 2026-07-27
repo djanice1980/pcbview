@@ -185,7 +185,10 @@ public:
     // session opened -- typically at the monitor, since that is where you were
     // when you launched it. Turn around afterwards and the board is off to your
     // side, edge-on.
-    void reanchor() { anchored_ = false; }
+    void reanchor() {
+        anchored_ = false;
+        anchorWaited_ = 0;
+    }
 
     // The grip pose of a controller, in pcbview world millimetres, when one is
     // tracked. Index 0 = left, 1 = right.
@@ -242,6 +245,10 @@ private:
     float anchorPos_[3] = {0.0f, 0.0f, 0.0f};
     float anchorRot_[4] = {0.0f, 0.0f, 0.0f, 1.0f};  // xyzw
     bool anchored_ = false;
+    // How many times we have logged "waiting for a tracked pose" since the last
+    // reanchor. Capped so a genuinely stuck session says so twice rather than
+    // once per frame forever.
+    int anchorWaited_ = 0;
     float gripPosMm_[2][3] = {};
     float gripQuat_[2][4] = {};
     bool gripTracked_[2] = {false, false};

@@ -1418,9 +1418,9 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     // predicted 0.648), so stereo was never the problem; both eyes were simply
     // looking at a board that had been parked in the wrong place.
     uint32_t got = 0;
+    XrViewState vs{XR_TYPE_VIEW_STATE};
     std::vector<XrView> views(chains_->size(), {XR_TYPE_VIEW});
     {
-        XrViewState vs{XR_TYPE_VIEW_STATE};
         XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
         vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         vli.displayTime = displayTime_;
@@ -1429,10 +1429,43 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
                       views.data());
     }
 
-    // Anchor the board to the viewer on the first located frame, and never
+    // Is the head pose REAL, or is the runtime just handing back a filled-in
+    // struct?
+    //
+    // xrLocateViews succeeds and reports two views whether or not it actually
+    // knows where the head is; viewStateFlags is the only thing that says so,
+    // and this used to ignore it entirely. While the headset is being put on --
+    // exactly when the handover below re-anchors -- SteamVR returns identity
+    // poses with these bits clear. Anchoring to one of those places the board
+    // at LOCAL's origin facing -Z, which for anyone not already facing -Z is
+    // off to the side and edge-on: the sliver that keeps getting reported.
+    //
+    // TRACKED and not merely VALID: VALID says the fields hold meaningful data,
+    // TRACKED says the data is CURRENT rather than the last pose known before
+    // tracking dropped. An anchor decides where the board sits for the rest of
+    // the session off a single frame, so it is worth waiting for the real one.
+    const XrViewStateFlags kUsable = XR_VIEW_STATE_POSITION_VALID_BIT |
+                                     XR_VIEW_STATE_ORIENTATION_VALID_BIT |
+                                     XR_VIEW_STATE_POSITION_TRACKED_BIT |
+                                     XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
+    const bool posesTracked = (vs.viewStateFlags & kUsable) == kUsable;
+
+    // Anchor the board to the viewer on the first TRACKED frame, and never
     // again -- an anchor that updates every frame would drag the board along
     // with your head, which is the opposite of an object sitting in a room.
-    if (!anchored_ && got >= 2) {
+    // Until one arrives the previous anchor stands, so the board stays put
+    // rather than jumping to the origin while tracking settles.
+    if (!anchored_ && got >= 2 && !posesTracked && anchorWaited_ < 2) {
+        // Once per wait, not once per frame: if this ever does hang, the log
+        // says which bits were missing instead of leaving us to guess.
+        ++anchorWaited_;
+        std::printf("vr: anchor deferred, head pose not tracked yet "
+                    "(viewStateFlags 0x%llx)\n",
+                    static_cast<unsigned long long>(vs.viewStateFlags));
+        std::fflush(stdout);
+    }
+    if (!anchored_ && got >= 2 && posesTracked) {
+        anchorWaited_ = 0;
         anchored_ = true;
         anchorPos_[0] =
             (views[0].pose.position.x + views[1].pose.position.x) * 0.5f;
@@ -1444,8 +1477,17 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         anchorRot_[1] = views[0].pose.orientation.y;
         anchorRot_[2] = views[0].pose.orientation.z;
         anchorRot_[3] = views[0].pose.orientation.w;
-        std::printf("vr: board anchored at head (%.2f %.2f %.2f)\n",
-                    anchorPos_[0], anchorPos_[1], anchorPos_[2]);
+        // Yaw as well as position. Yaw is what decides which way the board
+        // faces, so an anchor that looks fine by position alone can still put
+        // the board off to one side -- and that is invisible in a log that only
+        // prints where your head was.
+        const glm::quat aq(anchorRot_[3], anchorRot_[0], anchorRot_[1],
+                           anchorRot_[2]);
+        const glm::vec3 afwd = aq * glm::vec3(0.0f, 0.0f, -1.0f);
+        std::printf("vr: board anchored at head (%.2f %.2f %.2f) facing %.0f "
+                    "deg\n",
+                    anchorPos_[0], anchorPos_[1], anchorPos_[2],
+                    glm::degrees(std::atan2(-afwd.x, -afwd.z)));
         std::fflush(stdout);
     }
 
