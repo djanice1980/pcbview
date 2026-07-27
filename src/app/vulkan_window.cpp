@@ -335,12 +335,21 @@ void VulkanWindow::stepVr() {
         // than to the screen, so neither changes character as you walk up to it
         // or step back.
         renderer_->setWorldScale(span);
-        // Raster needs none of the path tracer's buffers, and at a
-        // supersampled resolution they are thirteen RGBA32F images of well over
-        // half a gigabyte each. Allocating them regardless is what put a
-        // ceiling on how far supersampling could go before it simply ran out of
-        // memory.
-        renderer_->setPathTraceResourcesEnabled(allowPt);
+        // NOT freeing the path tracer's buffers in raster mode, despite the
+        // temptation: they are thirteen RGBA32F images at scene resolution and
+        // raster touches none of them.
+        //
+        // Tearing them down crashed on the first VR frame. The obvious causes
+        // are all ruled out -- destroyImage clears its handles so there is no
+        // double free, recordPathTrace is gated on the render mode, and the
+        // descriptor updates bail out on null views -- so the real reason is
+        // still unknown, and it is only reachable with a headset attached,
+        // which is not something the desktop path can exercise. An unexplained
+        // crash is not worth a memory saving nobody has asked for.
+        //
+        // It does put a ceiling on supersampling: at 1.5x on a full-resolution
+        // eye those buffers are over eight gigabytes. PCBVIEW_VR_RES is the
+        // release valve until this is understood properly.
 
         // Say what is actually running, once.
         //
