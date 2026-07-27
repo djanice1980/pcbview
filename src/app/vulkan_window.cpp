@@ -430,14 +430,15 @@ void VulkanWindow::stepVr() {
             if (on) {
                 vr_->setRateAutoReport(false);
                 std::printf(
-                    "\nvr-sweep: %zu configurations, about 7 s each. Keep the "
-                    "board in view.\n"
-                    "vr-sweep: GPU ms is the measurement. 'dist' is the mean "
-                    "board distance over the window --\nvr-sweep: rows at "
-                    "different distances are not comparable, because fill "
-                    "cost follows coverage.\n"
-                    "vr-sweep: %-28s %8s %7s %7s\n",
-                    std::size(kSweep), "configuration", "GPU ms", "dist", "Hz");
+                    "\nvr-sweep: %zu configurations. Press SPACE (blind, with "
+                    "the headset on) when you have seen enough of one.\n"
+                    "vr-sweep: You control the boundaries, so what you say "
+                    "about each row can be trusted to be about THAT row --\n"
+                    "vr-sweep: the timed version gave rows you could not tell "
+                    "apart, at wildly different durations.\n"
+                    "vr-sweep: GPU ms is the measurement; 'dist' is the mean "
+                    "board distance, since fill cost follows coverage.\n",
+                    std::size(kSweep));
                 std::fflush(stdout);
             }
             return on;
@@ -464,19 +465,36 @@ void VulkanWindow::stepVr() {
         }
         if (sweeping && !sweepDone && render) {
             sweepIdle = 0;
-            // Settle first and throw those frames away. A configuration change
-            // costs a scene-target rebuild and the runtime needs a moment to
-            // settle on a pacing decision; measuring across that would report
-            // the transition rather than the configuration.
-            const int kSettle = 120, kMeasure = 480;
-            if (++sweepFrame == kSettle) {
+            ++sweepFrame;
+            // Recover, then settle, then measure.
+            //
+            // The recovery phase runs plain raster before every row, and it is
+            // not politeness -- the runtime's pacing is a control loop with
+            // hysteresis. Coming straight off an expensive configuration it
+            // stays throttled into the next one, so a cheap row measured after
+            // a dear one inherits its penalty and reads as worse than it is.
+            // That is what made the first ray-budget sweep report 7 rays as
+            // slower than 11. Letting it climb back to full rate first makes
+            // each row independent of the order they were tried in, and gives
+            // an unmistakable visual boundary between them besides.
+            const int kRecover = 150, kSettle = 90;
+            const int kMinFrames = kRecover + kSettle + 60;
+            if (sweepFrame <= kRecover) {
+                rtEff = false;
+                rayQEff = 2;
+                ssEff = 1.0f;
+            } else if (sweepFrame == kRecover + 1) {
+                std::printf("\nvr-sweep: [%zu/%zu] NOW SHOWING: %s\n"
+                            "vr-sweep: press SPACE when you have seen enough.\n",
+                            sweepStep + 1, std::size(kSweep),
+                            kSweep[sweepStep].name);
+                std::fflush(stdout);
+            } else if (sweepFrame == kRecover + kSettle) {
                 vr_->takeRate();
                 sweepGpuMs_ = 0.0;
                 sweepDist_ = 0.0;
                 sweepSamples_ = 0;
-            } else if (sweepFrame > kSettle) {
-                // Accumulate the GPU's own timestamp delta, and the distance
-                // the measurement was taken at.
+            } else if (sweepFrame > kRecover + kSettle) {
                 const double g = renderer_->lastGpuMs();
                 if (g > 0.0) {
                     sweepGpuMs_ += g;
@@ -484,10 +502,15 @@ void VulkanWindow::stepVr() {
                     ++sweepSamples_;
                 }
             }
-            if (sweepFrame >= kSettle + kMeasure) {
+            // Ignore SPACE until there is something to report, so a stray
+            // press cannot skip a row before it has been measured.
+            if (vrSweepAdvance_ && sweepFrame >= kMinFrames) {
+                vrSweepAdvance_ = false;
                 const auto st = vr_->takeRate();
                 const double n = sweepSamples_ ? sweepSamples_ : 1;
-                std::printf("vr-sweep: %-28s %7.2f %6.2fm %6.0f\n",
+                std::printf("vr-sweep: [%zu/%zu] %-28s %7.2f ms GPU  %.2f m  "
+                            "paced %.0f Hz\n",
+                            sweepStep + 1, std::size(kSweep),
                             kSweep[sweepStep].name, sweepGpuMs_ / n,
                             sweepDist_ / n, st.hz);
                 std::fflush(stdout);
@@ -495,17 +518,14 @@ void VulkanWindow::stepVr() {
                 if (++sweepStep >= std::size(kSweep)) {
                     sweepDone = true;
                     std::printf(
-                        "vr-sweep: done. READ THE Hz COLUMN -- it is the "
-                        "rate the runtime decided we can sustain, and it is "
-                        "the result.\nvr-sweep: 'late' and 'frame ms' are "
-                        "near-meaningless here: once the runtime has paced a "
-                        "configuration down we comfortably hit that slower "
-                        "target, so late falls to zero, and frame ms is CPU "
-                        "submission time while the GPU runs on behind it.\n"
-                        "vr-sweep: holding the last configuration.\n\n");
+                        "\nvr-sweep: done -- GPU ms is the measurement. The "
+                        "paced Hz lags it by about a step and is context "
+                        "only.\nvr-sweep: holding the last configuration.\n\n");
                     std::fflush(stdout);
                     vr_->setRateAutoReport(true);
                 }
+            } else if (vrSweepAdvance_) {
+                vrSweepAdvance_ = false;   // too early; swallow it
             }
         }
 
@@ -2825,6 +2845,11 @@ void VulkanWindow::keyPressEvent(QKeyEvent* e) {
             // Handled here as well as on the View menu action: QAction
             // shortcuts never fire while this native QWindow has focus.
             case Qt::Key_Home: recenterAll(); return;
+            // Advance the VR configuration sweep. Pressed blind, with the
+            // headset on -- which is the point: only the wearer knows when
+            // they have seen enough of a configuration to judge it, and a
+            // fixed timer gave rows the wearer could not tell apart.
+            case Qt::Key_Space: vrSweepAdvance_ = true; return;
             case Qt::Key_O:
                 camera_.orthographic = !camera_.orthographic;
                 emit orthoChanged(camera_.orthographic);

@@ -417,6 +417,7 @@ public:
     double sweepGpuMs_ = 0.0;
     double sweepDist_ = 0.0;
     int sweepSamples_ = 0;
+    bool vrSweepAdvance_ = false;   // set by SPACE, consumed by stepVr
     const BoardPose& boardPose() const { return board_; }
     // Board -> world. Rotation happens about the bounds centre so the centre
     // holds still and the camera's orbit target stays meaningful.
