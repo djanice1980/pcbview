@@ -1262,8 +1262,18 @@ void VulkanWindow::initialise() {
     // OpenXR, not chosen. Failing to find a headset is an ordinary outcome, not
     // an error: the app simply carries on as a desktop session.
     if (vrRequested_ && !xrSystem_ && instance_ == VK_NULL_HANDLE) {
+        // Step-by-step, because every one of these can block and from the
+        // outside they are indistinguishable: the window simply stops
+        // responding. Creating the OpenXR instance starts SteamVR, asking for
+        // the system waits on the headset, and the hand-over talks to the
+        // compositor -- knowing WHICH one is the difference between a fix and
+        // a guess.
+        std::printf("vr: bring-up 1/4 -- asking the runtime for a session\n");
+        std::fflush(stdout);
         xrSystem_ = std::make_unique<xr::System>();
         if (xrSystem_->start()) {
+            std::printf("vr: bring-up 2/4 -- runtime answered\n");
+            std::fflush(stdout);
             xrSystem_->installHooks();
             std::printf("vr: %s -- Vulkan will be created through the runtime\n",
                         xrSystem_->headsetName());
@@ -1307,7 +1317,16 @@ void VulkanWindow::initialise() {
         const bool wantValidation =
             !qEnvironmentVariableIsSet("PCBVIEW_NO_VALIDATION");
 #endif
+        if (xrSystem_) {
+            std::printf("vr: bring-up 3/4 -- creating the Vulkan instance "
+                        "through the runtime\n");
+            std::fflush(stdout);
+        }
         instance_ = createInstance(wantValidation, extensions);
+        if (xrSystem_) {
+            std::printf("vr: bring-up 4/4 -- instance created\n");
+            std::fflush(stdout);
+        }
         if (wantValidation) messenger_ = createDebugMessenger(instance_);
 
         // Hand Qt OUR instance rather than letting it make one. This is what
