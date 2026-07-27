@@ -1135,15 +1135,21 @@ glm::mat4 placement(const float centre[3], float scale,
     // How far in front. PCBVIEW_VR_DIST, in metres.
     //
     // Closer is not only a preference: the board covers more of the view, so
-    // every feature spans more pixels and aliases less. 0.3 m is comfortably
-    // outside the range where the eyes have to strain to converge, which
-    // starts to bite below about 0.2 m.
+    // every feature spans more pixels and aliases less. Convergence strain
+    // starts to bite below about 0.2 m, so that is the floor.
+    //
+    // 0.4 m rather than the 0.3 m this started at, and the reason is measured
+    // rather than taste. Frame pacing tracked distance directly: up close the
+    // frame rate fell and the compositor reprojected hard, and it recovered on
+    // backing away. That is a fill-bound frame -- the nearer the board, the
+    // more of each eye it covers, and every covered pixel carries a shadow and
+    // AO trace. Distance is a fill-rate control here, not just comfort.
     static const float dist = [] {
         const char* v = std::getenv("PCBVIEW_VR_DIST");
-        if (!v || !v[0]) return 0.30f;
+        if (!v || !v[0]) return 0.40f;
         char* end = nullptr;
         const float f = std::strtof(v, &end);
-        return (end && end != v && f >= 0.15f && f <= 3.0f) ? f : 0.30f;
+        return (end && end != v && f >= 0.15f && f <= 3.0f) ? f : 0.40f;
     }();
     m = glm::translate(m, glm::vec3(0.0f, 0.0f, -dist));
     m = glm::scale(m, glm::vec3(scale));
