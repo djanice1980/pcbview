@@ -121,11 +121,18 @@ void main() {
     // history belongs to the chip, and blending it in drags the chip's colour
     // across the newly-visible board: a smear trailing every object.
     //
-    // The tolerance scales with distance rather than being a fixed span. One
-    // pixel covers more world at range, so a constant threshold would be far
-    // too strict close up and far too slack out at the edges, and would want
-    // retuning for every board size.
-    const float tol = pc.params.y * max(distance(pos.xyz, pc.eye), 1.0e-3);
+    // An ABSOLUTE world distance, deliberately not scaled by how far away the
+    // viewer is.
+    //
+    // It used to scale with view distance, on the reasoning that a pixel covers
+    // more world at range. True, but irrelevant: what this test discriminates
+    // is a chip's HEIGHT or a via's thickness, and those are fixed in
+    // millimetres however you look at them. Scaling made it too slack far away
+    // -- a whole millimetre of tolerance, enough to let a package top and the
+    // board trade history -- and tighter than copper thickness up close, where
+    // it rejected everything and the picture crawled. Measured exactly as the
+    // symptom described: bleed at distance, crawl close up.
+    const float tol = pc.params.y;
 
     // Measured ALONG THE NORMAL, not straight-line -- and this is the whole
     // difference between edges that settle and edges that boil.

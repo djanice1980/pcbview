@@ -366,6 +366,17 @@ public:
     }
     void setHistoryReset() { temporalReset_ = true; }
 
+    // The board's size across, in world units. Both the temporal test and the
+    // spatial filter measure in WORLD distance rather than pixels, so they need
+    // to know the scale of the thing being looked at.
+    //
+    // Measuring in pixels is what made quality depend on where you stood: the
+    // filter's fixed 32-pixel reach covered a sliver of board up close and a
+    // large piece of it from far away, so colour bled worse the further back
+    // you went. Anchored to the board instead, it covers the same amount of
+    // board wherever you are.
+    void setWorldScale(float spanMm) { worldSpan_ = spanMm; }
+
     // Light the raster path from a world-fixed sun instead of the
     // camera-relative key.
     //
@@ -832,6 +843,7 @@ private:
     float curViewProj_[16] = {};
     int temporalSlot_ = -1;
     int temporalMaxFrames_ = 32;
+    float worldSpan_ = 0.0f;   // board width; 0 = unknown, world limits off
     bool temporalReset_ = false;
     void createTemporal();
     void updateTemporalDescriptors();

@@ -321,6 +321,10 @@ void VulkanWindow::stepVr() {
         // why it is asynchronous and why it can never serve a headset.
         // PCBVIEW_VR_DENOISE=0 disables it for comparison.
         renderer_->setGpuDenoisePasses(allowPt ? dnPasses : 0);
+        // Anchor the temporal test and the filter's reach to the BOARD rather
+        // than to the screen, so neither changes character as you walk up to it
+        // or step back.
+        renderer_->setWorldScale(span);
 
         // Say what is actually running, once.
         //

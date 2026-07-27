@@ -22,6 +22,9 @@ layout(set = 0, binding = 0, rgba32f) uniform readonly image2D srcImg;
 layout(set = 0, binding = 1, rgba32f) uniform writeonly image2D dstImg;
 layout(set = 0, binding = 2, rgba32f) uniform readonly image2D albedoImg;
 layout(set = 0, binding = 3, rgba32f) uniform readonly image2D normalImg;
+// First-hit world position, so the filter knows how much WORLD its taps cover
+// and not merely how many pixels.
+layout(set = 0, binding = 4, rgba32f) uniform readonly image2D posImg;
 
 layout(push_constant) uniform Push {
     uvec4 dim;      // x width, y height, z step width, w pass index
@@ -62,6 +65,16 @@ void main() {
     // filtered the same amount regardless of what it actually knows.
     const float hist = max(srcC.a, 1.0);
     const float boost = clamp(8.0 / sqrt(hist), 1.0, 8.0);
+
+    // Where this pixel is in the world. The tap spacing doubles each pass and
+    // reaches 32 pixels, which is a modest patch of board seen from close to
+    // and a large one seen from far away -- so a filter bounded only in pixels
+    // quietly blends across more and more distinct materials as you back away.
+    // That is exactly the colour bleed that got worse with distance. Bounding
+    // the reach in MILLIMETRES makes the filter cover the same amount of board
+    // wherever you stand.
+    const vec4 pC = imageLoad(posImg, px);
+    const float worldRadius = pc.misc.y;
     const vec3 nRaw = imageLoad(normalImg, px).xyz;
     const vec3 aC = imageLoad(albedoImg, px).rgb * pc.misc.x;
     const float lC = luma(centre);
@@ -96,6 +109,13 @@ void main() {
             const vec3 nQraw = imageLoad(normalImg, q).xyz;
             if (dot(nQraw, nQraw) < 1e-6) continue;  // never pull sky in
             const vec3 nQ = normalize(nQraw);
+            // Too far away in the WORLD to be the same surface detail, however
+            // few pixels separate them on screen.
+            if (worldRadius > 0.0 && pC.w > 0.5) {
+                const vec4 pQ = imageLoad(posImg, q);
+                if (pQ.w < 0.5 || distance(pQ.xyz, pC.xyz) > worldRadius)
+                    continue;
+            }
             const vec3 aQ = imageLoad(albedoImg, q).rgb * pc.misc.x;
 
             // Orientation: a high power makes this fall off sharply, so a tap

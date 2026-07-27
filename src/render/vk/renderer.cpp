@@ -2089,7 +2089,7 @@ void Renderer::createTemporal() {
 
     // One set per eye, six images each, plus the a-trous entry set (four).
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                            6 * kTemporalSlots + 4};
+                            6 * kTemporalSlots + 5};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = kTemporalSlots + 1;
     pi.poolSizeCount = 1;
@@ -2169,14 +2169,15 @@ void Renderer::updateTemporalDescriptors() {
 
     // A-trous entry reading the temporally blended image.
     if (dnTemporalSet_ && ptDenoised_.view != VK_NULL_HANDLE) {
-        VkDescriptorImageInfo info[4] = {
+        VkDescriptorImageInfo info[5] = {
             {VK_NULL_HANDLE, ptTemporal_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptPosition_.view, VK_IMAGE_LAYOUT_GENERAL},
         };
-        VkWriteDescriptorSet w[4]{};
-        for (int i = 0; i < 4; ++i) {
+        VkWriteDescriptorSet w[5]{};
+        for (int i = 0; i < 5; ++i) {
             w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w[i].dstSet = dnTemporalSet_;
             w[i].dstBinding = static_cast<uint32_t>(i);
@@ -2184,7 +2185,7 @@ void Renderer::updateTemporalDescriptors() {
             w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w[i].pImageInfo = &info[i];
         }
-        vkUpdateDescriptorSets(device_.handle, 4, w, 0, nullptr);
+        vkUpdateDescriptorSets(device_.handle, 5, w, 0, nullptr);
     }
 }
 
@@ -2228,8 +2229,12 @@ void Renderer::recordTemporal(VkCommandBuffer cmd, const float viewProj[16]) {
     // That shows up twice over -- as colour bleeding between them, and as edges
     // that never settle, since which of the two a pixel picks up changes every
     // frame. At 0.25% the same pair is comfortably separated.
-    static const float tolFrac = envFloat("PCBVIEW_VR_TOL", 0.0025f);
-    push.params[1] = tolFrac;
+    // An absolute world distance now, as a fraction of the BOARD -- 0.4% of a
+    // 50 mm board is 0.2 mm, comfortably under a package's height and well
+    // over copper thickness, which is the separation actually wanted. Falls
+    // back to a scale-free guess when the board size is unknown.
+    static const float tolFrac = envFloat("PCBVIEW_VR_TOL", 0.004f);
+    push.params[1] = worldSpan_ > 0.0f ? worldSpan_ * tolFrac : tolFrac * 50.0f;
     push.params[2] = static_cast<float>(std::max(temporalMaxFrames_, 1));
     for (int i = 0; i < 3; ++i) push.eye[i] = rayEye_[i];
     vkCmdPushConstants(cmd, rpPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
@@ -2282,8 +2287,8 @@ void Renderer::recordTemporal(VkCommandBuffer cmd, const float viewProj[16]) {
 void Renderer::createGpuDenoise() {
     if (!rtSupported_) return;
 
-    VkDescriptorSetLayoutBinding b[4]{};
-    for (uint32_t i = 0; i < 4; ++i) {
+    VkDescriptorSetLayoutBinding b[5]{};
+    for (uint32_t i = 0; i < 5; ++i) {
         b[i].binding = i;
         b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         b[i].descriptorCount = 1;
@@ -2291,14 +2296,14 @@ void Renderer::createGpuDenoise() {
     }
     VkDescriptorSetLayoutCreateInfo li{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 4;
+    li.bindingCount = 5;
     li.pBindings = b;
     check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr,
                                       &dnSetLayout_),
           "denoise set layout");
 
-    // Three sets, four storage images each.
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12};
+    // Three sets, five storage images each.
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 15};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 3;
     pi.poolSizeCount = 1;
@@ -2362,14 +2367,15 @@ void Renderer::updateGpuDenoiseDescriptors() {
     };
 
     for (int s = 0; s < 3; ++s) {
-        VkDescriptorImageInfo info[4] = {
+        VkDescriptorImageInfo info[5] = {
             {VK_NULL_HANDLE, chain[s][0], VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, chain[s][1], VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL},
             {VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL},
+            {VK_NULL_HANDLE, ptPosition_.view, VK_IMAGE_LAYOUT_GENERAL},
         };
-        VkWriteDescriptorSet w[4]{};
-        for (int i = 0; i < 4; ++i) {
+        VkWriteDescriptorSet w[5]{};
+        for (int i = 0; i < 5; ++i) {
             w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w[i].dstSet = dnSets_[s];
             w[i].dstBinding = static_cast<uint32_t>(i);
@@ -2377,7 +2383,7 @@ void Renderer::updateGpuDenoiseDescriptors() {
             w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
             w[i].pImageInfo = &info[i];
         }
-        vkUpdateDescriptorSets(device_.handle, 4, w, 0, nullptr);
+        vkUpdateDescriptorSets(device_.handle, 5, w, 0, nullptr);
     }
 }
 
@@ -2457,6 +2463,12 @@ void Renderer::recordGpuDenoise(VkCommandBuffer cmd) {
         // a sum on the first, since later passes read an already-averaged
         // image. So this divide does not turn off after pass 0.
         push.misc[0] = invSamples;
+        // How much BOARD a tap may reach across, regardless of how few pixels
+        // separate them. 8% of the board's width is generous enough to smooth
+        // noise and far short of crossing between components -- and unlike the
+        // pixel reach, it means the same thing from any viewing distance.
+        static const float radiusFrac = envFloat("PCBVIEW_VR_DN_RADIUS", 0.08f);
+        push.misc[1] = worldSpan_ > 0.0f ? worldSpan_ * radiusFrac : 0.0f;
         vkCmdPushConstants(cmd, dnPipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(push), &push);
         vkCmdDispatch(cmd, gx, gy, 1);
