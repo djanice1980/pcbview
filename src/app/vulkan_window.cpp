@@ -218,6 +218,19 @@ void VulkanWindow::stepVr() {
         const int n = qgetenv("PCBVIEW_VR_RATE_DIV").toInt(&ok);
         return (ok && n >= 1 && n <= 4) ? n : 1;
     }();
+    // PCBVIEW_VR_RT=0 drops the ray-traced shadows and AO for plain raster
+    // shading -- no rays anywhere in the frame. Worth having as a baseline:
+    // everything else is layered on top of it, so when the picture misbehaves
+    // this is the floor to compare against. Read here rather than at the point
+    // of use so the sweep below can override it.
+    static const bool wantRt = [] {
+        const QByteArray v = qgetenv("PCBVIEW_VR_RT");
+        return !(v == "0" || v == "false");
+    }();
+    // What this frame actually uses. Identical to the settings above unless
+    // the sweep below is driving them.
+    float ssEff = ss;
+    bool rtEff = wantRt;
     // How far back temporal reuse averages. This is the quality/latency dial:
     // higher is cleaner and slower to react to a change in the picture, and it
     // is what lets a handful of samples a frame look like a great many.
@@ -369,6 +382,79 @@ void VulkanWindow::stepVr() {
         // eye those buffers are over eight gigabytes. PCBVIEW_VR_RES is the
         // release valve until this is understood properly.
 
+        // --- Measured sweep -------------------------------------------------
+        //
+        // PCBVIEW_VR_SWEEP=1 walks the two fill-rate levers and reports pacing
+        // for each, so they get chosen from numbers instead of impressions.
+        // Both are per-frame settable: ray tracing is a renderer flag, and the
+        // render scale is the scene target's size, which is decoupled from the
+        // swapchain and blitted to it. The swapchain itself cannot change
+        // mid-session, which is why this sweeps the render scale and not
+        // PCBVIEW_VR_RES.
+        //
+        // Hold the board in view and stay roughly still for the run: the whole
+        // point is that fill cost tracks how much of the eye the board covers,
+        // so wandering makes the rows incomparable.
+        struct SweepStep {
+            const char* name;
+            bool rt;
+            float ss;
+        };
+        static const SweepStep kSweep[] = {
+            {"ray-traced raster, full res", true, 1.00f},
+            {"plain raster,      full res", false, 1.00f},
+            {"ray-traced raster, 0.70x   ", true, 0.70f},
+            {"plain raster,      0.70x   ", false, 0.70f},
+        };
+        static const bool sweeping = [this] {
+            const QByteArray v = qgetenv("PCBVIEW_VR_SWEEP");
+            const bool on = !v.isEmpty() && v != "0";
+            if (on) {
+                vr_->setRateAutoReport(false);
+                std::printf(
+                    "\nvr-sweep: %zu configurations, about 7 s each. Keep the "
+                    "board in view and hold still.\n"
+                    "vr-sweep: %-28s %7s %7s %8s %10s\n",
+                    std::size(kSweep), "configuration", "Hz", "late", "lost",
+                    "frame ms");
+                std::fflush(stdout);
+            }
+            return on;
+        }();
+        static size_t sweepStep = 0;
+        static int sweepFrame = 0;
+        static bool sweepDone = false;
+        if (sweeping && !sweepDone) {
+            ssEff = kSweep[sweepStep].ss;
+            rtEff = kSweep[sweepStep].rt;
+            // Settle first and throw those frames away. A configuration change
+            // costs a scene-target rebuild and the runtime needs a moment to
+            // settle on a pacing decision; measuring across that would report
+            // the transition rather than the configuration.
+            const int kSettle = 120, kMeasure = 480;
+            if (++sweepFrame == kSettle) {
+                vr_->takeRate();
+            } else if (sweepFrame >= kSettle + kMeasure) {
+                const auto st = vr_->takeRate();
+                const double frames = st.frames ? st.frames : 1;
+                std::printf("vr-sweep: %-28s %6.0f %6.1f%% %8u %9.2f\n",
+                            kSweep[sweepStep].name, st.hz,
+                            100.0 * st.late / frames, st.periodsLost,
+                            st.frameMs / frames);
+                std::fflush(stdout);
+                sweepFrame = 0;
+                if (++sweepStep >= std::size(kSweep)) {
+                    sweepDone = true;
+                    std::printf(
+                        "vr-sweep: done. Lower 'late' and 'lost' is better; "
+                        "Hz is what the runtime paced us at.\nvr-sweep: "
+                        "holding the last configuration.\n\n");
+                    std::fflush(stdout);
+                    vr_->setRateAutoReport(true);
+                }
+            }
+        }
+
         // Say what is actually running, once.
         //
         // Every one of these is an environment variable, and an environment
@@ -381,14 +467,13 @@ void VulkanWindow::stepVr() {
         if (!cfgDumped) {
             cfgDumped = true;
             const bool rtOn =
-                !allowPt && renderer_->rayTracingSupported() &&
-                !(qgetenv("PCBVIEW_VR_RT") == "0");
+                !allowPt && renderer_->rayTracingSupported() && rtEff;
             std::printf("vr-cfg: %s, spp=%d, supersample=%.2fx, denoise=%d, "
                         "rate=1/%d, world-sun=yes\n",
                         allowPt ? "PATH TRACED (PCBVIEW_VR_PT)"
                                 : (rtOn ? "ray-traced raster"
                                         : "PLAIN RASTER (no rays)"),
-                        allowPt ? spp : 0, ss, allowPt ? dnPasses : 0,
+                        allowPt ? spp : 0, ssEff, allowPt ? dnPasses : 0,
                         rateDiv);
             std::fflush(stdout);
         }
@@ -398,15 +483,7 @@ void VulkanWindow::stepVr() {
         // immediately when the mode already matches, so this is free.
         if (!allowPt) {
             renderer_->setRenderMode(vk::RenderMode::Raster);
-            // PCBVIEW_VR_RT=0 drops the ray-traced shadows and AO for plain
-            // raster shading -- no rays anywhere in the frame. Worth having as
-            // a baseline: everything else is layered on top of it, so when the
-            // picture misbehaves this is the floor to compare against.
-            static const bool wantRt = [] {
-                const QByteArray v = qgetenv("PCBVIEW_VR_RT");
-                return !(v == "0" || v == "false");
-            }();
-            renderer_->setRayTracing(wantRt && rtAvailable());
+            renderer_->setRayTracing(rtEff && rtAvailable());
         }
         // A sun that stays put in the room. The desktop's key light rides the
         // camera, which is right when you orbit with a mouse and wrong the
@@ -463,8 +540,8 @@ void VulkanWindow::stepVr() {
             // silhouettes at more than double the frame time. Raise it only if
             // there is headroom to spare.
             renderer_->setCaptureExtent(
-                static_cast<uint32_t>(std::lround(e.width * ss)),
-                static_cast<uint32_t>(std::lround(e.height * ss)));
+                static_cast<uint32_t>(std::lround(e.width * ssEff)),
+                static_cast<uint32_t>(std::lround(e.height * ssEff)));
             // The path tracer ignores viewProj entirely -- it traces from a ray
             // basis, and the only place that basis was ever set is the desktop
             // render path. So traced VR was rendering the DESKTOP camera's

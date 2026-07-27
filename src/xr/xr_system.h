@@ -191,6 +191,21 @@ public:
         anchorWaited_ = 0;
     }
 
+    // Frame pacing, as counted against the runtime's own display clock.
+    // frameMs is the TOTAL across `frames`, so callers divide.
+    struct RateStats {
+        unsigned frames = 0;
+        unsigned late = 0;         // frames that arrived after their slot
+        unsigned periodsLost = 0;  // display periods the compositor filled in
+        double frameMs = 0.0;
+        double hz = 0.0;           // the rate the runtime is currently pacing us at
+    };
+    // Read and reset. Used to attribute a measured window to one configuration.
+    RateStats takeRate();
+    // The periodic vr-rate line. Off while sweeping, so the sweep owns the
+    // output and its rows are not interleaved with unrelated ones.
+    void setRateAutoReport(bool on) { rateAuto_ = on; }
+
     // The grip pose of a controller, in pcbview world millimetres, when one is
     // tracked. Index 0 = left, 1 = right.
     bool gripPose(int hand, float outPosMm[3], float outQuat[4]) const;
@@ -260,6 +275,8 @@ private:
     unsigned missedFrames_ = 0;
     unsigned missedTotal_ = 0;
     double frameCpuMs_ = 0.0;
+    long long lastPeriodNs_ = 0;
+    bool rateAuto_ = true;
     std::chrono::steady_clock::time_point frameStart_{};
     float gripPosMm_[2][3] = {};
     float gripQuat_[2][4] = {};

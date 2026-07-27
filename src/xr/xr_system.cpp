@@ -1470,8 +1470,9 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
             }
         }
         lastDisplayTime_ = fs.predictedDisplayTime;
+        lastPeriodNs_ = fs.predictedDisplayPeriod;
 
-        if (timedFrames_ >= 240) {
+        if (rateAuto_ && timedFrames_ >= 240) {
             const double hz = 1.0e9 / static_cast<double>(fs.predictedDisplayPeriod);
             // "frame" and not "cpu": this is wall time from xrBeginFrame to
             // xrEndFrame, which includes drawFrame blocking on the previous
@@ -1912,6 +1913,20 @@ void VrSession::releaseEye(int index) {
     if ((*chains_)[index].depthChain)
         xrReleaseSwapchainImage((*chains_)[index].depthChain, &ri);
     depthTarget_ = VK_NULL_HANDLE;
+}
+
+VrSession::RateStats VrSession::takeRate() {
+    RateStats s;
+    s.frames = timedFrames_;
+    s.late = missedFrames_;
+    s.periodsLost = missedTotal_;
+    s.frameMs = frameCpuMs_;
+    s.hz = lastPeriodNs_ > 0 ? 1.0e9 / static_cast<double>(lastPeriodNs_) : 0.0;
+    timedFrames_ = 0;
+    missedFrames_ = 0;
+    missedTotal_ = 0;
+    frameCpuMs_ = 0.0;
+    return s;
 }
 
 void VrSession::endFrame() {
