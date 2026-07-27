@@ -645,9 +645,25 @@ void MainWindow::rebuildViewport() {
     // viewport -- and the flag keeps that re-push out of ordinary board loads.
     reapplyNetsOnUpload_ = true;
 
-    VulkanWindow* oldViewport = viewport_;
     QWidget* oldContainer = viewportContainer_;
     stack_->removeWidget(oldContainer);
+
+    // Destroy the old viewport NOW, before building its replacement.
+    //
+    // This was deleteLater(), which left the old Vulkan instance, device and
+    // swapchain alive while the new window came up -- harmless for a GPU swap,
+    // and not harmless at all for VR. Entering the headset means the new window
+    // asks OpenXR to create the Vulkan instance and device, and the runtime
+    // will not do that alongside a live instance from the window being
+    // replaced: the app hangs at the hand-over with no session and no error.
+    //
+    // Safe to delete directly here because this slot is invoked through a
+    // QUEUED connection, so nothing is executing inside the object being
+    // deleted. The container owns the QWindow, so this takes the surface,
+    // swapchain, device and instance with it.
+    viewport_ = nullptr;
+    viewportContainer_ = nullptr;
+    delete oldContainer;
 
     buildViewport();
     if (loaded_) stack_->setCurrentWidget(viewportContainer_);
@@ -671,10 +687,6 @@ void MainWindow::rebuildViewport() {
     statusPerf_->setText(QString());
     frameCounter_ = 14;  // next rendered frame refreshes the readout
 
-    // The container owns the QWindow; deleting it tears down the old surface,
-    // swapchain and device with it (releaseResources via PlatformSurface).
-    oldContainer->deleteLater();
-    Q_UNUSED(oldViewport);
 }
 
 bool MainWindow::loadBoard(const QString& path) {
@@ -1414,10 +1426,20 @@ void MainWindow::buildMenus() {
     vrAction_->setCheckable(true);
     vrAction_->setChecked(VulkanWindow::vrRequested());
     connect(vrAction_, &QAction::triggered, this, [this](bool on) {
-        statusBar()->showMessage(on ? "Starting VR — rebuilding the viewport…"
-                                    : "Leaving VR — rebuilding the viewport…",
-                                 4000);
+        // Say what is happening, and PAINT it, before handing over.
+        //
+        // Starting a session blocks this thread while the runtime comes up --
+        // creating an OpenXR instance launches SteamVR if it is not already
+        // running, which is seconds, sometimes tens of them. Without this the
+        // window simply stops responding and the honest reading is that the
+        // app has hung.
+        statusBar()->showMessage(
+            on ? "Starting VR — this can take a moment while SteamVR comes up…"
+               : "Leaving VR — rebuilding the viewport…");
+        QGuiApplication::setOverrideCursor(Qt::BusyCursor);
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
         viewport_->setVrMode(on);
+        QGuiApplication::restoreOverrideCursor();
     });
 
     // Viewport size presets: pin the render area to an aspect for video
