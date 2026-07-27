@@ -153,6 +153,13 @@ int gpuReport() {
                 device.rayQueryEnabled
                     ? "yes -- ray-traced shadows/AO available"
                     : "no -- raster only, which is a supported fallback");
+    // The VR raster path can draw both eyes in one pass when both of these
+    // hold: multiview itself, and a push block wide enough for two eyes'
+    // matrices (224 bytes, past the 128-byte Vulkan minimum).
+    std::printf("Multiview: %s (maxPushConstantsSize %u, two-eye block needs "
+                "224)\n",
+                device.multiviewEnabled ? "yes" : "no",
+                device.maxPushConstants);
 
     pcbview::destroyDevice(device);
     vkDestroyInstance(instance, nullptr);

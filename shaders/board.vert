@@ -5,6 +5,24 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 
 // Must match board.frag byte for byte -- one push block spans both stages.
+//
+// MULTIVIEW builds a second copy of this shader in which the per-eye values
+// become two-element arrays selected by gl_ViewIndex, so one draw feeds both
+// eyes. The block grows from 128 to 224 bytes, past the Vulkan minimum, which
+// is why the renderer checks maxPushConstantsSize before using these.
+#ifdef MULTIVIEW
+#extension GL_EXT_multiview : require
+layout(push_constant) uniform Push {
+    mat4 viewProj[2];
+    vec4 cameraPos[2];
+    vec4 params;
+    vec4 camAxis[2];
+    ivec4 highlight;
+} push;
+#define VIEWPROJ  push.viewProj[gl_ViewIndex]
+#define CAMERAPOS push.cameraPos[gl_ViewIndex]
+#define CAMAXIS   push.camAxis[gl_ViewIndex]
+#else
 layout(push_constant) uniform Push {
     mat4 viewProj;
     vec4 cameraPos;
@@ -16,6 +34,10 @@ layout(push_constant) uniform Push {
     vec4 camAxis;
     ivec4 highlight;
 } push;
+#define VIEWPROJ  push.viewProj
+#define CAMERAPOS push.cameraPos
+#define CAMAXIS   push.camAxis
+#endif
 
 struct Material {
     vec4 albedo;  // rgb + opacity
@@ -68,5 +90,5 @@ void main() {
 
     outNormal = inNormal;
     outWorldPos = pos;
-    gl_Position = push.viewProj * vec4(pos, 1.0);
+    gl_Position = VIEWPROJ * vec4(pos, 1.0);
 }

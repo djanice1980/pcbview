@@ -57,6 +57,13 @@ struct Device {
     // advertised. Renderers gate the RT path on this.
     bool rayTracingEnabled = false;
     bool rayQueryEnabled = false;
+    // Whether multiview was enabled, which is what lets the VR raster path draw
+    // both eyes in one pass. Not advertised by CPU devices we care about, and
+    // useless to the compute path tracer either way.
+    bool multiviewEnabled = false;
+    // maxPushConstantsSize, carried so the renderer can tell whether the wider
+    // two-eye push block fits before it commits to multiview.
+    uint32_t maxPushConstants = 128;
 };
 
 // ---- OpenXR takes over Vulkan creation --------------------------------------

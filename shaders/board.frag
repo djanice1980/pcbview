@@ -48,6 +48,19 @@ layout(std430, set = 0, binding = 4) readonly buffer NetSpans {
 } netSpanTable;
 
 // Must match board.vert byte for byte -- one push block spans both stages.
+// See board.vert for what MULTIVIEW changes and why.
+#ifdef MULTIVIEW
+#extension GL_EXT_multiview : require
+layout(push_constant) uniform Push {
+    mat4 viewProj[2];
+    vec4 cameraPos[2];
+    vec4 params;
+    vec4 camAxis[2];
+    ivec4 highlight;
+} push;
+#define CAMERAPOS push.cameraPos[gl_ViewIndex]
+#define CAMAXIS   push.camAxis[gl_ViewIndex]
+#else
 layout(push_constant) uniform Push {
     mat4 viewProj;
     vec4 cameraPos;
@@ -59,6 +72,9 @@ layout(push_constant) uniform Push {
     // x = highlighted net index, -1 for none.
     ivec4 highlight;
 } push;
+#define CAMERAPOS push.cameraPos
+#define CAMAXIS   push.camAxis
+#endif
 
 // Net highlighting. The chosen net keeps its colour and gains a warm lift;
 // everything else desaturates toward the laminate so the signal reads at a
@@ -154,12 +170,12 @@ vec3 applyNetHighlight(vec3 albedo) {
 // camera-relative key/fill lights away, collapsing the surface to ambient. That
 // was the black near edge on a zoomed-in orthographic board.
 vec3 viewVector(vec3 worldPos) {
-    if (push.camAxis.w > 0.0) return -push.camAxis.xyz;
-    return normalize(push.cameraPos.xyz - worldPos);
+    if (CAMAXIS.w > 0.0) return -CAMAXIS.xyz;
+    return normalize(CAMERAPOS.xyz - worldPos);
 }
 float viewScale(vec3 worldPos) {
-    if (push.camAxis.w > 0.0) return push.camAxis.w;
-    return length(push.cameraPos.xyz - worldPos);
+    if (CAMAXIS.w > 0.0) return CAMAXIS.w;
+    return length(CAMERAPOS.xyz - worldPos);
 }
 
 // How transparent the substrate goes at a full peel. The laminate is what hides
@@ -224,12 +240,12 @@ void main() {
     // the scene, so edges stay lit at any zoom.
     vec3 keyDir;
     float keyDist;
-    if (push.camAxis.w > 0.0) {
-        keyDir = normalize(-push.camAxis.xyz + camRight * 0.55 + camUp * 0.55);
+    if (CAMAXIS.w > 0.0) {
+        keyDir = normalize(-CAMAXIS.xyz + camRight * 0.55 + camUp * 0.55);
         keyDist = 1.0e4;  // effectively infinite, for the shadow ray
     } else {
         vec3 keyPos =
-            push.cameraPos.xyz + (camRight * 0.55 + camUp * 0.55) * viewDist;
+            CAMERAPOS.xyz + (camRight * 0.55 + camUp * 0.55) * viewDist;
         keyDir = normalize(keyPos - inWorldPos);
         keyDist = length(keyPos - inWorldPos);
     }

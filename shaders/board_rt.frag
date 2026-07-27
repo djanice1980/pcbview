@@ -28,6 +28,19 @@ layout(std430, set = 0, binding = 0) readonly buffer Materials {
 
 layout(set = 0, binding = 1) uniform accelerationStructureEXT tlas;
 
+// See board.vert for what MULTIVIEW changes and why.
+#ifdef MULTIVIEW
+#extension GL_EXT_multiview : require
+layout(push_constant) uniform Push {
+    mat4 viewProj[2];
+    vec4 cameraPos[2];  // .w = RT enable
+    vec4 params;
+    vec4 camAxis[2];
+    ivec4 highlight;
+} push;
+#define CAMERAPOS push.cameraPos[gl_ViewIndex]
+#define CAMAXIS   push.camAxis[gl_ViewIndex]
+#else
 layout(push_constant) uniform Push {
     mat4 viewProj;
     vec4 cameraPos;  // .w = RT enable
@@ -37,6 +50,9 @@ layout(push_constant) uniform Push {
     // x = highlighted net index, -1 for none.
     ivec4 highlight;
 } push;
+#define CAMERAPOS push.cameraPos
+#define CAMAXIS   push.camAxis
+#endif
 
 // Per-triangle net index and position along that net. Keep in step with
 // board.frag, including netChase below.
@@ -116,12 +132,12 @@ vec3 applyNetHighlight(vec3 albedo) {
 // the eye-point shortcut reverses at/behind the eye plane, blackening the near
 // edge. Keep these two in step with board.frag.
 vec3 viewVector(vec3 worldPos) {
-    if (push.camAxis.w > 0.0) return -push.camAxis.xyz;
-    return normalize(push.cameraPos.xyz - worldPos);
+    if (CAMAXIS.w > 0.0) return -CAMAXIS.xyz;
+    return normalize(CAMERAPOS.xyz - worldPos);
 }
 float viewScale(vec3 worldPos) {
-    if (push.camAxis.w > 0.0) return push.camAxis.w;
-    return length(push.cameraPos.xyz - worldPos);
+    if (CAMAXIS.w > 0.0) return CAMAXIS.w;
+    return length(CAMERAPOS.xyz - worldPos);
 }
 
 // Peeled-substrate target opacity: user-adjustable, in extra.y (x1000).
@@ -249,18 +265,18 @@ void main() {
     // your head and every shadow swings with it, and the board never appears to
     // sit in a lit room. The world-fixed sun is the same one the path tracer
     // uses, so the two modes agree about where the light comes from.
-    const bool worldSun = push.cameraPos.w > 1.5;
+    const bool worldSun = CAMERAPOS.w > 1.5;
     vec3 keyDir;
     float keyDist;
     if (worldSun) {
         keyDir = kSunDirWorld;
         keyDist = 1.0e5;
-    } else if (push.camAxis.w > 0.0) {
-        keyDir = normalize(-push.camAxis.xyz + camRight * 0.55 + camUp * 0.55);
+    } else if (CAMAXIS.w > 0.0) {
+        keyDir = normalize(-CAMAXIS.xyz + camRight * 0.55 + camUp * 0.55);
         keyDist = 1.0e4;
     } else {
         vec3 keyPos =
-            push.cameraPos.xyz + (camRight * 0.55 + camUp * 0.55) * viewDist;
+            CAMERAPOS.xyz + (camRight * 0.55 + camUp * 0.55) * viewDist;
         keyDir = normalize(keyPos - inWorldPos);
         keyDist = length(keyPos - inWorldPos);
     }
@@ -272,7 +288,7 @@ void main() {
     // Ray-traced shadow + AO, only when the gate is set.
     float shadow = 1.0;
     float ao = 1.0;
-    if (push.cameraPos.w > 0.5) {
+    if (CAMERAPOS.w > 0.5) {
         shadow = sunVisibility(inWorldPos + n * 0.05, n, keyDir, keyDist);
         ao = ambientOcclusion(inWorldPos, n);
     }

@@ -343,9 +343,29 @@ Device createDevice(const GpuInfo& gpu,
     v12.descriptorBindingPartiallyBound = VK_TRUE;
     v12.pNext = &v13;
 
+    // Multiview: one draw feeds both eyes, gl_ViewIndex picking the per-eye
+    // matrices. Core since 1.1, so it is a feature bit rather than an
+    // extension, and asked for only when the GPU says it has it -- enabling an
+    // unsupported feature is a hard device-creation failure, and this is worth
+    // nothing to a CPU device that never drives a headset.
+    VkPhysicalDeviceVulkan11Features v11{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan11Features have11{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceFeatures2 probe{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    probe.pNext = &have11;
+    vkGetPhysicalDeviceFeatures2(gpu.handle, &probe);
+    const bool wantMultiview = have11.multiview && !isCpu;
+    if (wantMultiview) {
+        v11.multiview = VK_TRUE;
+        v11.pNext = &v12;
+    }
+
     VkPhysicalDeviceFeatures2 features{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    features.pNext = &v12;
+    features.pNext = wantMultiview ? static_cast<void*>(&v11)
+                                   : static_cast<void*>(&v12);
     features.features.samplerAnisotropy = VK_TRUE;
     features.features.fillModeNonSolid = VK_TRUE;
     // gl_PrimitiveID in a FRAGMENT shader (net highlighting looks the
@@ -372,6 +392,12 @@ Device createDevice(const GpuInfo& gpu,
     device.gpu = gpu;
     device.rayTracingEnabled = wantRt;
     device.rayQueryEnabled = wantRq;
+    device.multiviewEnabled = wantMultiview;
+    {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(gpu.handle, &props);
+        device.maxPushConstants = props.limits.maxPushConstantsSize;
+    }
     // Same reasoning as the instance: the runtime injects the device extensions
     // a session needs, so VR has to create the device through it.
     if (g_hooks && g_hooks->createDevice) {

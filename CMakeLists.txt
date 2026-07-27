@@ -229,9 +229,29 @@ function(pcbview_add_shader SHADER_NAME)
     set(SHADER_OUTPUTS ${SHADER_OUTPUTS} ${OUT} PARENT_SCOPE)
 endfunction()
 
+# A second SPIR-V module from the same source, built with -DMULTIVIEW so the
+# per-eye push values become gl_ViewIndex-selected arrays. The VR raster path
+# draws both eyes in one pass with these; every other path uses the plain
+# build, byte for byte as before.
+function(pcbview_add_shader_mv SHADER_NAME)
+    set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER_NAME})
+    set(OUT ${SHADER_INCLUDE_DIR}/shaders/${SHADER_NAME}.mv.inc)
+    add_custom_command(
+        OUTPUT ${OUT}
+        COMMAND ${GLSLC} -mfmt=c -O -DMULTIVIEW=1 --target-env=vulkan1.3 ${SRC} -o ${OUT}
+        DEPENDS ${SRC}
+        COMMENT "Compiling ${SHADER_NAME} (multiview) -> SPIR-V"
+        VERBATIM
+    )
+    set(SHADER_OUTPUTS ${SHADER_OUTPUTS} ${OUT} PARENT_SCOPE)
+endfunction()
+
 pcbview_add_shader(board.vert)
 pcbview_add_shader(board.frag)
 pcbview_add_shader(board_rt.frag)
+pcbview_add_shader_mv(board.vert)
+pcbview_add_shader_mv(board.frag)
+pcbview_add_shader_mv(board_rt.frag)
 pcbview_add_shader(pathtrace.comp)
 pcbview_add_shader(denoise.comp)
 pcbview_add_shader(reproject.comp)
