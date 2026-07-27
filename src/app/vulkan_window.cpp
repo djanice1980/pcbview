@@ -639,7 +639,18 @@ void VulkanWindow::stepVr() {
             if (throttled || overBudget) {
                 ++over;
                 under = 0;
-            } else if (frameGpuMs > 0.0 && frameGpuMs < budget * 0.5) {
+            } else if (frameGpuMs > 0.0 && frameGpuMs < budget * 0.35) {
+                // 0.35 of budget, not 0.5, and the difference is the cost of
+                // the step ITSELF.
+                //
+                // Climbing a rung multiplies the frame cost -- 0.80x back to
+                // full resolution is 1/0.64, about 1.56x. Measuring 4.9 ms at
+                // 0.80x satisfies "under half the budget" and then lands at
+                // roughly 9 ms, which fits until the smallest lean forward
+                // pushes it over and the rung drops again. That is the pumping
+                // in the log: fourteen changes in one session, several of them
+                // resolution, which is the most visible kind. Leaving room for
+                // the step's own increase is what stops it.
                 ++under;
                 over = 0;
             } else {
@@ -650,7 +661,7 @@ void VulkanWindow::stepVr() {
                 ++pacingTier;
                 over = 0;
                 dwell = 120;
-            } else if (!dwell && under >= 240 && pacingTier > 0) {
+            } else if (!dwell && under >= 360 && pacingTier > 0) {
                 --pacingTier;
                 under = 0;
                 dwell = 120;
@@ -668,7 +679,11 @@ void VulkanWindow::stepVr() {
             if (tierHold > 0) --tierHold;
             const int want = std::max(distTier, pacingTier);
             if (want != tierNow && tierHold == 0) {
-                tierHold = 90;
+                // Two seconds, not one. A resolution change re-sharpens or
+                // softens the entire image, which is far more noticeable than
+                // a shadow getting a little coarser, and the rungs that move
+                // it are the ones the pacing backstop reaches.
+                tierHold = 180;
                 std::printf("vr-adapt: %s -> %s  (%.2f m, %.1f ms of %.1f, "
                             "paced %.0f Hz)\n",
                             kTiers[tierNow].name, kTiers[want].name, d,
