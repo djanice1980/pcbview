@@ -441,6 +441,13 @@ public:
     // sweep reading it back gets an answer that depends on the order the
     // configurations were tried. A timestamp delta depends on nothing but the
     // work.
+    // Foveation strength, 0 = off. 1 coarsens only the far edge, 2 is
+    // aggressive. Shades one fragment per 2x2 then 4x4 pixels as you go out
+    // from the middle, which on this workload removes rays in direct
+    // proportion -- and the lenses are throwing that detail away regardless.
+    void setFoveation(int level);
+    bool foveationAvailable() const { return device_.shadingRateEnabled; }
+
     double lastGpuMs() const { return gpuMs_; }
 
     // GPU milliseconds accumulated since the last call, then reset.
@@ -818,6 +825,14 @@ private:
     int rayQuality_ = 0;
     // Two timestamps per frame in flight, read back when that slot's fence has
     // signalled and the results are therefore available.
+    // --- Foveation (variable-rate shading) ----------------------------------
+    Image shadingRate_;
+    VkExtent2D shadingRateExtent_{0, 0};
+    int foveation_ = 0;
+    int foveationBuilt_ = -1;          // level the current image holds
+    VkExtent2D foveationBuiltFor_{0, 0};
+    void buildShadingRateImage();
+
     VkQueryPool timePool_ = VK_NULL_HANDLE;
     float timestampPeriod_ = 0.0f;  // ns per tick; 0 = unsupported
     std::vector<bool> timeArmed_;

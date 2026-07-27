@@ -66,6 +66,11 @@ struct Device {
     // both eyes in one pass. Not advertised by CPU devices we care about, and
     // useless to the compute path tracer either way.
     bool multiviewEnabled = false;
+    // Attachment-based variable-rate shading, and the tile size one texel of
+    // that attachment covers. Foveation without an eye tracker.
+    bool shadingRateEnabled = false;
+    uint32_t shadingRateTexelW = 16;
+    uint32_t shadingRateTexelH = 16;
     // maxPushConstantsSize, carried so the renderer can tell whether the wider
     // two-eye push block fits before it commits to multiview.
     uint32_t maxPushConstants = 128;

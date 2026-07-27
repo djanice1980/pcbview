@@ -244,6 +244,7 @@ Renderer::~Renderer() {
     if (pipelineOpaque_) vkDestroyPipeline(device_.handle, pipelineOpaque_, nullptr);
     if (pipelineBlend_) vkDestroyPipeline(device_.handle, pipelineBlend_, nullptr);
     destroyBloom();
+    destroyImage(shadingRate_);
     if (timePool_) vkDestroyQueryPool(device_.handle, timePool_, nullptr);
     if (maskPipeline_) vkDestroyPipeline(device_.handle, maskPipeline_, nullptr);
     if (maskLayout_)
@@ -2467,6 +2468,137 @@ void Renderer::setVisibilityMask(int eye, const float* ndcXY,
     m.version = version;
 }
 
+void Renderer::setFoveation(int level) {
+    foveation_ = level < 0 ? 0 : (level > 2 ? 2 : level);
+}
+
+void Renderer::buildShadingRateImage() {
+    if (!device_.shadingRateEnabled) return;
+    // Rebuild only when the setting or the target size actually changes: this
+    // uploads through a staging buffer and waits, which must not happen per
+    // frame.
+    if (foveationBuilt_ == foveation_ &&
+        foveationBuiltFor_.width == sceneExtent_.width &&
+        foveationBuiltFor_.height == sceneExtent_.height)
+        return;
+    foveationBuilt_ = foveation_;
+    foveationBuiltFor_ = sceneExtent_;
+
+    vkDeviceWaitIdle(device_.handle);
+    destroyImage(shadingRate_);
+    if (foveation_ <= 0) {
+        shadingRateExtent_ = {0, 0};
+        return;
+    }
+
+    const uint32_t tw = device_.shadingRateTexelW;
+    const uint32_t th = device_.shadingRateTexelH;
+    shadingRateExtent_ = {(sceneExtent_.width + tw - 1) / tw,
+                          (sceneExtent_.height + th - 1) / th};
+    shadingRate_ = createImage(
+        shadingRateExtent_, VK_FORMAT_R8_UINT,
+        VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR |
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT);
+
+    // The pattern. One byte per tile, encoding the fragment size as
+    // (log2(width) << 2) | log2(height) -- so 0 is 1x1, 5 is 2x2, 10 is 4x4.
+    //
+    // Radial, on the SHORTER axis so the falloff is circular rather than
+    // stretched. The middle stays 1x1 because that is where the eye actually
+    // is with a fixed pattern; the outer ring goes coarse because the lens is
+    // already smearing it. Level 1 keeps a generous sharp middle and only
+    // coarsens the corners; level 2 pulls both rings inward.
+    const float sharp = foveation_ == 1 ? 0.55f : 0.38f;
+    const float mid = foveation_ == 1 ? 0.80f : 0.62f;
+    std::vector<uint8_t> rates(size_t(shadingRateExtent_.width) *
+                               shadingRateExtent_.height);
+    const float cx = shadingRateExtent_.width * 0.5f;
+    const float cy = shadingRateExtent_.height * 0.5f;
+    const float norm = std::min(cx, cy);
+    for (uint32_t y = 0; y < shadingRateExtent_.height; ++y) {
+        for (uint32_t x = 0; x < shadingRateExtent_.width; ++x) {
+            const float dx = (x + 0.5f - cx) / norm;
+            const float dy = (y + 0.5f - cy) / norm;
+            const float r = std::sqrt(dx * dx + dy * dy);
+            uint8_t v = 0;                       // 1x1
+            if (r > mid) v = (2 << 2) | 2;       // 4x4
+            else if (r > sharp) v = (1 << 2) | 1;  // 2x2
+            rates[size_t(y) * shadingRateExtent_.width + x] = v;
+        }
+    }
+
+    Buffer staging = createBuffer(rates.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    void* p = nullptr;
+    if (vkMapMemory(device_.handle, staging.memory, 0, rates.size(), 0, &p) ==
+        VK_SUCCESS) {
+        std::memcpy(p, rates.data(), rates.size());
+        vkUnmapMemory(device_.handle, staging.memory);
+    }
+    {
+        VkCommandBufferAllocateInfo a{
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        a.commandPool = commandPool_;
+        a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        a.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        check(vkAllocateCommandBuffers(device_.handle, &a, &cmd),
+              "alloc(shading rate)");
+        VkCommandBufferBeginInfo bi{
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &bi);
+
+        VkImageMemoryBarrier2 toDst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        toDst.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        toDst.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        toDst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toDst.image = shadingRate_.handle;
+        toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        d.imageMemoryBarrierCount = 1;
+        d.pImageMemoryBarriers = &toDst;
+        vkCmdPipelineBarrier2(cmd, &d);
+
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageExtent = {shadingRateExtent_.width, shadingRateExtent_.height, 1};
+        vkCmdCopyBufferToImage(cmd, staging.handle, shadingRate_.handle,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+
+        VkImageMemoryBarrier2 toRate = toDst;
+        toRate.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        toRate.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        toRate.dstStageMask =
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+        toRate.dstAccessMask =
+            VK_ACCESS_2_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR;
+        toRate.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toRate.newLayout =
+            VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+        d.pImageMemoryBarriers = &toRate;
+        vkCmdPipelineBarrier2(cmd, &d);
+
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo s{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        s.commandBufferCount = 1;
+        s.pCommandBuffers = &cmd;
+        check(vkQueueSubmit(device_.graphicsQueue, 1, &s, VK_NULL_HANDLE),
+              "submit(shading rate)");
+        vkQueueWaitIdle(device_.graphicsQueue);
+        vkFreeCommandBuffers(device_.handle, commandPool_, 1, &cmd);
+    }
+    destroyBuffer(staging);
+
+    std::printf("vr-foveate: level %d, %ux%u tiles of %ux%u px\n", foveation_,
+                shadingRateExtent_.width, shadingRateExtent_.height, tw, th);
+    std::fflush(stdout);
+}
+
 void Renderer::createMaskPipeline() {
     VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     check(vkCreatePipelineLayout(device_.handle, &pl, nullptr, &maskLayout_),
@@ -3019,9 +3151,29 @@ void Renderer::createPipeline() {
     rendering.pColorAttachmentFormats = &colorFormat_;
     rendering.depthAttachmentFormat = depthFormat_;
 
+    // Let the shading-rate ATTACHMENT decide, when one is bound.
+    //
+    // Without this the pipeline's own rate wins and the attachment is ignored
+    // entirely: the default combiner is KEEP, which returns the first operand.
+    // combinerOps[1] = REPLACE makes the attachment's value the result, so a
+    // pass with no rate attachment still shades 1x1 as before and a pass with
+    // one is foveated.
+    VkPipelineFragmentShadingRateStateCreateInfoKHR shadingRate{
+        VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR};
+    shadingRate.fragmentSize = {1, 1};
+    shadingRate.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+    shadingRate.combinerOps[1] =
+        VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
+    if (device_.shadingRateEnabled) {
+        shadingRate.pNext = &rendering;
+    }
+
     VkGraphicsPipelineCreateInfo info{
         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
-    info.pNext = &rendering;  // dynamic rendering: no VkRenderPass
+    // dynamic rendering: no VkRenderPass
+    info.pNext = device_.shadingRateEnabled
+                     ? static_cast<const void*>(&shadingRate)
+                     : static_cast<const void*>(&rendering);
     info.stageCount = 2;
     info.pStages = stages;
     info.pVertexInputState = &vertexInput;
@@ -4518,6 +4670,12 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
         tracedVisDirty_ = false;
     }
 
+    // Before ANY recording starts. This uploads through a staging buffer and
+    // waits on the queue, so it cannot happen inside an open render pass or
+    // between recorded commands -- it rebuilds only when the level or the
+    // target size actually changes, which is a handful of times a session.
+    buildShadingRateImage();
+
     VkCommandBuffer cmd = commandBuffers_[frame_];
     vkResetCommandBuffer(cmd, 0);
 
@@ -4682,6 +4840,21 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &color;
     rendering.pDepthAttachment = &depthAttach;
+
+    // Foveation, when it is on. One texel of this attachment sets the shading
+    // rate for a whole tile, so the periphery shades once per 2x2 or 4x4
+    // pixels -- and since every shaded fragment here fires shadow and AO rays,
+    // that is a direct cut in rays where the lens is blurring anyway.
+    VkRenderingFragmentShadingRateAttachmentInfoKHR rateAttach{
+        VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR};
+    if (foveation_ > 0 && shadingRate_.view != VK_NULL_HANDLE) {
+        rateAttach.imageView = shadingRate_.view;
+        rateAttach.imageLayout =
+            VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+        rateAttach.shadingRateAttachmentTexelSize = {
+            device_.shadingRateTexelW, device_.shadingRateTexelH};
+        rendering.pNext = &rateAttach;
+    }
     vkCmdBeginRendering(cmd, &rendering);
 
     VkViewport vp{0.0f, 0.0f, static_cast<float>(sceneExtent_.width),
@@ -4737,6 +4910,7 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
                       .count())
             : 0;
     push.highlight[3] = netAnimate_ ? 1 : 0;
+
     // Pass 0: the hidden-area mesh. Stamps the near plane over the corners the
     // lenses bend away, so everything drawn afterwards fails the depth test
     // there and is never shaded -- around 22% of each eye on this headset.

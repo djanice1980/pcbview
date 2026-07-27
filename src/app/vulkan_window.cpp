@@ -240,6 +240,13 @@ void VulkanWindow::stepVr() {
     float ssEff = ss;
     bool rtEff = wantRt;
     int rayQEff = rayQ;
+    // PCBVIEW_VR_FOVEATE forces a level; the ladder drives it otherwise.
+    static const int fovEnv = [] {
+        bool ok = false;
+        const int n = qgetenv("PCBVIEW_VR_FOVEATE").toInt(&ok);
+        return (ok && n >= 0 && n <= 2) ? n : -1;
+    }();
+    int fovEff = fovEnv >= 0 ? fovEnv : 0;
 
     // Both eyes' GPU time for the frame just completed. Taken once, here, so
     // the ladder below and the sweep see the same number.
@@ -333,6 +340,9 @@ void VulkanWindow::stepVr() {
             // The hidden-area mesh belongs to the headset's lenses. Drawing it
             // into a desktop window would punch holes in the corners.
             renderer_->selectVisibilityMask(-1);
+            // Foveation is for lenses. A desktop window has none, and blurring
+            // the edges of a monitor would simply look broken.
+            renderer_->setFoveation(0);
             // Back to the interactive sample ramp and OIDN for a mouse camera:
             // the desktop can afford the round trip and gets the better result.
             renderer_->setPathTraceBatch(0);
@@ -413,14 +423,27 @@ void VulkanWindow::stepVr() {
         struct Tier {
             bool rt;
             int rayQ;
+            int fov;
             const char* name;
         };
+        // The bottom rung keeps its shadows.
+        //
+        // It used to be plain raster, which is what made getting close
+        // unsatisfying: walk up to the board to look at something and the
+        // shadows vanish, exactly when you most want the depth cue. Foveation
+        // buys that back -- coarsening the periphery to one shaded fragment
+        // per 2x2 and then 4x4 pixels cuts rays where the lens is blurring
+        // anyway, so the middle of the view can keep tracing.
+        //
+        // Plain raster survives only as a final fallback for a device with no
+        // variable-rate shading, chosen at runtime below.
         static const Tier kTiers[] = {
-            {true, 0, "11 rays"},
-            {true, 1, "7 rays"},
-            {true, 2, "4 rays"},
-            {false, 2, "plain raster"},
+            {true, 0, 0, "11 rays"},
+            {true, 1, 0, "7 rays"},
+            {true, 2, 1, "4 rays, foveated"},
+            {true, 2, 2, "4 rays, foveated hard"},
         };
+        static const Tier kNoFoveation = {false, 2, 0, "plain raster"};
         static const int kLast = static_cast<int>(std::size(kTiers)) - 1;
         // Explicitly asking for a ray budget pins it -- an override that a
         // controller quietly walks away from is not an override.
@@ -523,8 +546,15 @@ void VulkanWindow::stepVr() {
                 std::fflush(stdout);
                 tierNow = want;
             }
-            rtEff = kTiers[tierNow].rt;
-            rayQEff = kTiers[tierNow].rayQ;
+            // Without variable-rate shading the bottom rung cannot buy its
+            // rays back, so it falls back to plain raster as before.
+            const Tier& t = (kTiers[tierNow].fov > 0 &&
+                             !renderer_->foveationAvailable())
+                                ? kNoFoveation
+                                : kTiers[tierNow];
+            rtEff = t.rt;
+            rayQEff = t.rayQ;
+            fovEff = t.fov;
         }
 
         // --- Measured sweep -------------------------------------------------
@@ -702,6 +732,7 @@ void VulkanWindow::stepVr() {
             renderer_->setRenderMode(vk::RenderMode::Raster);
             renderer_->setRayTracing(rtEff && rtAvailable());
             renderer_->setRayQuality(rayQEff);
+            renderer_->setFoveation(fovEnv >= 0 ? fovEnv : fovEff);
         }
         // A sun that stays put in the room. The desktop's key light rides the
         // camera, which is right when you orbit with a mouse and wrong the

@@ -298,6 +298,29 @@ Device createDevice(const GpuInfo& gpu,
     if (wantRt) extensions.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
     if (wantRq) extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
 
+    // Variable-rate shading, for foveation. Wanted only where it pays: this
+    // shades one fragment per tile of several pixels in the periphery, and
+    // every fragment here carries shadow and AO rays, so it removes rays in
+    // direct proportion. Useless on a CPU device.
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsrFeat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+    bool wantFsr = false;
+    if (gpu.hasFragmentShadingRate && !isCpu) {
+        VkPhysicalDeviceFragmentShadingRateFeaturesKHR have{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 probe2{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        probe2.pNext = &have;
+        vkGetPhysicalDeviceFeatures2(gpu.handle, &probe2);
+        // Only the ATTACHMENT source matters -- a per-pipeline or per-primitive
+        // rate cannot vary across the image, which is the entire point.
+        if (have.attachmentFragmentShadingRate) {
+            wantFsr = true;
+            fsrFeat.attachmentFragmentShadingRate = VK_TRUE;
+            extensions.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+        }
+    }
+
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipeline{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
     rtPipeline.rayTracingPipeline = VK_TRUE;
@@ -366,8 +389,13 @@ Device createDevice(const GpuInfo& gpu,
 
     VkPhysicalDeviceFeatures2 features{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    features.pNext = wantMultiview ? static_cast<void*>(&v11)
-                                   : static_cast<void*>(&v12);
+    void* chainHead = wantMultiview ? static_cast<void*>(&v11)
+                                    : static_cast<void*>(&v12);
+    if (wantFsr) {
+        fsrFeat.pNext = chainHead;
+        chainHead = &fsrFeat;
+    }
+    features.pNext = chainHead;
     features.features.samplerAnisotropy = VK_TRUE;
     features.features.fillModeNonSolid = VK_TRUE;
     // gl_PrimitiveID in a FRAGMENT shader (net highlighting looks the
@@ -395,6 +423,25 @@ Device createDevice(const GpuInfo& gpu,
     device.rayTracingEnabled = wantRt;
     device.rayQueryEnabled = wantRq;
     device.multiviewEnabled = wantMultiview;
+    device.shadingRateEnabled = wantFsr;
+    if (wantFsr) {
+        // The tile one texel of the rate attachment covers. Pick the runtime's
+        // MAXIMUM: the coarsest tiling makes the smallest attachment, and a
+        // foveation pattern is a smooth radial gradient that needs no fine
+        // detail to describe.
+        VkPhysicalDeviceFragmentShadingRatePropertiesKHR fsrProps{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &fsrProps;
+        vkGetPhysicalDeviceProperties2(gpu.handle, &p2);
+        if (fsrProps.maxFragmentShadingRateAttachmentTexelSize.width > 0) {
+            device.shadingRateTexelW =
+                fsrProps.maxFragmentShadingRateAttachmentTexelSize.width;
+            device.shadingRateTexelH =
+                fsrProps.maxFragmentShadingRateAttachmentTexelSize.height;
+        }
+    }
     {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(gpu.handle, &props);

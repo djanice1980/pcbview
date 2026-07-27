@@ -163,6 +163,9 @@ int gpuReport() {
                 "224)\n",
                 device.multiviewEnabled ? "yes" : "no",
                 device.maxPushConstants);
+    std::printf("Foveation (attachment VRS): %s (tile %ux%u)\n",
+                device.shadingRateEnabled ? "yes" : "no",
+                device.shadingRateTexelW, device.shadingRateTexelH);
 
     pcbview::destroyDevice(device);
     vkDestroyInstance(instance, nullptr);
