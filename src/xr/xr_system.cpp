@@ -590,6 +590,13 @@ bool qEnvSwapEyes() {
 // convention exactly matters: a frustum that merely looks reasonable renders
 // plausibly and reads as wrong depth through the lenses.
 //
+// The VR frustum's two ends, in ROOM metres. One definition each, because the
+// depth layer has to declare the same pair to the runtime and a copy that
+// drifted would describe a buffer we are not producing -- which the compositor
+// would then reproject wrongly, silently.
+constexpr float kVrNear = 0.01f;
+constexpr float kVrFar = 100.0f;
+
 // glm is column-major, so p[col][row].
 void projectionFromFov(const XrFovf& fov, float zNear, float out[16]) {
     const float tanL = std::tan(fov.angleLeft);
@@ -604,9 +611,30 @@ void projectionFromFov(const XrFovf& fov, float zNear, float out[16]) {
     p[5] = 2.0f / h;                 // p[1][1]
     p[8] = (tanR + tanL) / w;        // p[2][0]  x offset
     p[9] = (tanU + tanD) / h;        // p[2][1]  y offset
-    p[10] = 0.0f;                    // p[2][2]  infinite far
-    p[11] = -1.0f;                   // p[2][3]
-    p[14] = zNear;                   // p[3][2]  reverse-Z
+    // Reverse-Z with a FINITE far plane, and the finiteness is the point.
+    //
+    // This was an infinite reverse-Z projection: p[10] = 0, p[14] = zNear, so
+    // depth came out zNear/d -- 1 at the near plane, 0 at infinity. Correct,
+    // and free of a far plane to tune. But the depth layer has to tell the
+    // runtime what distance each end of the buffer means, and with infinity at
+    // minDepth that makes nearZ infinite. The spec allows farZ to be infinite;
+    // it never allows nearZ to be, and the usual linearisation
+    //
+    //     d = nearZ*farZ / (farZ + D*(nearZ - farZ))
+    //
+    // is inf/inf at nearZ = infinity. It is the right answer only as a limit,
+    // and a runtime that does not special-case it gets a NaN and reprojects
+    // with garbage. That matches what was measured: with depth submitted the
+    // image swims, with PCBVIEW_VR_DEPTH=0 it is steadier, because without
+    // depth the compositor falls back to a rigid warp it cannot get wrong.
+    //
+    // A finite far plane makes both ends ordinary numbers. Solving for
+    // ndc.z = 1 at zNear and 0 at zFar gives the two terms below. Reverse-Z
+    // keeps its precision either way -- the float exponent does the work, not
+    // the far plane -- and 100 m is past anything a board on a desk needs.
+    p[10] = zNear / (kVrFar - zNear);            // p[2][2]
+    p[11] = -1.0f;                               // p[2][3]
+    p[14] = zNear * kVrFar / (kVrFar - zNear);   // p[3][2]  reverse-Z
     // Vulkan's Y is flipped. clip.y is p[1][1]*y + p[2][1]*z, so BOTH terms
     // flip -- negating only the scale, as the symmetric path can get away with
     // because it has no offset, would shear the image off-centre.
@@ -1432,15 +1460,19 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
             ++timedFrames_;
             if (periods > 1) {
                 ++missedFrames_;
-                missedTotal_ += periods - 1;
+                missedTotal_ += static_cast<unsigned>(periods - 1);
             }
         }
         lastDisplayTime_ = fs.predictedDisplayTime;
 
         if (timedFrames_ >= 240) {
             const double hz = 1.0e9 / static_cast<double>(fs.predictedDisplayPeriod);
+            // "frame" and not "cpu": this is wall time from xrBeginFrame to
+            // xrEndFrame, which includes drawFrame blocking on the previous
+            // submission's fence. Reading it as CPU cost would send anyone
+            // optimising in the wrong direction.
             std::printf("vr-rate: %.0f Hz target | %u frames, %u late "
-                        "(%.1f%%), %u display periods lost | app cpu %.2f ms "
+                        "(%.1f%%), %u display periods lost | app frame %.2f ms "
                         "of %.2f ms\n",
                         hz, timedFrames_, missedFrames_,
                         100.0 * missedFrames_ / static_cast<double>(timedFrames_),
@@ -1691,7 +1723,7 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
                     continue;
 
                 float proj[16];
-                projectionFromFov(views[i].fov, 0.01f, proj);
+                projectionFromFov(views[i].fov, kVrNear, proj);
                 mask_[i].ndc.clear();
                 mask_[i].ndc.reserve(verts.size() * 2);
                 for (const XrVector2f& v : verts) {
@@ -1749,7 +1781,7 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
         e.height = (*chains_)[i].height;
         float proj[16];
         // 1mm near plane in ROOM metres, then scaled with everything else.
-        projectionFromFov(views[i].fov, 0.01f, proj);
+        projectionFromFov(views[i].fov, kVrNear, proj);
         const glm::mat4 P = glm::make_mat4(proj);
         const glm::mat4 V = glm::inverse(poseMatrix(views[i].pose));
         // World(mm) -> room -> eye -> clip, in one matrix, so the renderer is
@@ -1940,8 +1972,13 @@ void VrSession::endFrame() {
                 d.subImage.imageArrayIndex = 0;
                 d.minDepth = 0.0f;
                 d.maxDepth = 1.0f;
-                d.nearZ = std::numeric_limits<float>::infinity();
-                d.farZ = 0.01f;
+                // Both finite now. minDepth 0 is the far plane and maxDepth 1
+                // the near plane, so nearZ (the distance at minDepth) is 100 m
+                // and farZ (the distance at maxDepth) is the near plane --
+                // nearZ > farZ, which is how the spec says to declare reversed
+                // depth. Keep these in step with projectionFromFov's zFar.
+                d.nearZ = kVrFar;
+                d.farZ = kVrNear;
                 depths.push_back(d);
                 v.next = &depths.back();
             }
