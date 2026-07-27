@@ -133,11 +133,12 @@ bool System::start() {
                             "XR_META_foveation_eye_tracked") == 0)
                 haveFoveationExt = true;
         }
-        std::printf("vr-caps: eye gaze %s, runtime foveation %s\n",
-                    haveGazeExt ? "AVAILABLE" : "not offered",
-                    haveFoveationExt ? "AVAILABLE" : "not offered");
+        std::printf("vr-caps: eye gaze extension %s, runtime foveation %s\n",
+                    haveGazeExt ? "offered" : "not offered",
+                    haveFoveationExt ? "offered" : "not offered");
         std::fflush(stdout);
     }
+    eyeGazeExtension_ = haveGazeExt;
 
     // The visibility mask is the shape of what the LENSES can actually show.
     // SteamVR puts it at 22% of each eye on this headset -- better than a fifth
@@ -148,6 +149,9 @@ bool System::start() {
     std::vector<const char*> ext{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
     if (haveDepthExt) ext.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
     if (haveMaskExt) ext.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+    // Enabled purely so the system-properties query below is legal. Nothing
+    // consumes gaze yet; this is what tells us whether it COULD.
+    if (haveGazeExt) ext.push_back("XR_EXT_eye_gaze_interaction");
     XrInstanceCreateInfo ici{XR_TYPE_INSTANCE_CREATE_INFO};
     std::snprintf(ici.applicationInfo.applicationName,
                   sizeof(ici.applicationInfo.applicationName), "pcbview");
@@ -179,9 +183,29 @@ bool System::start() {
         return false;
     }
 
+    // Does the HEADSET actually do eye gaze, or does the runtime merely list
+    // the extension?
+    //
+    // Those are different questions and only the second one is answered by the
+    // extension list -- a runtime can offer XR_EXT_eye_gaze_interaction and
+    // then report no support for the attached device. Since eye-tracked
+    // foveation lives or dies on this, ask the system properties rather than
+    // inferring it, and say which of the two we actually established.
+    XrSystemEyeGazeInteractionPropertiesEXT gaze{
+        XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT};
     XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
+    if (eyeGazeExtension_) sp.next = &gaze;
     if (XR_SUCCEEDED(xrGetSystemProperties(inst, sys, &sp)))
         std::snprintf(headsetName_, sizeof(headsetName_), "%s", sp.systemName);
+    if (eyeGazeExtension_) {
+        eyeGazeSupported_ = gaze.supportsEyeGazeInteraction != 0;
+        std::printf("vr-caps: this headset reports eye gaze %s\n",
+                    eyeGazeSupported_ ? "SUPPORTED -- eye-tracked foveation is "
+                                        "reachable"
+                                      : "unsupported (extension listed, device "
+                                        "does not provide it)");
+        std::fflush(stdout);
+    }
 
     // MANDATORY, not informational. The spec requires the graphics-requirements
     // call for the chosen API before xrCreateSession, and skipping it makes

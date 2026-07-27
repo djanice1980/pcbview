@@ -43,6 +43,9 @@ public:
     // session knows whether to build depth swapchains.
     bool depthLayerSupported() const { return depthLayerSupported_; }
     bool visibilityMaskSupported() const { return visibilityMaskSupported_; }
+    // Whether the HEADSET provides eye gaze, not merely whether the runtime
+    // lists the extension. The prerequisite for eye-tracked foveation.
+    bool eyeGazeSupported() const { return eyeGazeSupported_; }
 
     // Route pcbview's Vulkan creation through the runtime. Must bracket the
     // createInstance/createDevice calls.
@@ -68,6 +71,8 @@ private:
     unsigned long long system_ = 0;  // XrSystemId
     bool depthLayerSupported_ = false;
     bool visibilityMaskSupported_ = false;
+    bool eyeGazeExtension_ = false;
+    bool eyeGazeSupported_ = false;
     char headsetName_[256] = {};
     VulkanCreationHooks hooks_{};
 };
