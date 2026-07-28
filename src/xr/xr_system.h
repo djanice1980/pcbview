@@ -170,6 +170,21 @@ public:
     // described before anything has been drawn into it.
     void setDepthValid(bool valid) { depthValid_ = valid; }
 
+    // How much of each swapchain image the renderer filled this frame.
+    //
+    // OpenXR's answer to dynamic resolution: render into part of the image and
+    // describe that rectangle, and the runtime maps it onto the view's whole
+    // field of view. It replaces stretching a smaller render up to fill the
+    // image, which could not carry depth with it. Zero means "all of it".
+    //
+    // Held across frames for the same reason as setDepthValid: a frame that is
+    // not redrawn resubmits the last drawn frame's images, and the rectangle
+    // that described them still does.
+    void setSubmitExtent(uint32_t w, uint32_t h) {
+        submitW_ = w;
+        submitH_ = h;
+    }
+
     // The hidden-area mesh for an eye, already projected to screen space:
     // pairs of floats in NDC, plus a triangle index list. Empty when the
     // runtime has no visibility mask, or before the first located frame -- the
@@ -307,6 +322,7 @@ private:
     VkImage depthTarget_ = VK_NULL_HANDLE;
     VkImageView depthTargetView_ = VK_NULL_HANDLE;
     bool depthValid_ = false;
+    uint32_t submitW_ = 0, submitH_ = 0;
     // Kept so the depth image views can be destroyed with the session.
     VkDevice device_ = VK_NULL_HANDLE;
     float placeCentre_[3] = {0, 0, 0};

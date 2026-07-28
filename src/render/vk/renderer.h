@@ -338,6 +338,15 @@ public:
     // worse than not submitting it -- see the comment at the test site.
     bool vrDepthWritten() const { return vrDepthWritten_; }
 
+    // How much of the runtime's images the last drawFrame actually filled.
+    //
+    // Below full resolution the scene lands in the corner at 1:1 rather than
+    // being stretched to fill, so the runtime has to be told the rectangle --
+    // that is what keeps depth usable at every rung. Equal to the eye's size
+    // whenever the scene is the same size or larger.
+    uint32_t vrSubmitWidth() const { return vrSubmitW_; }
+    uint32_t vrSubmitHeight() const { return vrSubmitH_; }
+
     // This eye's hidden-area mesh, in NDC, uploaded once per eye and then
     // referenced by index. Drawn into depth at the head of the scene pass so
     // the rasterizer discards the fragments the lenses cannot show -- 22% of
@@ -850,6 +859,7 @@ private:
     VkImageView vrDepthView_ = VK_NULL_HANDLE;
     VkImage vrDepthImage_ = VK_NULL_HANDLE;
     bool vrDepthWritten_ = false;
+    uint32_t vrSubmitW_ = 0, vrSubmitH_ = 0;
 
     // --- Hidden-area mesh ---------------------------------------------------
     struct MaskBuffers {

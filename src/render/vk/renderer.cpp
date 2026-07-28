@@ -4554,14 +4554,40 @@ void Renderer::recordVrBlit(VkCommandBuffer cmd) {
     barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
             VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
+    // Render SMALLER than the eye and it goes in the corner at 1:1, not
+    // stretched to fill.
+    //
+    // Stretching was what cost us depth. The runtime's depth image is fixed at
+    // the eye's resolution and cannot be resized mid-session, and depth cannot
+    // be scaled into it -- blitting depth is optional in Vulkan, most formats
+    // refuse it, and interpolating depth across a silhouette invents a surface
+    // that is not there. So every rung below full resolution silently dropped
+    // the depth layer.
+    //
+    // OpenXR's own answer to dynamic resolution is subImage.imageRect: render
+    // into part of the swapchain image and tell the runtime how much you used.
+    // It maps that rectangle onto the view's full field of view and scales it
+    // itself, at the same point it is already resampling for the lenses. The
+    // depth pass then needs nothing special -- a renderArea smaller than its
+    // attachment writes the matching corner for free.
+    //
+    // Supersampling still scales, because there the source is LARGER than the
+    // eye and the point of the blit is to resolve it down. Hence min(): shrink
+    // to the corner, grow to the whole image.
+    const uint32_t subW = std::min(sceneExtent_.width, dw);
+    const uint32_t subH = std::min(sceneExtent_.height, dh);
+    vrSubmitW_ = subW;
+    vrSubmitH_ = subH;
+
     VkImageBlit region{};
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.srcOffsets[1] = {static_cast<int32_t>(sceneExtent_.width),
                             static_cast<int32_t>(sceneExtent_.height), 1};
     region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.dstOffsets[1] = {static_cast<int32_t>(dw),
-                            static_cast<int32_t>(dh), 1};
-    // LINEAR: this is also the supersample resolve.
+    region.dstOffsets[1] = {static_cast<int32_t>(subW),
+                            static_cast<int32_t>(subH), 1};
+    // LINEAR: this is also the supersample resolve. At 1:1 it samples texel
+    // centres and copies exactly.
     vkCmdBlitImage(cmd, sceneColor_.handle,
                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
@@ -4853,16 +4879,20 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // would then bend the image around geometry that was never there. Taking
     // one sample's depth is the standard choice for exactly that reason.
     //
-    // The size test is not a detail. The runtime's depth image is fixed at the
-    // eye's resolution, and depth cannot be scaled on the way out -- so the
-    // moment the scene renders at any other size (the adaptive ladder's 0.80x
-    // and 0.65x rungs do exactly that), nothing is written here at all. The
-    // caller has to be told, because submitting the depth LAYER over an image
-    // this frame did not write hands the compositor a depth buffer belonging to
-    // some earlier pose and it warps every pixel by it.
+    // Smaller than the eye is fine, and is the normal case on every rung below
+    // full resolution. A renderArea smaller than its attachment simply writes
+    // that corner, which is exactly the corner recordVrBlit puts the colour in
+    // and exactly the rectangle endFrame describes to the runtime.
+    //
+    // LARGER is not fine: supersampling renders above the eye's resolution and
+    // there is nowhere to put the extra depth, since the runtime's image cannot
+    // grow and depth cannot be scaled down. The caller is told, because
+    // submitting the depth LAYER over an image this frame did not write hands
+    // the compositor a depth buffer belonging to some earlier pose and it warps
+    // every pixel by it.
     const bool vrDepth =
-        vrDepthView_ != VK_NULL_HANDLE && vrTargetW_ == sceneExtent_.width &&
-        vrTargetH_ == sceneExtent_.height;
+        vrDepthView_ != VK_NULL_HANDLE && sceneExtent_.width <= vrTargetW_ &&
+        sceneExtent_.height <= vrTargetH_;
     vrDepthWritten_ = vrDepth;
     if (vrDepth) {
         if (msaaActive()) {

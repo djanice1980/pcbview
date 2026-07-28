@@ -1049,6 +1049,9 @@ void VulkanWindow::stepVr() {
         // last drawn frame produced, and its depth still matches them.
         const bool depthOk = renderer_->vrDepthWritten();
         vr_->setDepthValid(depthOk);
+        // And how much of the images that frame actually covers.
+        vr_->setSubmitExtent(renderer_->vrSubmitWidth(),
+                             renderer_->vrSubmitHeight());
         if (depthOk != vrDepthWasOk_) {
             vrDepthWasOk_ = depthOk;
             std::printf("vr-depth: %s (scene %.2fx eye)\n",

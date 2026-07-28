@@ -2161,10 +2161,21 @@ void VrSession::endFrame() {
             // swap, and one run with this set settles whether the ordering is
             // the fault far faster than reasoning about sign conventions.
             v.subImage.swapchain = (*chains_)[swapEyes_ ? (1 - i) : i].chain;
+            // The rectangle the renderer filled, which is the whole image at
+            // full resolution and its top-left corner on every rung below.
+            // The runtime maps this onto the view's entire field of view, so
+            // describing it is what makes rendering smaller legal rather than
+            // merely cheaper -- and, unlike stretching the colour ourselves,
+            // depth comes along.
+            const uint32_t rectW =
+                submitW_ ? std::min(submitW_, (*chains_)[i].width)
+                         : (*chains_)[i].width;
+            const uint32_t rectH =
+                submitH_ ? std::min(submitH_, (*chains_)[i].height)
+                         : (*chains_)[i].height;
             v.subImage.imageRect.offset = {0, 0};
-            v.subImage.imageRect.extent = {
-                static_cast<int32_t>((*chains_)[i].width),
-                static_cast<int32_t>((*chains_)[i].height)};
+            v.subImage.imageRect.extent = {static_cast<int32_t>(rectW),
+                                           static_cast<int32_t>(rectH)};
             v.subImage.imageArrayIndex = 0;
 
             // REVERSED-Z, and the mapping has to say so or the runtime will
@@ -2192,10 +2203,12 @@ void VrSession::endFrame() {
                 XrCompositionLayerDepthInfoKHR d{
                     XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR};
                 d.subImage.swapchain = (*chains_)[i].depthChain;
+                // The SAME rectangle as the colour. Two rects that disagreed
+                // would describe different parts of the view to a compositor
+                // that assumes they are the same pixels.
                 d.subImage.imageRect.offset = {0, 0};
-                d.subImage.imageRect.extent = {
-                    static_cast<int32_t>((*chains_)[i].width),
-                    static_cast<int32_t>((*chains_)[i].height)};
+                d.subImage.imageRect.extent = {static_cast<int32_t>(rectW),
+                                               static_cast<int32_t>(rectH)};
                 d.subImage.imageArrayIndex = 0;
                 d.minDepth = 0.0f;
                 d.maxDepth = 1.0f;
