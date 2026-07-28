@@ -1368,6 +1368,17 @@ void VrSession::setBoardSizeMul(float m) {
 
 float VrSession::boardSizeMetres() const { return placeSizeM_; }
 
+float VrSession::eyeSeparationMetres() const {
+    if (lastViews_.size() < 2) return 0.063f;  // a typical adult IPD
+    const float dx = lastViews_[1].pos[0] - lastViews_[0].pos[0];
+    const float dy = lastViews_[1].pos[1] - lastViews_[0].pos[1];
+    const float dz = lastViews_[1].pos[2] - lastViews_[0].pos[2];
+    const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+    // A runtime that has not located the views yet reports both eyes at the
+    // origin; fall back rather than collapse the stereo to zero.
+    return (d > 0.03f && d < 0.12f) ? d : 0.063f;
+}
+
 bool VrSession::eyeFov(int i, float out4[4]) const {
     if (i < 0 || static_cast<size_t>(i) >= lastViews_.size()) return false;
     for (int k = 0; k < 4; ++k) out4[k] = lastViews_[i].fov[k];

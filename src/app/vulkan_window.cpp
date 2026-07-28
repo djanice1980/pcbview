@@ -1528,12 +1528,16 @@ void VulkanWindow::stepVr() {
             // and fixed so it stays put however the board is manipulated.
             // PCBVIEW_VR_HUD_M overrides it while that number is being judged.
             float fov[4] = {-0.9f, 0.9f, 0.9f, -0.9f};
-            if (vr_->eyeFov(static_cast<int>(i), fov) && eyes.size() >= 2) {
-                const glm::vec3 e0(eyes[0].eye[0], eyes[0].eye[1],
-                                   eyes[0].eye[2]);
-                const glm::vec3 e1(eyes[1].eye[0], eyes[1].eye[1],
-                                   eyes[1].eye[2]);
-                const float ipd = glm::length(e1 - e0);
+            if (vr_->eyeFov(static_cast<int>(i), fov)) {
+                // From the ROOM, not from the Eye structs. Those carry the eye
+                // position in BOARD space -- millimetres scaled by the
+                // placement -- so a separation measured from them grows with
+                // the board. That is what made the panel's two images drift
+                // apart and together as the board was zoomed: the depth was
+                // being computed from an "IPD" that changed size with the
+                // scene. The viewer's own geometry has to come from the
+                // viewer's own units.
+                const float ipd = vr_->eyeSeparationMetres();
                 static const float D = [] {
                     bool ok = false;
                     const float v = qgetenv("PCBVIEW_VR_HUD_M").toFloat(&ok);

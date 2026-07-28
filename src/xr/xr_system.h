@@ -197,6 +197,14 @@ public:
     // DISTANCE: the frusta are asymmetric, so the same pixel means a different
     // angle in each eye, and the shift that fixes it depends on both.
     bool eyeFov(int i, float out4[4]) const;
+    // The viewer's interpupillary distance, in ROOM METRES.
+    //
+    // Deliberately not derivable from the Eye positions handed to the render
+    // loop: those are in BOARD space, in millimetres scaled by the placement,
+    // so a separation computed from them grows and shrinks with the board.
+    // Anything reasoning about the viewer's own geometry -- stereo depth for an
+    // overlay, say -- needs the room's units and not the board's.
+    float eyeSeparationMetres() const;
 
     // Grow or shrink the board in the room, about the size it was placed at.
     // The way to read fine detail without putting your face in it -- see the
