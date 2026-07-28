@@ -1496,6 +1496,46 @@ void VulkanWindow::stepVr() {
             renderer_->setTemporalSlot(allowPt ? static_cast<int>(i) : -1,
                                        histFrames);
             renderer_->setRayCamera(e.eye, e.fwd, e.right, e.up, false);
+
+            // Put the overlay OUT THERE, at the board, rather than against the
+            // viewer's face.
+            //
+            // Drawn at the same pixels in both eyes it is not at "no depth" --
+            // it is at whatever depth the frusta impose, and these are strongly
+            // asymmetric (eye 0 spans -1.073 to +0.758 rad). A point straight
+            // ahead of eye 0 lands at ndc.x +0.325, and at -0.325 for eye 1, so
+            // identical pixels carry a large convergent disparity: the panel
+            // reads as centimetres from the eyes and has to be crossed at.
+            //
+            // Solve it properly instead of nudging the position. For a panel
+            // centred at distance D straight ahead of the head, this eye sees
+            // it at horizontal tangent t = -ex/D, where ex is the eye's own
+            // lateral offset, and projectionFromFov puts that at
+            //     ndc.x = (2t - tanR - tanL) / (tanR - tanL)
+            // which is the shift the overlay needs, in pixels.
+            //
+            // D is the board's own distance, so the text sits in the same
+            // depth plane as the thing being read -- no refocusing to check a
+            // number, which is the whole complaint.
+            float fov[4] = {-0.9f, 0.9f, 0.9f, -0.9f};
+            if (vr_->eyeFov(static_cast<int>(i), fov) && eyes.size() >= 2) {
+                const glm::vec3 e0(eyes[0].eye[0], eyes[0].eye[1],
+                                   eyes[0].eye[2]);
+                const glm::vec3 e1(eyes[1].eye[0], eyes[1].eye[1],
+                                   eyes[1].eye[2]);
+                const float ipd = glm::length(e1 - e0);
+                const float D = std::clamp(vr_->boardDistance(), 0.25f, 4.0f);
+                const float ex = (i == 0 ? -0.5f : 0.5f) * ipd;
+                const float tanL = std::tan(fov[0]);
+                const float tanR = std::tan(fov[1]);
+                const float t = -ex / D;
+                const float ndcx =
+                    (2.0f * t - tanR - tanL) / std::max(tanR - tanL, 1.0e-3f);
+                renderer_->setOverlayShiftPx(
+                    ndcx * 0.5f *
+                    static_cast<float>(width()) *
+                    static_cast<float>(devicePixelRatio()));
+            }
             // Eye 0 presents, so the desktop window becomes a mirror of the
             // left eye; eye 1 renders offscreen. Presenting both made the
             // window flip between two viewpoints every frame.
@@ -3944,11 +3984,13 @@ void VulkanWindow::buildOverlay() {
         if (age > kHoldMs) {
             padStatus_.clear();
         } else {
-            const VkExtent2D se = renderer_->sceneExtent();
-            const float w = se.width > 0 ? static_cast<float>(se.width)
-                                         : static_cast<float>(width()) * dpr;
-            const float h = se.height > 0 ? static_cast<float>(se.height)
-                                          : static_cast<float>(height()) * dpr;
+            // WINDOW pixels, which is what the overlay shader normalises by --
+            // it divides through extent_, the window, and the viewport stretches
+            // that across whatever it is drawn into. Laying out against the
+            // scene extent instead put the panel well off centre in VR, where
+            // the eye target (2082x2122) and the window (1628x1738) differ.
+            const float w = static_cast<float>(width()) * dpr;
+            const float h = static_cast<float>(height()) * dpr;
             const float fade =
                 age < kHoldMs * 2 / 3
                     ? 1.0f
@@ -3989,11 +4031,9 @@ void VulkanWindow::buildOverlay() {
     // laying it out in window pixels would push it off to one side of both
     // eyes. On the desktop the two are the same and this changes nothing.
     if (viewMenuOpen_) {
-        const VkExtent2D se = renderer_->sceneExtent();
-        const float w = se.width > 0 ? static_cast<float>(se.width)
-                                     : static_cast<float>(width()) * dpr;
-        const float h = se.height > 0 ? static_cast<float>(se.height)
-                                      : static_cast<float>(height()) * dpr;
+        // Window pixels, as above: the shader normalises by the window extent.
+        const float w = static_cast<float>(width()) * dpr;
+        const float h = static_cast<float>(height()) * dpr;
         // Scaled to the target rather than to the desktop's DPI, so it reads
         // the same size through the lenses as it does on a monitor.
         const float ts = std::max(13.0f, h * 0.022f);

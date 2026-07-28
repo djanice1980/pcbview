@@ -3407,7 +3407,8 @@ void Renderer::recordOverlay(VkCommandBuffer cmd, VkExtent2D drawArea) {
     // Always the WINDOW size: vertices are in window pixels, and the viewport
     // above does the stretching when drawArea is a bigger export target.
     const float vpPush[4] = {static_cast<float>(extent_.width),
-                             static_cast<float>(extent_.height), 0.0f, 0.0f};
+                             static_cast<float>(extent_.height),
+                             overlayShiftPx_, 0.0f};
     vkCmdPushConstants(cmd, overlayLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0,
                        sizeof(vpPush), vpPush);
     VkDeviceSize zero = 0;

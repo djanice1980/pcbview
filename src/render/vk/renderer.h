@@ -143,6 +143,14 @@ public:
     // resolution, over every render mode. An empty vector clears it.
     void setOverlay(std::vector<float> tris) { overlayTris_ = std::move(tris); }
 
+    // Horizontal shift, in the same window pixels the overlay is authored in,
+    // applied to THIS eye's copy. That shift is what gives a screen-space
+    // overlay a distance in stereo: identical pixels in both eyes carry
+    // whatever disparity the frusta impose, which on an asymmetric pair is
+    // large and convergent, so the panel sits against the viewer's face. Set
+    // per eye each frame; zero on the desktop.
+    void setOverlayShiftPx(float px) { overlayShiftPx_ = px; }
+
     // Net highlighting: light up every triangle on `net` (an index into the
     // BoardMesh net table) and mute the rest, so one signal can be followed
     // across layers and through the exploded view. -1 clears.
@@ -697,6 +705,7 @@ private:
     VkPipeline overlayPipeline_ = VK_NULL_HANDLE;
     std::vector<Buffer> overlayVb_;
     std::vector<float> overlayTris_;
+    float overlayShiftPx_ = 0.0f;
 
     VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;

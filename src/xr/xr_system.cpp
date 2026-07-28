@@ -1368,6 +1368,12 @@ void VrSession::setBoardSizeMul(float m) {
 
 float VrSession::boardSizeMetres() const { return placeSizeM_; }
 
+bool VrSession::eyeFov(int i, float out4[4]) const {
+    if (i < 0 || static_cast<size_t>(i) >= lastViews_.size()) return false;
+    for (int k = 0; k < 4; ++k) out4[k] = lastViews_[i].fov[k];
+    return true;
+}
+
 float VrSession::eyeFovHalfY() const {
     // Half the vertical field of view, from the runtime's own numbers rather
     // than a guess. The quality model needs it to turn "the board is 0.15 m

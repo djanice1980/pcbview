@@ -192,6 +192,11 @@ public:
     // is.
     float boardSizeMetres() const;
     float eyeFovHalfY() const;
+    // This eye's four FOV half-angles (left, right, up, down) as the runtime
+    // reported them. Needed to place a screen-space overlay at a chosen
+    // DISTANCE: the frusta are asymmetric, so the same pixel means a different
+    // angle in each eye, and the shift that fixes it depends on both.
+    bool eyeFov(int i, float out4[4]) const;
 
     // Grow or shrink the board in the room, about the size it was placed at.
     // The way to read fine detail without putting your face in it -- see the
