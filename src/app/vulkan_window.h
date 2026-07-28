@@ -400,6 +400,9 @@ private:
     float vrSizeMul_ = 1.0f;
     // SQUARE held: the labelled view menu is up and the D-pad picks from it.
     bool viewMenuOpen_ = false;
+    // An eased D-pad quarter-turn in flight, and where it is heading.
+    bool boardTurning_ = false;
+    glm::quat boardTurnTarget_{1.0f, 0.0f, 0.0f, 0.0f};
     // Edge-triggered logging for the depth layer: it turns itself off whenever
     // the quality ladder renders at a fraction of the eye's resolution, and
     // that transition needs to be visible in the log rather than inferred.
@@ -418,6 +421,10 @@ public:
     // drive from a Sense controller's grip.
     void rotateBoard(const glm::vec3& axisWorldSpace, float radians);
     void setBoardRotation(const glm::quat& q);
+    // A quarter-turn that EASES rather than snapping -- the D-pad's discrete
+    // board turns. Composes onto the pending target, so two quick presses give
+    // a half turn instead of the second restarting from mid-animation.
+    void turnBoardBy(const glm::vec3& axisBoardSpace, float radians);
 
     // Turn the board by exactly as much as moving the camera from `before` to
     // `after` would have appeared to, and leave the camera alone.

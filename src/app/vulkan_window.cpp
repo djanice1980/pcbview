@@ -1830,6 +1830,46 @@ void VulkanWindow::stepGamepad() {
         if (g.pressedDpadDown) setViewBottom();
         if (g.pressedDpadLeft) setViewIso();
         if (g.pressedDpadRight) frameBoard();
+    } else {
+        // Unmodified, the D-pad turns the BOARD in quarter-turns: up and down
+        // tumble it away and toward you, left and right spin it in its own
+        // plane. Two presses of up is end over end, which is the move you make
+        // with a real board when you want the other side.
+        //
+        // Axes in BOARD space, so "flip it over" means about its own edge
+        // however it happens to be oriented at the time -- the same thing your
+        // hands would do. Screen-space axes would make the result depend on
+        // where you were standing.
+        //
+        // Discrete quarter-turns rather than a rate, which is what makes them
+        // worth having alongside the sticks: the sticks turn the board to any
+        // angle, these return it to a square one.
+        constexpr float kQuarter = 1.5707963f;
+        if (g.pressedDpadUp) turnBoardBy({1.0f, 0.0f, 0.0f}, kQuarter);
+        if (g.pressedDpadDown) turnBoardBy({1.0f, 0.0f, 0.0f}, -kQuarter);
+        if (g.pressedDpadLeft) turnBoardBy({0.0f, 0.0f, 1.0f}, kQuarter);
+        if (g.pressedDpadRight) turnBoardBy({0.0f, 0.0f, 1.0f}, -kQuarter);
+    }
+
+    // Ease toward the quarter-turn target. A large object teleporting a half
+    // turn right in front of your face is unpleasant even when it is the board
+    // moving and not you, so this covers the distance in about a quarter of a
+    // second. A stick cancels it: fighting an animation for control of the
+    // same rotation is worse than losing the animation.
+    if (boardTurning_) {
+        if (g.rightX != 0.0f || g.rightY != 0.0f || g.heldTouchpad) {
+            boardTurning_ = false;
+        } else {
+            const float t = std::clamp(fdt * 6.0f, 0.0f, 1.0f);
+            board_.rotation =
+                glm::normalize(glm::slerp(board_.rotation, boardTurnTarget_, t));
+            if (glm::abs(glm::dot(board_.rotation, boardTurnTarget_)) >
+                0.99999f) {
+                board_.rotation = boardTurnTarget_;
+                boardTurning_ = false;
+            }
+            moved = true;
+        }
     }
     if (viewMenuOpen_ != menuWasOpen) {
         buildOverlay();
@@ -2375,6 +2415,19 @@ void VulkanWindow::rotateBoard(const glm::vec3& axisBoardSpace, float radians) {
     // already reasoning in.
     board_.rotation = glm::normalize(
         glm::angleAxis(radians, axisBoardSpace / len) * board_.rotation);
+    requestUpdate();
+}
+
+void VulkanWindow::turnBoardBy(const glm::vec3& axisBoardSpace, float radians) {
+    const float len = glm::length(axisBoardSpace);
+    if (radians == 0.0f || len < 1e-6f) return;
+    // Compose onto the TARGET, not onto the current rotation, so pressing twice
+    // quickly gives a half turn rather than the second press restarting from
+    // wherever the first had eased to.
+    const glm::quat from = boardTurning_ ? boardTurnTarget_ : board_.rotation;
+    boardTurnTarget_ = glm::normalize(
+        glm::angleAxis(radians, axisBoardSpace / len) * from);
+    boardTurning_ = true;
     requestUpdate();
 }
 
