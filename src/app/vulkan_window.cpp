@@ -1523,10 +1523,13 @@ void VulkanWindow::stepVr() {
             // not do; and the board sits around 0.4 m, which is a close focus to
             // hold and still reads as being in your face.
             //
-            // Two metres instead. Far enough that the eyes are near their
-            // resting convergence, so the panel costs nothing to glance at,
-            // and fixed so it stays put however the board is manipulated.
-            // PCBVIEW_VR_HUD_M overrides it while that number is being judged.
+            // Eight metres, judged in the headset rather than reasoned about.
+            //
+            // Two was the textbook answer and it still read as close. At eight
+            // the eyes are essentially parallel, so a glance at the panel costs
+            // no convergence at all and there is nothing to refocus when the
+            // board is at arm's length. Fixed, so it stays put however the
+            // board is scaled or moved. PCBVIEW_VR_HUD_M overrides.
             float fov[4] = {-0.9f, 0.9f, 0.9f, -0.9f};
             if (vr_->eyeFov(static_cast<int>(i), fov)) {
                 // From the ROOM, not from the Eye structs. Those carry the eye
@@ -1541,7 +1544,7 @@ void VulkanWindow::stepVr() {
                 static const float D = [] {
                     bool ok = false;
                     const float v = qgetenv("PCBVIEW_VR_HUD_M").toFloat(&ok);
-                    return (ok && v >= 0.5f && v <= 20.0f) ? v : 2.0f;
+                    return (ok && v >= 0.5f && v <= 20.0f) ? v : 8.0f;
                 }();
                 const float ex = (i == 0 ? -0.5f : 0.5f) * ipd;
                 const float tanL = std::tan(fov[0]);
