@@ -5419,8 +5419,41 @@ bool Renderer::fetchCapture(std::vector<uint8_t>& out, uint32_t& w,
 void Renderer::setCaptureExtent(uint32_t w, uint32_t h) {
     if (captureExtent_.width == w && captureExtent_.height == h) return;
     captureExtent_ = {w, h};
-    if (extent_.width > 0 && extent_.height > 0)
-        resize(extent_.width, extent_.height);
+    if (extent_.width == 0 || extent_.height == 0) return;
+
+    // Scene targets only. NOT the swapchain.
+    //
+    // This called resize(), which destroys and recreates the swapchain and its
+    // semaphores along with everything else -- for a change that alters nothing
+    // about the window. The swapchain is the window's and the window is exactly
+    // the size it was.
+    //
+    // In VR that is not a rare event. The adaptive ladder changes the scene
+    // size every time it moves between resolution rungs, which is every time
+    // the viewer leans across a distance threshold, and swapchain recreation on
+    // Windows goes through WSI and the display driver and is slow out of all
+    // proportion to the images involved. The session log makes it plain: every
+    // 240-frame window containing a rung change lost 8 display periods, about
+    // 89 ms, while every window without one lost none. That is the board
+    // "bouncing around wildly and then fixing itself".
+    //
+    // What genuinely depends on the capture extent is the scene targets --
+    // destroySceneTargets takes the bloom texture with them, so the three calls
+    // below are self-contained.
+    //
+    // Timed, because "the swapchain was the expensive part" is a claim about
+    // where 89 ms went and it should be measured rather than believed.
+    const auto t0 = std::chrono::steady_clock::now();
+    vkDeviceWaitIdle(device_.handle);
+    destroySceneTargets();
+    createSceneTargets();
+    createBloomTargets();
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    std::printf("vr-retarget: scene %ux%u rebuilt in %.1f ms\n",
+                sceneExtent_.width, sceneExtent_.height, ms);
+    std::fflush(stdout);
 }
 
 void Renderer::resize(uint32_t width, uint32_t height) {
