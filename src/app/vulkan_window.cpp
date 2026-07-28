@@ -326,6 +326,23 @@ void VulkanWindow::stepVr() {
         return (ok && n >= 0 && n <= 2) ? n : -1;
     }();
     int fovEff = fovEnv >= 0 ? fovEnv : 0;
+    // PCBVIEW_VR_RT=0 forces the shadow and AO rays off for the whole session,
+    // whatever the ladder, the model or the Render menu would have chosen.
+    //
+    // A diagnostic, and a decisive one. The rays are the only part of the frame
+    // whose cost depends on which way a surface faces: on the shadowed side
+    // they meet the board slab within a few BVH nodes, on the lit side they fly
+    // into open space and traverse the whole structure before missing. Turning
+    // them off makes both faces cost the same, so if an artefact that appears
+    // on one face and not the other survives it, lighting cost is not what
+    // causes it. The Render menu can do this too, but only before entering VR
+    // and only if the ladder does not override it, which is exactly how the
+    // last attempt ended up logging "ray-traced raster" anyway.
+    static const int rtEnv = [] {
+        const QByteArray v = qgetenv("PCBVIEW_VR_RT");
+        if (v.isEmpty()) return -1;
+        return (v == "0" || v == "false") ? 0 : 1;
+    }();
 
     // Both eyes' GPU time for the frame just completed. Taken once, here, so
     // the ladder below and the sweep see the same number.
@@ -1281,6 +1298,10 @@ void VulkanWindow::stepVr() {
                 vrSweepAdvance_ = false;   // too early; swallow it
             }
         }
+
+        // The override goes here, after every chooser has had its say, so
+        // nothing downstream can quietly turn the rays back on.
+        if (rtEnv >= 0) rtEff = rtEnv != 0;
 
         // Say what is actually running, once.
         //
