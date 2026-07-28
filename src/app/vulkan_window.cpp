@@ -994,14 +994,43 @@ void VulkanWindow::stepVr() {
                     // nothing to learn -- which is when the previous fit is
                     // still the best answer available, so keep it.
                     const double den = f.n * f.xx - f.x * f.x;
-                    if (f.n > 30.0 && den > 1.0e-6) {
+                    // Refuse to refit when the workload has not MOVED.
+                    //
+                    // Slope and intercept trade off against each other, and the
+                    // only thing that separates them is variation in x. Hold
+                    // still and the fragment count barely changes, so the fit
+                    // slides freely along that trade-off and lands anywhere:
+                    // the log showed k=[0.02 0.01 0.01] with fixed at 3.65 ms
+                    // and again at 5.25 ms -- the constant swallowing the whole
+                    // frame while fragments came out nearly free. An absolute
+                    // floor on the determinant cannot catch that, because with
+                    // a thousand samples it passes on noise alone.
+                    //
+                    // Require the spread to be a real FRACTION of the mean
+                    // instead. Below that the previous fit is the better
+                    // answer, and there is nothing to learn from standing
+                    // still anyway.
+                    const double meanX = f.x / std::max(f.n, 1.0);
+                    const double varX = f.xx / std::max(f.n, 1.0) - meanX * meanX;
+                    const double spread =
+                        meanX > 1.0e-6 ? std::sqrt(std::max(varX, 0.0)) / meanX
+                                       : 0.0;
+                    if (f.n > 30.0 && den > 1.0e-6 && spread > 0.12) {
                         const double k = (f.n * f.xy - f.x * f.y) / den;
                         const double b = (f.y - k * f.x) / f.n;
                         // A negative slope or intercept is the fit telling us
                         // the data was degenerate this instant, not that rays
                         // are free. Clamp rather than believe it.
+                        //
+                        // The intercept ceiling is 2.5 ms and that is a
+                        // statement about the renderer, not a fudge: the
+                        // non-fragment work is the visibility mask, the eye
+                        // blit, bloom and the per-eye fixed cost. It is not
+                        // five milliseconds. Allowing it to be lets it eat the
+                        // budget and leaves the chooser pricing every
+                        // configuration identically.
                         f.k = std::clamp(k, 0.0, 100.0);
-                        f.b = std::clamp(b, 0.0, 8.0);
+                        f.b = std::clamp(b, 0.0, 2.5);
                         f.known = true;
                     }
                 }
