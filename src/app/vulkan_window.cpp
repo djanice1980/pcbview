@@ -738,12 +738,31 @@ void VulkanWindow::stepVr() {
         // without having to perturb anything deliberately. Accumulators decay
         // so the fit follows the board and the view rather than averaging the
         // whole session.
+        // ONE fit, over fragments TIMES rays -- not one per ray level.
+        //
+        // Three independent lines was the mistake, and the log showed exactly
+        // how it fails. Each level is only ever fitted on the frames it happens
+        // to run during, so k[0] was learned while the viewer was far away and
+        // everything was cheap while k[2] was learned up close where it was
+        // not. The regression cannot tell "this configuration is cheaper" from
+        // "the view got easier", so the three lines drift apart on view history
+        // alone. One session ended at k=[0.06 0.32 0.46]: eleven rays priced
+        // seven times cheaper per fragment than four, which is impossible, and
+        // a chooser fed that will thrash forever.
+        //
+        // Rays are very nearly linear in cost -- a clean session measured
+        // [1.89 1.35 0.74] for 11, 7 and 4 rays, ratios of 2.55 and 1.82
+        // against ray-count ratios of 2.75 and 1.75 -- so folding the ray count
+        // into the regressor gives one well-conditioned line that every frame
+        // contributes to, whatever configuration it ran. It cannot invert,
+        // because there is nothing left to invert against.
         struct Fit {
             double n = 0.0, x = 0.0, y = 0.0, xx = 0.0, xy = 0.0;
-            double k = 0.0, b = 0.0;   // ms per fragment, ms fixed
+            double k = 0.0, b = 0.0;   // ms per (Mfrag * ray), ms fixed
             bool known = false;
         };
-        static Fit fits[3];
+        static Fit fit;
+        static const double kRayCount[3] = {11.0, 7.0, 4.0};
         // How badly the fit has recently UNDER-predicted, as a multiplier on
         // every prediction.
         //
@@ -777,6 +796,9 @@ void VulkanWindow::stepVr() {
         // established does not fit.
         static int rejectedScore = 1000;
         static int rejectCooldown = 0;
+        // Consecutive evaluations on which the CURRENT setting fitted. Reaching
+        // for something richer needs a run of these, not one lucky frame.
+        static int comfortable = 0;
         // Whether the model is the one choosing. The distance ladder still runs
         // underneath -- it seeds the fit and covers devices that cannot count
         // fragments -- but once the model takes over, the ladder's own
@@ -953,11 +975,12 @@ void VulkanWindow::stepVr() {
                     // frame to the 4-ray coefficient, so k[0] and k[1] stayed
                     // at zero forever and k[2] swung over a twelvefold range.
                     const int q = std::clamp(appliedRayQ, 0, 2);
-                    Fit& f = fits[q];
-                    // Fragments in millions, so the accumulators stay in a
-                    // range where the normal equations are numerically sane --
-                    // squaring two million raw would not be.
-                    const double x = frameFragInv * 1.0e-6;
+                    Fit& f = fit;
+                    // Fragments in millions TIMES the ray count they each fired
+                    // -- the actual unit of work. Millions so the accumulators
+                    // stay in a range where the normal equations are
+                    // numerically sane; squaring two million raw would not be.
+                    const double x = frameFragInv * 1.0e-6 * kRayCount[q];
                     const double y = frameGpuMs;
                     const double decay = 0.999;
                     f.n = f.n * decay + 1.0;
@@ -1004,23 +1027,7 @@ void VulkanWindow::stepVr() {
                 // towards "that will be more expensive than you think", which
                 // costs a little quality and never a dropped frame. The moment
                 // that level actually runs, measurement replaces the guess.
-                static const double kRays[3] = {11.0, 7.0, 4.0};
-                auto fitFor = [&](int q, double* k, double* b) -> bool {
-                    if (fits[q].known) {
-                        *k = fits[q].k;
-                        *b = fits[q].b;
-                        return true;
-                    }
-                    for (int s = 0; s < 3; ++s)
-                        if (fits[s].known) {
-                            *k = fits[s].k * std::pow(kRays[q] / kRays[s], 1.3);
-                            *b = fits[s].b;  // fixed cost does not follow rays
-                            return true;
-                        }
-                    return false;
-                };
-                double k0 = 0.0, b0 = 0.0;
-                modelReady = fitFor(2, &k0, &b0);
+                modelReady = fit.known;
 
                 if (modelReady && frameFragInv > 10000.0) {
                     // Half the nominal budget, not all of it. The compositor's
@@ -1035,10 +1042,9 @@ void VulkanWindow::stepVr() {
                         const double fragScale =
                             double(c.ss * c.ss) / double(ssNow * ssNow) *
                             double(fovFactor(c.fov, coverR)) / double(fovNow);
-                        double k = 0.0, b = 0.0;
-                        fitFor(c.rayQ, &k, &b);
                         return safety *
-                               (b + k * frameFragInv * 1.0e-6 * fragScale);
+                               (fit.b + fit.k * frameFragInv * 1.0e-6 *
+                                            fragScale * kRayCount[c.rayQ]);
                     };
 
                     // Update the safety multiplier from how the CURRENT setting
@@ -1047,9 +1053,9 @@ void VulkanWindow::stepVr() {
                     // against a measurement, so it is the one that calibrates
                     // everything else.
                     {
-                        double k = 0.0, b = 0.0;
-                        fitFor(std::clamp(appliedRayQ, 0, 2), &k, &b);
-                        const double pred = b + k * frameFragInv * 1.0e-6;
+                        const double pred =
+                            fit.b + fit.k * frameFragInv * 1.0e-6 *
+                                        kRayCount[std::clamp(appliedRayQ, 0, 2)];
                         if (pred > 0.05 && frameGpuMs > 0.0) {
                             const double ratio = frameGpuMs / pred;
                             safety = std::clamp(
@@ -1061,9 +1067,42 @@ void VulkanWindow::stepVr() {
                                                 : modelSs > 0.72f ? 1
                                                                   : 0) +
                                          10 * (2 - modelFov) + (2 - modelRayQ);
+
+                    // IF WHAT IS RUNNING STILL FITS, LEAVE IT ALONE.
+                    //
+                    // This is the change that matters. The chooser used to pick
+                    // the best-scoring affordable candidate on every evaluation,
+                    // so it re-ran the whole contest constantly -- and since the
+                    // prediction moves with the fit, the safety multiplier and
+                    // the viewer's head, the winner changed whenever any of
+                    // those wobbled, even though nothing was wrong with what was
+                    // already on screen. The log was dozens of vr-model lines a
+                    // session, frequently two inside one 240-frame window, each
+                    // one a visible change and often a scene-target rebuild.
+                    //
+                    // A controller should act on a PROBLEM, not on a
+                    // recalculation. So: step down only when the current
+                    // configuration no longer fits, and step up only when a
+                    // better one fits with room to spare AND the current one has
+                    // been comfortable for a while. Holding is the default and
+                    // costs nothing.
+                    const Cand curCand{modelRayQ, modelFov, modelSs, scoreNow};
+                    const double curPred = predict(curCand);
+                    const bool curFits = curPred <= target;
+                    if (curFits) ++comfortable; else comfortable = 0;
+
                     int pick = -1;
                     if (rejectCooldown > 0) --rejectCooldown;
-                    for (size_t i = 0; i < kCands.size(); ++i) {
+                    // Reaching for MORE requires the current setting to have
+                    // been comfortable for a while, not merely comfortable this
+                    // instant -- one cheap frame is not evidence of headroom.
+                    const bool considerAny = !curFits || comfortable > 240;
+                    for (size_t i = 0; considerAny && i < kCands.size(); ++i) {
+                        // Never consider anything WORSE than what is running
+                        // while it still fits, and never anything better while
+                        // it does not.
+                        if (curFits && kCands[i].score <= scoreNow) break;
+                        if (!curFits && kCands[i].score >= scoreNow) continue;
                         // Do not climb straight back to something just
                         // abandoned. The log showed 4 rays to 7 and back within
                         // two decisions: nothing remembered that the richer
@@ -1122,8 +1161,9 @@ void VulkanWindow::stepVr() {
                                 modelRayQ == 0 ? 11 : (modelRayQ == 1 ? 7 : 4),
                                 modelFov, modelSs,
                                 c.rayQ == 0 ? 11 : (c.rayQ == 1 ? 7 : 4), c.fov,
-                                c.ss, coverR, predict(c), target, fits[0].k,
-                                fits[1].k, fits[2].k, fits[2].b, safety);
+                                c.ss, coverR, predict(c), target,
+                                fit.k * kRayCount[0], fit.k * kRayCount[1],
+                                fit.k * kRayCount[2], fit.b, safety);
                             std::fflush(stdout);
                             modelRayQ = c.rayQ;
                             modelFov = c.fov;
