@@ -1289,12 +1289,36 @@ void VrSession::setBoardPlacement(const float centreMm[3], float spanMm) {
     // PCBVIEW_VR_SIZE, in metres -- independent of distance, so the two can be
     // traded: nearer at the same size fills more of the view, nearer at a
     // smaller size keeps the same apparent size but improves stereo depth.
-    static const float sizeM = [] {
+    // Two ways to say how big, and the second is the honest one.
+    //
+    // A plain number is an absolute width in metres, and that is what this
+    // always did: EVERY board is shown 0.35 m across, whatever it measures.
+    // That silently magnifies by wildly different amounts -- a 50 mm board by
+    // seven times, a 191 mm board by under two -- so fine detail is legible on
+    // small boards and not on large ones, for no reason connected to the
+    // boards. It reads as "the big board is blurry" when what is happening is
+    // that the big board is being shown four times smaller relative to itself.
+    //
+    // An "x" prefix or suffix asks for a MAGNIFICATION of the board's real
+    // size instead: x1 is life size, the board as it would lie on a bench, and
+    // x3 is three times that. Detail then reads the same on every board, which
+    // is what an inspection tool should do.
+    const float sizeM = [&] {
         const char* v = std::getenv("PCBVIEW_VR_SIZE");
         if (!v || !v[0]) return 0.35f;
+        const char* p = (v[0] == 'x' || v[0] == 'X') ? v + 1 : v;
         char* end = nullptr;
-        const float f = std::strtof(v, &end);
-        return (end && end != v && f >= 0.05f && f <= 2.0f) ? f : 0.35f;
+        const float f = std::strtof(p, &end);
+        if (!end || end == p) return 0.35f;
+        const bool magnify =
+            (v[0] == 'x' || v[0] == 'X') || (*end == 'x' || *end == 'X');
+        if (magnify) {
+            if (f < 0.1f || f > 40.0f) return 0.35f;
+            // spanMm is the board's own width; mm -> m, times the factor.
+            const float m = spanMm * 0.001f * f;
+            return (m >= 0.02f && m <= 8.0f) ? m : 0.35f;
+        }
+        return (f >= 0.05f && f <= 8.0f) ? f : 0.35f;
     }();
     placeSpanMm_ = spanMm;
     placeSizeBaseM_ = sizeM;
