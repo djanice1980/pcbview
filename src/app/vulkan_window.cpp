@@ -1727,6 +1727,34 @@ void VulkanWindow::stepGamepad() {
             std::fflush(stdout);
         }
         moved = true;
+    } else if (vrMode && (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f)) {
+        // WITHOUT the chord, the triggers move the board NEARER and FURTHER.
+        //
+        // Size and distance are different tools and both are wanted. Growing
+        // the board is how you read fine detail without leaning in; moving it
+        // is how you place it where you want it in the room -- push it away to
+        // see the whole thing, pull it in to work on it. They were briefly
+        // collapsed into one control when the dolly was dropped, which lost
+        // the placement half.
+        //
+        // Analog here rather than the shoulders' fixed rate, so a light pull
+        // nudges and a full pull travels; scaled by the board's span so a small
+        // board and a large one move at the same apparent rate.
+        const auto& bb = mesh_->bounds;
+        const float span = static_cast<float>(
+            std::max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]));
+        constexpr float kCurve = 0.55f;
+        const float pull = std::pow(g.rightTrigger, kCurve) -
+                           std::pow(g.leftTrigger, kCurve);
+        board_.translation.z += pull * span * 0.6f * fdt;
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::printf("vr-pad: trigger dolly live (R2 brings the board in, "
+                        "L2 pushes it away)\n");
+            std::fflush(stdout);
+        }
+        moved = true;
     }
 
     // GYRO HOLD-AND-TURN: hold the touchpad and physically twist the pad, and
