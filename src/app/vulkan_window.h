@@ -568,6 +568,12 @@ private:
     std::unique_ptr<vk::Renderer> renderer_;
     QStringList gpuNames_;         // every usable GPU, for the picker
     QString preferredGpu_;         // name substring; empty = auto (discrete + RT)
+    // The toolbar's device line: GPU, RENDER MODE, triangle count. Re-emitted
+    // whenever the mode changes, because it was previously sent once at device
+    // creation and reported the ray-tracing TOGGLE -- which reads the same for
+    // full-scene path tracing and for raster with four shadow rays, two
+    // renderers that produce visibly different images.
+    void emitDeviceStatus();
     bool rtEnabled_ = false;       // ray-traced shadows/AO requested
     bool ptEnabled_ = false;       // path-tracing mode requested
     bool oidnEnabled_ = false;     // neural denoising requested

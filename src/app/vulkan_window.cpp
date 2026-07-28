@@ -2257,15 +2257,7 @@ void VulkanWindow::createDeviceAndRenderer() {
     renderer_->setDenoising(oidnEnabled_);
     if (mesh_) renderer_->uploadBoard(*mesh_);
 
-    const bool isCpu = device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_CPU;
-    emit statusMessage(
-        QString("%1  |  ray tracing: %2  |  %3 triangles")
-            .arg(QString::fromStdString(device_.gpu.name))
-            .arg(isCpu ? "all rendering via Embree (CPU)"
-                 : !device_.rayQueryEnabled ? "unsupported"
-                 : rtEnabled_             ? "ON"
-                                          : "available (off)")
-            .arg(renderer_->stats().trianglesTotal));
+    emitDeviceStatus();
 
     // Headless verification hook: dump the chosen device + RT state to a file so
     // GPU selection can be confirmed without reading the status bar.
@@ -2335,6 +2327,39 @@ void VulkanWindow::setPreferredGpu(const QString& nameSubstring) {
     requestUpdate();
 }
 
+void VulkanWindow::emitDeviceStatus() {
+    if (!renderer_) return;
+    // Report the RENDER MODE, not the ray-tracing toggle.
+    //
+    // This used to read "ray tracing: ON" whenever the RT toggle was set, which
+    // is true of both the path tracer and the raster path with shadow rays --
+    // two renderers that produce visibly different images. A board sitting in
+    // full-scene path tracing therefore announced itself in the same words as
+    // raster with four shadow rays, and the difference between those is exactly
+    // what someone reads the status bar to find out. It cost a wrong conclusion
+    // about why VR and the desktop looked different.
+    //
+    // Re-emitted whenever the mode changes, too. It was sent once at device
+    // creation, so toggling path tracing in the menu left the bar describing
+    // the mode you had left.
+    const bool isCpu = device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    const bool pt = ptEnabled_ && ptAvailable();
+    QString mode;
+    if (pt)
+        mode = oidnEnabled_ ? "PATH TRACED + neural denoise" : "PATH TRACED";
+    else if (!device_.rayQueryEnabled && !isCpu)
+        mode = "raster (no ray query on this device)";
+    else if (rtEnabled_)
+        mode = "ray-traced raster (sun shadows + AO)";
+    else
+        mode = "raster (no rays)";
+    if (isCpu) mode += " — via Embree (CPU)";
+    emit statusMessage(QString("%1  |  %2  |  %3 triangles")
+                           .arg(QString::fromStdString(device_.gpu.name))
+                           .arg(mode)
+                           .arg(renderer_->stats().trianglesTotal));
+}
+
 void VulkanWindow::setPathTracing(bool on) {
     ptEnabled_ = on;
     appSettings().setValue("pathTracing", on);
@@ -2343,11 +2368,13 @@ void VulkanWindow::setPathTracing(bool on) {
                                      ? vk::RenderMode::PathTraced
                                      : vk::RenderMode::Raster);
     }
-    emit statusMessage(QString("Path tracing %1")
-                           .arg(!ptAvailable() ? "unsupported on this device"
-                                : on ? (cpuRender() ? "ON — CPU (Embree), accumulating…"
-                                                    : "ON — accumulating…")
-                                     : "off"));
+    // The toolbar line now names the render mode, so refresh it rather than
+    // replacing it with a one-off sentence that then sits there permanently
+    // describing a toggle instead of the state.
+    if (!ptAvailable())
+        emit statusMessage("Path tracing unsupported on this device");
+    else
+        emitDeviceStatus();
     requestUpdate();
 }
 
@@ -2396,11 +2423,7 @@ void VulkanWindow::setDenoising(bool on) {
     oidnEnabled_ = on;
     appSettings().setValue("denoising", on);
     if (renderer_) renderer_->setDenoising(on);
-    const QString dev =
-        renderer_ ? QString::fromStdString(renderer_->oidnDeviceName()) : "?";
-    emit statusMessage(QString("Neural denoise %1%2")
-                           .arg(on ? "ON" : "off")
-                           .arg(on ? "  |  OIDN device: " + dev : QString()));
+    emitDeviceStatus();
     requestUpdate();
 }
 
