@@ -246,6 +246,7 @@ Renderer::~Renderer() {
     destroyBloom();
     for (Image& img : shadingRate_) destroyImage(img);
     if (timePool_) vkDestroyQueryPool(device_.handle, timePool_, nullptr);
+    if (statPool_) vkDestroyQueryPool(device_.handle, statPool_, nullptr);
     if (maskPipeline_) vkDestroyPipeline(device_.handle, maskPipeline_, nullptr);
     if (maskLayout_)
         vkDestroyPipelineLayout(device_.handle, maskLayout_, nullptr);
@@ -3730,6 +3731,26 @@ void Renderer::createSyncAndCommands() {
         }
     }
 
+    // Fragment shader invocations, over the same span as the timestamps.
+    //
+    // This is the input the adaptive quality model was missing. Distance was
+    // only ever a proxy for how much of the view the board covers, and a poor
+    // one -- it cannot know the board's size, so thresholds tuned on a 191 mm
+    // board threw resolution away on a 50 mm one at the same distance. This
+    // counts the fragments that were actually shaded, which folds in coverage,
+    // the shading rate, the hidden-area mask and depth rejection at once.
+    if (device_.pipelineStatsEnabled) {
+        VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        q.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+        q.queryCount = kFramesInFlight;
+        q.pipelineStatistics =
+            VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+        if (vkCreateQueryPool(device_.handle, &q, nullptr, &statPool_) ==
+            VK_SUCCESS) {
+            statArmed_.assign(kFramesInFlight, false);
+        }
+    }
+
     imageAvailable_.resize(kFramesInFlight);
     inFlight_.resize(kFramesInFlight);
     // One render-finished semaphore per swapchain image, not per frame in
@@ -4795,11 +4816,27 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
             gpuMsAccum_ += gpuMs_;
         }
     }
+    if (statPool_ && statArmed_[frame_]) {
+        uint64_t n = 0;
+        if (vkGetQueryPoolResults(device_.handle, statPool_, frame_, 1,
+                                  sizeof(n), &n, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            fragInvAccum_ += double(n);
+        }
+    }
     if (timePool_) {
         vkCmdResetQueryPool(cmd, timePool_, frame_ * 2, 2);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
                              timePool_, frame_ * 2);
         timeArmed_[frame_] = true;
+    }
+    // Begun here and ended beside the closing timestamp, so the fragment count
+    // and the millisecond figure always cover the same commands. Outside any
+    // render pass at both ends, which is what a statistics query requires.
+    if (statPool_) {
+        vkCmdResetQueryPool(cmd, statPool_, frame_, 1);
+        vkCmdBeginQuery(cmd, statPool_, frame_, 0);
+        statArmed_[frame_] = true;
     }
 
     // Shared by the scene pass and the later blit/UI barriers.
@@ -5220,6 +5257,7 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     if (offscreenOnly_) {
     // Close the frame's timestamp pair. BOTTOM_OF_PIPE so it is written only
     // once everything recorded above has finished executing.
+    if (statPool_) vkCmdEndQuery(cmd, statPool_, frame_);
     if (timePool_)
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
                              timePool_, frame_ * 2 + 1);
@@ -5321,6 +5359,7 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
 
     // Close the frame's timestamp pair. BOTTOM_OF_PIPE so it is written only
     // once everything recorded above has finished executing.
+    if (statPool_) vkCmdEndQuery(cmd, statPool_, frame_);
     if (timePool_)
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
                              timePool_, frame_ * 2 + 1);

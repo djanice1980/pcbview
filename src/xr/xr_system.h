@@ -185,6 +185,14 @@ public:
         submitH_ = h;
     }
 
+    // What the board is scaled to in the room, and how wide an eye sees. The
+    // quality model turns these plus the distance into "what fraction of the
+    // eye does the board cover", which is the quantity distance thresholds were
+    // always standing in for -- badly, since they cannot know how big the board
+    // is.
+    float boardSizeMetres() const;
+    float eyeFovHalfY() const;
+
     // The hidden-area mesh for an eye, already projected to screen space:
     // pairs of floats in NDC, plus a triangle index list. Empty when the
     // runtime has no visibility mask, or before the first located frame -- the
@@ -327,6 +335,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     float placeCentre_[3] = {0, 0, 0};
     float placeScale_ = 0.001f;   // mm -> m
+    float placeSizeM_ = 0.35f;    // how wide the board is made, in room metres
     // Where the viewer was when the board was last anchored. Captured once, so
     // the board stays put in the room instead of following your head around.
     float anchorPos_[3] = {0.0f, 0.0f, 0.0f};

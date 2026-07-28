@@ -1297,6 +1297,21 @@ void VrSession::setBoardPlacement(const float centreMm[3], float spanMm) {
         return (end && end != v && f >= 0.05f && f <= 2.0f) ? f : 0.35f;
     }();
     placeScale_ = spanMm > 1.0f ? sizeM / spanMm : 0.001f;
+    placeSizeM_ = sizeM;
+}
+
+float VrSession::boardSizeMetres() const { return placeSizeM_; }
+
+float VrSession::eyeFovHalfY() const {
+    // Half the vertical field of view, from the runtime's own numbers rather
+    // than a guess. The quality model needs it to turn "the board is 0.15 m
+    // away" into "the board covers this fraction of the eye", which is the
+    // thing that actually costs.
+    if (lastViews_.empty()) return 0.9f;
+    const float up = std::fabs(lastViews_[0].fov[2]);
+    const float dn = std::fabs(lastViews_[0].fov[3]);
+    const float h = std::max(up, dn);
+    return (h > 0.05f && h < 1.5f) ? h : 0.9f;
 }
 
 bool VrSession::begin(System& sys, VkInstance vkInstance, VkDevice device,

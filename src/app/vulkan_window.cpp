@@ -330,6 +330,10 @@ void VulkanWindow::stepVr() {
     // Both eyes' GPU time for the frame just completed. Taken once, here, so
     // the ladder below and the sweep see the same number.
     const double frameGpuMs = renderer_->takeGpuMs();
+    // Its matched pair: how many fragments that cost paid for. Taken here for
+    // the same reason -- one read per frame, one number everyone below agrees
+    // on. Zero when the device cannot count them, which the model checks for.
+    const double frameFragInv = renderer_->takeFragInvocations();
     // How far back temporal reuse averages. This is the quality/latency dial:
     // higher is cleaner and slower to react to a change in the picture, and it
     // is what lets a handful of samples a frame look like a great many.
@@ -595,6 +599,114 @@ void VulkanWindow::stepVr() {
         static int over = 0, under = 0, dwell = 0;
         static float distSmooth = 0.0f;
         static int tierHold = 0;
+
+        // ---- measured cost model, in place of tuned distance thresholds ----
+        //
+        // The ladder below works, and every number in it was measured -- on ONE
+        // board, on ONE GPU. That is the problem. Distance is only ever a proxy
+        // for how much of the eye the board covers, and it cannot know how big
+        // the board is: thresholds tuned on a 191 mm board make a 50 mm board
+        // drop to 0.65x at 0.22 m while the frame costs 2.5 ms of 11.1. It
+        // throws away resolution it has no reason to.
+        //
+        // So price the frame instead. Two things are now measured directly:
+        // the GPU milliseconds (timestamps) and the fragments actually shaded
+        // (a pipeline-statistics query). The second folds in coverage, shading
+        // rate, hidden-area mask and depth rejection at once -- everything a
+        // distance threshold was standing in for.
+        //
+        //     ms  ~=  base + k[rays] * fragments
+        //
+        // base and k are fitted from the frames as they go by, so they are this
+        // board on this GPU at this moment, not a constant from a session in
+        // July. k is per ray count rather than a multiplier on one coefficient
+        // because rays are measurably NOT linear: extrapolating from four rays
+        // put eleven at 6.7 ms and eleven measured 11.09.
+        //
+        // To price a configuration we have not run, scale the fragments we DID
+        // measure: resolution is exactly quadratic, and the shading rate's
+        // effect is computed from the same radial pattern the rate image is
+        // built from, integrated over the disc the board actually covers. Then
+        // pick the nicest configuration that fits.
+        //
+        // PCBVIEW_VR_ADAPT=ladder goes back to the distance thresholds, so the
+        // two can be compared in the headset rather than argued about.
+        static const bool useModel = [] {
+            const QByteArray a = qgetenv("PCBVIEW_VR_ADAPT");
+            return !(a == "ladder" || a == "distance");
+        }();
+
+        // The knobs, and how much each is worth giving up.
+        //
+        // Ordering is a judgement a cost model cannot make: it knows what
+        // things cost, not which of two equally affordable pictures looks
+        // better. This encodes the one the ladder already embodied -- give up
+        // rays first, then peripheral sharpness, and resolution last -- which
+        // is also what was asked for: shadows kept when close, and the sharp
+        // image protected, because softening the whole frame is what made
+        // traces wiggle.
+        //
+        // Foveation level 0 (none) is deliberately not a candidate. The ladder
+        // never used it either: it coarsens only the periphery, which the lens
+        // is blurring anyway, so paying full rate out there buys nothing.
+        struct Cand {
+            int rayQ;    // 0 = 11 rays, 1 = 7, 2 = 4
+            int fov;     // 1 = gentle, 2 = hard
+            float ss;    // scene size as a fraction of the eye
+            int score;   // higher is nicer to look at
+        };
+        static const std::vector<Cand> kCands = [] {
+            const float kSs[3] = {0.65f, 0.80f, 1.00f};
+            std::vector<Cand> v;
+            for (int r = 0; r < 3; ++r)
+                for (int f = 1; f <= 2; ++f)
+                    for (int s = 0; s < 3; ++s)
+                        v.push_back({r, f, kSs[s],
+                                     100 * s + 10 * (2 - f) + (2 - r)});
+            std::sort(v.begin(), v.end(),
+                      [](const Cand& a, const Cand& b) {
+                          return a.score > b.score;
+                      });
+            return v;
+        }();
+
+        // Mean fragments shaded per pixel for a foveation level, over the disc
+        // the board covers. The radii are the ones buildShadingRateImage uses,
+        // in the same units (fraction of half the SHORTER axis), and a 2x2 tile
+        // shades one fragment for four pixels, a 4x4 one for sixteen.
+        //
+        // Integrating over the BOARD's disc rather than the whole view is the
+        // point. A board filling the middle of the eye sits almost entirely in
+        // the sharp zone, so switching to hard foveation saves it almost
+        // nothing -- while a whole-view average would promise a large saving
+        // and be wrong exactly when the viewer is closest.
+        auto fovFactor = [](int level, float r) {
+            if (level <= 0) return 1.0f;
+            const float sharp = level == 1 ? 0.55f : 0.38f;
+            const float mid = level == 1 ? 0.80f : 0.62f;
+            const float R = std::clamp(r, 0.02f, 1.42f);
+            const float R2 = R * R;
+            const float a1 = std::min(R, sharp) * std::min(R, sharp);
+            const float a2 =
+                std::max(0.0f, std::min(R, mid) * std::min(R, mid) -
+                                   std::min(R, sharp) * std::min(R, sharp));
+            const float a3 = std::max(0.0f, R2 - std::min(R, mid) * std::min(R, mid));
+            return (a1 + 0.25f * a2 + 0.0625f * a3) / R2;
+        };
+
+        // Fitted online. base is the frame's fixed cost -- everything that is
+        // not a shaded fragment -- tracked as a slowly recovering floor, since
+        // the cheapest frames observed are the ones with almost no board in
+        // view. k starts at zero meaning "not yet known", and until every level
+        // the chooser wants has a value the distance ladder is left in charge.
+        static double baseMs = 1.0e9;
+        static double kPerFrag[3] = {0.0, 0.0, 0.0};
+        static int stableFrames = 0;
+        static int modelHold = 0;
+        static int modelRayQ = 2, modelFov = 2;
+        static float modelSs = 1.0f;
+        static bool modelReady = false;
+
         if (adapt && !allowPt) {
             const double budget = vr_->nativeFrameMs();
 
@@ -742,6 +854,133 @@ void VulkanWindow::stepVr() {
             rayQEff = t.rayQ;
             fovEff = t.fov;
             ssEff = ss * t.ss;
+
+            // ---- and now the measured model, which overrides the above once
+            // it knows enough to. ----
+            if (useModel && renderer_->fragCountingAvailable() &&
+                renderer_->foveationAvailable()) {
+                // Only learn from a frame whose configuration was already
+                // settled. Two frames are in flight, so a measurement arriving
+                // now describes a frame recorded two slots ago -- crediting it
+                // to the settings in force at this instant would fit the model
+                // to the wrong picture every time the quality changed.
+                ++stableFrames;
+                if (frameGpuMs > 0.0 && frameFragInv > 10000.0 &&
+                    stableFrames > 4) {
+                    if (frameGpuMs < baseMs) baseMs = frameGpuMs;
+                    else baseMs *= 1.0004;  // let the floor recover
+                    baseMs = std::clamp(baseMs, 0.05, 2.0);
+                    const double sample =
+                        std::max(0.0, frameGpuMs - baseMs) / frameFragInv;
+                    double& k = kPerFrag[std::clamp(rayQEff, 0, 2)];
+                    k = k <= 0.0 ? sample : k * 0.97 + sample * 0.03;
+                }
+
+                // The board's projected radius, in the same units the rate
+                // pattern uses: a fraction of half the shorter axis. This is
+                // the "how much of the eye" that distance was approximating,
+                // and unlike distance it knows how big the board is.
+                const float sizeM = vr_->boardSizeMetres();
+                const float tanHalf = std::tan(vr_->eyeFovHalfY());
+                const float coverR =
+                    (d > 0.01f && tanHalf > 0.01f)
+                        ? std::clamp((sizeM * 0.5f) / d / tanHalf, 0.02f, 1.42f)
+                        : 0.3f;
+
+                // A ray count that has not been run yet still needs a price,
+                // or the model would rate it as free and jump straight to it.
+                //
+                // Seeded from whichever level HAS been measured, scaled by ray
+                // count with a deliberately pessimistic exponent. Rays measured
+                // worse than linear -- extrapolating four to eleven linearly
+                // predicted 6.7 ms against an actual 11.09 -- so 1.3 errs
+                // towards "that will be more expensive than you think", which
+                // costs a little quality and never a dropped frame. The moment
+                // that level actually runs, measurement replaces the guess.
+                static const double kRays[3] = {11.0, 7.0, 4.0};
+                auto kFor = [&](int q) -> double {
+                    if (kPerFrag[q] > 0.0) return kPerFrag[q];
+                    for (int s = 0; s < 3; ++s)
+                        if (kPerFrag[s] > 0.0)
+                            return kPerFrag[s] *
+                                   std::pow(kRays[q] / kRays[s], 1.3);
+                    return 0.0;
+                };
+                // One measured level is enough to start; the rest are seeded.
+                modelReady = kFor(2) > 0.0 && baseMs < 1.0e8;
+
+                if (modelReady && frameFragInv > 10000.0) {
+                    // Half the nominal budget, not all of it. The compositor's
+                    // share of a frame is real, grows with the swapchain, and
+                    // is invisible to us -- measured repeatedly as the point
+                    // where the runtime starts pacing us down.
+                    const double target = budget * 0.55;
+                    const float fovNow = fovFactor(fovEff, coverR);
+                    const float ssNow = std::max(0.01f, ssEff);
+
+                    auto predict = [&](const Cand& c) {
+                        const double fragScale =
+                            double(c.ss * c.ss) / double(ssNow * ssNow) *
+                            double(fovFactor(c.fov, coverR)) / double(fovNow);
+                        return baseMs + kFor(c.rayQ) * frameFragInv * fragScale;
+                    };
+
+                    const int scoreNow = 100 * (modelSs > 0.9f    ? 2
+                                                : modelSs > 0.72f ? 1
+                                                                  : 0) +
+                                         10 * (2 - modelFov) + (2 - modelRayQ);
+                    int pick = -1;
+                    for (size_t i = 0; i < kCands.size(); ++i) {
+                        // Improving the picture has to clear a wider bar than
+                        // holding it. Stepping up multiplies the frame cost, so
+                        // a candidate that only just fits at today's price will
+                        // not fit once it is running -- that asymmetry is what
+                        // stops the ladder pumping between two rungs.
+                        const bool up = kCands[i].score > scoreNow;
+                        const double limit = up ? target * 0.75 : target;
+                        if (predict(kCands[i]) <= limit) {
+                            pick = static_cast<int>(i);
+                            break;
+                        }
+                    }
+
+                    if (modelHold > 0) --modelHold;
+                    if (pick >= 0) {
+                        const Cand& c = kCands[pick];
+                        const bool changed = c.rayQ != modelRayQ ||
+                                             c.fov != modelFov ||
+                                             std::fabs(c.ss - modelSs) > 0.01f;
+                        if (changed && modelHold == 0) {
+                            // A resolution change resamples the entire image
+                            // and still costs a scene-target rebuild, so it
+                            // gets a longer hold than a shadow getting coarser.
+                            const bool resMoved =
+                                std::fabs(c.ss - modelSs) > 0.01f;
+                            modelHold = resMoved ? 150 : 60;
+                            std::printf(
+                                "vr-model: %d rays fov%d %.2fx -> %d rays fov%d "
+                                "%.2fx | cover %.2f, pred %.1f ms of %.1f, "
+                                "k=[%.2f %.2f %.2f] ms/Mfrag, base %.2f ms\n",
+                                modelRayQ == 0 ? 11 : (modelRayQ == 1 ? 7 : 4),
+                                modelFov, modelSs,
+                                c.rayQ == 0 ? 11 : (c.rayQ == 1 ? 7 : 4), c.fov,
+                                c.ss, coverR, predict(c), target,
+                                kPerFrag[0] * 1.0e6, kPerFrag[1] * 1.0e6,
+                                kPerFrag[2] * 1.0e6, baseMs);
+                            std::fflush(stdout);
+                            modelRayQ = c.rayQ;
+                            modelFov = c.fov;
+                            modelSs = c.ss;
+                            stableFrames = 0;
+                        }
+                    }
+
+                    rtEff = true;
+                    rayQEff = modelRayQ;
+                    fovEff = modelFov;
+                    ssEff = ss * modelSs;
+                }
+            }
         }
 
         // --- Measured sweep -------------------------------------------------

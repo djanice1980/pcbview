@@ -404,6 +404,11 @@ Device createDevice(const GpuInfo& gpu,
     // NVIDIA tolerated it without; the validation layer does not, and a
     // stricter driver would fail to create the module.
     features.features.geometryShader = VK_TRUE;
+    // Fragment-shader invocation counts, for the adaptive quality model. Asked
+    // for only when the device offers it -- requesting an unsupported feature
+    // fails device creation outright, and this one is a nicety.
+    const bool wantStats = probe.features.pipelineStatisticsQuery;
+    if (wantStats) features.features.pipelineStatisticsQuery = VK_TRUE;
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -424,6 +429,7 @@ Device createDevice(const GpuInfo& gpu,
     device.rayQueryEnabled = wantRq;
     device.multiviewEnabled = wantMultiview;
     device.shadingRateEnabled = wantFsr;
+    device.pipelineStatsEnabled = wantStats;
     if (wantFsr) {
         // The tile one texel of the rate attachment covers. Pick the runtime's
         // MAXIMUM: the coarsest tiling makes the smallest attachment, and a

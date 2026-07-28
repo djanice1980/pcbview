@@ -71,6 +71,13 @@ struct Device {
     bool shadingRateEnabled = false;
     uint32_t shadingRateTexelW = 16;
     uint32_t shadingRateTexelH = 16;
+    // Fragment-shader invocation counting. The adaptive quality model prices a
+    // frame as roughly base + k * fragments-shaded, and this is the only way to
+    // learn the second factor rather than guess it from distance -- it already
+    // accounts for how much of the view the board covers, for the shading rate,
+    // for the hidden-area mask and for depth rejection, none of which a
+    // distance threshold can know.
+    bool pipelineStatsEnabled = false;
     // maxPushConstantsSize, carried so the renderer can tell whether the wider
     // two-eye push block fits before it commits to multiview.
     uint32_t maxPushConstants = 128;

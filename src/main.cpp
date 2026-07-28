@@ -166,6 +166,9 @@ int gpuReport() {
     std::printf("Foveation (attachment VRS): %s (tile %ux%u)\n",
                 device.shadingRateEnabled ? "yes" : "no",
                 device.shadingRateTexelW, device.shadingRateTexelH);
+    std::printf("Fragment counting: %s (VR quality model prices a frame by it; "
+                "without it, tuned distance thresholds)\n",
+                device.pipelineStatsEnabled ? "yes" : "no");
 
     pcbview::destroyDevice(device);
     vkDestroyInstance(instance, nullptr);

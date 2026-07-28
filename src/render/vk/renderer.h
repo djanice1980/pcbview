@@ -479,6 +479,17 @@ public:
         return v;
     }
 
+    // Fragment shader invocations over exactly the same span as takeGpuMs, and
+    // summed the same way across both eyes -- the two numbers are a matched
+    // pair, and a cost model built from them would be nonsense if their scopes
+    // disagreed. Zero when the device cannot count them.
+    double takeFragInvocations() {
+        const double v = fragInvAccum_;
+        fragInvAccum_ = 0.0;
+        return v;
+    }
+    bool fragCountingAvailable() const { return statPool_ != VK_NULL_HANDLE; }
+
     // ---- pipelined capture (video) -----------------------------------------
     // A ring of host staging slots: the capture copy rides inside the
     // frame's own command stream and each slot gets its own fence, so the
@@ -854,6 +865,11 @@ private:
     std::vector<bool> timeArmed_;
     double gpuMs_ = 0.0;
     double gpuMsAccum_ = 0.0;
+    // Fragment invocations, armed and read on the same schedule as the
+    // timestamps above so the pair always describes one frame's work.
+    VkQueryPool statPool_ = VK_NULL_HANDLE;
+    std::vector<bool> statArmed_;
+    double fragInvAccum_ = 0.0;
     VkImage vrTarget_ = VK_NULL_HANDLE;
     uint32_t vrTargetW_ = 0, vrTargetH_ = 0;
     VkImageView vrDepthView_ = VK_NULL_HANDLE;
