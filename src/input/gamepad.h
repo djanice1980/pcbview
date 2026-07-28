@@ -31,6 +31,11 @@ struct GamepadState {
     bool pressedLeftShoulder = false, pressedRightShoulder = false;
 
     bool heldLeftShoulder = false, heldRightShoulder = false;
+    // SOUTH and WEST held, as MODIFIERS rather than actions -- south gates the
+    // explode chord, west opens the view menu. The other face buttons stay
+    // edge-triggered because they fire one-shots; a chord needs the button's
+    // state, not its transition.
+    bool heldSouth = false, heldWest = false;
     // DualSense touchpad click. Absent on an Xbox pad, which simply never
     // reports it -- used as the gyro "grab", so it costs no existing binding.
     bool heldTouchpad = false;

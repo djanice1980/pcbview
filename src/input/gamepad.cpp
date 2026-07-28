@@ -176,6 +176,11 @@ const GamepadState& Gamepad::poll() {
     state_.heldLeftShoulder = (now & (1u << 12)) != 0;
     state_.heldRightShoulder = (now & (1u << 13)) != 0;
     state_.heldTouchpad = (now & (1u << 14)) != 0;
+    // Held, not just pressed: the face buttons are edge-triggered because they
+    // fire one-shot actions, but SOUTH and WEST also serve as modifiers -- a
+    // chord needs to know the key is down, not that it went down.
+    state_.heldSouth = (now & (1u << 0)) != 0;
+    state_.heldWest = (now & (1u << 2)) != 0;
 
     if (state_.hasGyro) {
         float g[3] = {0.0f, 0.0f, 0.0f};

@@ -398,6 +398,8 @@ private:
     // How much the viewer has grown the board in the room, about the size it
     // was placed at. The readable-detail control -- see stepGamepad.
     float vrSizeMul_ = 1.0f;
+    // SQUARE held: the labelled view menu is up and the D-pad picks from it.
+    bool viewMenuOpen_ = false;
     // Edge-triggered logging for the depth layer: it turns itself off whenever
     // the quality ladder renders at a fraction of the eye's resolution, and
     // that transition needs to be visible in the log rather than inferred.

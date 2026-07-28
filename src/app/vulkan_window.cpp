@@ -1695,7 +1695,19 @@ void VulkanWindow::stepGamepad() {
     // L2/R2 explode and collapse the stack. These are ANALOG, so unlike the
     // shoulders they give a pressure-proportional peel rate: ease into it for
     // a slow reveal, bury the trigger to throw the stack apart.
-    if (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f) {
+    // HELD AS A CHORD: cross (south) plus a trigger, not a trigger alone.
+    //
+    // Taking the stack apart rearranges the whole board, and the tell that it
+    // was too easy to reach is that it happened by accident -- a zoom control
+    // briefly shared these triggers and every attempt to zoom peeled the
+    // layers, which was reported in good faith as the silkscreen floating and
+    // the mask turning transparent. A modifier makes it deliberate without
+    // costing anything: the pressure-proportional peel is exactly as it was
+    // once the chord is held.
+    //
+    // Cross rather than one of the others because it is the button a thumb
+    // rests on, so the chord is comfortable to hold while the trigger sweeps.
+    if (g.heldSouth && (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f)) {
         // Two knobs, because "eager" has two causes. kRate is the top speed at
         // a full pull; kCurve bends the response so LIGHT pressure already
         // moves the stack -- an exponent below 1 lifts the bottom of the travel
@@ -1707,6 +1719,13 @@ void VulkanWindow::stepGamepad() {
         const float pull = std::pow(g.rightTrigger, kCurve) -
                            std::pow(g.leftTrigger, kCurve);
         setExplodeProgress(explodeProgress_ + pull * kRate * fdt);
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::printf("pad: explode chord live (hold CROSS + R2 to peel, "
+                        "L2 to collapse)\n");
+            std::fflush(stdout);
+        }
         moved = true;
     }
 
@@ -1764,12 +1783,30 @@ void VulkanWindow::stepGamepad() {
         }
     }
 
-    // Face buttons pick views, by position so one mapping fits both pads:
-    // south/east/west/north = cross/circle/square/triangle = A/B/X/Y.
-    if (g.pressedSouth) frameBoard();
-    if (g.pressedEast) setViewIso();
-    if (g.pressedWest) setViewTop();
-    if (g.pressedNorth) setViewBottom();
+    // VIEWS MOVE ONTO A HELD MENU, off the four face buttons.
+    //
+    // They used to be one button each, which spent the whole face on four
+    // presets and left nothing for a modifier -- and a controller with no
+    // spare buttons is how the explode chord ended up sharing the zoom
+    // triggers. Holding SQUARE now raises a labelled menu and the D-pad picks,
+    // which costs one extra button-press, fits four more views whenever they
+    // are wanted, and says on screen what each direction does instead of
+    // requiring it to be memorised. The D-pad was completely unbound.
+    //
+    // That frees CROSS for the explode chord, and leaves CIRCLE and TRIANGLE
+    // unassigned.
+    const bool menuWasOpen = viewMenuOpen_;
+    viewMenuOpen_ = g.heldWest;
+    if (viewMenuOpen_) {
+        if (g.pressedDpadUp) setViewTop();
+        if (g.pressedDpadDown) setViewBottom();
+        if (g.pressedDpadLeft) setViewIso();
+        if (g.pressedDpadRight) frameBoard();
+    }
+    if (viewMenuOpen_ != menuWasOpen) {
+        buildOverlay();
+        requestUpdate();
+    }
     // L3 levels the roll; R3 toggles object mode.
     if (g.pressedLeftStick) {
         camera_.roll = 0.0f;
@@ -1782,9 +1819,11 @@ void VulkanWindow::stepGamepad() {
     // Start recentres -- the way out of having slid or spun the board somewhere
     // unhelpful without reaching for the keyboard.
     if (g.pressedStart) recenterAll();
-    const bool acted = g.pressedSouth || g.pressedEast || g.pressedWest ||
-                       g.pressedNorth || g.pressedLeftStick ||
-                       g.pressedRightStick || g.pressedStart;
+    const bool acted = (viewMenuOpen_ &&
+                        (g.pressedDpadUp || g.pressedDpadDown ||
+                         g.pressedDpadLeft || g.pressedDpadRight)) ||
+                       g.pressedLeftStick || g.pressedRightStick ||
+                       g.pressedStart;
 
     // Assigned, not OR'd into the gyro block's earlier write, because that
     // write would otherwise be clobbered here.
@@ -3716,6 +3755,60 @@ void VulkanWindow::buildOverlay() {
                          y0 + pad + lh * (static_cast<float>(i) + 0.5f), ts,
                          i == 0 ? kAmber : kWhite);
             }
+        }
+    }
+
+    // ---- view menu, while SQUARE is held ------------------------------------
+    //
+    // Centred on the SCENE extent rather than the window, because in the
+    // headset those differ: the overlay is recorded into the eye target, so
+    // laying it out in window pixels would push it off to one side of both
+    // eyes. On the desktop the two are the same and this changes nothing.
+    if (viewMenuOpen_) {
+        const VkExtent2D se = renderer_->sceneExtent();
+        const float w = se.width > 0 ? static_cast<float>(se.width)
+                                     : static_cast<float>(width()) * dpr;
+        const float h = se.height > 0 ? static_cast<float>(se.height)
+                                      : static_cast<float>(height()) * dpr;
+        // Scaled to the target rather than to the desktop's DPI, so it reads
+        // the same size through the lenses as it does on a monitor.
+        const float ts = std::max(13.0f, h * 0.022f);
+        const float lh = ts * 1.9f;
+        const float pad = ts * 1.1f;
+
+        struct Row { const char* key; const char* label; };
+        static const Row kRows[4] = {{"UP", "Top"},
+                                     {"DOWN", "Bottom"},
+                                     {"LEFT", "Isometric"},
+                                     {"RIGHT", "Fit board"}};
+        text::TextStyle st;
+        st.size = {static_cast<double>(ts) * 0.9, static_cast<double>(ts)};
+        st.thickness = ts * 0.14;
+        float wMax = 0.0f;
+        for (const Row& r : kRows) {
+            const std::string s = std::string(r.key) + "   " + r.label;
+            wMax = std::max(wMax, static_cast<float>(text::measure(s, st)));
+        }
+        const std::string title = "VIEW";
+        wMax = std::max(wMax, static_cast<float>(text::measure(title, st)));
+
+        const float panelW = wMax + 2.0f * pad;
+        const float panelH = 5.0f * lh + 2.0f * pad;
+        const float x0 = (w - panelW) * 0.5f;
+        const float x1 = x0 + panelW;
+        const float y0 = (h - panelH) * 0.5f;
+
+        static const float kMenuBg[4] = {0.06f, 0.06f, 0.08f, 0.88f};
+        quad(x0, y0 + panelH * 0.5f, x1, y0 + panelH * 0.5f, panelH, kMenuBg);
+        quad(x0, y0 + panelH * 0.5f, x0 + ts * 0.25f, y0 + panelH * 0.5f,
+             panelH, kAmber);
+        drawText(title, (x0 + x1) * 0.5f, y0 + pad + lh * 0.5f, ts, kAmber);
+        for (int i = 0; i < 4; ++i) {
+            const std::string s =
+                std::string(kRows[i].key) + "   " + kRows[i].label;
+            drawText(s, (x0 + x1) * 0.5f,
+                     y0 + pad + lh * (static_cast<float>(i) + 1.5f), ts,
+                     kWhite);
         }
     }
 
