@@ -1660,6 +1660,32 @@ void VulkanWindow::stepVr() {
                 // the other eye's mask be drawn over it.
                 renderer_->selectVisibilityMask(-1);
             }
+            // PCBVIEW_VR_DUMP_EYES=<prefix> writes each eye's scene image to
+            // <prefix>_eye0.bmp / _eye1.bmp the first time the zoom panel is up.
+            //
+            // Every attempt to settle the HUD's stereo shift so far has gone
+            // through a person alternating their eyes and reporting which glyph
+            // landed on which, and that measurement has a confound nothing on
+            // this side can remove: the reference for "the same place" is
+            // whatever else is in view, and the board is itself at 0.4 m with
+            // about 90 px of disparity of its own. Two readings taken that way
+            // agreed with each other to 4% and disagreed with the arithmetic by
+            // 20%, which is exactly the shape of a systematic error in the
+            // instrument. So take the instrument out: the panel's position in
+            // each eye image is a fact on disk, and the difference between the
+            // two is the applied shift with nothing subjective in it.
+            //
+            // Held to the frame the panel is actually visible for -- it lives
+            // 1400 ms after a trigger -- so a dump is never a picture of an
+            // empty room.
+            static bool dumpedEyes = false;
+            static const std::string dumpPrefix =
+                qgetenv("PCBVIEW_VR_DUMP_EYES").toStdString();
+            if (!dumpPrefix.empty() && !dumpedEyes && !padStatus_.empty()) {
+                renderer_->requestCapture(
+                    dumpPrefix + "_eye" + std::to_string(i) + ".bmp", true);
+                if (i + 1 >= eyes.size()) dumpedEyes = true;
+            }
             renderer_->drawFrame(e.viewProj, e.eye);
             if (i < 2) vrSamples_[i] = renderer_->accumulatedSamples();
             if (eyeImage != VK_NULL_HANDLE)

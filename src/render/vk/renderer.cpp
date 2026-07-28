@@ -5281,6 +5281,20 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
         // and nothing downstream waiting to present.
         check(vkQueueSubmit(device_.graphicsQueue, 1, &solo, inFlight_[frame_]),
               "vkQueueSubmit(offscreen)");
+        // An offscreen frame can be captured too, and until now could not: this
+        // path returned straight out, so the request sat in capturePath_ and
+        // silently produced nothing. That is precisely the frame worth having
+        // in VR, where eye 1 renders offscreen -- asking for both eyes wrote
+        // one file and no error.
+        //
+        // toBlit[0] above is issued in BOTH modes, so sceneColor_ is already in
+        // TRANSFER_SRC_OPTIMAL, which is the layout captureImage requires.
+        if (!capturePath_.empty() || captureBuffer_) {
+            vkQueueWaitIdle(device_.graphicsQueue);
+            captureImage(0);  // ignored: captureScene_ reads sceneColor_
+            capturePath_.clear();
+            captureBuffer_ = nullptr;
+        }
         frame_ = (frame_ + 1) % kFramesInFlight;
         return true;
     }
