@@ -244,7 +244,7 @@ Renderer::~Renderer() {
     if (pipelineOpaque_) vkDestroyPipeline(device_.handle, pipelineOpaque_, nullptr);
     if (pipelineBlend_) vkDestroyPipeline(device_.handle, pipelineBlend_, nullptr);
     destroyBloom();
-    destroyImage(shadingRate_);
+    for (Image& img : shadingRate_) destroyImage(img);
     if (timePool_) vkDestroyQueryPool(device_.handle, timePool_, nullptr);
     if (maskPipeline_) vkDestroyPipeline(device_.handle, maskPipeline_, nullptr);
     if (maskLayout_)
@@ -2498,28 +2498,37 @@ void Renderer::setFoveation(int level) {
 
 void Renderer::buildShadingRateImage() {
     if (!device_.shadingRateEnabled) return;
-    // Rebuild only when the setting or the target size actually changes: this
-    // uploads through a staging buffer and waits, which must not happen per
+    // BOTH patterns, built together, and only when the target SIZE changes.
+    //
+    // This used to rebuild whenever the LEVEL changed, and rebuilding means
+    // vkDeviceWaitIdle, an image creation, a staging upload and a
+    // vkQueueWaitIdle -- a complete pipeline drain in the middle of a live
+    // session. The adaptive ladder changes level most often exactly where the
+    // viewer is closest, so each change cost a dropped frame at the distance
+    // where a dropped frame is most visible. That stall was ours, not the
+    // compositor's.
+    //
+    // There are only two patterns, they depend on nothing but the extent, and
+    // they are a few kilobytes each. Build both once and changing level
+    // becomes choosing an image view: no waits, no allocation, no dropped
     // frame.
-    if (foveationBuilt_ == foveation_ &&
-        foveationBuiltFor_.width == sceneExtent_.width &&
+    if (foveationBuiltFor_.width == sceneExtent_.width &&
         foveationBuiltFor_.height == sceneExtent_.height)
         return;
-    foveationBuilt_ = foveation_;
     foveationBuiltFor_ = sceneExtent_;
 
     vkDeviceWaitIdle(device_.handle);
-    destroyImage(shadingRate_);
-    if (foveation_ <= 0) {
-        shadingRateExtent_ = {0, 0};
-        return;
-    }
+    for (Image& img : shadingRate_) destroyImage(img);
 
     const uint32_t tw = device_.shadingRateTexelW;
     const uint32_t th = device_.shadingRateTexelH;
     shadingRateExtent_ = {(sceneExtent_.width + tw - 1) / tw,
                           (sceneExtent_.height + th - 1) / th};
-    shadingRate_ = createImage(
+    if (shadingRateExtent_.width == 0 || shadingRateExtent_.height == 0) return;
+
+    for (int level = 1; level <= 2; ++level) {
+    Image& target = shadingRate_[level - 1];
+    target = createImage(
         shadingRateExtent_, VK_FORMAT_R8_UINT,
         VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR |
             VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -2533,8 +2542,8 @@ void Renderer::buildShadingRateImage() {
     // is with a fixed pattern; the outer ring goes coarse because the lens is
     // already smearing it. Level 1 keeps a generous sharp middle and only
     // coarsens the corners; level 2 pulls both rings inward.
-    const float sharp = foveation_ == 1 ? 0.55f : 0.38f;
-    const float mid = foveation_ == 1 ? 0.80f : 0.62f;
+    const float sharp = level == 1 ? 0.55f : 0.38f;
+    const float mid = level == 1 ? 0.80f : 0.62f;
     std::vector<uint8_t> rates(size_t(shadingRateExtent_.width) *
                                shadingRateExtent_.height);
     const float cx = shadingRateExtent_.width * 0.5f;
@@ -2581,7 +2590,7 @@ void Renderer::buildShadingRateImage() {
         toDst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
         toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toDst.image = shadingRate_.handle;
+        toDst.image = target.handle;
         toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
         d.imageMemoryBarrierCount = 1;
@@ -2591,7 +2600,7 @@ void Renderer::buildShadingRateImage() {
         VkBufferImageCopy r{};
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         r.imageExtent = {shadingRateExtent_.width, shadingRateExtent_.height, 1};
-        vkCmdCopyBufferToImage(cmd, staging.handle, shadingRate_.handle,
+        vkCmdCopyBufferToImage(cmd, staging.handle, target.handle,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
 
         VkImageMemoryBarrier2 toRate = toDst;
@@ -2617,8 +2626,10 @@ void Renderer::buildShadingRateImage() {
         vkFreeCommandBuffers(device_.handle, commandPool_, 1, &cmd);
     }
     destroyBuffer(staging);
+    }
 
-    std::printf("vr-foveate: level %d, %ux%u tiles of %ux%u px\n", foveation_,
+    std::printf("vr-foveate: both patterns built, %ux%u tiles of %ux%u px -- "
+                "changing level is free from here\n",
                 shadingRateExtent_.width, shadingRateExtent_.height, tw, th);
     std::fflush(stdout);
 }
@@ -4841,9 +4852,18 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // invents a surface halfway between the near and far ones, and reprojection
     // would then bend the image around geometry that was never there. Taking
     // one sample's depth is the standard choice for exactly that reason.
+    //
+    // The size test is not a detail. The runtime's depth image is fixed at the
+    // eye's resolution, and depth cannot be scaled on the way out -- so the
+    // moment the scene renders at any other size (the adaptive ladder's 0.80x
+    // and 0.65x rungs do exactly that), nothing is written here at all. The
+    // caller has to be told, because submitting the depth LAYER over an image
+    // this frame did not write hands the compositor a depth buffer belonging to
+    // some earlier pose and it warps every pixel by it.
     const bool vrDepth =
         vrDepthView_ != VK_NULL_HANDLE && vrTargetW_ == sceneExtent_.width &&
         vrTargetH_ == sceneExtent_.height;
+    vrDepthWritten_ = vrDepth;
     if (vrDepth) {
         if (msaaActive()) {
             depthAttach.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
@@ -4871,8 +4891,9 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // that is a direct cut in rays where the lens is blurring anyway.
     VkRenderingFragmentShadingRateAttachmentInfoKHR rateAttach{
         VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR};
-    if (foveation_ > 0 && shadingRate_.view != VK_NULL_HANDLE) {
-        rateAttach.imageView = shadingRate_.view;
+    if (foveation_ > 0 &&
+        shadingRate_[foveation_ - 1].view != VK_NULL_HANDLE) {
+        rateAttach.imageView = shadingRate_[foveation_ - 1].view;
         rateAttach.imageLayout =
             VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
         rateAttach.shadingRateAttachmentTexelSize = {

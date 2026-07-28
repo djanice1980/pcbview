@@ -2177,7 +2177,18 @@ void VrSession::endFrame() {
             // depth reversed, minDepth 0 is infinitely far and maxDepth 1 is
             // the near plane -- nearZ infinite, farZ 0.01 m. The spec allows
             // nearZ > farZ precisely to describe this.
-            if ((*chains_)[i].depthChain) {
+            //
+            // And only when this frame's depth image was actually written.
+            // The renderer can only write it when the scene renders at exactly
+            // the eye's resolution, which the adaptive quality ladder breaks
+            // the moment it drops to a fractional rung. Describing the layer
+            // anyway does not degrade to "no depth" -- it hands the compositor
+            // a full, plausible depth buffer left over from an earlier pose,
+            // and every pixel gets warped by it. That reads as the board's
+            // whole face sliding around inside a silhouette that stays put,
+            // because the correction a per-pixel warp applies grows as 1/z:
+            // large over the near surface, nil over the far background.
+            if ((*chains_)[i].depthChain && depthValid_) {
                 XrCompositionLayerDepthInfoKHR d{
                     XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR};
                 d.subImage.swapchain = (*chains_)[i].depthChain;

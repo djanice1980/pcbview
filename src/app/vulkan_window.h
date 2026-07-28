@@ -391,6 +391,10 @@ private:
     // pinned near 1 means something resets it every frame. The two are
     // indistinguishable through the lenses.
     int vrSamples_[2] = {0, 0};
+    // Edge-triggered logging for the depth layer: it turns itself off whenever
+    // the quality ladder renders at a fraction of the eye's resolution, and
+    // that transition needs to be visible in the log rather than inferred.
+    bool vrDepthWasOk_ = false;
     void stepVr();
 
     // Showcase routing: the orientation actually rendered from while active,

@@ -161,6 +161,15 @@ public:
     VkImage acquiredDepthImage() const;
     VkImageView acquiredDepthView() const;
 
+    // Whether the depth image the renderer was handed actually got written.
+    //
+    // Held across frames rather than reset per frame, on purpose: on a frame
+    // that is deliberately not redrawn the depth image still holds the content
+    // that matches the colour image being resubmitted, so the last drawn
+    // frame's answer is the correct one. Starts false, so depth is never
+    // described before anything has been drawn into it.
+    void setDepthValid(bool valid) { depthValid_ = valid; }
+
     // The hidden-area mesh for an eye, already projected to screen space:
     // pairs of floats in NDC, plus a triangle index list. Empty when the
     // runtime has no visibility mask, or before the first located frame -- the
@@ -297,6 +306,7 @@ private:
     MaskMesh mask_[2];
     VkImage depthTarget_ = VK_NULL_HANDLE;
     VkImageView depthTargetView_ = VK_NULL_HANDLE;
+    bool depthValid_ = false;
     // Kept so the depth image views can be destroyed with the session.
     VkDevice device_ = VK_NULL_HANDLE;
     float placeCentre_[3] = {0, 0, 0};

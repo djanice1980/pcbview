@@ -332,6 +332,12 @@ public:
         vrDepthImage_ = image;
     }
 
+    // Did the last drawFrame actually write the runtime's depth image? False
+    // when the scene rendered at a size other than the eye's, which is when
+    // depth silently cannot be produced. Submitting the depth layer anyway is
+    // worse than not submitting it -- see the comment at the test site.
+    bool vrDepthWritten() const { return vrDepthWritten_; }
+
     // This eye's hidden-area mesh, in NDC, uploaded once per eye and then
     // referenced by index. Drawn into depth at the head of the scene pass so
     // the rasterizer discards the fragments the lenses cannot show -- 22% of
@@ -826,10 +832,11 @@ private:
     // Two timestamps per frame in flight, read back when that slot's fence has
     // signalled and the results are therefore available.
     // --- Foveation (variable-rate shading) ----------------------------------
-    Image shadingRate_;
+    // One per level, both built up front. Switching level must not allocate
+    // or wait -- see buildShadingRateImage.
+    Image shadingRate_[2];
     VkExtent2D shadingRateExtent_{0, 0};
     int foveation_ = 0;
-    int foveationBuilt_ = -1;          // level the current image holds
     VkExtent2D foveationBuiltFor_{0, 0};
     void buildShadingRateImage();
 
@@ -842,6 +849,7 @@ private:
     uint32_t vrTargetW_ = 0, vrTargetH_ = 0;
     VkImageView vrDepthView_ = VK_NULL_HANDLE;
     VkImage vrDepthImage_ = VK_NULL_HANDLE;
+    bool vrDepthWritten_ = false;
 
     // --- Hidden-area mesh ---------------------------------------------------
     struct MaskBuffers {

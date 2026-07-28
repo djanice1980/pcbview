@@ -1002,6 +1002,19 @@ void VulkanWindow::stepVr() {
             if (eyeImage != VK_NULL_HANDLE)
                 vr_->releaseEye(static_cast<int>(i));
         }
+        // Whether the depth layer may describe what was just drawn. Both eyes
+        // render at the same size, so the last eye's answer is the frame's.
+        // Only set on a drawn frame: a skipped one is resubmitting images the
+        // last drawn frame produced, and its depth still matches them.
+        const bool depthOk = renderer_->vrDepthWritten();
+        vr_->setDepthValid(depthOk);
+        if (depthOk != vrDepthWasOk_) {
+            vrDepthWasOk_ = depthOk;
+            std::printf("vr-depth: %s (scene %.2fx eye)\n",
+                        depthOk ? "submitted" : "WITHHELD, rigid warp instead",
+                        static_cast<double>(ssEff));
+            std::fflush(stdout);
+        }
     }
     // Per-eye convergence, about once a second while path tracing. Whether
     // these numbers CLIMB is the difference between "accumulation is working
