@@ -1523,13 +1523,26 @@ void VulkanWindow::stepVr() {
             // not do; and the board sits around 0.4 m, which is a close focus to
             // hold and still reads as being in your face.
             //
-            // Eight metres, judged in the headset rather than reasoned about.
+            // Two metres, which is where the lenses focus.
             //
-            // Two was the textbook answer and it still read as close. At eight
-            // the eyes are essentially parallel, so a glance at the panel costs
-            // no convergence at all and there is nothing to refocus when the
-            // board is at arm's length. Fixed, so it stays put however the
-            // board is scaled or moved. PCBVIEW_VR_HUD_M overrides.
+            // Eight was tried first, on the reasoning that parallel eyes cost
+            // no convergence. That reasoning is incomplete: the panel of a
+            // PSVR2 sits at a FIXED optical distance of roughly 1.3-2 m no
+            // matter what disparity is rendered, so vergence at eight metres
+            // is pulling against an accommodation the optics have already
+            // fixed at two. The further out the HUD is placed the worse that
+            // conflict gets, which is why "push it further away" kept failing
+            // to make it easier to look at. Two metres puts vergence and
+            // accommodation in the same place.
+            //
+            // It is also the last distance where the knob still does anything:
+            // 2 m and 8 m differ by about 7 px of per-eye shift, 8 m and 12 m
+            // by half a pixel. Past a couple of metres stereo has no remaining
+            // authority over apparent distance, so a HUD that reads as "too
+            // close" at 8 m was never going to be fixed by moving it to 12.
+            //
+            // Fixed, so it stays put however the board is scaled or moved.
+            // PCBVIEW_VR_HUD_M overrides.
             float fov[4] = {-0.9f, 0.9f, 0.9f, -0.9f};
             if (vr_->eyeFov(static_cast<int>(i), fov)) {
                 // From the ROOM, not from the Eye structs. Those carry the eye
@@ -1544,49 +1557,68 @@ void VulkanWindow::stepVr() {
                 static const float D = [] {
                     bool ok = false;
                     const float v = qgetenv("PCBVIEW_VR_HUD_M").toFloat(&ok);
-                    return (ok && v >= 0.5f && v <= 20.0f) ? v : 8.0f;
+                    return (ok && v >= 0.5f && v <= 20.0f) ? v : 2.0f;
                 }();
                 const float ex = (i == 0 ? -0.5f : 0.5f) * ipd;
                 const float tanL = std::tan(fov[0]);
                 const float tanR = std::tan(fov[1]);
-                const float t = -ex / D;
-                const float ndcx =
-                    (2.0f * t - tanR - tanL) / std::max(tanR - tanL, 1.0e-3f);
-                // PCBVIEW_VR_HUD_SHIFT scales the computed shift, and exists
-                // because the arithmetic and the report disagree.
+                const float den = std::max(tanR - tanL, 1.0e-3f);
+                // The shift is TWO terms, and keeping them apart is the whole
+                // lesson of the week it took to get here.
                 //
-                // Between 8 m and 10 m this shift changes by about half a
-                // pixel -- the eyes are parallel long before that -- so a
-                // visible change in apparent distance across that range cannot
-                // come from the model as written. Something in the
-                // implementation does not match it, and a multiplier settles
-                // which way: 0 removes the per-eye offset entirely, 1 is the
-                // computed value, and if 0 reads as FARTHER than 1 then the
-                // shift has the wrong sign and is pushing the panel toward the
-                // viewer rather than away.
-                static const float shiftMul = [] {
+                // RECENTRE is the larger by a factor of about 170. It has
+                // nothing to do with depth: the frusta are strongly asymmetric
+                // (eye 0 spans -1.073 to +0.758 rad), so the direction
+                // straight ahead of an eye is simply not the middle of that
+                // eye's image, and a screen-space panel has to be moved there
+                // before any question of distance arises. It is fixed by the
+                // headset's optics and must never be scaled.
+                //
+                // DEPTH is the disparity proper, and it is tiny: the entire
+                // range from 40 cm to infinity is 0.05 of ndc, against 0.32
+                // for the recentring.
+                //
+                // A multiplier over the SUM of the two was the previous knob,
+                // and it could only ever be wrong -- 1.0 is 2 m, 1.06 is 1 m,
+                // 1.17 is 40 cm and 1.5 asks the eyes to converge on something
+                // eleven centimetres from the nose. Every value that is not
+                // almost exactly 1.0 is unfusable, so sweeping it read as "the
+                // maths is wrong" when it was only ever "this knob has no
+                // usable range". The headset and the arithmetic agreed the
+                // whole time: 0 and 2 land equal and opposite about 1.0, which
+                // is the derivation's own answer.
+                //
+                // What survives is an ADDITIVE nudge in pixels, default 0. If
+                // a residual ever does show up, whatever value lands is
+                // directly readable as "the model is off by N pixels" instead
+                // of being tangled up with a term 170x its size.
+                const float ndcRecentre = (-tanR - tanL) / den;
+                const float ndcDepth = (2.0f * (-ex / D)) / den;
+                const float ndcx = ndcRecentre + ndcDepth;
+                static const float nudgePx = [] {
                     bool ok = false;
-                    const float v = qgetenv("PCBVIEW_VR_HUD_SHIFT").toFloat(&ok);
-                    return (ok && v >= -3.0f && v <= 3.0f) ? v : 1.0f;
+                    const float v =
+                        qgetenv("PCBVIEW_VR_HUD_NUDGE_PX").toFloat(&ok);
+                    return (ok && v >= -400.0f && v <= 400.0f) ? v : 0.0f;
                 }();
                 const float halfW = 0.5f * static_cast<float>(width()) *
                                     static_cast<float>(devicePixelRatio());
-                renderer_->setOverlayShiftPx(shiftMul * ndcx * halfW);
-                // Printed once per eye because the derivation says the
-                // multiplier should be exactly 1.0 and the headset says it is
-                // nearer 1.6. One of these numbers is not what I think it is,
-                // and guessing which has already failed twice.
+                const float sign = (i == 0 ? 1.0f : -1.0f);
+                renderer_->setOverlayShiftPx(ndcx * halfW + sign * nudgePx);
+                // Once per eye, with the two terms broken out: the failure
+                // this replaces was invisible precisely because they were
+                // summed before anyone could see their relative size.
                 static bool saidShift[2] = {false, false};
                 const size_t si = i < 2 ? i : 1;
                 if (!saidShift[si]) {
                     saidShift[si] = true;
-                    std::printf("vr-hud: eye %zu ipd=%.4f m D=%.1f m "
-                                "tanL=%.3f tanR=%.3f ndcx=%+.4f halfW=%.1f "
-                                "shift=%+.1f px | window %dx%d dpr %.2f "
-                                "scene %ux%u\n",
-                                si, ipd, D, tanL, tanR, ndcx, halfW,
-                                shiftMul * ndcx * halfW, width(), height(),
-                                devicePixelRatio(),
+                    std::printf("vr-hud: eye %zu D=%.1f m ipd=%.4f m -> ndc "
+                                "%+.4f (recentre %+.4f, depth %+.4f) | shift "
+                                "%+.1f px, nudge %+.1f px | window %dx%d dpr "
+                                "%.2f scene %ux%u\n",
+                                si, D, ipd, ndcx, ndcRecentre, ndcDepth,
+                                ndcx * halfW + sign * nudgePx, sign * nudgePx,
+                                width(), height(), devicePixelRatio(),
                                 renderer_->sceneExtent().width,
                                 renderer_->sceneExtent().height);
                     std::fflush(stdout);
