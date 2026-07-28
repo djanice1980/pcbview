@@ -1003,6 +1003,10 @@ private:
     int temporalMaxFrames_ = 32;
     float worldSpan_ = 0.0f;   // board width; 0 = unknown, world limits off
     bool ptResourcesWanted_ = true;
+    // Scene size the path tracer's images were last built at. They are NOT
+    // rebuilt on every scene resize -- only when something is about to trace
+    // into them -- so this records how stale they are. Zero means never built.
+    VkExtent2D ptImagesFor_{0, 0};
     bool temporalReset_ = false;
     void createTemporal();
     void updateTemporalDescriptors();

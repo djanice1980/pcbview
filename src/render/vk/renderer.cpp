@@ -643,6 +643,22 @@ void Renderer::rebuildTracedGeometry(float progress) {
 void Renderer::setRenderMode(RenderMode m) {
     if (m == mode_) return;
     mode_ = m;
+    // Pay for the path tracer's buffers here, where the mode is chosen once,
+    // instead of on every scene resize -- see createSceneTargets. They may have
+    // been left at an older size while raster was running, and this is the
+    // moment that stops being harmless.
+    if (m == RenderMode::PathTraced && rtSupported_ && ptResourcesWanted_ &&
+        (ptImagesFor_.width != sceneExtent_.width ||
+         ptImagesFor_.height != sceneExtent_.height) &&
+        sceneExtent_.width > 0 && sceneExtent_.height > 0) {
+        vkDeviceWaitIdle(device_.handle);
+        abortDenoise();
+        recreatePtImagesLive();
+        if (ptSet_) updatePathTraceDescriptors();
+        updateGpuDenoiseDescriptors();
+        updateTemporalDescriptors();
+        ptImagesFor_ = sceneExtent_;
+    }
     resetAccumulation();
 }
 
@@ -2095,11 +2111,33 @@ void Renderer::createSceneTargets() {
     // Path-tracer targets, at the same resolution. HDR accumulation + the two
     // denoiser guides, all storage images kept in GENERAL layout.
     if (rtSupported_ && ptResourcesWanted_) {
-        // The async denoise's fenced readback references these images; drain it
-        // before they go away.
-        abortDenoise();
-        recreatePtImagesLive();
-        if (ptSet_) updatePathTraceDescriptors();
+        // Only when something is actually going to trace into them.
+        //
+        // recreatePtImagesLive frees and reallocates seven RGBA32F images at
+        // the scene's resolution. At an eye's 2082x2122 that is about 70 MB
+        // each, so roughly half a gigabyte of VRAM churned -- and it was
+        // happening on EVERY scene resize, including the adaptive ladder's
+        // resolution rungs, in VR, which runs raster and never dispatches the
+        // path tracer at all. Measured at 24 to 32 ms per rung change: two or
+        // three dropped frames, every time the viewer leaned across a
+        // threshold.
+        //
+        // Deferred rather than freed. Freeing them in raster mode crashed on
+        // the first VR frame for reasons never established, so this does not
+        // touch that: the images stay allocated and their descriptors stay
+        // valid, they simply keep the size they had until path tracing is
+        // selected, which is the only thing that cares. setRenderMode rebuilds
+        // them if the scene changed size in the meantime.
+        const bool never =
+            ptImagesFor_.width == 0 || ptImagesFor_.height == 0;
+        if (never || mode_ == RenderMode::PathTraced) {
+            // The async denoise's fenced readback references these images;
+            // drain it before they go away.
+            abortDenoise();
+            recreatePtImagesLive();
+            if (ptSet_) updatePathTraceDescriptors();
+            ptImagesFor_ = sceneExtent_;
+        }
     }
 }
 
@@ -2208,6 +2246,7 @@ void Renderer::setPathTraceResourcesEnabled(bool on) {
             if (ptSet_) updatePathTraceDescriptors();
             updateGpuDenoiseDescriptors();
             updateTemporalDescriptors();
+            ptImagesFor_ = sceneExtent_;
         }
     } else {
         // Thirteen full-resolution RGBA32F buffers handed back. At a
