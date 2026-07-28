@@ -584,6 +584,17 @@ void MainWindow::buildViewport() {
             QSignalBlocker block(vrAction_);
             vrAction_->setChecked(on);
         }
+        // Re-push the appearance when a session comes up.
+        //
+        // Entering VR destroys the renderer and builds another, and every
+        // Effects value lives in THIS window -- the renderer only holds a copy.
+        // applyAppearance normally rides on boardUploaded, but that is a race
+        // against the new renderer's own creation, and losing it leaves the
+        // headset on the renderer's defaults: component reflections at 0 where
+        // the window has them at 100, which reads as "the chips went matte in
+        // VR". Cheap, idempotent, and it removes the ordering question rather
+        // than betting on it.
+        if (on) applyAppearance();
         statusBar()->showMessage(
             on ? "VR session running — the window mirrors the left eye"
                : "VR unavailable — no headset or runtime answered",

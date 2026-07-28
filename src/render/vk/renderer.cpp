@@ -5196,11 +5196,21 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // raster, RT and path tracing alike, and lands in high-res exports too.
     recordBloom(cmd);
 
-    // On an export frame the overlay goes into the SCENE image as well, at the
-    // export resolution -- otherwise a high-res screenshot would silently drop
-    // the measurements and dimension callouts the user is looking at. The
-    // on-screen copy is still drawn later, onto the swapchain.
-    if (!capturePath_.empty() && captureScene_ && !overlayTris_.empty()) {
+    // The overlay goes into the SCENE image for an export frame -- otherwise a
+    // high-res screenshot would silently drop the measurements and dimension
+    // callouts the user is looking at -- and for a VR frame, which is the only
+    // way it reaches the headset at all.
+    //
+    // The eye is fed by copying sceneColor_, so anything not in that image
+    // before the blit simply does not exist as far as the runtime is
+    // concerned. The other overlay pass draws onto the WINDOW's swapchain,
+    // which in VR is a mirror of one eye at the window's size: the second eye
+    // never sees it, and the first only would if the copy happened afterwards,
+    // which it does not. Measurements, the view menu and the zoom readout were
+    // all invisible through the lenses for exactly that reason.
+    const bool vrFrame = vrTarget_ != VK_NULL_HANDLE;
+    if (!overlayTris_.empty() &&
+        (vrFrame || (!capturePath_.empty() && captureScene_))) {
         VkRenderingAttachmentInfo oColor{
             VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         oColor.imageView = sceneColor_.view;
