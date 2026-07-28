@@ -700,7 +700,27 @@ void VulkanWindow::stepVr() {
         // view. k starts at zero meaning "not yet known", and until every level
         // the chooser wants has a value the distance ladder is left in charge.
         static double baseMs = 1.0e9;
+        static double baseWinA = 1.0e9, baseWinB = 1.0e9;
+        static int baseWinN = 0;
         static double kPerFrag[3] = {0.0, 0.0, 0.0};
+        // A deliberately PESSIMISTIC price alongside the average one, and the
+        // pessimistic one is what decisions use.
+        //
+        // Fragments are not all equal, and the reported symptom is what proves
+        // it: the dark side of the board is not glitchy at all. A fragment
+        // facing away from the sun skips its shadow rays entirely, so it costs
+        // a fraction of a lit one -- and the model prices a frame by fragment
+        // COUNT, which cannot tell them apart. Fitted while looking at the
+        // shadowed side, k is far too low; turn to the lit side and the
+        // configuration it chose is suddenly unaffordable, which is exactly
+        // "glitchy up close, lit side only", and worse on the denser board
+        // because every ray that IS fired traverses more geometry.
+        //
+        // A slowly decaying maximum remembers the expensive view for about
+        // half a minute and reacts to a new one instantly. The cost is a
+        // slightly conservative choice while looking at the cheap side; the
+        // alternative is being caught out every time the viewer turns around.
+        static double kHi[3] = {0.0, 0.0, 0.0};
         static int stableFrames = 0;
         static int modelHold = 0;
         static int modelRayQ = 2, modelFov = 2;
@@ -710,6 +730,11 @@ void VulkanWindow::stepVr() {
         // measurement arrives two slots late, so this is the only honest thing
         // to credit a sample to.
         static int appliedRayQ = 2;
+        // The score last stepped DOWN from, and how long it stays out of
+        // bounds. Stops the chooser climbing back into a setting it has just
+        // established does not fit.
+        static int rejectedScore = 1000;
+        static int rejectCooldown = 0;
         // Whether the model is the one choosing. The distance ladder still runs
         // underneath -- it seeds the fit and covers devices that cannot count
         // fragments -- but once the model takes over, the ladder's own
@@ -879,20 +904,28 @@ void VulkanWindow::stepVr() {
                 ++stableFrames;
                 if (frameGpuMs > 0.0 && frameFragInv > 10000.0 &&
                     stableFrames > 4) {
-                    // The floor, not a guess at it. The cheapest frames are the
-                    // ones with almost no board in view, which happens whenever
-                    // the viewer looks away, so a running minimum finds it. The
-                    // creep upwards lets it recover if conditions change.
+                    // The floor, as a true sliding-window minimum.
                     //
-                    // The ceiling on this clamp used to be 2 ms and the log
-                    // showed base pinned there on every line -- the clamp, not
-                    // a measurement, with everything above it wrongly charged
-                    // to the fragments. Both eyes' fixed costs, the visibility
-                    // mask, the blit and bloom all live in here, and they add
-                    // up to more than that.
-                    if (frameGpuMs < baseMs) baseMs = frameGpuMs;
-                    else baseMs *= 1.0001;
-                    baseMs = std::clamp(baseMs, 0.05, 8.0);
+                    // The cheapest frames are the ones with almost no board in
+                    // view, which happens whenever the viewer looks away, so a
+                    // minimum finds the fixed cost. It was a decaying minimum
+                    // -- pulled down by any cheap frame, nudged up otherwise --
+                    // and the log showed exactly what that does: base climbed
+                    // monotonically from 0.34 to 1.55 ms over one session,
+                    // 1.0001 per frame compounding to 2.7x a minute at 90 Hz.
+                    // A floor that drifts upward quietly reassigns real
+                    // per-fragment cost to the constant term.
+                    //
+                    // Two buckets, swapped on a timer, minimum of both: a
+                    // genuine minimum over the last 20 to 40 seconds, which
+                    // forgets stale conditions without inventing a trend.
+                    baseWinA = std::min(baseWinA, frameGpuMs);
+                    if (++baseWinN >= 1800) {
+                        baseWinB = baseWinA;
+                        baseWinA = 1.0e9;
+                        baseWinN = 0;
+                    }
+                    baseMs = std::clamp(std::min(baseWinA, baseWinB), 0.05, 8.0);
                     const double sample =
                         std::max(0.0, frameGpuMs - baseMs) / frameFragInv;
                     // Credited to the settings the measured frame was drawn
@@ -901,8 +934,12 @@ void VulkanWindow::stepVr() {
                     // chosen. Getting that wrong charged every 7- and 11-ray
                     // frame to the 4-ray coefficient, so k[0] and k[1] stayed
                     // at zero forever and k[2] swung over a twelvefold range.
-                    double& k = kPerFrag[std::clamp(appliedRayQ, 0, 2)];
-                    k = k <= 0.0 ? sample : k * 0.97 + sample * 0.03;
+                    const int q = std::clamp(appliedRayQ, 0, 2);
+                    double& k = kPerFrag[q];
+                    k = k <= 0.0 ? sample : k * 0.985 + sample * 0.015;
+                    // Instantly up, slowly down: the worst recently seen, which
+                    // is the one that has to fit.
+                    kHi[q] = std::max(sample, kHi[q] * 0.9995);
                 }
 
                 // The board's projected radius, in the same units the rate
@@ -928,11 +965,10 @@ void VulkanWindow::stepVr() {
                 // that level actually runs, measurement replaces the guess.
                 static const double kRays[3] = {11.0, 7.0, 4.0};
                 auto kFor = [&](int q) -> double {
-                    if (kPerFrag[q] > 0.0) return kPerFrag[q];
+                    if (kHi[q] > 0.0) return kHi[q];
                     for (int s = 0; s < 3; ++s)
-                        if (kPerFrag[s] > 0.0)
-                            return kPerFrag[s] *
-                                   std::pow(kRays[q] / kRays[s], 1.3);
+                        if (kHi[s] > 0.0)
+                            return kHi[s] * std::pow(kRays[q] / kRays[s], 1.3);
                     return 0.0;
                 };
                 // One measured level is enough to start; the rest are seeded.
@@ -959,7 +995,17 @@ void VulkanWindow::stepVr() {
                                                                   : 0) +
                                          10 * (2 - modelFov) + (2 - modelRayQ);
                     int pick = -1;
+                    if (rejectCooldown > 0) --rejectCooldown;
                     for (size_t i = 0; i < kCands.size(); ++i) {
+                        // Do not climb straight back to something just
+                        // abandoned. The log showed 4 rays to 7 and back within
+                        // two decisions: nothing remembered that the richer
+                        // setting had already been tried and found wanting, so
+                        // the smallest wobble in the fit re-proposed it. This
+                        // is what a hysteresis band cannot express, because the
+                        // two configurations are not adjacent on one axis.
+                        if (rejectCooldown > 0 && kCands[i].score >= rejectedScore)
+                            continue;
                         // Improving the picture has to clear a wider bar than
                         // holding it. Stepping up multiplies the frame cost, so
                         // a candidate that only just fits at today's price will
@@ -995,16 +1041,22 @@ void VulkanWindow::stepVr() {
                             const bool resMoved =
                                 std::fabs(c.ss - modelSs) > 0.01f;
                             modelHold = resMoved ? 240 : 60;
+                            // Stepping DOWN records what did not fit, so the
+                            // chooser does not climb straight back into it.
+                            if (c.score < scoreNow) {
+                                rejectedScore = scoreNow;
+                                rejectCooldown = 900;  // ten seconds
+                            }
                             std::printf(
                                 "vr-model: %d rays fov%d %.2fx -> %d rays fov%d "
                                 "%.2fx | cover %.2f, pred %.1f ms of %.1f, "
-                                "k=[%.2f %.2f %.2f] ms/Mfrag, base %.2f ms\n",
+                                "kHi=[%.2f %.2f %.2f] ms/Mfrag, base %.2f ms\n",
                                 modelRayQ == 0 ? 11 : (modelRayQ == 1 ? 7 : 4),
                                 modelFov, modelSs,
                                 c.rayQ == 0 ? 11 : (c.rayQ == 1 ? 7 : 4), c.fov,
                                 c.ss, coverR, predict(c), target,
-                                kPerFrag[0] * 1.0e6, kPerFrag[1] * 1.0e6,
-                                kPerFrag[2] * 1.0e6, baseMs);
+                                kHi[0] * 1.0e6, kHi[1] * 1.0e6, kHi[2] * 1.0e6,
+                                baseMs);
                             std::fflush(stdout);
                             modelRayQ = c.rayQ;
                             modelFov = c.fov;
