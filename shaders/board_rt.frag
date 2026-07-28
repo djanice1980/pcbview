@@ -351,7 +351,21 @@ void main() {
     diffuse *= mix(0.7, 1.0, ao);
 
     vec3 h = normalize(keyDir + viewDir);
-    float roughness = clamp(m.params.x, 0.05, 1.0);
+    // A WORLD-FIXED sun needs a wider lobe than a camera-relative one.
+    //
+    // The desktop's key light sits just off the eye, so the half-vector is
+    // always near the normal on a surface you are facing and a near-mirror
+    // highlight is permanently visible -- which is why polished copper reads as
+    // polished there. Under a sun fixed in the room the same lobe is only
+    // visible from the one angle that reflects it into your eye, so at pad
+    // shine 0.94 (roughness 0.049, an 831-power lobe barely two degrees wide)
+    // the board mostly shows no highlight at all. Correct for a mirror, and it
+    // reads as dull.
+    //
+    // Widening the floor to 0.12 spreads the lobe to something a head can
+    // actually find while still looking like polished metal rather than
+    // plastic. The desktop keeps the tighter mirror it was tuned with.
+    float roughness = clamp(m.params.x, worldSun ? 0.12 : 0.05, 1.0);
     float specPower = 2.0 / (roughness * roughness) - 2.0;
     float spec = pow(max(dot(n, h), 0.0), specPower) * (1.0 - roughness) * shadow;
 
@@ -364,9 +378,16 @@ void main() {
     vec3 refl = reflect(-viewDir, n);
     float envUp = clamp(refl.z * 0.5 + 0.5, 0.0, 1.0);
     vec3 env = mix(vec3(0.22), vec3(1.05), envUp);
+    // The environment term does the work under a fixed sun, because it is the
+    // only one that does not need the light caught at one exact angle: it
+    // varies with where the surface POINTS rather than with where the sun is,
+    // so copper stays metallic from every viewpoint and brightens as a pad
+    // turns to face you. Lifted in world-sun mode for that reason -- with the
+    // mirror lobe rarely in view, this is what has to read as shine.
+    float envWeight = worldSun ? 0.55 : 0.35;
     vec3 lit = applyNetHighlight(m.albedo.rgb) * diffuse
              + specTint * spec * mix(0.12, 1.3, m.params.y)
-             + specTint * env * (m.params.y * 0.35)
+             + specTint * env * (m.params.y * envWeight)
              + vec3(fresnel) * 0.08;
 
     float alpha = mix(m.albedo.a,
