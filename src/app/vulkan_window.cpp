@@ -1575,6 +1575,31 @@ void VulkanWindow::stepGamepad() {
         moved = true;
     }
 
+    // L2/R2 GROW the board, in the headset only. R2 bigger, L2 smaller.
+    //
+    // The way to read fine detail, and a better one than leaning in. Angular
+    // size is all readability depends on, and enlarging buys exactly as much of
+    // it as approaching -- but a 191 mm board at 0.35 m across puts 1 mm of
+    // silkscreen at about five pixels, so reading it means either 0.13 m away,
+    // where the eyes cross and the board fills the view, or three times the
+    // size at arm's length. The second costs no more: fill is bounded by the
+    // screen, not the board, so whatever overflows the view is free.
+    //
+    // Analog, and exponential, so a light pull creeps and a full pull moves.
+    if (vrMode && (g.leftTrigger > 0.0f || g.rightTrigger > 0.0f)) {
+        const float rate = (g.rightTrigger - g.leftTrigger) * 1.1f * fdt;
+        vrSizeMul_ = std::clamp(vrSizeMul_ * std::exp(rate), 0.25f, 12.0f);
+        vr_->setBoardSizeMul(vrSizeMul_);
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::printf("vr-size: trigger zoom live (R2 grows, L2 shrinks) -- "
+                        "grow the board rather than leaning into it\n");
+            std::fflush(stdout);
+        }
+        moved = true;
+    }
+
     // L1/R1 dolly: R1 pulls in, L1 pushes out. Exponential so the rate is
     // constant in perceived terms rather than crawling when close and
     // rocketing when far. Digital buttons, so this is a fixed rate.

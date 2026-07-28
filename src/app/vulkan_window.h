@@ -395,6 +395,9 @@ private:
     // back to the window rebuilds the swapchain and every scene target, so it
     // waits for silence that lasts rather than reacting to a single frame.
     int vrIdleFrames_ = 0;
+    // How much the viewer has grown the board in the room, about the size it
+    // was placed at. The readable-detail control -- see stepGamepad.
+    float vrSizeMul_ = 1.0f;
     // Edge-triggered logging for the depth layer: it turns itself off whenever
     // the quality ladder renders at a fraction of the eye's resolution, and
     // that transition needs to be visible in the log rather than inferred.

@@ -193,6 +193,12 @@ public:
     float boardSizeMetres() const;
     float eyeFovHalfY() const;
 
+    // Grow or shrink the board in the room, about the size it was placed at.
+    // The way to read fine detail without putting your face in it -- see the
+    // note at the definition.
+    void setBoardSizeMul(float m);
+    float boardSizeMul() const { return sizeMul_; }
+
     // The hidden-area mesh for an eye, already projected to screen space:
     // pairs of floats in NDC, plus a triangle index list. Empty when the
     // runtime has no visibility mask, or before the first located frame -- the
@@ -336,6 +342,10 @@ private:
     float placeCentre_[3] = {0, 0, 0};
     float placeScale_ = 0.001f;   // mm -> m
     float placeSizeM_ = 0.35f;    // how wide the board is made, in room metres
+    float placeSizeBaseM_ = 0.35f;  // before the viewer's size multiplier
+    float placeSpanMm_ = 0.0f;      // the board's own width
+    float sizeMul_ = 1.0f;
+    void applyBoardSize();
     // Where the viewer was when the board was last anchored. Captured once, so
     // the board stays put in the room instead of following your head around.
     float anchorPos_[3] = {0.0f, 0.0f, 0.0f};

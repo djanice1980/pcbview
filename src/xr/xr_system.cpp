@@ -1296,8 +1296,34 @@ void VrSession::setBoardPlacement(const float centreMm[3], float spanMm) {
         const float f = std::strtof(v, &end);
         return (end && end != v && f >= 0.05f && f <= 2.0f) ? f : 0.35f;
     }();
-    placeScale_ = spanMm > 1.0f ? sizeM / spanMm : 0.001f;
-    placeSizeM_ = sizeM;
+    placeSpanMm_ = spanMm;
+    placeSizeBaseM_ = sizeM;
+    applyBoardSize();
+}
+
+void VrSession::applyBoardSize() {
+    placeSizeM_ = placeSizeBaseM_ * sizeMul_;
+    placeScale_ =
+        placeSpanMm_ > 1.0f ? placeSizeM_ / placeSpanMm_ : 0.001f;
+}
+
+void VrSession::setBoardSizeMul(float m) {
+    // GROWING the board is how you inspect fine detail, not approaching it.
+    //
+    // Readability depends on ANGULAR size, and closing the distance and
+    // enlarging the board buy exactly the same amount of it. They are not
+    // equally pleasant. A 191 mm board shown at 0.35 m across renders 1 mm of
+    // silkscreen as about five pixels: to read it you need roughly three times
+    // that, which means either 0.13 m away -- where the eyes have to cross and
+    // the board swallows the view -- or three times the size at a comfortable
+    // arm's length.
+    //
+    // The second costs no more than the first. Fill is bounded by the SCREEN,
+    // not by the board, so whatever overflows the view is free. Same pixels,
+    // same rays, no vergence strain, and the parts you are not reading simply
+    // extend past the edge of vision the way a real board on a real bench does.
+    sizeMul_ = m < 0.25f ? 0.25f : (m > 12.0f ? 12.0f : m);
+    applyBoardSize();
 }
 
 float VrSession::boardSizeMetres() const { return placeSizeM_; }
