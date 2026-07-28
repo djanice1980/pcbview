@@ -706,6 +706,16 @@ void VulkanWindow::stepVr() {
         static int modelRayQ = 2, modelFov = 2;
         static float modelSs = 1.0f;
         static bool modelReady = false;
+        // What the frames now being measured were actually drawn with. The
+        // measurement arrives two slots late, so this is the only honest thing
+        // to credit a sample to.
+        static int appliedRayQ = 2;
+        // Whether the model is the one choosing. The distance ladder still runs
+        // underneath -- it seeds the fit and covers devices that cannot count
+        // fragments -- but once the model takes over, the ladder's own
+        // announcements describe a decision nothing acts on, so they are
+        // silenced rather than left to litter the log with fictional changes.
+        static bool modelDriving = false;
 
         if (adapt && !allowPt) {
             const double budget = vr_->nativeFrameMs();
@@ -837,11 +847,13 @@ void VulkanWindow::stepVr() {
                 // a shadow getting a little coarser, and the rungs that move
                 // it are the ones the pacing backstop reaches.
                 tierHold = 180;
-                std::printf("vr-adapt: %s -> %s  (%.2f m, %.1f ms of %.1f, "
-                            "paced %.0f Hz)\n",
-                            kTiers[tierNow].name, kTiers[want].name, d,
-                            frameGpuMs, budget, 1000.0 / vr_->pacedFrameMs());
-                std::fflush(stdout);
+                if (!modelDriving) {
+                    std::printf("vr-adapt: %s -> %s  (%.2f m, %.1f ms of %.1f, "
+                                "paced %.0f Hz)\n",
+                                kTiers[tierNow].name, kTiers[want].name, d,
+                                frameGpuMs, budget, 1000.0 / vr_->pacedFrameMs());
+                    std::fflush(stdout);
+                }
                 tierNow = want;
             }
             // Without variable-rate shading the bottom rung cannot buy its
@@ -867,12 +879,29 @@ void VulkanWindow::stepVr() {
                 ++stableFrames;
                 if (frameGpuMs > 0.0 && frameFragInv > 10000.0 &&
                     stableFrames > 4) {
+                    // The floor, not a guess at it. The cheapest frames are the
+                    // ones with almost no board in view, which happens whenever
+                    // the viewer looks away, so a running minimum finds it. The
+                    // creep upwards lets it recover if conditions change.
+                    //
+                    // The ceiling on this clamp used to be 2 ms and the log
+                    // showed base pinned there on every line -- the clamp, not
+                    // a measurement, with everything above it wrongly charged
+                    // to the fragments. Both eyes' fixed costs, the visibility
+                    // mask, the blit and bloom all live in here, and they add
+                    // up to more than that.
                     if (frameGpuMs < baseMs) baseMs = frameGpuMs;
-                    else baseMs *= 1.0004;  // let the floor recover
-                    baseMs = std::clamp(baseMs, 0.05, 2.0);
+                    else baseMs *= 1.0001;
+                    baseMs = std::clamp(baseMs, 0.05, 8.0);
                     const double sample =
                         std::max(0.0, frameGpuMs - baseMs) / frameFragInv;
-                    double& k = kPerFrag[std::clamp(rayQEff, 0, 2)];
+                    // Credited to the settings the measured frame was drawn
+                    // with -- appliedRayQ -- and NOT to rayQEff, which at this
+                    // point still holds what the distance ladder would have
+                    // chosen. Getting that wrong charged every 7- and 11-ray
+                    // frame to the 4-ray coefficient, so k[0] and k[1] stayed
+                    // at zero forever and k[2] swung over a twelvefold range.
+                    double& k = kPerFrag[std::clamp(appliedRayQ, 0, 2)];
                     k = k <= 0.0 ? sample : k * 0.97 + sample * 0.03;
                 }
 
@@ -937,7 +966,16 @@ void VulkanWindow::stepVr() {
                         // not fit once it is running -- that asymmetry is what
                         // stops the ladder pumping between two rungs.
                         const bool up = kCands[i].score > scoreNow;
-                        const double limit = up ? target * 0.75 : target;
+                        // Raising RESOLUTION is held to a tighter bar than any
+                        // other improvement. It multiplies the cost the most,
+                        // it is the most visible change, and it is the only one
+                        // that still drags a scene-target rebuild behind it --
+                        // so a resolution rung that turns out not to fit is
+                        // paid for twice, once going up and once coming back.
+                        const bool resUp = kCands[i].ss > modelSs + 0.01f;
+                        const double limit = resUp   ? target * 0.60
+                                             : up    ? target * 0.75
+                                                     : target;
                         if (predict(kCands[i]) <= limit) {
                             pick = static_cast<int>(i);
                             break;
@@ -956,7 +994,7 @@ void VulkanWindow::stepVr() {
                             // gets a longer hold than a shadow getting coarser.
                             const bool resMoved =
                                 std::fabs(c.ss - modelSs) > 0.01f;
-                            modelHold = resMoved ? 150 : 60;
+                            modelHold = resMoved ? 240 : 60;
                             std::printf(
                                 "vr-model: %d rays fov%d %.2fx -> %d rays fov%d "
                                 "%.2fx | cover %.2f, pred %.1f ms of %.1f, "
@@ -981,6 +1019,10 @@ void VulkanWindow::stepVr() {
                     ssEff = ss * modelSs;
                 }
             }
+            // Whatever ended up in force, model or ladder. Read at the top of a
+            // later frame to price the measurement that frame produces.
+            appliedRayQ = rayQEff;
+            modelDriving = useModel && modelReady;
         }
 
         // --- Measured sweep -------------------------------------------------
