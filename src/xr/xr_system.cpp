@@ -1303,22 +1303,38 @@ void VrSession::setBoardPlacement(const float centreMm[3], float spanMm) {
     // size instead: x1 is life size, the board as it would lie on a bench, and
     // x3 is three times that. Detail then reads the same on every board, which
     // is what an inspection tool should do.
+    // THREE TIMES LIFE SIZE by default, not a fixed width.
+    //
+    // Every board used to open 0.35 m across whatever it measured, which
+    // magnifies by wildly different amounts: a 50 mm board seven times, a
+    // 191 mm board under two. Fine detail was therefore legible on small boards
+    // and not on large ones, for no reason connected to the boards -- it reads
+    // as "the big one is blurry" when the big one is simply being shown four
+    // times smaller relative to itself.
+    //
+    // A magnification treats every board alike. Three, because that is what
+    // was tried in the headset and found comfortable: it puts 1 mm of
+    // silkscreen at a readable size at arm's length without the board
+    // swallowing the view. Small board 50 mm -> 0.15 m, large board 191 mm ->
+    // 0.57 m, and the shoulders adjust either from there.
+    const auto lifeSize = [&](float mult) {
+        const float m = spanMm * 0.001f * mult;
+        return (m >= 0.02f && m <= 8.0f) ? m : 0.35f;
+    };
     const float sizeM = [&] {
         const char* v = std::getenv("PCBVIEW_VR_SIZE");
-        if (!v || !v[0]) return 0.35f;
+        if (!v || !v[0]) return lifeSize(3.0f);
         const char* p = (v[0] == 'x' || v[0] == 'X') ? v + 1 : v;
         char* end = nullptr;
         const float f = std::strtof(p, &end);
-        if (!end || end == p) return 0.35f;
+        if (!end || end == p) return lifeSize(3.0f);
         const bool magnify =
             (v[0] == 'x' || v[0] == 'X') || (*end == 'x' || *end == 'X');
-        if (magnify) {
-            if (f < 0.1f || f > 40.0f) return 0.35f;
-            // spanMm is the board's own width; mm -> m, times the factor.
-            const float m = spanMm * 0.001f * f;
-            return (m >= 0.02f && m <= 8.0f) ? m : 0.35f;
-        }
-        return (f >= 0.05f && f <= 8.0f) ? f : 0.35f;
+        // A plain number still means an absolute width in metres, for anyone
+        // who wants every board the same size on purpose.
+        if (magnify)
+            return (f >= 0.1f && f <= 40.0f) ? lifeSize(f) : lifeSize(3.0f);
+        return (f >= 0.05f && f <= 8.0f) ? f : lifeSize(3.0f);
     }();
     placeSpanMm_ = spanMm;
     placeSizeBaseM_ = sizeM;
@@ -1932,9 +1948,15 @@ bool VrSession::beginFrame(std::vector<Eye>* eyes) {
     static bool dumped = false;
     if (!dumped && got >= 2) {
         dumped = true;
-        std::printf("vr-diag: placement scale=%.6f (board span -> 0.35 m), "
-                    "anchored at head (%.2f %.2f %.2f)\n",
-                    placeScale_, anchorPos_[0], anchorPos_[1], anchorPos_[2]);
+        // The size is no longer a constant, so print what it actually is --
+        // a hardcoded "0.35 m" here would have quietly lied the moment the
+        // default became a magnification.
+        std::printf("vr-diag: placement scale=%.6f (board span -> %.2f m, "
+                    "%.1fx life size), anchored at head (%.2f %.2f %.2f)\n",
+                    placeScale_, placeSizeM_,
+                    placeSpanMm_ > 1.0f ? placeSizeM_ * 1000.0f / placeSpanMm_
+                                        : 0.0f,
+                    anchorPos_[0], anchorPos_[1], anchorPos_[2]);
         for (uint32_t i = 0; i < got; ++i) {
             std::printf("vr-diag: eye %u room-pos(%+.4f %+.4f %+.4f) "
                         "fov L%+.3f R%+.3f U%+.3f D%+.3f\n",
