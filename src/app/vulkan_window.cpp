@@ -1644,54 +1644,42 @@ void VulkanWindow::stepGamepad() {
         moved = true;
     }
 
-    // L2/R2 GROW the board, in the headset only. R2 bigger, L2 smaller.
-    //
-    // The way to read fine detail, and a better one than leaning in. Angular
-    // size is all readability depends on, and enlarging buys exactly as much of
-    // it as approaching -- but a 191 mm board at 0.35 m across puts 1 mm of
-    // silkscreen at about five pixels, so reading it means either 0.13 m away,
-    // where the eyes cross and the board fills the view, or three times the
-    // size at arm's length. The second costs no more: fill is bounded by the
-    // screen, not the board, so whatever overflows the view is free.
-    //
-    // Analog, and exponential, so a light pull creeps and a full pull moves.
-    if (vrMode && (g.leftTrigger > 0.0f || g.rightTrigger > 0.0f)) {
-        const float rate = (g.rightTrigger - g.leftTrigger) * 1.1f * fdt;
-        vrSizeMul_ = std::clamp(vrSizeMul_ * std::exp(rate), 0.25f, 12.0f);
-        vr_->setBoardSizeMul(vrSizeMul_);
-        static bool said = false;
-        if (!said) {
-            said = true;
-            std::printf("vr-size: trigger zoom live (R2 grows, L2 shrinks) -- "
-                        "grow the board rather than leaning into it\n");
-            std::fflush(stdout);
-        }
-        moved = true;
-    }
-
     // L1/R1 dolly: R1 pulls in, L1 pushes out. Exponential so the rate is
     // constant in perceived terms rather than crawling when close and
     // rocketing when far. Digital buttons, so this is a fixed rate.
     if (g.heldLeftShoulder != g.heldRightShoulder) {
         if (vrMode) {
-            // In the headset there is no orbit distance to change -- the
-            // camera is a head. Slide the board along the axis it faces the
-            // viewer down instead, which reads as the same thing: R1 brings it
-            // to you, L1 pushes it away. In millimetres of board, scaled by
-            // its span so a small board and a large one move at the same
-            // apparent rate.
-            const auto& bb = mesh_->bounds;
-            const float span = static_cast<float>(
-                std::max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]));
-            board_.translation.z +=
-                (g.heldRightShoulder ? 1.0f : -1.0f) * span * 0.6f * fdt;
+            // In the headset the shoulders GROW the board rather than sliding
+            // it closer, and the difference matters.
+            //
+            // Readability depends only on ANGULAR size, and approaching and
+            // enlarging buy identical amounts of it -- but a 191 mm board shown
+            // 0.35 m across renders 1 mm of silkscreen at about five pixels, so
+            // reading it means either 0.13 m away, where the eyes have to cross
+            // and the board swallows the view, or three times the size at a
+            // comfortable arm's length. The second costs no more, because fill
+            // is bounded by the screen rather than by the board and whatever
+            // overflows the view is free. Confirmed in the headset: comfortable,
+            // readable, and none of the close-range glitching.
+            //
+            // This replaces a dolly that changed distance, which did the same
+            // job worse. It deliberately does NOT go on the triggers: those
+            // have peeled the stack apart since long before VR existed, and
+            // briefly having size on them too meant every attempt to zoom also
+            // exploded the board -- which is what "the silkscreen is floating"
+            // and "I can see through the mask" actually were.
+            vrSizeMul_ = std::clamp(
+                vrSizeMul_ *
+                    std::exp((g.heldRightShoulder ? 1.0f : -1.0f) * 0.9f * fdt),
+                0.25f, 12.0f);
+            vr_->setBoardSizeMul(vrSizeMul_);
             // Once, so "is the pad reaching the board at all" is answered by
             // the log rather than by squinting through the lenses.
             static bool said = false;
             if (!said) {
                 said = true;
-                std::printf("vr-pad: shoulder dolly live (R1 pulls in, L1 "
-                            "pushes out)\n");
+                std::printf("vr-pad: shoulder zoom live (R1 grows the board, "
+                            "L1 shrinks it); L2/R2 still explode the stack\n");
                 std::fflush(stdout);
             }
         } else {
