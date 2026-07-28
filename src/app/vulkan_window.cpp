@@ -699,28 +699,50 @@ void VulkanWindow::stepVr() {
         // the cheapest frames observed are the ones with almost no board in
         // view. k starts at zero meaning "not yet known", and until every level
         // the chooser wants has a value the distance ladder is left in charge.
-        static double baseMs = 1.0e9;
-        static double baseWinA = 1.0e9, baseWinB = 1.0e9;
-        static int baseWinN = 0;
-        static double kPerFrag[3] = {0.0, 0.0, 0.0};
-        // A deliberately PESSIMISTIC price alongside the average one, and the
-        // pessimistic one is what decisions use.
+        // A LEAST-SQUARES FIT of milliseconds against fragments, per ray level.
+        // Both the slope and the intercept are fitted; neither is assumed.
         //
-        // Fragments are not all equal, and the reported symptom is what proves
-        // it: the dark side of the board is not glitchy at all. A fragment
-        // facing away from the sun skips its shadow rays entirely, so it costs
-        // a fraction of a lit one -- and the model prices a frame by fragment
-        // COUNT, which cannot tell them apart. Fitted while looking at the
-        // shadowed side, k is far too low; turn to the lit side and the
-        // configuration it chose is suddenly unaffordable, which is exactly
-        // "glitchy up close, lit side only", and worse on the denser board
-        // because every ray that IS fired traverses more geometry.
+        // The intercept was previously taken to be the cheapest frame observed,
+        // on the reasoning that the cheapest frames have almost no board in
+        // view. They do not. The viewer is looking AT the board, so even the
+        // cheapest frame still shades a great many fragments -- the minimum is
+        // a point ON the line, not the line's intercept. Reading it as the
+        // intercept charged several milliseconds of genuine per-fragment work
+        // to a constant: the log showed base at 3 to 5 ms against a 6.1 ms
+        // target, leaving about one millisecond of apparent headroom, which
+        // pinned the chooser to the bottom rung the moment it engaged. The
+        // chooser was not at fault; the arithmetic beneath it was.
         //
-        // A slowly decaying maximum remembers the expensive view for about
-        // half a minute and reacts to a new one instantly. The cost is a
-        // slightly conservative choice while looking at the cheap side; the
-        // alternative is being caught out every time the viewer turns around.
-        static double kHi[3] = {0.0, 0.0, 0.0};
+        // Coverage varies constantly as the viewer moves, so the fragment count
+        // spans a wide range on its own and the regression is well conditioned
+        // without having to perturb anything deliberately. Accumulators decay
+        // so the fit follows the board and the view rather than averaging the
+        // whole session.
+        struct Fit {
+            double n = 0.0, x = 0.0, y = 0.0, xx = 0.0, xy = 0.0;
+            double k = 0.0, b = 0.0;   // ms per fragment, ms fixed
+            bool known = false;
+        };
+        static Fit fits[3];
+        // How badly the fit has recently UNDER-predicted, as a multiplier on
+        // every prediction.
+        //
+        // A single line cannot describe both sides of the board. The reported
+        // symptom is the proof: the shadowed side never glitches. Same rays
+        // either way -- the shader fires the centre shadow ray and all AO taps
+        // regardless -- but on the shadowed side those rays meet the board slab
+        // within a few BVH nodes, while on the lit side they fly into open
+        // space and traverse the entire structure before concluding nothing was
+        // hit. Neptune's is 8.65M vertices against cx4's 1.24M, which is why
+        // the gap is so much wider there.
+        //
+        // Fitting one slope through both regimes averages them, so the model
+        // overcommits the moment the viewer turns to the expensive one. Instead
+        // of trying to model orientation, watch the residual: if reality has
+        // recently cost 1.6x what was predicted, inflate predictions by 1.6x
+        // until that memory decays. Instantly up, forgetting over about half a
+        // minute, and it needs to know nothing about why.
+        static double safety = 1.0;
         static int stableFrames = 0;
         static int modelHold = 0;
         static int modelRayQ = 2, modelFov = 2;
@@ -904,30 +926,6 @@ void VulkanWindow::stepVr() {
                 ++stableFrames;
                 if (frameGpuMs > 0.0 && frameFragInv > 10000.0 &&
                     stableFrames > 4) {
-                    // The floor, as a true sliding-window minimum.
-                    //
-                    // The cheapest frames are the ones with almost no board in
-                    // view, which happens whenever the viewer looks away, so a
-                    // minimum finds the fixed cost. It was a decaying minimum
-                    // -- pulled down by any cheap frame, nudged up otherwise --
-                    // and the log showed exactly what that does: base climbed
-                    // monotonically from 0.34 to 1.55 ms over one session,
-                    // 1.0001 per frame compounding to 2.7x a minute at 90 Hz.
-                    // A floor that drifts upward quietly reassigns real
-                    // per-fragment cost to the constant term.
-                    //
-                    // Two buckets, swapped on a timer, minimum of both: a
-                    // genuine minimum over the last 20 to 40 seconds, which
-                    // forgets stale conditions without inventing a trend.
-                    baseWinA = std::min(baseWinA, frameGpuMs);
-                    if (++baseWinN >= 1800) {
-                        baseWinB = baseWinA;
-                        baseWinA = 1.0e9;
-                        baseWinN = 0;
-                    }
-                    baseMs = std::clamp(std::min(baseWinA, baseWinB), 0.05, 8.0);
-                    const double sample =
-                        std::max(0.0, frameGpuMs - baseMs) / frameFragInv;
                     // Credited to the settings the measured frame was drawn
                     // with -- appliedRayQ -- and NOT to rayQEff, which at this
                     // point still holds what the distance ladder would have
@@ -935,11 +933,34 @@ void VulkanWindow::stepVr() {
                     // frame to the 4-ray coefficient, so k[0] and k[1] stayed
                     // at zero forever and k[2] swung over a twelvefold range.
                     const int q = std::clamp(appliedRayQ, 0, 2);
-                    double& k = kPerFrag[q];
-                    k = k <= 0.0 ? sample : k * 0.985 + sample * 0.015;
-                    // Instantly up, slowly down: the worst recently seen, which
-                    // is the one that has to fit.
-                    kHi[q] = std::max(sample, kHi[q] * 0.9995);
+                    Fit& f = fits[q];
+                    // Fragments in millions, so the accumulators stay in a
+                    // range where the normal equations are numerically sane --
+                    // squaring two million raw would not be.
+                    const double x = frameFragInv * 1.0e-6;
+                    const double y = frameGpuMs;
+                    const double decay = 0.999;
+                    f.n = f.n * decay + 1.0;
+                    f.x = f.x * decay + x;
+                    f.y = f.y * decay + y;
+                    f.xx = f.xx * decay + x * x;
+                    f.xy = f.xy * decay + x * y;
+                    // Ordinary least squares. The denominator is n times the
+                    // variance of the fragment count, so it goes to zero
+                    // exactly when the viewer has held still and there is
+                    // nothing to learn -- which is when the previous fit is
+                    // still the best answer available, so keep it.
+                    const double den = f.n * f.xx - f.x * f.x;
+                    if (f.n > 30.0 && den > 1.0e-6) {
+                        const double k = (f.n * f.xy - f.x * f.y) / den;
+                        const double b = (f.y - k * f.x) / f.n;
+                        // A negative slope or intercept is the fit telling us
+                        // the data was degenerate this instant, not that rays
+                        // are free. Clamp rather than believe it.
+                        f.k = std::clamp(k, 0.0, 100.0);
+                        f.b = std::clamp(b, 0.0, 8.0);
+                        f.known = true;
+                    }
                 }
 
                 // The board's projected radius, in the same units the rate
@@ -964,15 +985,22 @@ void VulkanWindow::stepVr() {
                 // costs a little quality and never a dropped frame. The moment
                 // that level actually runs, measurement replaces the guess.
                 static const double kRays[3] = {11.0, 7.0, 4.0};
-                auto kFor = [&](int q) -> double {
-                    if (kHi[q] > 0.0) return kHi[q];
+                auto fitFor = [&](int q, double* k, double* b) -> bool {
+                    if (fits[q].known) {
+                        *k = fits[q].k;
+                        *b = fits[q].b;
+                        return true;
+                    }
                     for (int s = 0; s < 3; ++s)
-                        if (kHi[s] > 0.0)
-                            return kHi[s] * std::pow(kRays[q] / kRays[s], 1.3);
-                    return 0.0;
+                        if (fits[s].known) {
+                            *k = fits[s].k * std::pow(kRays[q] / kRays[s], 1.3);
+                            *b = fits[s].b;  // fixed cost does not follow rays
+                            return true;
+                        }
+                    return false;
                 };
-                // One measured level is enough to start; the rest are seeded.
-                modelReady = kFor(2) > 0.0 && baseMs < 1.0e8;
+                double k0 = 0.0, b0 = 0.0;
+                modelReady = fitFor(2, &k0, &b0);
 
                 if (modelReady && frameFragInv > 10000.0) {
                     // Half the nominal budget, not all of it. The compositor's
@@ -987,8 +1015,27 @@ void VulkanWindow::stepVr() {
                         const double fragScale =
                             double(c.ss * c.ss) / double(ssNow * ssNow) *
                             double(fovFactor(c.fov, coverR)) / double(fovNow);
-                        return baseMs + kFor(c.rayQ) * frameFragInv * fragScale;
+                        double k = 0.0, b = 0.0;
+                        fitFor(c.rayQ, &k, &b);
+                        return safety *
+                               (b + k * frameFragInv * 1.0e-6 * fragScale);
                     };
+
+                    // Update the safety multiplier from how the CURRENT setting
+                    // actually turned out. Predicting the configuration we are
+                    // already running is the one prediction that can be checked
+                    // against a measurement, so it is the one that calibrates
+                    // everything else.
+                    {
+                        double k = 0.0, b = 0.0;
+                        fitFor(std::clamp(appliedRayQ, 0, 2), &k, &b);
+                        const double pred = b + k * frameFragInv * 1.0e-6;
+                        if (pred > 0.05 && frameGpuMs > 0.0) {
+                            const double ratio = frameGpuMs / pred;
+                            safety = std::clamp(
+                                std::max(ratio, safety * 0.9995), 1.0, 4.0);
+                        }
+                    }
 
                     const int scoreNow = 100 * (modelSs > 0.9f    ? 2
                                                 : modelSs > 0.72f ? 1
@@ -1050,13 +1097,13 @@ void VulkanWindow::stepVr() {
                             std::printf(
                                 "vr-model: %d rays fov%d %.2fx -> %d rays fov%d "
                                 "%.2fx | cover %.2f, pred %.1f ms of %.1f, "
-                                "kHi=[%.2f %.2f %.2f] ms/Mfrag, base %.2f ms\n",
+                                "k=[%.2f %.2f %.2f] ms/Mfrag, fixed %.2f ms, "
+                                "safety %.2fx\n",
                                 modelRayQ == 0 ? 11 : (modelRayQ == 1 ? 7 : 4),
                                 modelFov, modelSs,
                                 c.rayQ == 0 ? 11 : (c.rayQ == 1 ? 7 : 4), c.fov,
-                                c.ss, coverR, predict(c), target,
-                                kHi[0] * 1.0e6, kHi[1] * 1.0e6, kHi[2] * 1.0e6,
-                                baseMs);
+                                c.ss, coverR, predict(c), target, fits[0].k,
+                                fits[1].k, fits[2].k, fits[2].b, safety);
                             std::fflush(stdout);
                             modelRayQ = c.rayQ;
                             modelFov = c.fov;
