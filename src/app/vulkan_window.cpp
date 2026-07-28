@@ -4031,9 +4031,23 @@ void VulkanWindow::buildOverlay() {
             // put it where the eye already is. It fades in well under two
             // seconds, so briefly covering the middle costs nothing.
             const float cy = vr_ ? h * 0.5f : h - panelH * 1.6f;
-            const float bg[4] = {0.06f, 0.06f, 0.08f, 0.80f * fade};
-            const float fg[4] = {kAmber[0], kAmber[1], kAmber[2], fade};
-            quad(x0, cy, x0 + panelW, cy, panelH, bg);
+            // Readable against ANY backdrop, which a near-black panel is not.
+            //
+            // The room behind the board is dark grey, so a dark panel at 80%
+            // alpha effectively disappeared -- and the giveaway was that it
+            // only became visible once the board was grown enough to fill the
+            // view and put bright green behind it. Contrast, not placement.
+            //
+            // Near-opaque, with a bright rule top and bottom so the panel has
+            // an edge of its own whatever it happens to be sitting on.
+            const float bg[4] = {0.05f, 0.05f, 0.07f, 0.94f * fade};
+            const float fg[4] = {1.0f, 1.0f, 1.0f, fade};
+            const float rule[4] = {kAmber[0], kAmber[1], kAmber[2], fade};
+            const float x1 = x0 + panelW;
+            quad(x0, cy, x1, cy, panelH, bg);
+            const float edge = std::max(2.0f, ts * 0.10f);
+            quad(x0, cy - panelH * 0.5f, x1, cy - panelH * 0.5f, edge, rule);
+            quad(x0, cy + panelH * 0.5f, x1, cy + panelH * 0.5f, edge, rule);
             drawText(padStatus_, w * 0.5f, cy, ts, fg);
         }
     }
