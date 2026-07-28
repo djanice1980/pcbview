@@ -64,6 +64,17 @@ struct BoardPose {
     // way it turns. Sliding it through space while the viewpoint stays put is
     // the thing that actually reads as "I moved the object".
     glm::vec3 translation = glm::vec3(0.0f);
+    // Uniform scale about the same bounds centre the rotation uses.
+    //
+    // Worth having even though, with the camera aimed at that centre, scaling
+    // the board by s produces the identical image to moving the camera to 1/s
+    // of its distance -- uniform scale about the look-at point IS a dolly, same
+    // projection, same perspective. Two things make it a real control anyway:
+    // once the board has been slid off-centre the camera is no longer looking
+    // at the scale pivot, so the two stop being equivalent; and in VR they
+    // never were, because translating changes how far your eyes converge on the
+    // board and scaling does not.
+    float scale = 1.0f;
 };
 
 struct Camera {

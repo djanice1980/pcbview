@@ -1701,15 +1701,22 @@ void VulkanWindow::stepGamepad() {
                 std::fflush(stdout);
             }
         } else {
-            const float rate = (g.heldLeftShoulder ? 1.0f : -1.0f) * 1.6f * fdt;
-            camera_.distance =
-                std::clamp(camera_.distance * std::exp(rate), 0.5f, 5000.0f);
-            // A wheel glide in flight would fight this.
-            zoomAnimating_ = false;
+            // The DESKTOP grows and shrinks the board too, so the shoulders
+            // mean the same thing in both modes. It is a real scale about the
+            // board's own centre, not a renamed dolly -- which matters once the
+            // board has been slid off-centre, where the camera is no longer
+            // looking at the scale pivot and the two stop being equivalent.
+            const bool bigger = g.heldRightShoulder;
+            board_.scale = std::clamp(
+                board_.scale * std::exp((bigger ? 1.0f : -1.0f) * 1.6f * fdt),
+                0.1f, 20.0f);
+            const auto& bb = mesh_->bounds;
+            const float span = static_cast<float>(
+                std::max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]));
             char s[96];
-            std::snprintf(s, sizeof(s), "%s   %.1f mm away",
-                          g.heldRightShoulder ? "NEARER" : "FURTHER",
-                          static_cast<double>(camera_.distance));
+            std::snprintf(s, sizeof(s), "%s   board %.1f mm across",
+                          bigger ? "BIGGER" : "SMALLER",
+                          static_cast<double>(span * board_.scale));
             setPadStatus(s);
         }
         moved = true;
@@ -2442,6 +2449,7 @@ glm::mat4 VulkanWindow::boardMatrix() const {
     const glm::vec3 c = boardPivot();
     return glm::translate(glm::mat4(1.0f), board_.translation + c) *
            glm::mat4_cast(board_.rotation) *
+           glm::scale(glm::mat4(1.0f), glm::vec3(board_.scale)) *
            glm::translate(glm::mat4(1.0f), -c);
 }
 
@@ -2576,6 +2584,7 @@ void VulkanWindow::frameBoard(bool snap) {
     // home by hand. Orientation is deliberately kept -- you asked to frame it,
     // not to un-turn it.
     board_.translation = glm::vec3(0.0f);
+    board_.scale = 1.0f;
     const auto& b = mesh_->bounds;
     Camera dest = camera_;
     dest.targetX = static_cast<float>((b.min[0] + b.max[0]) * 0.5);
@@ -2879,13 +2888,17 @@ void VulkanWindow::render() {
     // away every translation while the board was still square-on -- the board
     // simply refused to slide until you had also turned it.
     if (board_.rotation != glm::quat(1.0f, 0.0f, 0.0f, 0.0f) ||
-        board_.translation != glm::vec3(0.0f)) {
+        board_.translation != glm::vec3(0.0f) || board_.scale != 1.0f) {
         const glm::mat4 inv = glm::inverse(boardMatrix());
         const glm::mat3 invR(inv);
         basis.eye = glm::vec3(inv * glm::vec4(basis.eye, 1.0f));
-        basis.forward = invR * basis.forward;
-        basis.right = invR * basis.right;
-        basis.up = invR * basis.up;
+        // RENORMALISED, because the inverse carries 1/scale and these are
+        // directions. Rotation and translation left them unit length so this
+        // was safe to skip before; scale does not, and a ray basis whose axes
+        // are 1/s long would stretch every trace by that factor.
+        basis.forward = glm::normalize(invR * basis.forward);
+        basis.right = glm::normalize(invR * basis.right);
+        basis.up = glm::normalize(invR * basis.up);
     }
     const glm::vec3 eye = basis.eye;
     const glm::mat4 view = viewFromBasis(basis);
@@ -2896,7 +2909,13 @@ void VulkanWindow::render() {
     // Near plane scales with the orbit distance rather than sitting at a fixed
     // hair's breadth. Reversed-Z makes precision forgiving, but there is no
     // reason to ask for a 200,000:1 range on a 50mm board.
-    const float zNear = std::max(camera_.distance * 0.005f, 0.02f);
+    //
+    // Divided by the board's scale, because the eye above has been moved into
+    // BOARD space and a board grown by s puts the camera 1/s of the distance
+    // away in that frame. Using the raw orbit distance would clip the near face
+    // off a board that had been enlarged.
+    const float zNear = std::max(
+        camera_.distance / std::max(board_.scale, 1.0e-3f) * 0.005f, 0.02f);
 
     glm::mat4 proj;
     if (camera_.orthographic) {
