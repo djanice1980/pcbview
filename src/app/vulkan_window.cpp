@@ -1678,8 +1678,9 @@ void VulkanWindow::stepGamepad() {
             static bool said = false;
             if (!said) {
                 said = true;
-                std::printf("vr-pad: shoulder zoom live (R1 grows the board, "
-                            "L1 shrinks it); L2/R2 still explode the stack\n");
+                std::printf("vr-pad: R1/L1 grow and shrink the board, R2/L2 "
+                            "bring it nearer and further; hold CROSS with a "
+                            "trigger to explode\n");
                 std::fflush(stdout);
             }
         } else {
@@ -1727,32 +1728,38 @@ void VulkanWindow::stepGamepad() {
             std::fflush(stdout);
         }
         moved = true;
-    } else if (vrMode && (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f)) {
-        // WITHOUT the chord, the triggers move the board NEARER and FURTHER.
+    } else if (g.rightTrigger > 0.0f || g.leftTrigger > 0.0f) {
+        // WITHOUT the chord, the triggers bring the board NEARER and FURTHER.
         //
-        // Size and distance are different tools and both are wanted. Growing
-        // the board is how you read fine detail without leaning in; moving it
-        // is how you place it where you want it in the room -- push it away to
-        // see the whole thing, pull it in to work on it. They were briefly
-        // collapsed into one control when the dolly was dropped, which lost
-        // the placement half.
+        // Size and distance are different tools in the headset and both are
+        // wanted. Growing the board is how you read fine detail without leaning
+        // in; moving it is how you place it in the room -- push it away to take
+        // in the whole thing, pull it in to work on part of it.
         //
-        // Analog here rather than the shoulders' fixed rate, so a light pull
-        // nudges and a full pull travels; scaled by the board's span so a small
-        // board and a large one move at the same apparent rate.
-        const auto& bb = mesh_->bounds;
-        const float span = static_cast<float>(
-            std::max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]));
+        // On a MONITOR they are the same picture. There is no room to sit in,
+        // so a bigger board and a nearer board are indistinguishable, and both
+        // pairs necessarily fall back to the camera's zoom. They stay distinct
+        // in feel rather than in kind: the shoulders step at a fixed rate, the
+        // triggers are pressure-proportional, so this pair is the fine control.
+        //
+        // Analog either way, so a light pull nudges and a full pull travels.
         constexpr float kCurve = 0.55f;
         const float pull = std::pow(g.rightTrigger, kCurve) -
                            std::pow(g.leftTrigger, kCurve);
-        board_.translation.z += pull * span * 0.6f * fdt;
-        static bool said = false;
-        if (!said) {
-            said = true;
-            std::printf("vr-pad: trigger dolly live (R2 brings the board in, "
-                        "L2 pushes it away)\n");
-            std::fflush(stdout);
+        if (vrMode) {
+            // Scaled by the board's span so a 50 mm board and a 191 mm one
+            // travel at the same apparent rate.
+            const auto& bb = mesh_->bounds;
+            const float span = static_cast<float>(
+                std::max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]));
+            board_.translation.z += pull * span * 0.6f * fdt;
+        } else {
+            // Exponential, like the shoulders, so the rate is constant in
+            // perceived terms rather than crawling when close and rocketing
+            // when far. Half their rate: this is the fine one.
+            camera_.distance = std::clamp(
+                camera_.distance * std::exp(-pull * 0.8f * fdt), 0.5f, 5000.0f);
+            zoomAnimating_ = false;  // a wheel glide would fight this
         }
         moved = true;
     }
