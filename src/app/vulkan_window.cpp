@@ -3965,19 +3965,16 @@ void VulkanWindow::buildOverlay() {
             const float panelW = tw + 2.0f * pad;
             const float panelH = ts * 2.2f;
             const float x0 = (w - panelW) * 0.5f;
-            // WELL clear of the bottom in the headset.
+            // DEAD CENTRE in the headset.
             //
-            // A render target's edges are not the edges of what you can see
-            // through a lens. The outer margin is bent away, the hidden-area
-            // mask deliberately discards the corners, and the last stretch
-            // before the rim needs an uncomfortable eye roll to reach -- so a
-            // panel sitting a hair above the bottom edge, which is exactly
-            // right on a monitor, is barely findable in VR.
-            //
-            // Three quarters of the way down keeps it in easy view while still
-            // reading as "status at the bottom" rather than something in the
-            // middle of the board.
-            const float cy = vr_ ? h * 0.74f : h - panelH * 1.6f;
+            // The bottom margin that is right on a monitor was invisible
+            // through the lenses, and so was three quarters of the way down --
+            // a render target's edges are nowhere near the edges of what a lens
+            // shows, the mask throws the corners away, and the outer band takes
+            // an eye roll to reach. Rather than keep guessing at a margin,
+            // put it where the eye already is. It fades in well under two
+            // seconds, so briefly covering the middle costs nothing.
+            const float cy = vr_ ? h * 0.5f : h - panelH * 1.6f;
             const float bg[4] = {0.06f, 0.06f, 0.08f, 0.80f * fade};
             const float fg[4] = {kAmber[0], kAmber[1], kAmber[2], fade};
             quad(x0, cy, x0 + panelW, cy, panelH, bg);
