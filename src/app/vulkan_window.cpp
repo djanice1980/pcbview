@@ -413,8 +413,22 @@ void VulkanWindow::stepVr() {
     // still cannot present, and the render mode has to go back to the user's
     // own settings rather than the raster VR forces.
     vrRendering_ = render;
+    // A handover is expensive, so it has to mean something.
+    //
+    // setCaptureExtent(0, 0) runs Renderer::resize: a device wait, the
+    // swapchain destroyed and rebuilt, and every scene and bloom target with
+    // it. Doing that the instant the runtime declines a SINGLE frame -- and
+    // then again on the next frame when it asks for one -- is two full rebuilds
+    // for nothing. The session log showed the scene extent flipping between the
+    // window's size and the eye's over and over, and each flip is a stall the
+    // viewer sees.
+    //
+    // What this exists for is the headset being set down, and that lasts. Half
+    // a second of consistent silence tells it apart from a hiccup and costs
+    // nothing when the headset really has come off.
+    vrIdleFrames_ = render ? 0 : vrIdleFrames_ + 1;
     if (!render) {
-        if (vrOwnsRenderer_) {
+        if (vrOwnsRenderer_ && vrIdleFrames_ >= 45) {
             vrOwnsRenderer_ = false;
             renderer_->setOffscreenOnly(false);
             // Give the scene resolution back to the WINDOW.
@@ -603,9 +617,36 @@ void VulkanWindow::stepVr() {
             // transition of the lot, flickering. 40%, smoothing, and a hold
             // after each change together make a move mean the viewer actually
             // went somewhere.
-            const float kStep[3] = {1.00f, 0.60f, 0.30f};
+            // One threshold per rung, all the way to the bottom.
+            //
+            // There used to be three, for six rungs. The bottom two were
+            // reachable only through the pacing backstop, which needs 45
+            // consecutive late frames -- half a second of missing frames every
+            // single time you lean in. The runtime does not wait that long: it
+            // halves the target to 45 Hz, then 30, then 23, and everything it
+            // then has to fill in is a reprojection. That IS the swimming. It
+            // happens whether or not we submit depth (measured both ways), and
+            // it has to, because no warp of a stale frame can invent the
+            // parallax of a surface 100 mm from your face.
+            //
+            // So distance drives every rung now, and the numbers come from the
+            // 191 mm board, which is the one that runs out of budget. Measured
+            // there, converted to a common rung by the resolution ratio:
+            //
+            //   4 rays foveated       0.30 m  10.9 ms
+            //   4 rays foveated hard  0.11 m  17.4 ms      (0.21 m ~14.8)
+            //   4 rays 0.80x          0.21 m   9.5 ms, 0.13 m 10.9 ms
+            //   4 rays 0.65x          0.47 m   3.1 ms
+            //
+            // Cost stops climbing below about 0.13 m, where the board covers
+            // the whole view and there is nothing left to add. The usable
+            // ceiling is around half the 11.11 ms budget, since the
+            // compositor's share is real and invisible to us -- so each rung is
+            // placed where the one above it passes ~7 ms, not where it passes
+            // 11.
+            const float kStep[5] = {1.00f, 0.60f, 0.45f, 0.32f, 0.22f};
             int distTier = 0;
-            for (int i = 0; i < 3; ++i) {
+            for (int i = 0; i < 5; ++i) {
                 const float t = (tierNow > i) ? kStep[i] * 1.40f : kStep[i];
                 if (d < t) distTier = i + 1;
             }

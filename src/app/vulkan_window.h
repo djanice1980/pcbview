@@ -391,6 +391,10 @@ private:
     // pinned near 1 means something resets it every frame. The two are
     // indistinguishable through the lenses.
     int vrSamples_[2] = {0, 0};
+    // Consecutive frames the runtime has not asked for. Handing the renderer
+    // back to the window rebuilds the swapchain and every scene target, so it
+    // waits for silence that lasts rather than reacting to a single frame.
+    int vrIdleFrames_ = 0;
     // Edge-triggered logging for the depth layer: it turns itself off whenever
     // the quality ladder renders at a fraction of the eye's resolution, and
     // that transition needs to be visible in the log rather than inferred.
