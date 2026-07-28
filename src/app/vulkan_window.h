@@ -403,6 +403,14 @@ private:
     // An eased D-pad quarter-turn in flight, and where it is heading.
     bool boardTurning_ = false;
     glm::quat boardTurnTarget_{1.0f, 0.0f, 0.0f, 0.0f};
+    // Transient readout for the zoom controls: what just changed and to what.
+    // Size and distance look identical while they are moving -- the board fills
+    // more of the view either way -- so without this there is no way to tell
+    // which pair you have hold of, or how far a blind trigger pull has taken
+    // you. Fades on its own; empty means nothing to draw.
+    std::string padStatus_;
+    QElapsedTimer padStatusClock_;
+    void setPadStatus(const std::string& s);
     // Edge-triggered logging for the depth layer: it turns itself off whenever
     // the quality ladder renders at a fraction of the eye's resolution, and
     // that transition needs to be visible in the log rather than inferred.

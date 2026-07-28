@@ -1569,6 +1569,15 @@ void VulkanWindow::stepVr() {
 }
 
 void VulkanWindow::stepGamepad() {
+    // Keep the zoom readout alive and fading, BEFORE any of the early returns
+    // below. It has to tick even when the pad has been put down, the app has
+    // lost focus or the controller has been unplugged mid-fade -- otherwise the
+    // panel freezes at whatever brightness it had and never clears.
+    if (!padStatus_.empty()) {
+        buildOverlay();
+        requestUpdate();
+    }
+
     // The video recorder owns the clock while paused; a stray stick must not
     // be able to shift the camera midway through a render.
     if (animationsPaused_) return;
@@ -1668,11 +1677,19 @@ void VulkanWindow::stepGamepad() {
             // briefly having size on them too meant every attempt to zoom also
             // exploded the board -- which is what "the silkscreen is floating"
             // and "I can see through the mask" actually were.
+            const bool bigger = g.heldRightShoulder;
             vrSizeMul_ = std::clamp(
-                vrSizeMul_ *
-                    std::exp((g.heldRightShoulder ? 1.0f : -1.0f) * 0.9f * fdt),
+                vrSizeMul_ * std::exp((bigger ? 1.0f : -1.0f) * 0.9f * fdt),
                 0.25f, 12.0f);
             vr_->setBoardSizeMul(vrSizeMul_);
+            // The width in ROOM metres, which is the number that means
+            // something: it says how big the thing in front of you is, and it
+            // is the one that decides whether the silkscreen is readable.
+            char s[96];
+            std::snprintf(s, sizeof(s), "%s   board %.2f m wide",
+                          bigger ? "BIGGER" : "SMALLER",
+                          static_cast<double>(vr_->boardSizeMetres()));
+            setPadStatus(s);
             // Once, so "is the pad reaching the board at all" is answered by
             // the log rather than by squinting through the lenses.
             static bool said = false;
@@ -1689,6 +1706,11 @@ void VulkanWindow::stepGamepad() {
                 std::clamp(camera_.distance * std::exp(rate), 0.5f, 5000.0f);
             // A wheel glide in flight would fight this.
             zoomAnimating_ = false;
+            char s[96];
+            std::snprintf(s, sizeof(s), "%s   %.1f mm away",
+                          g.heldRightShoulder ? "NEARER" : "FURTHER",
+                          static_cast<double>(camera_.distance));
+            setPadStatus(s);
         }
         moved = true;
     }
@@ -1753,6 +1775,11 @@ void VulkanWindow::stepGamepad() {
             const float span = static_cast<float>(
                 std::max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]));
             board_.translation.z += pull * span * 0.6f * fdt;
+            char s[96];
+            std::snprintf(s, sizeof(s), "%s   %.2f m away",
+                          pull > 0.0f ? "NEARER" : "FURTHER",
+                          static_cast<double>(vr_->boardDistance()));
+            setPadStatus(s);
         } else {
             // Exponential, like the shoulders, so the rate is constant in
             // perceived terms rather than crawling when close and rocketing
@@ -1760,6 +1787,11 @@ void VulkanWindow::stepGamepad() {
             camera_.distance = std::clamp(
                 camera_.distance * std::exp(-pull * 0.8f * fdt), 0.5f, 5000.0f);
             zoomAnimating_ = false;  // a wheel glide would fight this
+            char s[96];
+            std::snprintf(s, sizeof(s), "%s   %.1f mm away",
+                          pull > 0.0f ? "NEARER" : "FURTHER",
+                          static_cast<double>(camera_.distance));
+            setPadStatus(s);
         }
         moved = true;
     }
@@ -2422,6 +2454,13 @@ void VulkanWindow::rotateBoard(const glm::vec3& axisBoardSpace, float radians) {
     // already reasoning in.
     board_.rotation = glm::normalize(
         glm::angleAxis(radians, axisBoardSpace / len) * board_.rotation);
+    requestUpdate();
+}
+
+void VulkanWindow::setPadStatus(const std::string& s) {
+    padStatus_ = s;
+    padStatusClock_.restart();
+    buildOverlay();
     requestUpdate();
 }
 
@@ -3843,6 +3882,52 @@ void VulkanWindow::buildOverlay() {
                          y0 + pad + lh * (static_cast<float>(i) + 0.5f), ts,
                          i == 0 ? kAmber : kWhite);
             }
+        }
+    }
+
+    // ---- transient zoom readout ---------------------------------------------
+    //
+    // Growing the board and moving it closer look IDENTICAL while they are
+    // happening -- the board fills more of the view either way -- so without a
+    // readout there is no telling which pair you have hold of, nor how far a
+    // blind trigger pull has taken you with a headset on. The number is the
+    // point: metres across for size, metres away for distance.
+    //
+    // Bottom centre, clear of the measurement panel (top right) and the view
+    // menu (centre). Fades over the last third of its life so it leaves
+    // quietly rather than blinking out.
+    if (!padStatus_.empty() && padStatusClock_.isValid()) {
+        constexpr qint64 kHoldMs = 1400;
+        const qint64 age = padStatusClock_.elapsed();
+        if (age > kHoldMs) {
+            padStatus_.clear();
+        } else {
+            const VkExtent2D se = renderer_->sceneExtent();
+            const float w = se.width > 0 ? static_cast<float>(se.width)
+                                         : static_cast<float>(width()) * dpr;
+            const float h = se.height > 0 ? static_cast<float>(se.height)
+                                          : static_cast<float>(height()) * dpr;
+            const float fade =
+                age < kHoldMs * 2 / 3
+                    ? 1.0f
+                    : 1.0f - static_cast<float>(age - kHoldMs * 2 / 3) /
+                                 static_cast<float>(kHoldMs / 3);
+            const float ts = std::max(13.0f, h * 0.020f);
+            const float pad = ts * 0.8f;
+            text::TextStyle st;
+            st.size = {static_cast<double>(ts) * 0.9,
+                       static_cast<double>(ts)};
+            st.thickness = ts * 0.14;
+            const float tw =
+                static_cast<float>(text::measure(padStatus_, st));
+            const float panelW = tw + 2.0f * pad;
+            const float panelH = ts * 2.2f;
+            const float x0 = (w - panelW) * 0.5f;
+            const float cy = h - panelH * 1.6f;
+            const float bg[4] = {0.06f, 0.06f, 0.08f, 0.80f * fade};
+            const float fg[4] = {kAmber[0], kAmber[1], kAmber[2], fade};
+            quad(x0, cy, x0 + panelW, cy, panelH, bg);
+            drawText(padStatus_, w * 0.5f, cy, ts, fg);
         }
     }
 
