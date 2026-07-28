@@ -1569,10 +1569,28 @@ void VulkanWindow::stepVr() {
                     const float v = qgetenv("PCBVIEW_VR_HUD_SHIFT").toFloat(&ok);
                     return (ok && v >= -3.0f && v <= 3.0f) ? v : 1.0f;
                 }();
-                renderer_->setOverlayShiftPx(
-                    shiftMul * ndcx * 0.5f *
-                    static_cast<float>(width()) *
-                    static_cast<float>(devicePixelRatio()));
+                const float halfW = 0.5f * static_cast<float>(width()) *
+                                    static_cast<float>(devicePixelRatio());
+                renderer_->setOverlayShiftPx(shiftMul * ndcx * halfW);
+                // Printed once per eye because the derivation says the
+                // multiplier should be exactly 1.0 and the headset says it is
+                // nearer 1.6. One of these numbers is not what I think it is,
+                // and guessing which has already failed twice.
+                static bool saidShift[2] = {false, false};
+                const size_t si = i < 2 ? i : 1;
+                if (!saidShift[si]) {
+                    saidShift[si] = true;
+                    std::printf("vr-hud: eye %zu ipd=%.4f m D=%.1f m "
+                                "tanL=%.3f tanR=%.3f ndcx=%+.4f halfW=%.1f "
+                                "shift=%+.1f px | window %dx%d dpr %.2f "
+                                "scene %ux%u\n",
+                                si, ipd, D, tanL, tanR, ndcx, halfW,
+                                shiftMul * ndcx * halfW, width(), height(),
+                                devicePixelRatio(),
+                                renderer_->sceneExtent().width,
+                                renderer_->sceneExtent().height);
+                    std::fflush(stdout);
+                }
             }
             // Eye 0 presents, so the desktop window becomes a mirror of the
             // left eye; eye 1 renders offscreen. Presenting both made the
