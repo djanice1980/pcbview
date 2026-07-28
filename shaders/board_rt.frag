@@ -281,7 +281,27 @@ void main() {
     float keyDist;
     if (worldSun) {
         keyDir = kSunDirWorld;
-        keyDist = 1.0e5;
+        // HOW FAR the shadow ray is allowed to look, and it matters enormously.
+        //
+        // This was 1.0e5 -- a hundred metres, in board millimetres -- which is
+        // "unbounded" in practice. A ray from a SHADOWED surface hits the board
+        // slab within a few BVH nodes and stops. A ray from a LIT surface has
+        // nothing to hit, so it walks the ENTIRE acceleration structure before
+        // it can conclude nothing was there. That is the whole lit-versus-dark
+        // cost asymmetry, and it scales with the structure: measured far worse
+        // on a 8.65M-vertex board than on a 1.24M one, at the same distance.
+        //
+        // A board's shadows are cast by components a few millimetres tall, so a
+        // couple of centimetres keeps every contact shadow that reads as depth
+        // and bounds the traversal for lit fragments too. AO has always been
+        // capped this way -- 2.5 mm -- which is why it was never the expensive
+        // half.
+        //
+        // Carried in the HUNDREDS digit of the mode word, in units of 8 mm,
+        // because the push block is full at the 128 bytes every Vulkan device
+        // guarantees. Zero means unbounded, which is what the desktop uses.
+        const int rangeIdx = (int(CAMERAPOS.w + 0.5) / 100) % 10;
+        keyDist = rangeIdx > 0 ? float(rangeIdx) * 8.0 : 1.0e5;
     } else if (CAMAXIS.w > 0.0) {
         keyDir = normalize(-CAMAXIS.xyz + camRight * 0.55 + camUp * 0.55);
         keyDist = 1.0e4;

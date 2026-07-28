@@ -473,8 +473,11 @@ void VulkanWindow::stepVr() {
             // the desktop can afford the round trip and gets the better result.
             renderer_->setPathTraceBatch(0);
             renderer_->setGpuDenoisePasses(0);
-            // The desktop wants its key light back over the viewer's shoulder.
+            // The desktop wants its key light back over the viewer's shoulder,
+            // and its shadows unbounded -- it has the budget, and its
+            // camera-relative rig does not go through the capped path anyway.
             renderer_->setRasterWorldSun(false);
+            renderer_->setShadowRangeIndex(0);
             renderer_->setRenderMode(ptEnabled_ && ptAvailable()
                                          ? vk::RenderMode::PathTraced
                                          : vk::RenderMode::Raster);
@@ -1341,6 +1344,27 @@ void VulkanWindow::stepVr() {
         // looked around, and the board would never read as an object standing
         // in a lit room.
         renderer_->setRasterWorldSun(true);
+        // Bound the sun shadow ray in the headset.
+        //
+        // Measured: with rays off the headset holds 90 Hz with zero late frames
+        // right down to 0.08 m on the dense board; with them on it paces to
+        // 45 Hz by 0.20 m. An unbounded ray from a lit fragment is the reason
+        // -- nothing to hit, so it traverses the whole structure to find that
+        // out. The desktop keeps its unbounded shadows, where there is budget
+        // for them and the camera-relative rig is used anyway.
+        //
+        // Default 3, so 24 mm: taller than any component on a board and far
+        // shorter than a walk across it. PCBVIEW_VR_SHADOW_MM overrides in
+        // millimetres, rounded to the 8 mm the packing allows, so the visual
+        // trade can be judged in the headset rather than argued about.
+        static const int shadowIdx = [] {
+            bool ok = false;
+            const int mm = qgetenv("PCBVIEW_VR_SHADOW_MM").toInt(&ok);
+            if (!ok) return 3;
+            if (mm <= 0) return 0;  // explicit 0 = unbounded, as before
+            return std::clamp((mm + 4) / 8, 1, 9);
+        }();
+        renderer_->setShadowRangeIndex(shadowIdx);
     }
 
     // Render at a fraction of the headset's rate and let the COMPOSITOR fill

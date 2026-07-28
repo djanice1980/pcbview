@@ -433,6 +433,19 @@ public:
     // modes agree about where the light comes from.
     void setRasterWorldSun(bool on) { rasterWorldSun_ = on; }
 
+    // How far a sun shadow ray may travel, in units of 8 mm. 0 = unbounded.
+    //
+    // The single biggest lever on ray cost, because an unbounded ray from a LIT
+    // surface has nothing to hit and therefore traverses the whole acceleration
+    // structure before concluding so, while a shadowed one stops at the board
+    // within a few nodes. Bounding it makes the two cost about the same and
+    // costs only shadows longer than the bound -- which, for components a few
+    // millimetres tall, is nothing anyone looks at. Rides in the hundreds digit
+    // of the mode word; see the note there about the push block being full.
+    void setShadowRangeIndex(int i) {
+        shadowRangeIdx_ = i < 0 ? 0 : (i > 9 ? 9 : i);
+    }
+
     // How many rays each shaded fragment may spend.
     //
     //   0 = 4 extra shadow taps + 6 AO  (11 rays, the desktop look)
@@ -848,6 +861,7 @@ private:
     float boardRotInv_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     bool offscreenOnly_ = false;
     bool rasterWorldSun_ = false;
+    int shadowRangeIdx_ = 0;  // 0 = unbounded, else n * 8 mm
     int rayQuality_ = 0;
     // Two timestamps per frame in flight, read back when that slot's fence has
     // signalled and the results are therefore available.

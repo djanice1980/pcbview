@@ -5030,7 +5030,8 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // already occupies the 128 bytes every Vulkan device is guaranteed to
     // provide and some provide nothing more.
     push.cameraPos[3] =
-        rtOn ? static_cast<float>((rasterWorldSun_ ? 2 : 1) + 10 * rayQuality_)
+        rtOn ? static_cast<float>((rasterWorldSun_ ? 2 : 1) + 10 * rayQuality_ +
+                                  100 * shadowRangeIdx_)
              : 0.0f;
     push.params[0] = explodeStep_;
     push.params[1] = explodeProgress_;
