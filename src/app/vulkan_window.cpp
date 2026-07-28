@@ -1552,8 +1552,25 @@ void VulkanWindow::stepVr() {
                 const float t = -ex / D;
                 const float ndcx =
                     (2.0f * t - tanR - tanL) / std::max(tanR - tanL, 1.0e-3f);
+                // PCBVIEW_VR_HUD_SHIFT scales the computed shift, and exists
+                // because the arithmetic and the report disagree.
+                //
+                // Between 8 m and 10 m this shift changes by about half a
+                // pixel -- the eyes are parallel long before that -- so a
+                // visible change in apparent distance across that range cannot
+                // come from the model as written. Something in the
+                // implementation does not match it, and a multiplier settles
+                // which way: 0 removes the per-eye offset entirely, 1 is the
+                // computed value, and if 0 reads as FARTHER than 1 then the
+                // shift has the wrong sign and is pushing the panel toward the
+                // viewer rather than away.
+                static const float shiftMul = [] {
+                    bool ok = false;
+                    const float v = qgetenv("PCBVIEW_VR_HUD_SHIFT").toFloat(&ok);
+                    return (ok && v >= -3.0f && v <= 3.0f) ? v : 1.0f;
+                }();
                 renderer_->setOverlayShiftPx(
-                    ndcx * 0.5f *
+                    shiftMul * ndcx * 0.5f *
                     static_cast<float>(width()) *
                     static_cast<float>(devicePixelRatio()));
             }
