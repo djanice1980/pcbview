@@ -4012,12 +4012,23 @@ void VulkanWindow::buildOverlay() {
             // the eye target (2082x2122) and the window (1628x1738) differ.
             const float w = static_cast<float>(width()) * dpr;
             const float h = static_cast<float>(height()) * dpr;
+            // SMALLER in the headset, because past a few metres size is the
+            // only depth cue left to adjust.
+            //
+            // The stereo shift is right now, but disparity runs out: at 8 m the
+            // eyes are already parallel, and 8, 12 and 20 metres differ by well
+            // under a pixel. What still says "near" is angular size -- the
+            // panel was about 2.4 degrees of text, and text that big is either
+            // close or a third of a metre tall, so familiar-size wins and
+            // overrides the disparity. Roughly 1.4 degrees reads as something
+            // across the room rather than in front of the face, and is still
+            // comfortably legible on a 2082-pixel eye.
             const float fade =
                 age < kHoldMs * 2 / 3
                     ? 1.0f
                     : 1.0f - static_cast<float>(age - kHoldMs * 2 / 3) /
                                  static_cast<float>(kHoldMs / 3);
-            const float ts = std::max(13.0f, h * 0.020f);
+            const float ts = std::max(13.0f, h * (vr_ ? 0.012f : 0.020f));
             const float pad = ts * 0.8f;
             text::TextStyle st;
             st.size = {static_cast<double>(ts) * 0.9,
