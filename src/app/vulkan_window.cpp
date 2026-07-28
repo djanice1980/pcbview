@@ -1514,9 +1514,19 @@ void VulkanWindow::stepVr() {
             //     ndc.x = (2t - tanR - tanL) / (tanR - tanL)
             // which is the shift the overlay needs, in pixels.
             //
-            // D is the board's own distance, so the text sits in the same
-            // depth plane as the thing being read -- no refocusing to check a
-            // number, which is the whole complaint.
+            // D is FIXED, not the board's distance.
+            //
+            // Putting it at the board sounded right -- read the number in the
+            // same depth plane as the thing it describes -- and is wrong twice.
+            // The panel then moves toward and away from the viewer as the board
+            // is zoomed or dollied, which is exactly what a status readout must
+            // not do; and the board sits around 0.4 m, which is a close focus to
+            // hold and still reads as being in your face.
+            //
+            // Two metres instead. Far enough that the eyes are near their
+            // resting convergence, so the panel costs nothing to glance at,
+            // and fixed so it stays put however the board is manipulated.
+            // PCBVIEW_VR_HUD_M overrides it while that number is being judged.
             float fov[4] = {-0.9f, 0.9f, 0.9f, -0.9f};
             if (vr_->eyeFov(static_cast<int>(i), fov) && eyes.size() >= 2) {
                 const glm::vec3 e0(eyes[0].eye[0], eyes[0].eye[1],
@@ -1524,7 +1534,11 @@ void VulkanWindow::stepVr() {
                 const glm::vec3 e1(eyes[1].eye[0], eyes[1].eye[1],
                                    eyes[1].eye[2]);
                 const float ipd = glm::length(e1 - e0);
-                const float D = std::clamp(vr_->boardDistance(), 0.25f, 4.0f);
+                static const float D = [] {
+                    bool ok = false;
+                    const float v = qgetenv("PCBVIEW_VR_HUD_M").toFloat(&ok);
+                    return (ok && v >= 0.5f && v <= 20.0f) ? v : 2.0f;
+                }();
                 const float ex = (i == 0 ? -0.5f : 0.5f) * ipd;
                 const float tanL = std::tan(fov[0]);
                 const float tanR = std::tan(fov[1]);
