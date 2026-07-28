@@ -1078,7 +1078,16 @@ void VulkanWindow::stepGamepad() {
     // Only drive the view while pcbview is the active application, or a pad
     // being used in another window would quietly steer the board in the
     // background.
-    if (QGuiApplication::applicationState() != Qt::ApplicationActive) {
+    //
+    // Except in the headset, where that reasoning inverts. The premise is that
+    // an unfocused window is one the viewer is not looking at -- but in VR the
+    // display IS the headset, the desktop window is a mirror, and the viewer
+    // cannot see which window Windows considers focused, let alone click one.
+    // Entering VR rebuilds the window outright, so focus routinely lands
+    // somewhere else the moment the session starts, and every pad poll returned
+    // here before reading a button. The pad appeared dead in the one mode where
+    // it is the only way to move anything.
+    if (!vr_ && QGuiApplication::applicationState() != Qt::ApplicationActive) {
         padSteering_ = false;
         return;
     }
@@ -1154,6 +1163,15 @@ void VulkanWindow::stepGamepad() {
                 std::max(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1]));
             board_.translation.z +=
                 (g.heldRightShoulder ? 1.0f : -1.0f) * span * 0.6f * fdt;
+            // Once, so "is the pad reaching the board at all" is answered by
+            // the log rather than by squinting through the lenses.
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::printf("vr-pad: shoulder dolly live (R1 pulls in, L1 "
+                            "pushes out)\n");
+                std::fflush(stdout);
+            }
         } else {
             const float rate = (g.heldLeftShoulder ? 1.0f : -1.0f) * 1.6f * fdt;
             camera_.distance =
