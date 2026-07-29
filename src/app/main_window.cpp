@@ -583,6 +583,11 @@ void MainWindow::buildViewport() {
         if (vrAction_) {
             QSignalBlocker block(vrAction_);
             vrAction_->setChecked(on);
+            // The tick is enough inside the View menu, but the same action
+            // sits on the MENU BAR, where a checkable item draws no indicator
+            // at all -- so up there the words are the only thing that can say
+            // whether a session is running.
+            vrAction_->setText(on ? "Leave VR &mode" : "VR &mode");
         }
         // Re-push the appearance when a session comes up.
         //
@@ -1433,7 +1438,7 @@ void MainWindow::buildMenus() {
     // and device creation and so has to be running before either exists. The
     // rebuild is the same one a CPU<->GPU device switch already performs, and
     // the board, camera and explode state carry across it.
-    vrAction_ = view->addAction("&VR headset");
+    vrAction_ = view->addAction("VR &mode");
     vrAction_->setCheckable(true);
     vrAction_->setChecked(VulkanWindow::vrRequested());
     connect(vrAction_, &QAction::triggered, this, [this](bool on) {
@@ -1793,6 +1798,18 @@ void MainWindow::buildMenus() {
         if (viewport_->renderer())
             viewport_->renderer()->setNetAnimate(chase->isChecked());
     }
+
+    // The headset toggle again, this time on the menu bar itself.
+    //
+    // The SAME QAction as the View menu's, not a second one. Two checkable
+    // actions standing for one piece of state drift apart the moment either is
+    // used -- the orthographic toggle already shares one action between the
+    // View menu and the toolbar for exactly that reason. A single action added
+    // to two widgets cannot desync, so the tick, the enabled state and the
+    // failed-start handling all come along for free.
+    //
+    // Alt+M: F, V, L, R, E and H all belong to the menus either side of it.
+    menuBar()->addAction(vrAction_);
 
     QMenu* help = menuBar()->addMenu("&Help");
     // The Ko-fi badge as an actual graphic in the menu -- a plain text entry
