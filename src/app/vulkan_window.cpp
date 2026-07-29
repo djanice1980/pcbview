@@ -1458,6 +1458,17 @@ void VulkanWindow::stepVr() {
     // every frame. PCBVIEW_VR_RATE_DIV (read at the top) forces a divisor.
     const bool drawThisFrame = render && (++vrFrameCount_ % rateDiv) == 0;
 
+    // Decide the panel's depth ONCE per appearance, from where the board
+    // actually is. Held until the panel has faded, so reading it is not a
+    // moving target while a trigger is still down.
+    if (padStatus_.empty()) {
+        vrHudDistLatched_ = false;
+    } else if (!vrHudDistLatched_) {
+        vrHudDistLatched_ = true;
+        const float d = vr_->boardDistance();
+        vrHudDistM_ = std::clamp(d > 0.01f ? d : 2.0f, 0.25f, 20.0f);
+    }
+
     if (drawThisFrame) {
         for (size_t i = 0; i < eyes.size(); ++i) {
             const xr::VrSession::Eye& e = eyes[mono ? 0 : i];
@@ -1523,26 +1534,31 @@ void VulkanWindow::stepVr() {
             // not do; and the board sits around 0.4 m, which is a close focus to
             // hold and still reads as being in your face.
             //
-            // Two metres, which is where the lenses focus.
+            // At the BOARD's distance, because the panel is drawn on top of it.
             //
-            // Eight was tried first, on the reasoning that parallel eyes cost
-            // no convergence. That reasoning is incomplete: the panel of a
-            // PSVR2 sits at a FIXED optical distance of roughly 1.3-2 m no
-            // matter what disparity is rendered, so vergence at eight metres
-            // is pulling against an accommodation the optics have already
-            // fixed at two. The further out the HUD is placed the worse that
-            // conflict gets, which is why "push it further away" kept failing
-            // to make it easier to look at. Two metres puts vergence and
-            // accommodation in the same place.
+            // Fixed distances were tried at 8 m, 12 m and 2 m and every one of
+            // them read as wrong, which sent three rounds of work into the
+            // shift arithmetic. The arithmetic was never the problem. Dumping
+            // both eye images and measuring them settled it: the panel lands at
+            // +345.0 / -346.0 eye pixels against a predicted +/-345.4, and the
+            // board -- through the 3-D path -- at 781.5 px of separation
+            // against 781.0 predicted for 0.41 m. Both exact.
             //
-            // It is also the last distance where the knob still does anything:
-            // 2 m and 8 m differ by about 7 px of per-eye shift, 8 m and 12 m
-            // by half a pixel. Past a couple of metres stereo has no remaining
-            // authority over apparent distance, so a HUD that reads as "too
-            // close" at 8 m was never going to be fixed by moving it to 12.
+            // What is wrong is putting them at DIFFERENT depths in the same
+            // pixels. 2 m of panel over 0.41 m of board is 90 px of disparity
+            // between the text and what it is written across, or 6.9 degrees of
+            // vergence, more than ten times what can be fused. The eyes settle
+            // on one and the other doubles; no shift value avoids it, because
+            // the conflict is between two correct depths, not one wrong one.
             //
-            // Fixed, so it stays put however the board is scaled or moved.
-            // PCBVIEW_VR_HUD_M overrides.
+            // It also explains every reading taken by eye along the way. Asked
+            // which glyph lined up with which, the answer measured the panel
+            // against the BOARD -- 78.7 px reported against 90.5 px predicted
+            // for exactly that -- and looked like a shift error because the
+            // board was never accounted for as the reference it had become.
+            //
+            // Latched per appearance rather than followed, so the panel holds
+            // still while it is read. PCBVIEW_VR_HUD_M pins it instead.
             float fov[4] = {-0.9f, 0.9f, 0.9f, -0.9f};
             if (vr_->eyeFov(static_cast<int>(i), fov)) {
                 // From the ROOM, not from the Eye structs. Those carry the eye
@@ -1554,11 +1570,15 @@ void VulkanWindow::stepVr() {
                 // scene. The viewer's own geometry has to come from the
                 // viewer's own units.
                 const float ipd = vr_->eyeSeparationMetres();
-                static const float D = [] {
+                // PCBVIEW_VR_HUD_M pins the panel to a fixed distance; unset,
+                // it sits at the board's, which is the only depth that does not
+                // fight the thing it is drawn over.
+                static const float pinnedD = [] {
                     bool ok = false;
                     const float v = qgetenv("PCBVIEW_VR_HUD_M").toFloat(&ok);
-                    return (ok && v >= 0.5f && v <= 20.0f) ? v : 2.0f;
+                    return (ok && v >= 0.25f && v <= 20.0f) ? v : 0.0f;
                 }();
+                const float D = pinnedD > 0.0f ? pinnedD : vrHudDistM_;
                 const float ex = (i == 0 ? -0.5f : 0.5f) * ipd;
                 const float tanL = std::tan(fov[0]);
                 const float tanR = std::tan(fov[1]);
@@ -1605,13 +1625,18 @@ void VulkanWindow::stepVr() {
                                     static_cast<float>(devicePixelRatio());
                 const float sign = (i == 0 ? 1.0f : -1.0f);
                 renderer_->setOverlayShiftPx(ndcx * halfW + sign * nudgePx);
-                // Once per eye, with the two terms broken out: the failure
-                // this replaces was invisible precisely because they were
-                // summed before anyone could see their relative size.
-                static bool saidShift[2] = {false, false};
+                // Whenever the distance moves, with the two terms broken out.
+                //
+                // Separately, because their relative size IS the story: the
+                // recentring for the asymmetric frusta is about 170x the
+                // disparity that carries depth, and summing them before anyone
+                // could see that is what made a multiplier over the total look
+                // like a sensible knob. It has no usable range -- 1.00 is 2 m
+                // and 1.17 is 40 cm -- so sweeping it read as broken maths.
+                static float saidD[2] = {-1.0f, -1.0f};
                 const size_t si = i < 2 ? i : 1;
-                if (!saidShift[si]) {
-                    saidShift[si] = true;
+                if (std::abs(saidD[si] - D) > 0.05f * std::max(D, 0.25f)) {
+                    saidD[si] = D;
                     std::printf("vr-hud: eye %zu D=%.1f m ipd=%.4f m -> ndc "
                                 "%+.4f (recentre %+.4f, depth %+.4f) | shift "
                                 "%+.1f px, nudge %+.1f px | window %dx%d dpr "

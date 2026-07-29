@@ -426,6 +426,21 @@ private:
     // the quality ladder renders at a fraction of the eye's resolution, and
     // that transition needs to be visible in the log rather than inferred.
     bool vrDepthWasOk_ = false;
+    // How far away the zoom panel is drawn, in room metres, and whether that
+    // has been decided for the panel currently on screen.
+    //
+    // The panel is drawn over the board, so the two must be at the SAME depth.
+    // Measured from a pair of dumped eye images: a panel at 2 m over a board at
+    // 0.41 m puts 90 px of eye-image disparity between text and board, which is
+    // 6.9 degrees of vergence -- an order of magnitude past what can be fused,
+    // so whichever one the eyes converge on, the other doubles. No value of the
+    // shift fixes that, because the shift was never wrong.
+    //
+    // Latched when the panel appears rather than followed continuously: the
+    // board's distance changes while a trigger is held, and a panel that
+    // swims toward the viewer as it is read is its own problem.
+    float vrHudDistM_ = 2.0f;
+    bool vrHudDistLatched_ = false;
     void stepVr();
 
     // Showcase routing: the orientation actually rendered from while active,
