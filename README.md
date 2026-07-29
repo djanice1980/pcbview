@@ -35,6 +35,11 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
 - **3D components (KiCad).** Component bodies are exported once from your installed
   `kicad-cli` and cached, so later opens need neither KiCad nor a network. Top- and
   bottom-mounted parts are placed correctly.
+- **VR.** Renders to an OpenXR headset — stereo at the runtime's own per-eye
+  resolution, a submitted depth layer so dropped frames reproject by geometry,
+  the hidden-area mask, fixed foveation, and a quality ladder that holds 90 Hz
+  against a measured cost model. The board is placed at three times life size at
+  arm's length, and the Sense controllers pick it up. See [VR](#vr).
 - **Exploded view.** `Ctrl` + scroll peels the stack outside-in, one ring at a
   time, dwelling between stages. The **dielectric is sliced between copper layers**,
   so inner trace layers separate into their true positions instead of sliding
@@ -304,6 +309,80 @@ AL2009man, MIT licensed — see `docs/assets/LICENSE-gamepad-asset-pack.txt`.
 Layer visibility, appearance (thickness / substrate / mask), and the print modes
 live in the menus. Each side panel has a **pin** and a **hide** button — hide tucks
 it to a spine on the edge that pops open on hover; pin keeps it open.
+
+## VR
+
+pcbview renders to an OpenXR headset. **VR mode** on the menu bar (`Alt`+`M`)
+takes you in and out. Developed against a PSVR2 over SteamVR; any OpenXR runtime
+should work, though nothing else has been tried.
+
+Toggling rebuilds the viewport. That is not laziness — OpenXR *wraps* Vulkan
+instance and device creation, injecting its own extensions and naming the
+physical device, so the runtime has to be up before either exists. It reuses the
+same teardown the CPU↔GPU device switch already needs, and the board, camera and
+explode state all carry across. The check follows the live session rather than
+the request, so if SteamVR is closed or no headset answers, the menu item does
+not stay ticked.
+
+The board is placed about **three times life size** at arm's length, anchored
+where your head was. That is deliberate: readability depends on angular size, and
+a 191 mm board shown 0.35 m across renders 1 mm of silkscreen at roughly five
+pixels — readable either at 0.13 m, where the eyes have to cross and the board
+swallows the view, or at three times the size at a comfortable distance. The
+second costs no more, because fill is bounded by the screen rather than by the
+board.
+
+The desktop window mirrors the left eye while a session runs.
+
+### What it does
+
+- Stereo at the runtime's own per-eye resolution, using the asymmetric per-eye
+  frusta the headset actually reports.
+- A submitted depth layer (`XR_KHR_composition_layer_depth`), so a dropped frame
+  is reprojected by geometry. Without it the runtime can only warp rigidly, and a
+  rigid warp cannot reproduce parallax — at 0.4 m that reads as parts of the
+  image sliding against each other.
+- The hidden-area mesh (`XR_KHR_visibility_mask`), so corners the lenses never
+  show are not shaded.
+- Fixed foveation via `VK_KHR_fragment_shading_rate`.
+- A quality ladder that trades ray count, shading rate and render resolution
+  against a measured cost model to hold 90 Hz, rather than against hard-coded
+  distance thresholds.
+- Sense controller grips — reach out and take hold of the board.
+
+**Use ray-traced raster in the headset.** Path tracing works but is slow enough
+that SteamVR dislikes it, and it is not the mode to explore a board in.
+
+### Tuning
+
+Everything below is an environment variable, and all of it is optional — the
+defaults are what the headset was tuned with.
+
+| Variable | Effect |
+|---|---|
+| `PCBVIEW_VR_RT=0` | Ray-traced shading off. The cheapest large win if frames are late |
+| `PCBVIEW_VR_RAYQ=0..2` | Pin the ray count instead of letting the ladder choose |
+| `PCBVIEW_VR_FOVEATE=0..2` | Pin the foveation level |
+| `PCBVIEW_VR_RES=0.25..1.0` | Render scale against the runtime's recommendation. Default `0.5`, which still lands above the panel's own resolution — SteamVR's extra supersampling is not affordable alongside rays, and the rays are worth more |
+| `PCBVIEW_VR_ADAPT=0` | Turn the quality ladder off entirely (`=ladder` reverts to the old distance thresholds) |
+| `PCBVIEW_VR_SIZE=x3` | Board size at placement. `x3` is three times life size; a plain number is an absolute width in metres. Default `x3` |
+| `PCBVIEW_VR_DIST=<m>` | How far away it is anchored |
+| `PCBVIEW_VR_HUD_M=<m>` | Pin the zoom readout to a fixed distance instead of the board's |
+| `PCBVIEW_VR_DUMP_EYES=<prefix>` | Write both eye images to disk the first time the readout appears |
+| `PCBVIEW_VR_PT=1` | Path trace in the headset |
+| `PCBVIEW_VR_DEPTH=0` | Stop submitting the depth layer |
+
+### Known limitations
+
+- The quality ladder can change render resolution several times in quick
+  succession as the board moves through the view. Each change rebuilds the
+  per-eye targets and costs a few milliseconds, so it shows up as an occasional
+  hitch.
+- No OpenXR action manifest ships yet, so bindings are not rebindable from
+  SteamVR's own UI.
+- Eye-tracked foveation is not reachable: PSVR2 over PC does not expose eye gaze
+  to OpenXR, and the runtime offers no foveation extension of its own. The
+  foveation here is fixed, not gaze-driven.
 
 ## Installing
 
