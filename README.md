@@ -258,13 +258,31 @@ on an Xbox pad. The pad only steers while pcbview is the active application.
 |---|---|
 | Turn the board | Right stick |
 | Pan | Left stick |
-| Zoom out / in | `L1` / `R1` |
-| Collapse / explode | `L2` / `R2` (analog — press harder to peel faster) |
-| Fit / Iso / Top / Bottom | South / East / West / North (`✕ ○ □ △`, `A B X Y`) |
+| Shrink / grow the board | `L1` / `R1` |
+| Push further / bring nearer | `L2` / `R2` (analog — a light pull nudges, a full pull travels) |
+| Collapse / explode | Hold `✕` and pull `L2` / `R2` (analog — press harder to peel faster) |
+| Quarter-turns of the board | D-pad — up/down tumble it, left/right spin it in its own plane |
+| Fit / Iso / Top / Bottom | Hold `□` and press D-pad right / left / up / down |
 | Level the roll | `L3` |
 | Object / view mode | `R3` |
 | Recentre board and view | `Options` / `Start` |
 | Hold and turn | Hold the DualSense touchpad and move the pad — 1:1, so a 30° motion turns the board 30° |
+
+The size and distance pairs mean the same thing on a monitor and in the headset,
+so there is one set of controls to learn. They differ in what they do underneath:
+in VR the shoulders grow the board in the room and the triggers move it through
+it, which are genuinely different tools — a bigger board is how you read fine
+silkscreen without leaning into it. On a monitor there is no room to sit in, so
+both fall back to the camera and stay distinct only in feel: the shoulders step
+at a fixed rate, the triggers are pressure-proportional.
+
+Explode is a **chord** rather than a bare trigger. It used to be `L2` / `R2`
+alone, until a zoom control briefly shared those triggers and every attempt to
+zoom quietly peeled the stack apart — reported, in good faith, as the silkscreen
+floating above the board and the mask turning transparent. Holding `✕` costs
+nothing once the thumb is resting there anyway, and makes taking the board apart
+deliberate. That also freed the face buttons: `□` raises a labelled view menu
+that says on screen what each D-pad direction does, and `○` and `△` are unused.
 
 Hold-and-turn maps the pad's three motions to the three useful board motions:
 nose up/down pitches it, twisting it like a steering wheel turns it left and
