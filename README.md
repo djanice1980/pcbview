@@ -450,7 +450,38 @@ outside its own folder except `~/.pcbview/settings.xml`.
 
 ## Building from source
 
-pcbview is currently a **Windows / MSVC** build. You need:
+pcbview builds on **Windows (MSVC)** and **Linux**.
+
+### Linux
+
+On Arch/CachyOS the packaged route does everything — dependencies, the
+binary, a launcher entry with icon — and offers the optional pieces
+(KiCad + its 3D model library for component bodies, `vulkan-swrast` for
+CPU rendering, `ffmpeg` for video recording) as choices at install time:
+
+```sh
+cd packaging/linux && makepkg -si
+```
+
+Or build directly — Qt6, SDL3, OpenXR, Embree and Open Image Denoise come
+from system packages rather than being fetched:
+
+```sh
+sudo pacman -S --needed base-devel cmake ninja vulkan-headers shaderc \
+    qt6-base sdl3 openxr embree openimagedenoise
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/pcbview
+```
+
+VR is Windows-only (`PCBVIEW_ENABLE_VR` defaults OFF on Linux — a PSVR2
+has no Linux path today); everything else, including the path tracer,
+the denoiser, CPU rendering and video recording (via the system
+`ffmpeg`), works identically.
+
+### Windows
+
+You need:
 
 1. **Vulkan SDK 1.4+** — <https://vulkan.lunarg.com/> (sets the `VULKAN_SDK`
    environment variable; provides `glslc`, used at build time to compile shaders).
