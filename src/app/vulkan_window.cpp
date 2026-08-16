@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 
 namespace pcbview::app {
@@ -2215,6 +2216,12 @@ void VulkanWindow::initialise() {
     // names the physical device. See xr_system.h -- the ordering is forced by
     // OpenXR, not chosen. Failing to find a headset is an ordinary outcome, not
     // an error: the app simply carries on as a desktop session.
+#if !PCBVIEW_ENABLE_VR
+    // VR compiled out (the Linux build): the request can never be honoured, so
+    // clear it here -- the single gate every entry point (menu, env var, CLI)
+    // funnels through -- rather than guarding each one.
+    vrRequested_ = false;
+#endif
     if (vrRequested_ && !xrSystem_ && instance_ == VK_NULL_HANDLE) {
         // Step-by-step, because every one of these can block and from the
         // outside they are indistinguishable: the window simply stops
@@ -2252,7 +2259,27 @@ void VulkanWindow::initialise() {
 #ifdef Q_OS_WIN
         extensions.push_back("VK_KHR_win32_surface");
 #elif defined(Q_OS_LINUX)
-        extensions.push_back("VK_KHR_xcb_surface");
+        // Qt picks the windowing platform at runtime (wayland on a Wayland
+        // session, xcb under X11/XWayland or QT_QPA_PLATFORM=xcb), so enable
+        // every platform surface extension the loader actually offers rather
+        // than guessing one. Enabling an unused one costs nothing; missing the
+        // used one means Qt returns no VkSurfaceKHR and the viewport is dead.
+        {
+            uint32_t n = 0;
+            vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+            std::vector<VkExtensionProperties> avail(n);
+            vkEnumerateInstanceExtensionProperties(nullptr, &n, avail.data());
+            for (const char* want :
+                 {"VK_KHR_wayland_surface", "VK_KHR_xcb_surface",
+                  "VK_KHR_xlib_surface"}) {
+                for (const VkExtensionProperties& e : avail) {
+                    if (std::strcmp(e.extensionName, want) == 0) {
+                        extensions.push_back(want);
+                        break;
+                    }
+                }
+            }
+        }
 #endif
 
         // Validation is a DEBUG tool and was being enabled unconditionally,

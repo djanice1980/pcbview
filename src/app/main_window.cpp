@@ -471,7 +471,12 @@ MainWindow::MainWindow(const QString& path) {
     if (!appSettings().value("kofiNoticeShown", false).toBool() &&
         !qEnvironmentVariableIsSet("PCBVIEW_CAPTURE") &&
         !qEnvironmentVariableIsSet("PCBVIEW_GPU_REPORT") &&
-        !qEnvironmentVariableIsSet("PCBVIEW_ART_DUMP")) {
+        !qEnvironmentVariableIsSet("PCBVIEW_ART_DUMP") &&
+        // PCBVIEW_RECORD is headless too: its 1.5 s start timer loses the race
+        // against this dialog's 1.2 s one, and box.exec() then blocks the
+        // event loop -- a first-ever run that went straight to recording sat
+        // behind the notice and never wrote a frame.
+        !qEnvironmentVariableIsSet("PCBVIEW_RECORD")) {
         appSettings().setValue("kofiNoticeShown", true);
         QTimer::singleShot(1200, this, [this] {
             QMessageBox box(this);
@@ -1438,6 +1443,7 @@ void MainWindow::buildMenus() {
     // and device creation and so has to be running before either exists. The
     // rebuild is the same one a CPU<->GPU device switch already performs, and
     // the board, camera and explode state carry across it.
+#if PCBVIEW_ENABLE_VR
     vrAction_ = view->addAction("VR &mode");
     vrAction_->setCheckable(true);
     vrAction_->setChecked(VulkanWindow::vrRequested());
@@ -1457,6 +1463,7 @@ void MainWindow::buildMenus() {
         viewport_->setVrMode(on);
         QGuiApplication::restoreOverrideCursor();
     });
+#endif  // PCBVIEW_ENABLE_VR
 
     // Viewport size presets: pin the render area to an aspect for video
     // framing (the recorder keeps the viewport's aspect), or free it.
@@ -1809,7 +1816,7 @@ void MainWindow::buildMenus() {
     // failed-start handling all come along for free.
     //
     // Alt+M: F, V, L, R, E and H all belong to the menus either side of it.
-    menuBar()->addAction(vrAction_);
+    if (vrAction_) menuBar()->addAction(vrAction_);
 
     QMenu* help = menuBar()->addMenu("&Help");
     // The Ko-fi badge as an actual graphic in the menu -- a plain text entry
@@ -2944,11 +2951,11 @@ void MainWindow::videoFinish(const QString& message) {
     if (!job) return;
     videoJob_ = nullptr;
 
+    // NOTE: the encoder is finished AFTER the tail drain below, not here. It
+    // used to be finished first, which made the drain dead code: every
+    // writeFrame on the finalised encoder failed, and the last frames of the
+    // show were silently dropped on every platform.
     QString codec;
-    if (job->encOpen) {
-        job->enc.finish();
-        codec = job->enc.codecUsed();
-    }
     QObject::disconnect(job->frameConn);
     if (vk::Renderer* r = viewport_->renderer()) {
         // The last frames of the show may still be in the ring: best-effort
@@ -2973,6 +2980,13 @@ void MainWindow::videoFinish(const QString& message) {
         r->endPipelinedCapture();
         r->setCaptureExtent(0, 0);
         r->setUncappedPresent(false);
+    }
+    // Finalise even on the error path: a container closed early is a short
+    // but playable video; one abandoned mid-write has no index and plays
+    // nowhere.
+    if (job->encOpen) {
+        job->enc.finish();
+        codec = job->enc.codecUsed();
     }
     viewport_->setAspectOverride(0.0f);
     viewport_->setAnimationsPaused(false);

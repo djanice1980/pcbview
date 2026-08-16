@@ -1,13 +1,30 @@
 cmake_minimum_required(VERSION 3.24)
-project(pcbview VERSION 1.22.0 LANGUAGES CXX)
+# C is enabled alongside C++ for the vendored miniz .c files: MSVC's cl.exe
+# dispatches .c to its C mode by file extension regardless of what CMake
+# enables, but gcc/clang need CMake to know C is a project language.
+project(pcbview VERSION 1.22.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Vulkan comes from the SDK (VULKAN_SDK env var). Everything else arrives via
-# FetchContent -- no package manager to install.
+# Vulkan comes from the SDK (VULKAN_SDK env var) on Windows, or the system
+# vulkan-headers/vulkan-icd-loader packages on Linux. On Windows everything
+# else arrives via FetchContent -- no package manager to install. On Linux the
+# heavyweight prebuilts (OIDN, Embree, SDL3, OpenXR) come from system packages
+# instead; only the small header-only/source deps are still fetched.
 find_package(Vulkan REQUIRED)
+
+# VR ships on Windows (developed against SteamVR + PSVR2, which has no Linux
+# path today). The xr sources compile on every platform -- they are pure
+# OpenXR + Vulkan, no platform binding -- but with this OFF the session can
+# never start: the menu toggle, the PCBVIEW_VR env hook and the --xr CLI
+# subcommands are all compiled out.
+if(WIN32)
+    option(PCBVIEW_ENABLE_VR "Expose the VR mode (OpenXR)" ON)
+else()
+    option(PCBVIEW_ENABLE_VR "Expose the VR mode (OpenXR)" OFF)
+endif()
 
 include(FetchContent)
 
@@ -85,6 +102,7 @@ FetchContent_Declare(cgltf
 )
 FetchContent_MakeAvailable(cgltf)
 
+if(WIN32)
 # SDL3 (zlib licence, GPL-3-compatible): the gamepad layer. Qt6 dropped
 # QtGamepad -- it was a Qt5 module and was never ported -- so there is no
 # in-toolkit option. SDL is chosen over raw XInput because XInput cannot see a
@@ -175,6 +193,17 @@ FetchContent_Declare(embree
 FetchContent_MakeAvailable(embree)
 set(EMBREE_DIR "${embree_SOURCE_DIR}")
 
+else()  # ---- Linux: the same five dependencies, from system packages -------
+# Arch/CachyOS: pacman -S sdl3 openxr embree openimagedenoise vulkan-swrast
+# (vulkan-swrast is Mesa lavapipe -- on Linux it registers its ICD system-wide,
+# so none of the Windows-side bundling/registration machinery is needed; the
+# CPU device simply appears in the enumeration like any other).
+find_package(SDL3 REQUIRED CONFIG)
+find_package(OpenXR REQUIRED CONFIG)
+find_package(embree 4 REQUIRED CONFIG)
+find_package(OpenImageDenoise REQUIRED CONFIG)
+endif()
+
 # ---------------------------------------------------------------------------
 # Qt -- the GUI. Used under LGPL-3.0 via option 4(d)(1): DYNAMIC LINKING ONLY.
 #
@@ -186,21 +215,27 @@ set(EMBREE_DIR "${embree_SOURCE_DIR}")
 # Qt cannot be FetchContent'd; it must be installed. Point CMAKE_PREFIX_PATH at
 # the kit matching this compiler -- MinGW-built Qt cannot link against MSVC.
 # ---------------------------------------------------------------------------
-if(NOT DEFINED QT_ROOT)
-    set(QT_ROOT "C:/Qt/6.11.1/msvc2022_64" CACHE PATH "Qt kit matching this compiler")
-endif()
-list(APPEND CMAKE_PREFIX_PATH "${QT_ROOT}")
+if(WIN32)
+    if(NOT DEFINED QT_ROOT)
+        set(QT_ROOT "C:/Qt/6.11.1/msvc2022_64" CACHE PATH "Qt kit matching this compiler")
+    endif()
+    list(APPEND CMAKE_PREFIX_PATH "${QT_ROOT}")
 
-find_package(Qt6 6.5 COMPONENTS Core Gui Widgets PrintSupport QUIET)
-if(NOT Qt6_FOUND)
-    message(FATAL_ERROR
-        "Qt6 not found at '${QT_ROOT}'.\n"
-        "pcbview needs a Qt kit built with the SAME compiler as this project.\n"
-        "This build uses ${CMAKE_CXX_COMPILER_ID}; MinGW-built Qt is ABI-incompatible with MSVC.\n"
-        "\n"
-        "To install the MSVC kit: run C:/Qt/MaintenanceTool.exe\n"
-        "  -> Add or remove components -> Qt -> Qt 6.11.1 -> tick 'MSVC 2022 64-bit' -> install\n"
-        "Then re-run cmake, or pass -DQT_ROOT=<path-to-kit>.")
+    find_package(Qt6 6.5 COMPONENTS Core Gui Widgets PrintSupport QUIET)
+    if(NOT Qt6_FOUND)
+        message(FATAL_ERROR
+            "Qt6 not found at '${QT_ROOT}'.\n"
+            "pcbview needs a Qt kit built with the SAME compiler as this project.\n"
+            "This build uses ${CMAKE_CXX_COMPILER_ID}; MinGW-built Qt is ABI-incompatible with MSVC.\n"
+            "\n"
+            "To install the MSVC kit: run C:/Qt/MaintenanceTool.exe\n"
+            "  -> Add or remove components -> Qt -> Qt 6.11.1 -> tick 'MSVC 2022 64-bit' -> install\n"
+            "Then re-run cmake, or pass -DQT_ROOT=<path-to-kit>.")
+    endif()
+else()
+    # Linux: the distribution's Qt (qt6-base). No QT_ROOT dance.
+    find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets PrintSupport)
+    set(QT_ROOT "${Qt6_DIR}")
 endif()
 
 # AUTOMOC runs Qt's meta-object compiler over anything with Q_OBJECT; AUTORCC
@@ -264,6 +299,19 @@ pcbview_add_shader(overlay.frag)
 pcbview_add_shader(bloom_extract.frag)
 pcbview_add_shader(bloom_composite.frag)
 
+# Platform-specific sources. The video recorder has one implementation per
+# platform behind the same interface (video/mf_encoder.h): Media Foundation on
+# Windows, a piped system ffmpeg on Linux. The .rc (icon + VERSIONINFO) is a
+# Windows resource format.
+if(WIN32)
+    set(PCBVIEW_PLATFORM_SOURCES
+        src/video/mf_encoder.cpp
+        assets/pcbview.rc)
+else()
+    set(PCBVIEW_PLATFORM_SOURCES
+        src/video/ffmpeg_encoder.cpp)
+endif()
+
 add_executable(pcbview WIN32
     src/main.cpp
     src/io/sexpr.cpp
@@ -279,7 +327,6 @@ add_executable(pcbview WIN32
     src/io/odb/odb_project.cpp
     src/io/ipc2581/ipc2581.cpp
     src/io/altium/altium_pcb.cpp
-    src/video/mf_encoder.cpp
     src/geom/connectivity.cpp
     src/geom/tessellate.cpp
     ${MINIZ_SOURCES}
@@ -301,9 +348,13 @@ add_executable(pcbview WIN32
     src/xr/xr_probe.cpp
     src/xr/xr_system.cpp
     assets/icons.qrc
-    assets/pcbview.rc
+    ${PCBVIEW_PLATFORM_SOURCES}
     ${SHADER_OUTPUTS}
 )
+
+if(PCBVIEW_ENABLE_VR)
+    target_compile_definitions(pcbview PRIVATE PCBVIEW_ENABLE_VR=1)
+endif()
 
 target_include_directories(pcbview PRIVATE
     src
@@ -312,10 +363,16 @@ target_include_directories(pcbview PRIVATE
     ${miniz_SOURCE_DIR}
     ${pugixml_SOURCE_DIR}/src
     ${cgltf_SOURCE_DIR}
-    ${OIDN_DIR}/include
-    ${EMBREE_DIR}/include
     ${SHADER_INCLUDE_DIR}
 )
+if(WIN32)
+    # Prebuilt OIDN/Embree: headers live inside the extracted packages. (On
+    # Linux the imported targets carry their include paths themselves.)
+    target_include_directories(pcbview PRIVATE
+        ${OIDN_DIR}/include
+        ${EMBREE_DIR}/include
+    )
+endif()
 
 # miniz is third-party C; its warnings are not ours. MINIZ_EXPORT is normally
 # defined in a generated miniz_export.h (produced by miniz's own CMake, which we
@@ -344,11 +401,23 @@ target_link_libraries(pcbview PRIVATE
     Vulkan::Vulkan
     Clipper2
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::PrintSupport
-    SDL3::SDL3-static
     OpenXR::openxr_loader
-    ${OIDN_DIR}/lib/OpenImageDenoise.lib
-    ${EMBREE_DIR}/lib/embree4.lib
 )
+if(WIN32)
+    # Prebuilt packages: link the import libs directly.
+    target_link_libraries(pcbview PRIVATE
+        SDL3::SDL3-static
+        ${OIDN_DIR}/lib/OpenImageDenoise.lib
+        ${EMBREE_DIR}/lib/embree4.lib
+    )
+else()
+    # System packages: imported targets from their CMake configs.
+    target_link_libraries(pcbview PRIVATE
+        SDL3::SDL3
+        OpenImageDenoise
+        embree
+    )
+endif()
 
 # Geometry/importer regression tests: a console target with NO Vulkan and NO
 # Qt, runnable on a bare CI runner. It compiles the shared geometry + Gerber
@@ -384,6 +453,7 @@ target_include_directories(pcbview_tests PRIVATE
 target_compile_definitions(pcbview_tests PRIVATE MINIZ_EXPORT=)
 target_link_libraries(pcbview_tests PRIVATE Clipper2)
 
+if(WIN32)
 # Stage the OIDN runtime beside the exe: the CPU device plus the CUDA (NVIDIA) and
 # HIP (AMD) GPU devices. OIDN picks the fastest present at runtime -- a GPU when
 # its driver is installed, else the CPU. The CUDA/HIP device DLLs need only the
@@ -427,6 +497,7 @@ if(EXISTS "${LAVAPIPE_DIR}/vulkan_lvp.dll")
         VERBATIM
     )
 endif()
+endif()  # WIN32 runtime staging (OIDN, Embree, lavapipe -- system libs on Linux)
 
 if(MSVC)
     target_compile_options(pcbview PRIVATE /W4 /permissive-)
@@ -463,8 +534,9 @@ add_custom_command(TARGET pcbview POST_BUILD
 
 # windeployqt copies the Qt DLLs and plugins beside the exe -- this is what makes
 # the folder xcopy-deployable, and what keeps us on the dynamic-linking path.
+# (Linux links the system Qt; there is nothing to stage.)
 find_program(WINDEPLOYQT NAMES windeployqt HINTS "${QT_ROOT}/bin")
-if(WINDEPLOYQT)
+if(WIN32 AND WINDEPLOYQT)
     add_custom_target(deploy
         COMMAND ${WINDEPLOYQT} --release --no-translations --no-system-d3d-compiler
                 --no-opengl-sw $<TARGET_FILE:pcbview>

@@ -9,6 +9,7 @@
 #include <clipper2/clipper.h>
 
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <map>
@@ -523,6 +524,7 @@ int main(int argc, char** argv) {
         // rather than being mistaken for a board filename.
         if (std::string(argv[1]) == "--view" && argc == 2)
             return pcbview::app::runViewer("");
+#if PCBVIEW_ENABLE_VR
         // Bare --vr, with no board: the empty viewer, in the headset.
         if (std::string(argv[1]) == "--vr" && argc == 2) {
 #ifdef _WIN32
@@ -532,7 +534,9 @@ int main(int argc, char** argv) {
 #endif
             return pcbview::app::runViewer("");
         }
+#endif
         if (std::string(argv[1]) == "--gpu-info") return gpuReport();
+#if PCBVIEW_ENABLE_VR
         if (std::string(argv[1]) == "--xr-probe") return pcbview::xr::probe();
         if (std::string(argv[1]) == "--xr-device-test")
             return pcbview::xr::deviceTest();
@@ -540,6 +544,7 @@ int main(int argc, char** argv) {
             return pcbview::xr::inputTest();
         if (std::string(argv[1]) == "--xr-present-test")
             return pcbview::xr::presentTest();
+#endif
         if (std::string(argv[1]) == "--cpu-trace" && argc >= 4)
             return cpuTrace(argv[2], argv[3]);
         if (std::string(argv[1]) == "--gerber-probe" && argc >= 3)
@@ -582,6 +587,7 @@ int main(int argc, char** argv) {
                 noMirror = true;
             } else if (arg == "--view") {
                 view = true;
+#if PCBVIEW_ENABLE_VR
             } else if (arg == "--vr") {
                 // Sets the same switch the viewer already reads, because the
                 // decision genuinely has to be made this early: OpenXR WRAPS
@@ -595,6 +601,7 @@ int main(int argc, char** argv) {
                 _putenv_s("PCBVIEW_VR", "1");
 #else
                 setenv("PCBVIEW_VR", "1", 1);
+#endif
 #endif
             } else {
                 std::fprintf(stderr, "unknown argument: %s\n", arg.c_str());
