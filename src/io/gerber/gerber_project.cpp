@@ -699,10 +699,10 @@ geom::LayerArt importPackage(const std::string& path) {
                                   std::move(img.flashes)});
                 break;
             case FileFunction::Kind::Soldermask:
-                masks.push_back({fn, std::move(img.dark), {}});
+                masks.push_back({fn, std::move(img.dark), {}, {}});
                 break;
             case FileFunction::Kind::Silkscreen:
-                silks.push_back({fn, std::move(img.dark), {}});
+                silks.push_back({fn, std::move(img.dark), {}, {}});
                 break;
             case FileFunction::Kind::Profile:
                 profileDark = std::move(img.dark);

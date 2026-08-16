@@ -372,17 +372,6 @@ void collectShapes(const PolyPath64& node, std::vector<Shape>& out) {
     }
 }
 
-std::vector<Shape> unionToShapes(const Paths64& paths) {
-    Clipper64 clipper;
-    clipper.AddSubject(paths);
-    PolyTree64 tree;
-    clipper.Execute(ClipType::Union, FillRule::NonZero, tree);
-
-    std::vector<Shape> shapes;
-    collectShapes(tree, shapes);
-    return shapes;
-}
-
 // Extrude one shape between zBottom and zTop, appending to mesh.
 void extrude(const Shape& shape, double zBottom, double zTop, Mesh& mesh) {
     std::vector<std::vector<std::array<double, 2>>> polygon;

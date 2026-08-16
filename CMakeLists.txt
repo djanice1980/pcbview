@@ -510,7 +510,14 @@ if(MSVC)
     # forcing WinMain.
     target_link_options(pcbview PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
 else()
-    target_compile_options(pcbview PRIVATE -Wall -Wextra)
+    # -Wno-missing-field-initializers: the Vulkan idiom
+    # `VkFoo x{VK_STRUCTURE_TYPE_...}` value-initialises every remaining
+    # member to zero -- precisely what the API wants -- but GCC's -Wextra
+    # flags all several hundred of them, burying the warnings that matter.
+    # MSVC at /W4 does not warn on the same code, so the Windows build's
+    # signal is unchanged.
+    target_compile_options(pcbview PRIVATE -Wall -Wextra
+                           -Wno-missing-field-initializers)
 endif()
 
 # ---------------------------------------------------------------------------

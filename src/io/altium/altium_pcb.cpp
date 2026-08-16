@@ -46,8 +46,6 @@ constexpr int kMultiLayer = 74;
 constexpr uint16_t kNoNet = 0xFFFF;
 constexpr uint16_t kNoPoly = 0xFFFF;
 
-bool isCopperId(int id) { return id >= kTopLayer && id <= kBottomLayer; }
-
 // ---- binary stream reader --------------------------------------------------
 
 class Reader {

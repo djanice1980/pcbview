@@ -5390,9 +5390,10 @@ bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
     // Close the frame's timestamp pair. BOTTOM_OF_PIPE so it is written only
     // once everything recorded above has finished executing.
     if (statPool_) vkCmdEndQuery(cmd, statPool_, frame_);
-    if (timePool_)
+    if (timePool_) {
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
                              timePool_, frame_ * 2 + 1);
+    }
         vkEndCommandBuffer(cmd);
         VkSubmitInfo solo{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         solo.commandBufferCount = 1;
