@@ -3940,6 +3940,39 @@ void VulkanWindow::buildOverlay() {
     static const float kWhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     static const float kDim[4] = {0.72f, 0.84f, 1.0f, 0.9f};
 
+    // What is drawing this frame, top-right: the device and the active mode.
+    // The device picker and the bundled CPU driver mean the answer is not
+    // always obvious from looking at the image -- and being part of the
+    // overlay, it survives into screenshots and captures, so a saved frame
+    // carries its own provenance.
+    {
+        std::string dev = activeGpuName().toStdString();
+        // "AMD Radeon 8060S Graphics (RADV STRIX_HALO)" -> the name alone;
+        // llvmpipe's parenthetical is what identifies it as the CPU, keep it.
+        const size_t paren = dev.find(" (");
+        if (paren != std::string::npos &&
+            dev.find("llvmpipe") == std::string::npos)
+            dev.resize(paren);
+        const char* mode;
+        if (motionDowngraded_)
+            mode = "raster (moving)";
+        else if (renderer_->renderMode() == vk::RenderMode::PathTraced)
+            mode = cpuRender() ? "path tracing (Embree)" : "path tracing";
+        else if (cpuRender())
+            mode = rtEnabled_ ? "preview + shadows (Embree)" : "preview (Embree)";
+        else
+            mode = (rtEnabled_ && rtAvailable()) ? "ray-traced lighting"
+                                                 : "raster";
+        const std::string line = dev + " - " + mode;
+        const float size = 11.0f * dpr;
+        text::TextStyle st;
+        st.size = {size * 0.9, size};
+        st.thickness = size * 0.14;
+        const float wpx = static_cast<float>(width()) * dpr;
+        const float tw = static_cast<float>(text::measure(line, st));
+        drawText(line, wpx - 10.0f * dpr - tw * 0.5f, size * 1.6f, size, kDim);
+    }
+
     // Camera readout. Deliberately part of the OVERLAY rather than the status
     // bar: the overlay is drawn into the frame itself, so it survives
     // PCBVIEW_CAPTURE and a screenshot carries the exact view that produced
