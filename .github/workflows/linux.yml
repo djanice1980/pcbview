@@ -48,7 +48,8 @@ jobs:
             git cmake ninja vulkan-headers shaderc \
             qt6-base sdl3 openxr embree openimagedenoise onetbb \
             curl file desktop-file-utils fuse2 \
-            vulkan-swrast
+            vulkan-swrast \
+            github-cli
 
       - uses: actions/checkout@v4
 
@@ -97,6 +98,7 @@ jobs:
             tag='${{ github.ref_name }}'
           fi
           git config --global --add safe.directory "$PWD"
+          command -v gh  # fail HERE if the cli is missing, not silently in the loop
           # Wait for the Windows job to have created the draft on a tag push;
           # on workflow_dispatch the release already exists.
           for i in $(seq 1 30); do
