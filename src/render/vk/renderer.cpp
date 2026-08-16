@@ -769,7 +769,12 @@ void Renderer::createPathTracer() {
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},  // + netColour, netSpan
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 7}};  // 4 pt + 3 tonemap
+        // 6 pt (accum, albedo, normal, net phase, first-hit pos, first-hit
+        // normal) + 3 tonemap. Was 7 -- undercounted when bindings 11/13/14
+        // were added. Windows drivers don't enforce pool sizes so it never
+        // failed there; RADV does, and VK_ERROR_OUT_OF_POOL_MEMORY names the
+        // spot.
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 9}};
     VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pi.maxSets = 2;
     pi.poolSizeCount = 3;
