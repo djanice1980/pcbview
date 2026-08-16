@@ -3093,6 +3093,17 @@ void MainWindow::saveShowcase() {
 void MainWindow::loadShowcase() {
     QSettings s = appSettings();
     unpackShowcaseSteps(s.value("showcaseSteps").toString());
+    // First run (nothing ever saved): seed a default tour rather than showing
+    // an empty playlist. An empty Record/Play panel gives a new user no hint
+    // of what a step even looks like; these double as editable examples --
+    // one of each basic kind, ending back at the start pose. Only when the
+    // KEY is absent: a user who deliberately emptied their list keeps it
+    // empty, because saving writes the key.
+    if (showcaseSteps_.empty() && !s.contains("showcaseSteps")) {
+        unpackShowcaseSteps(
+            "view:iso:2;spin:yaw,360:6;view:top:2.5;explode:100:2;"
+            "explode:0:2;view:bottom:2.5;view:iso:2");
+    }
     // Blockers, or the widgets' change-signals fire saveShowcase() MID-LOAD
     // and overwrite the not-yet-parsed path data with an empty map.
     if (showcaseLoops_) {
