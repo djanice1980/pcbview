@@ -1,5 +1,6 @@
 # Build output (CMake, FetchContent deps, deployed Qt DLLs, compiled shaders)
 /build/
+/build-*/
 /out/
 /cmake-build-*/
 
