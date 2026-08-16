@@ -261,6 +261,7 @@ ComponentImport importComponents(const std::string& pcbPath,
     }
 
     const QString cache = cachePathFor(board);
+    QString exportErrOut;  // kicad-cli's stderr, kept for the empty-GLB case
     if (!QFileInfo::exists(cache)) {
         QProcess proc;
         QStringList args{"pcb",     "export",         "glb",
@@ -275,12 +276,12 @@ ComponentImport importComponents(const std::string& pcbPath,
         }
         // STEP tessellation of a full board can take a few seconds.
         proc.waitForFinished(120000);
+        exportErrOut =
+            QString::fromLocal8Bit(proc.readAllStandardError()).trimmed();
         if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0 ||
             !QFileInfo::exists(cache)) {
-            const QString errOut =
-                QString::fromLocal8Bit(proc.readAllStandardError()).trimmed();
             QString msg = "components skipped: kicad-cli export failed";
-            if (!errOut.isEmpty()) msg += " (" + errOut.left(200) + ")";
+            if (!exportErrOut.isEmpty()) msg += " (" + exportErrOut.left(200) + ")";
             result.message = msg.toStdString();
             return result;
         }
@@ -289,6 +290,23 @@ ComponentImport importComponents(const std::string& pcbPath,
     std::string err;
     result.parts = loadGlb(cache, boardBounds, err);
     if (result.parts.empty()) {
+        // The usual cause of a syntactically valid but EMPTY export: kicad-cli
+        // ran, but the 3D model library its footprints point into is not
+        // installed, so every body resolved to a file-not-found and the GLB
+        // holds nothing. The exit code is 0 in that case; the evidence is on
+        // stderr, one "File not found: ${KICAD*_3DMODEL_DIR}/..." per part.
+        // Name the actual fix per platform instead of shrugging.
+        if (exportErrOut.contains("3DMODEL_DIR")) {
+            result.message =
+                "components skipped: KiCad's 3D model library is not "
+                "installed (Linux: install kicad-library-3d; Windows: "
+                "re-run the KiCad installer with the 3D models component). "
+                "Reload the board after installing.";
+            // Do NOT leave the empty export behind as a cache hit: with the
+            // models installed, an unchanged board must re-export.
+            QFile::remove(cache);
+            return result;
+        }
         result.message = err.empty() ? "no components" : ("components: " + err);
         return result;
     }

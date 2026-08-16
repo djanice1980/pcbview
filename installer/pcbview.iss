@@ -71,3 +71,40 @@ Name: "{autodesktop}\pcbview"; Filename: "{app}\pcbview.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\pcbview.exe"; Description: "Launch pcbview"; Flags: nowait postinstall skipifsilent
+; KiCad is an optional runtime dependency, not a bundled one: pcbview uses its
+; kicad-cli (and its 3D model library) to export component bodies. When no
+; install is found, offer the download page as an unchecked finish-page option
+; -- the viewer is fully functional without it, minus component bodies.
+Filename: "https://www.kicad.org/download/"; Description: "Get KiCad (enables 3D component bodies on KiCad boards)"; Flags: shellexec nowait postinstall skipifsilent unchecked; Check: not KicadPresent
+
+[Code]
+// Mirrors findKicadCli in src/app/component_import.cpp: any versioned
+// install root containing bin\kicad-cli.exe counts.
+function DirHasKicadCli(const Root: string): Boolean;
+var
+  FindRec: TFindRec;
+begin
+  Result := False;
+  if FindFirst(Root + '\*', FindRec) then begin
+    try
+      repeat
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY <> 0) and
+           (FindRec.Name <> '.') and (FindRec.Name <> '..') and
+           FileExists(Root + '\' + FindRec.Name + '\bin\kicad-cli.exe') then
+        begin
+          Result := True;
+          Exit;
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
+function KicadPresent: Boolean;
+begin
+  Result := DirHasKicadCli(ExpandConstant('{localappdata}\Programs\KiCad')) or
+            DirHasKicadCli(ExpandConstant('{commonpf64}\KiCad')) or
+            DirHasKicadCli(ExpandConstant('{commonpf32}\KiCad'));
+end;
