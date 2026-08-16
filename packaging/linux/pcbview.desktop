@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=pcbview
+GenericName=PCB Viewer
+Comment=GPU-accelerated 3D viewer for KiCad projects and Gerber packages
+# Exec/Icon: template values. `Exec` must point at the built binary and `Icon`
+# at an installed icon; the repo's install-desktop-entry step rewrites both.
+Exec=pcbview %f
+Icon=pcbview
+Terminal=false
+Categories=Development;Engineering;Electronics;
+# x-kicad-pcb is registered by the kicad package's shared-mime-info; the
+# Gerber types below are pcbview's own openable inputs.
+MimeType=application/x-kicad-pcb;application/x-gerber;application/x-excellon;
+StartupWMClass=pcbview
+SingleMainWindow=false

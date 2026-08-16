@@ -3782,7 +3782,7 @@ void MainWindow::onFrameRendered() {
 
     const double ms = viewport_->frameMs();
     const VkExtent2D scene = r->sceneExtent();
-    statusPerf_->setText(
+    const QString perf =
         QString("%1 × %2 @ %3×  ·  %4 tris  ·  %5 draws  ·  %6 ms  ·  %7 fps")
             .arg(scene.width)
             .arg(scene.height)
@@ -3790,7 +3790,16 @@ void MainWindow::onFrameRendered() {
             .arg(r->stats().triangles)
             .arg(r->stats().drawCalls)
             .arg(QString::number(ms, 'f', 2))
-            .arg(ms > 0.0 ? QString::number(1000.0 / ms, 'f', 0) : "—"));
+            .arg(ms > 0.0 ? QString::number(1000.0 / ms, 'f', 0) : "—");
+    statusPerf_->setText(perf);
+    // Headless hook: the same line on stdout, so frame cost can be measured
+    // and A/B'd (RT on/off, MSAA, scale) from a script instead of by reading
+    // the status bar. Every 15th frame, same as the label.
+    static const bool logPerf = qEnvironmentVariableIsSet("PCBVIEW_PERF_LOG");
+    if (logPerf) {
+        std::printf("perf: %s\n", perf.toUtf8().constData());
+        std::fflush(stdout);
+    }
 }
 
 void MainWindow::showAppearanceDialog() {

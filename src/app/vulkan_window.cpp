@@ -2440,19 +2440,30 @@ void VulkanWindow::createDeviceAndRenderer() {
     if (qEnvironmentVariableIsSet("PCBVIEW_RENDER_SCALE"))
         renderer_->setRenderScale(qgetenv("PCBVIEW_RENDER_SCALE").toFloat());
 
-    // Fast movement: ON by default for the CPU device, OFF for a GPU, persisted
-    // per device class with an env override. The CPU downgrade no longer means
-    // llvmpipe raster (which profiling showed was the SLOW path) -- since the
-    // Embree-everything change it drops to the flat preview, one primary ray
-    // per pixel, genuinely the cheapest way this device can draw a frame while
-    // the camera moves.
+    // Fast movement: ON by default for the CPU device AND integrated GPUs,
+    // OFF for discrete, persisted per device class with an env override. The
+    // CPU downgrade no longer means llvmpipe raster (which profiling showed
+    // was the SLOW path) -- since the Embree-everything change it drops to the
+    // flat preview, one primary ray per pixel, genuinely the cheapest way this
+    // device can draw a frame while the camera moves.
+    //
+    // Integrated counts as slow on purpose: an iGPU can report ray_query and
+    // still pay ~25-40x raster for it (measured on a Radeon 8060S: 5.5 ms
+    // raster vs 24-213 ms with RT on, single-digit fps in view transitions).
+    // The "GPU is fast enough to leave RT on while moving" assumption that
+    // made OFF the right default was written on a discrete card. RT at rest
+    // is untouched -- on-demand rendering means a parked view costs nothing.
     if (qEnvironmentVariableIsSet("PCBVIEW_FAST_MOVE"))
         fastMove_ = qgetenv("PCBVIEW_FAST_MOVE").toInt() != 0;
-    else
+    else {
+        const bool slowClass =
+            cpuRender() ||
+            device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
         fastMove_ = appSettings()
                         .value(cpuRender() ? "fastMovementCpu" : "fastMovementGpu",
-                               cpuRender())
+                               slowClass)
                         .toBool();
+    }
     // A fresh renderer starts in whatever mode we set below; clear any stale
     // motion-downgrade latch from the previous device so the two agree.
     motionDowngraded_ = false;
