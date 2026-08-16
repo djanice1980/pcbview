@@ -3986,7 +3986,7 @@ void MainWindow::showAbout() {
     dlg.setWindowTitle("About pcbview");
 
     auto* text = new QLabel(
-        "<h3>pcbview 1.23.0</h3>"
+        "<h3>pcbview 1.24.0</h3>"
         "<p>Standalone 3D PCB viewer. Renders what the fab will build.</p>"
         "<p>Copyright © 2026 pcbview contributors.<br>"
         "pcbview is free software under the <b>GNU General Public License "
