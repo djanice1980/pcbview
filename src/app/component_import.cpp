@@ -15,6 +15,8 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <string>
+#include <tuple>
 
 // cgltf: single-header glTF/GLB loader (MIT). The implementation is compiled
 // here, in exactly one translation unit.
@@ -137,12 +139,28 @@ std::vector<geom::Part> loadGlb(const QString& glbPath,
 
     const double boardMidZ = 0.5 * (bounds.min[2] + bounds.max[2]);
 
-    // Key: material index (materials_count == "no material"), then mounting side.
-    std::map<std::pair<size_t, int>, Accum> groups;
+    // Key: the component's reference designator, then material index
+    // (materials_count == "no material"), then mounting side. Per-REFDES so
+    // individual components can be hidden and shown; the merge back into a
+    // few big batches happens at assembly time (appendComponents), so the
+    // renderer still sees a handful of draws either way.
+    std::map<std::tuple<std::string, size_t, int>, Accum> groups;
 
     for (size_t ni = 0; ni < data->nodes_count; ++ni) {
         const cgltf_node& node = data->nodes[ni];
         if (!node.mesh) continue;
+
+        // kicad-cli's GLB puts each footprint under a PARENT node named by
+        // its reference designator ("U1", "C6"); the child that holds the
+        // mesh has a generated name ("=>[0:1:1:3]"). Climb to the node just
+        // below the scene root -- that is where the refdes lives, including
+        // for footprints with several stacked models.
+        const cgltf_node* labelled = &node;
+        while (labelled->parent && labelled->parent->parent)
+            labelled = labelled->parent;
+        const std::string refdes =
+            (labelled->name && labelled->name[0]) ? labelled->name
+                                                  : "(unnamed)";
 
         float world[16];
         cgltf_node_transform_world(&node, world);
@@ -172,7 +190,7 @@ std::vector<geom::Part> loadGlb(const QString& glbPath,
             const size_t matIndex =
                 prim.material ? static_cast<size_t>(prim.material - data->materials)
                               : data->materials_count;
-            Accum& acc = groups[{matIndex, side}];
+            Accum& acc = groups[{refdes, matIndex, side}];
             acc.mountSide = side;
             if (prim.material && prim.material->has_pbr_metallic_roughness) {
                 const cgltf_float* c =
@@ -229,9 +247,11 @@ std::vector<geom::Part> loadGlb(const QString& glbPath,
         if (acc.mesh.indices.empty()) continue;
         geom::Part part;
         part.material = geom::Material::Component;
-        // One shared name, so the single "Components" tree toggle drives every
-        // colour/side group at once (onLayerToggled matches all parts by name).
-        part.name = "Components";
+        // Named by refdes -- the per-component visibility list keys on this.
+        // The single "Components" stackup toggle still works because
+        // appendComponents merges the visible parts into batches named
+        // "Components" before they reach the renderer.
+        part.name = std::get<0>(key);
         part.mesh = std::move(acc.mesh);
         part.color[0] = acc.color[0];
         part.color[1] = acc.color[1];

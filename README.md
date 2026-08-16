@@ -71,7 +71,12 @@ was built RT-ready from day one for a future hardware ray-tracing mode.
   it, in every render mode including path tracing. The status bar reports
   routed length and via count.
 - **Layer control.** Per-layer visibility, a one-click components toggle, and
-  auto-hiding side panels (pin, or peek-on-hover).
+  auto-hiding side panels (pin, or peek-on-hover). KiCad boards additionally
+  get **per-component visibility**: a searchable Components panel with a
+  checkbox per reference designator, and All/None acting on whatever the
+  filter currently matches — filter to `C`, hit None, and just the capacitors
+  vanish. (`PCBVIEW_HIDE` accepts refdes too, so captures can do the same
+  headlessly.)
 - **Print & export.** Print as-shown, flat (overhead orthographic), or **flat at
   true 1:1 physical size**, with a print preview. Save a PNG/JPG screenshot at
   **up to 4× the window** — a 4K/8K render for documentation or print, not a

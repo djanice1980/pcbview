@@ -11,6 +11,8 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>
+#include <string>
 #include <vector>
 
 class QCheckBox;
@@ -175,7 +177,19 @@ private:
     // Append the cached component parts onto mesh_ (fresh copies, so repeated
     // reassembles don't accumulate), shifting top-mounted parts to sit on the
     // current surface when a thickness override moves it. Also grows the bounds.
+    // Skips components in hiddenComponents_ and merges the rest into a few
+    // (colour, side) batches, so per-refdes visibility costs no draw calls.
     void appendComponents();
+
+    // Per-component visibility (KiCad boards). Session state, reset on load:
+    // refdes in the set = hidden. Toggling reassembles, same as a thickness
+    // change.
+    void buildComponentDock();
+    void populateComponents();
+    std::set<std::string> hiddenComponents_;
+    QDockWidget* componentDock_ = nullptr;
+    QListWidget* componentList_ = nullptr;
+    QLineEdit* componentFilter_ = nullptr;
 
     // Owned, so a reload can replace them wholesale. `board_` is only populated
     // for a .kicad_pcb; `fromGerber_` gates the semantics-dependent UI

@@ -25,6 +25,7 @@
 #include <QProgressDialog>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QCollator>
 #include <QShortcut>
 #include <QSpinBox>
 #include <QCheckBox>
@@ -212,6 +213,7 @@ MainWindow::MainWindow(const QString& path) {
     buildStackupDock();
     buildPropertiesDock();
     buildNetDock();
+    buildComponentDock();
     buildShowcaseDock();
     buildStatusBar();
 
@@ -276,9 +278,24 @@ MainWindow::MainWindow(const QString& path) {
         const QStringList hide =
             qEnvironmentVariable("PCBVIEW_HIDE").split(',', Qt::SkipEmptyParts);
         QTimer::singleShot(500, this, [this, hide] {
-            for (const QString& h : hide)
-                viewport_->renderer()->setPartVisible(h.trimmed().toStdString(),
-                                                      false);
+            // A name matching a loaded component's refdes hides that ONE
+            // component (same mechanism as the Components panel); anything
+            // else is a stackup part name for the renderer.
+            std::set<std::string> refs;
+            for (const geom::Part& p : componentParts_) refs.insert(p.name);
+            bool componentsChanged = false;
+            for (const QString& h : hide) {
+                const std::string name = h.trimmed().toStdString();
+                if (refs.count(name)) {
+                    componentsChanged |= hiddenComponents_.insert(name).second;
+                } else {
+                    viewport_->renderer()->setPartVisible(name, false);
+                }
+            }
+            if (componentsChanged) {
+                reassemble();
+                populateComponents();
+            }
             // Keep the stackup checkboxes honest about what is showing.
             for (int i = 0; i < stackup_->topLevelItemCount(); ++i)
                 syncStackupChecks(stackup_->topLevelItem(i), hide);
@@ -921,6 +938,7 @@ bool MainWindow::loadBoard(const QString& path) {
     // no component identity to render. Never fatal: on any failure the board
     // still shows and the reason lands in the status bar.
     componentParts_.clear();
+    hiddenComponents_.clear();  // a fresh board starts fully populated
     QString componentMsg;
     if (isKicad && qEnvironmentVariableIsEmpty("PCBVIEW_NO_COMPONENTS")) {
         ComponentImport ci =
@@ -929,6 +947,7 @@ bool MainWindow::loadBoard(const QString& path) {
         componentMsg = QString::fromStdString(ci.message);
     }
     appendComponents();
+    populateComponents();
 
     stack_->setCurrentIndex(1);  // reveal the viewport
     viewport_->setMesh(&mesh_);
@@ -1051,21 +1070,39 @@ void MainWindow::appendComponents() {
     const double eff = thicknessOverride_ > 0.0 ? thicknessOverride_ : design;
     const float dz = static_cast<float>(eff - design);
 
+    // The cache holds one part per (refdes, colour, side) so individual
+    // components can be hidden from the Components panel. Merge the VISIBLE
+    // ones back into one batch per (colour, side) here: the renderer keeps
+    // seeing a handful of parts, and they are all named "Components", which
+    // is what the stackup tree's all-components toggle matches.
+    std::map<std::pair<std::array<float, 4>, int>, geom::Part> batches;
     for (const geom::Part& src : componentParts_) {
-        geom::Part p = src;  // fresh copy per assemble
-        if (dz != 0.0f && p.mountSide > 0) {
-            for (geom::Vertex& v : p.mesh.vertices) v.position[2] += dz;
+        if (hiddenComponents_.count(src.name)) continue;
+        const std::array<float, 4> col{src.color[0], src.color[1], src.color[2],
+                                       src.color[3]};
+        geom::Part& dst = batches[{col, src.mountSide}];
+        if (dst.mesh.vertices.empty()) {
+            dst.material = geom::Material::Component;
+            dst.name = "Components";
+            for (int k = 0; k < 4; ++k) dst.color[k] = src.color[k];
+            dst.mountSide = src.mountSide;
         }
-        for (const geom::Vertex& v : p.mesh.vertices) {
+        const uint32_t base = static_cast<uint32_t>(dst.mesh.vertices.size());
+        for (const geom::Vertex& v : src.mesh.vertices) {
+            geom::Vertex w = v;  // fresh copy per assemble
+            if (dz != 0.0f && src.mountSide > 0) w.position[2] += dz;
             for (int k = 0; k < 3; ++k) {
-                mesh_.bounds.min[k] =
-                    std::min(mesh_.bounds.min[k], static_cast<double>(v.position[k]));
-                mesh_.bounds.max[k] =
-                    std::max(mesh_.bounds.max[k], static_cast<double>(v.position[k]));
+                mesh_.bounds.min[k] = std::min(mesh_.bounds.min[k],
+                                               static_cast<double>(w.position[k]));
+                mesh_.bounds.max[k] = std::max(mesh_.bounds.max[k],
+                                               static_cast<double>(w.position[k]));
             }
+            dst.mesh.vertices.push_back(w);
         }
-        mesh_.parts.push_back(std::move(p));
+        for (const uint32_t idx : src.mesh.indices)
+            dst.mesh.indices.push_back(base + idx);
     }
+    for (auto& [key, p] : batches) mesh_.parts.push_back(std::move(p));
 }
 
 void MainWindow::grabFrame(std::function<void(const QImage&)> then,
@@ -2124,6 +2161,119 @@ void MainWindow::buildNetDock() {
     dock->setMinimumWidth(230);
     addDockWidget(Qt::RightDockWidgetArea, dock);
     netDock_ = dock;
+}
+
+// Per-component visibility, KiCad boards only (gerbers carry no component
+// identity). Checked = shown. Session state, deliberately not persisted: a
+// hidden component silently missing on next week's open of the same board
+// would read as an import bug, not a remembered choice.
+void MainWindow::buildComponentDock() {
+    auto* dock =
+        new CollapsibleDock("COMPONENTS", Qt::RightDockWidgetArea, this);
+    auto* panel = new QWidget;
+    auto* layout = new QVBoxLayout(panel);
+    layout->setContentsMargins(6, 6, 6, 6);
+    layout->setSpacing(4);
+
+    auto* filterRow = new QHBoxLayout;
+    filterRow->setContentsMargins(0, 0, 0, 0);
+    filterRow->setSpacing(4);
+    componentFilter_ = new QLineEdit;
+    componentFilter_->setPlaceholderText("Filter components…");
+    componentFilter_->setClearButtonEnabled(true);
+    filterRow->addWidget(componentFilter_, 1);
+    layout->addLayout(filterRow);
+
+    componentList_ = new QListWidget;
+    componentList_->setSelectionMode(QAbstractItemView::NoSelection);
+    layout->addWidget(componentList_, 1);
+
+    // All / None act on what the filter currently shows, so "filter to C*,
+    // None" hides just the capacitors -- the batch operation people actually
+    // want, rather than a whole-board reset.
+    auto* btnRow = new QHBoxLayout;
+    btnRow->setContentsMargins(0, 0, 0, 0);
+    btnRow->setSpacing(4);
+    const auto setVisibleItems = [this](bool shown) {
+        bool changed = false;
+        for (int i = 0; i < componentList_->count(); ++i) {
+            QListWidgetItem* it = componentList_->item(i);
+            if (it->isHidden()) continue;
+            const std::string ref = it->text().toStdString();
+            const bool hide = !shown;
+            if (hide ? hiddenComponents_.insert(ref).second
+                     : hiddenComponents_.erase(ref) > 0)
+                changed = true;
+            const QSignalBlocker block(componentList_);
+            it->setCheckState(shown ? Qt::Checked : Qt::Unchecked);
+        }
+        if (changed) reassemble();
+    };
+    auto* allBtn = new QPushButton("All");
+    allBtn->setToolTip("Show every component the filter matches");
+    connect(allBtn, &QPushButton::clicked, this,
+            [setVisibleItems] { setVisibleItems(true); });
+    btnRow->addWidget(allBtn);
+    auto* noneBtn = new QPushButton("None");
+    noneBtn->setToolTip("Hide every component the filter matches");
+    connect(noneBtn, &QPushButton::clicked, this,
+            [setVisibleItems] { setVisibleItems(false); });
+    btnRow->addWidget(noneBtn);
+    btnRow->addStretch(1);
+    layout->addLayout(btnRow);
+
+    connect(componentList_, &QListWidget::itemChanged, this,
+            [this](QListWidgetItem* it) {
+                const std::string ref = it->text().toStdString();
+                const bool hide = it->checkState() != Qt::Checked;
+                const bool changed = hide ? hiddenComponents_.insert(ref).second
+                                          : hiddenComponents_.erase(ref) > 0;
+                if (changed) reassemble();
+            });
+    connect(componentFilter_, &QLineEdit::textChanged, this,
+            [this](const QString& t) {
+                for (int i = 0; i < componentList_->count(); ++i) {
+                    QListWidgetItem* it = componentList_->item(i);
+                    it->setHidden(!t.isEmpty() &&
+                                  !it->text().contains(t, Qt::CaseInsensitive));
+                }
+            });
+
+    dock->setContent(panel);
+    dock->setMinimumWidth(200);
+    addDockWidget(Qt::RightDockWidgetArea, dock);
+    componentDock_ = dock;
+}
+
+void MainWindow::populateComponents() {
+    if (!componentList_) return;
+    const QSignalBlocker block(componentList_);
+    componentList_->clear();
+
+    // Unique refdes (the cache holds one part per refdes-colour-side).
+    std::set<std::string> refs;
+    for (const geom::Part& p : componentParts_) refs.insert(p.name);
+
+    // Natural order: C2 before C10, which lexicographic sorting gets wrong.
+    QStringList names;
+    for (const std::string& r : refs) names << QString::fromStdString(r);
+    QCollator collator;
+    collator.setNumericMode(true);
+    std::sort(names.begin(), names.end(),
+              [&collator](const QString& a, const QString& b) {
+                  return collator.compare(a, b) < 0;
+              });
+
+    for (const QString& n : names) {
+        auto* it = new QListWidgetItem(n, componentList_);
+        it->setFlags(it->flags() | Qt::ItemIsUserCheckable);
+        it->setCheckState(hiddenComponents_.count(n.toStdString())
+                              ? Qt::Unchecked
+                              : Qt::Checked);
+    }
+    // No components (gerber path, or bodies unavailable): an empty panel says
+    // so more honestly than a missing one, but fold it out of the way.
+    if (componentDock_) componentDock_->setVisible(!names.isEmpty());
 }
 
 // ---- showcase --------------------------------------------------------------
