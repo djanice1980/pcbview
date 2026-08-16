@@ -47,7 +47,8 @@ jobs:
           pacman -Syu --noconfirm --needed \
             git cmake ninja vulkan-headers shaderc \
             qt6-base sdl3 openxr embree openimagedenoise onetbb \
-            curl file desktop-file-utils fuse2
+            curl file desktop-file-utils fuse2 \
+            vulkan-swrast
 
       - uses: actions/checkout@v4
 
@@ -70,13 +71,14 @@ jobs:
 
       - name: Smoke test the AppImage
         # --gpu-info proves the bundle LOADS: every library resolved and the
-        # app ran far enough to probe devices. A runner has no GPU; "no
-        # device" is the normal result and must not fail the build.
+        # app ran far enough to probe devices. The runner has no GPU, but
+        # vulkan-swrast (installed above) provides the lavapipe CPU device,
+        # so the probe exercises a real instance + device enumeration instead
+        # of dying at vkCreateInstance with no ICD at all.
         run: |
           cd artifacts
-          APPIMAGE_EXTRACT_AND_RUN=1 ./pcbview-*.AppImage --gpu-info || true
-          APPIMAGE_EXTRACT_AND_RUN=1 ./pcbview-*.AppImage --gpu-info 2>&1 | \
-            grep -q "Vulkan devices" && echo "loads OK"
+          APPIMAGE_EXTRACT_AND_RUN=1 ./pcbview-*.AppImage --gpu-info 2>&1 | tee gpu.txt
+          grep -q "Vulkan devices" gpu.txt && echo "loads OK"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
