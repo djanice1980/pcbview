@@ -7,6 +7,12 @@
 # Inno Setup compiler output
 /installer/Output/
 
+# makepkg / AppImage build output
+/packaging/linux/src/
+/packaging/linux/pkg/
+/packaging/linux/.tools/
+/packaging/linux/*.pkg.tar.zst
+
 # CMake bits if configured in-tree
 CMakeCache.txt
 CMakeFiles/

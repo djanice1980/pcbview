@@ -1,0 +1,106 @@
+name: linux
+
+# Builds the Linux packages -- the Arch package via makepkg and the AppImage
+# via packaging/linux/make-appimage.sh, the SAME script a local build uses, so
+# the two cannot drift. Runs in an archlinux container because that is the
+# environment the PKGBUILD targets and the one development happens on.
+#
+# On a v* tag the artifacts are attached to that tag's release (the Windows
+# workflow creates it as a draft; whichever job finishes second finds it
+# already there). workflow_dispatch takes an existing tag instead, so Linux
+# assets can be added to a release after the fact -- still CI-built, never
+# hand-uploaded, which is the whole point of building releases in CI.
+#
+# Portability note: an AppImage carries Qt and the render libraries but NOT
+# glibc, so it runs on distros with a glibc at least as new as the build
+# root's. Building on Arch means "current distros" -- the tradeoff accepted in
+# exchange for building in the environment the port is actually developed and
+# tested on.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packaging/linux/**'
+      - '.github/workflows/linux.yml'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to attach Linux assets to (e.g. v1.23.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+      options: --user root
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git cmake ninja vulkan-headers shaderc \
+            qt6-base sdl3 openxr embree openimagedenoise onetbb \
+            curl file desktop-file-utils fuse2
+
+      - uses: actions/checkout@v4
+
+      # makepkg refuses to run as root; the container starts as root.
+      - name: Create build user
+        run: |
+          useradd -m builder
+          chown -R builder: .
+
+      - name: Build Arch package (runs the geometry tests as check())
+        run: su builder -c 'cd packaging/linux && makepkg -f --noconfirm'
+
+      - name: Build AppImage
+        run: |
+          su builder -c 'cmake -S . -B build-ci -G Ninja -DCMAKE_BUILD_TYPE=Release'
+          su builder -c 'cmake --build build-ci --parallel'
+          su builder -c './packaging/linux/make-appimage.sh build-ci artifacts'
+          cp packaging/linux/*.pkg.tar.zst artifacts/
+          ls -la artifacts/
+
+      - name: Smoke test the AppImage
+        # --gpu-info proves the bundle LOADS: every library resolved and the
+        # app ran far enough to probe devices. A runner has no GPU; "no
+        # device" is the normal result and must not fail the build.
+        run: |
+          cd artifacts
+          APPIMAGE_EXTRACT_AND_RUN=1 ./pcbview-*.AppImage --gpu-info || true
+          APPIMAGE_EXTRACT_AND_RUN=1 ./pcbview-*.AppImage --gpu-info 2>&1 | \
+            grep -q "Vulkan devices" && echo "loads OK"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pcbview-linux-${{ github.sha }}
+          path: artifacts/*
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag='${{ github.event.inputs.release_tag }}'
+          else
+            tag='${{ github.ref_name }}'
+          fi
+          git config --global --add safe.directory "$PWD"
+          # Wait for the Windows job to have created the draft on a tag push;
+          # on workflow_dispatch the release already exists.
+          for i in $(seq 1 30); do
+            gh release view "$tag" > /dev/null 2>&1 && break
+            echo "release $tag not there yet, waiting ($i)"; sleep 20
+          done
+          gh release view "$tag" > /dev/null
+          gh release upload "$tag" artifacts/*.AppImage artifacts/*.pkg.tar.zst --clobber
+          sha256sum artifacts/*
