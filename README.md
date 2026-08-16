@@ -459,10 +459,19 @@ pcbview builds on **Windows (MSVC)** and **Linux**.
 
 ### Linux
 
-On Arch/CachyOS the packaged route does everything — dependencies, the
-binary, a launcher entry with icon — and offers the optional pieces
-(KiCad + its 3D model library for component bodies, `vulkan-swrast` for
-CPU rendering, `ffmpeg` for video recording) as choices at install time:
+On Arch/CachyOS, either install the release package — download it first,
+then install the local file (the packages are unsigned, and pacman
+demands a detached signature for URL installs but not for local files):
+
+```sh
+curl -LO https://github.com/djanice1980/pcbview/releases/latest/download/pcbview-<version>-1-x86_64.pkg.tar.zst
+sudo pacman -U ./pcbview-<version>-1-x86_64.pkg.tar.zst
+```
+
+— or build the same package yourself; it resolves dependencies, installs
+the binary and launcher entry, and offers the optional pieces (KiCad +
+its 3D model library for component bodies, `vulkan-swrast` for CPU
+rendering, `ffmpeg` for video recording) as choices at install time:
 
 ```sh
 cd packaging/linux && makepkg -si
