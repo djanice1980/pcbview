@@ -865,6 +865,16 @@ private:
     RenderMode mode_ = RenderMode::Raster;
     int ptSampleCount_ = 0;     // samples accumulated at the current camera
     int ptMaxSamples_ = 512;    // stop accumulating past this
+    // PT accumulation as separate queue SUBMISSIONS (integrated GPUs): each
+    // sample is sliced into this many horizontal bands, one submit apiece, so
+    // the kernel's GPU scheduler can interleave the compositor's work between
+    // them. A monolithic full-screen sample is a 50-80 ms dispatch on an iGPU
+    // that shares the die with the desktop -- the cursor visibly hitches while
+    // it runs. 0 = record inline in the frame buffer (discrete GPUs; exact
+    // pre-banding behaviour). The image is bitwise identical either way: the
+    // bands are disjoint pixels of the SAME sample, in the same order.
+    int ptSubmitBands() const;
+    std::vector<std::vector<VkCommandBuffer>> ptBandCmds_;  // per frame slot
     bool rayOrtho_ = false;
     // Identity quaternion until the board is turned.
     float boardRotInv_[4] = {0.0f, 0.0f, 0.0f, 1.0f};

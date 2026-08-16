@@ -298,6 +298,29 @@ Device createDevice(const GpuInfo& gpu,
     if (wantRt) extensions.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
     if (wantRq) extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
 
+    // Integrated GPUs share the die -- and the command ring -- with the
+    // desktop compositor. Ask for LOW queue priority where the driver offers
+    // it (VK_EXT_global_priority; LOW needs no privileges): at every
+    // submission boundary the kernel scheduler then runs the compositor's
+    // work first, so a converging path trace stops making the desktop cursor
+    // hitch. Pairs with the banded PT submits, which provide the boundaries
+    // -- priority without boundaries never gets to act, boundaries without
+    // priority just queue fairly behind a FIFO. Measured together on a
+    // Radeon 8060S: a second GPU client held near its full rate during
+    // convergence instead of falling to ~13 fps.
+    bool wantLowPriority = false;
+    if (gpu.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(gpu.handle, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> avail(n);
+        vkEnumerateDeviceExtensionProperties(gpu.handle, nullptr, &n,
+                                             avail.data());
+        if (hasExtension(avail, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME)) {
+            extensions.push_back(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME);
+            wantLowPriority = true;
+        }
+    }
+
     // Variable-rate shading, for foveation. Wanted only where it pays: this
     // shades one fragment per tile of several pixels in the periphery, and
     // every fragment here carries shadow and AO rays, so it removes rays in
@@ -415,6 +438,10 @@ Device createDevice(const GpuInfo& gpu,
     queue.queueFamilyIndex = gpu.graphicsQueueFamily;
     queue.queueCount = 1;
     queue.pQueuePriorities = &priority;
+    VkDeviceQueueGlobalPriorityCreateInfoEXT queuePrio{
+        VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT};
+    queuePrio.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_LOW_EXT;
+    if (wantLowPriority) queue.pNext = &queuePrio;
 
     VkDeviceCreateInfo info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     info.pNext = &features;
@@ -460,8 +487,14 @@ Device createDevice(const GpuInfo& gpu,
                                     &device.handle),
               "xrCreateVulkanDeviceKHR");
     } else {
-        check(vkCreateDevice(gpu.handle, &info, nullptr, &device.handle),
-              "vkCreateDevice");
+        VkResult r = vkCreateDevice(gpu.handle, &info, nullptr, &device.handle);
+        if (r != VK_SUCCESS && wantLowPriority) {
+            // A driver that advertises the extension but refuses LOW: run at
+            // default priority rather than refusing to start.
+            queue.pNext = nullptr;
+            r = vkCreateDevice(gpu.handle, &info, nullptr, &device.handle);
+        }
+        check(r, "vkCreateDevice");
     }
     vkGetDeviceQueue(device.handle, gpu.graphicsQueueFamily, 0,
                      &device.graphicsQueue);

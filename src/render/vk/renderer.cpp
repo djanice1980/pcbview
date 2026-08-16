@@ -806,6 +806,9 @@ void Renderer::createPathTracer() {
     cpi.stage.module = cs;
     cpi.stage.pName = "main";
     cpi.layout = ptLayout_;
+    // vkCmdDispatchBase (the banded accumulation on integrated GPUs) requires
+    // the pipeline to have been created with this flag; costs nothing else.
+    cpi.flags = VK_PIPELINE_CREATE_DISPATCH_BASE;
     check(vkCreateComputePipelines(device_.handle, VK_NULL_HANDLE, 1, &cpi, nullptr,
                                    &ptPipeline_),
           "pt compute pipeline");
@@ -1206,6 +1209,25 @@ void Renderer::recordCpuPathTrace(VkCommandBuffer cmd, bool preview) {
     vkCmdPipelineBarrier2(cmd, &d2);
 }
 
+// How many separate queue submissions to slice each PT sample into. On an
+// integrated GPU the desktop compositor shares the die: a monolithic sample is
+// one 50-80 ms compute dispatch it cannot preempt (measured on a Radeon 8060S:
+// a second GPU client fell from 180 fps to an erratic 13 while accumulation
+// ran -- which the user feels as the mouse cursor hitching). amdgpu arbitrates
+// between processes at submission boundaries, so slicing the sample into
+// band-per-submit pieces gives the compositor a scheduling window every few
+// milliseconds. Discrete GPUs don't composite the desktop they render to* and
+// keep the exact inline path. (*the common case; PCBVIEW_PT_BANDS overrides
+// both directions.)
+int Renderer::ptSubmitBands() const {
+    static const int env = [] {
+        const char* v = std::getenv("PCBVIEW_PT_BANDS");
+        return v && v[0] ? std::atoi(v) : -1;
+    }();
+    if (env >= 0) return env;
+    return device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 4 : 0;
+}
+
 void Renderer::recordPathTrace(VkCommandBuffer cmd) {
     const auto barrier = [&](VkImageMemoryBarrier2* b, uint32_t count) {
         VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -1215,6 +1237,10 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
     };
 
     // First use: UNDEFINED -> GENERAL for the storage images.
+    // Captured before the init block: banded submits run BEFORE this frame's
+    // command buffer, so on the frame that records the layout transitions the
+    // accumulation must stay inline behind them.
+    const bool ptImagesWereReady = ptImagesInitialised_;
     if (!ptImagesInitialised_) {
         Image* imgs[] = {&ptAccum_,        &ptAlbedo_,       &ptNormal_,
                          &ptNetPhase_,     &ptDenoised_,     &ptDenoiseTmp_,
@@ -1265,23 +1291,26 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
                 ? std::min(remaining, ptBatchOverride_)
                 : std::min(remaining, ptSampleCount_ < 4 ? 1 : 4);
 
-        for (int s = 0; s < batch; ++s) {
-            if (s > 0) {
-                // The accumulation images are read-modify-write; order the
-                // batch's dispatches.
-                VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
-                mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-                d.memoryBarrierCount = 1;
-                d.pMemoryBarriers = &mb;
-                vkCmdPipelineBarrier2(cmd, &d);
-            }
+        // The accumulation images are read-modify-write; order the batch's
+        // samples. Pipeline barriers order the QUEUE's command stream, not one
+        // buffer's, so this works identically recorded into the frame buffer
+        // or into a banded submission.
+        auto interSample = [&](VkCommandBuffer into) {
+            VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            d.memoryBarrierCount = 1;
+            d.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(into, &d);
+        };
 
-            PtPush p{};
+        // One sample's push block. Reads ptSampleCount_, so it is rebuilt per
+        // sample; identical for the inline and banded paths.
+        auto fillPtPush = [&](PtPush& p) {
             for (int i = 0; i < 3; ++i) {
                 p.eye[i] = rayEye_[i]; p.fwd[i] = rayFwd_[i];
                 p.right[i] = rayRight_[i]; p.up[i] = rayUp_[i];
@@ -1315,10 +1344,87 @@ void Renderer::recordPathTrace(VkCommandBuffer cmd) {
             p.boardRotInv[1] = boardRotInv_[1];
             p.boardRotInv[2] = boardRotInv_[2];
             p.boardRotInv[3] = boardRotInv_[3];
+        };
+
+        // See ptSubmitBands(): >0 slices each sample into band-per-submit
+        // pieces so the compositor sharing an integrated GPU is not starved
+        // for the length of a monolithic dispatch. Inline (0) on the frame
+        // that records the image layout transitions -- a submit issued now
+        // would run before them.
+        const int bands = ptImagesWereReady ? ptSubmitBands() : 0;
+        const uint32_t gx = (sceneExtent_.width + 7) / 8;
+        const uint32_t gyTotal = (sceneExtent_.height + 7) / 8;
+
+        for (int s = 0; s < batch; ++s) {
+            if (bands > 0) {
+                if (ptBandCmds_.size() < kFramesInFlight)
+                    ptBandCmds_.resize(kFramesInFlight);
+                const uint32_t gyPer = (gyTotal + bands - 1) / bands;
+                for (int b = 0; b < bands; ++b) {
+                    const uint32_t base = static_cast<uint32_t>(b) * gyPer;
+                    if (base >= gyTotal) break;
+                    const uint32_t cnt = std::min(gyPer, gyTotal - base);
+
+                    VkCommandBufferAllocateInfo a{
+                        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                    a.commandPool = commandPool_;
+                    a.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                    a.commandBufferCount = 1;
+                    VkCommandBuffer bc = VK_NULL_HANDLE;
+                    check(vkAllocateCommandBuffers(device_.handle, &a, &bc),
+                          "alloc(pt band)");
+                    VkCommandBufferBeginInfo bi{
+                        VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                    vkBeginCommandBuffer(bc, &bi);
+
+                    if (s == 0 && b == 0) {
+                        // WAR: the previous frame's tonemap/denoise READ of
+                        // the accumulation must retire before this write. An
+                        // execution-only dependency is enough for
+                        // write-after-read.
+                        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+                        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                        mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                        VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                        d.memoryBarrierCount = 1;
+                        d.pMemoryBarriers = &mb;
+                        vkCmdPipelineBarrier2(bc, &d);
+                    }
+                    if (s > 0 && b == 0) interSample(bc);
+
+                    vkCmdBindPipeline(bc, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      ptPipeline_);
+                    vkCmdBindDescriptorSets(bc, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                            ptLayout_, 0, 1, &ptSet_, 0,
+                                            nullptr);
+                    PtPush p{};
+                    fillPtPush(p);
+                    vkCmdPushConstants(bc, ptLayout_,
+                                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                       sizeof(p), &p);
+                    vkCmdDispatchBase(bc, 0, base, 0, gx, cnt, 1);
+
+                    vkEndCommandBuffer(bc);
+                    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                    si.commandBufferCount = 1;
+                    si.pCommandBuffers = &bc;
+                    check(vkQueueSubmit(device_.graphicsQueue, 1, &si,
+                                        VK_NULL_HANDLE),
+                          "submit(pt band)");
+                    ptBandCmds_[frame_].push_back(bc);
+                }
+                ++ptSampleCount_;
+                continue;
+            }
+
+            if (s > 0) interSample(cmd);
+
+            PtPush p{};
+            fillPtPush(p);
             vkCmdPushConstants(cmd, ptLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                sizeof(p), &p);
-            vkCmdDispatch(cmd, (sceneExtent_.width + 7) / 8,
-                          (sceneExtent_.height + 7) / 8, 1);
+            vkCmdDispatch(cmd, gx, gyTotal, 1);
             ++ptSampleCount_;
         }
 
@@ -4760,6 +4866,15 @@ void Renderer::blitSceneToImage(VkImage dst, uint32_t dstWidth,
 bool Renderer::drawFrame(const float viewProj[16], const float cameraPos[3],
                          const std::function<void(VkCommandBuffer)>& drawUi) {
     vkWaitForFences(device_.handle, 1, &inFlight_[frame_], VK_TRUE, UINT64_MAX);
+    // Banded PT submissions from this slot's previous frame are now retired:
+    // they are barrier-ordered before the fenced submit the wait just proved
+    // complete. Recycle their command buffers.
+    if (frame_ < ptBandCmds_.size() && !ptBandCmds_[frame_].empty()) {
+        vkFreeCommandBuffers(device_.handle, commandPool_,
+                             static_cast<uint32_t>(ptBandCmds_[frame_].size()),
+                             ptBandCmds_[frame_].data());
+        ptBandCmds_[frame_].clear();
+    }
     std::memcpy(curViewProj_, viewProj, sizeof(curViewProj_));
 
     // Offscreen: render the scene and stop. No swapchain image is acquired,
