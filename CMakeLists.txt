@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 # C is enabled alongside C++ for the vendored miniz .c files: MSVC's cl.exe
 # dispatches .c to its C mode by file extension regardless of what CMake
 # enables, but gcc/clang need CMake to know C is a project language.
-project(pcbview VERSION 1.25.0 LANGUAGES C CXX)
+project(pcbview VERSION 1.26.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
