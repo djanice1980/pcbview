@@ -1,4 +1,5 @@
 #include "app/vulkan_window.h"
+#include "app/camera_fit.h"
 
 #include <QElapsedTimer>
 #include <QFile>
@@ -2810,11 +2811,13 @@ float VulkanWindow::framedDistance() const {
     const auto& b = mesh_->bounds;
     const float spanX = static_cast<float>(b.max[0] - b.min[0]);
     const float spanY = static_cast<float>(b.max[1] - b.min[1]);
-    const float span = std::max(spanX, spanY);
-    // Back off far enough that the larger dimension fits the vertical FOV
-    // with a little margin.
     const float halfFov = glm::radians(camera_.fovDegrees) * 0.5f;
-    return (span * 0.62f) / std::tan(halfFov);
+    // Aspect-aware: fit each axis against its own FOV (camera_fit.h has the
+    // rationale -- the old vertical-only fit clipped wide boards horizontally
+    // whenever the window opened narrower than ~0.8 aspect).
+    const float aspect = height() > 0
+        ? static_cast<float>(width()) / static_cast<float>(height()) : 1.0f;
+    return camfit::fitDistance(spanX, spanY, halfFov, aspect);
 }
 
 void VulkanWindow::frameBoard(bool snap) {

@@ -38,6 +38,7 @@
 #include "io/odb/odb_features.h"
 #include "io/odb/odb_fs.h"
 #include "io/odb/odb_project.h"
+#include "app/camera_fit.h"
 
 namespace fs = std::filesystem;
 using namespace pcbview;
@@ -1587,7 +1588,39 @@ static void testOdbLzw() {
     CHECK(round == plain);
 }
 
+
+// ---- camera fit --------------------------------------------------------
+// The aspect-aware fit must (a) reproduce the old vertical-only behaviour
+// on square/landscape viewports where it was correct, and (b) back off
+// further on narrow viewports so wide boards stop clipping horizontally.
+static void testCameraFit() {
+    const float hf = 0.3f;  // ~34 degree FOV, arbitrary but fixed
+    const float t = std::tan(hf);
+    // Square viewport, wide board: horizontal is the binding axis and
+    // equals the old max(span)-against-vertical fit exactly.
+    CHECK_NEAR(camfit::fitDistance(50.0f, 40.0f, hf, 1.0f),
+               50.0f * camfit::kMargin / t, 1e-4f);
+    // Tall board on a square viewport: vertical binds.
+    CHECK_NEAR(camfit::fitDistance(30.0f, 60.0f, hf, 1.0f),
+               60.0f * camfit::kMargin / t, 1e-4f);
+    // Narrow (portrait) viewport, wide board: must back off 1/aspect
+    // further than the vertical-only fit -- this is the case that clipped.
+    const float d = camfit::fitDistance(50.0f, 47.0f, hf, 0.8f);
+    CHECK_NEAR(d, 50.0f * camfit::kMargin / (t * 0.8f), 1e-4f);
+    CHECK(d > 50.0f * camfit::kMargin / t);
+    // Coverage identity: at the returned distance both axes fit with the
+    // margin ratio, whatever the aspect.
+    for (float aspect : {0.6f, 0.9458f, 1.0f, 1.9f}) {
+        const float dd = camfit::fitDistance(50.25f, 47.0f, hf, aspect);
+        const float visY = dd * t / camfit::kMargin;
+        const float visX = dd * t * aspect / camfit::kMargin;
+        CHECK(visX + 1e-3f >= 50.25f);
+        CHECK(visY + 1e-3f >= 47.0f);
+    }
+}
+
 int main() {
+    testCameraFit();
     testParserTagged();
     testPackageTagged();
     testInference();
