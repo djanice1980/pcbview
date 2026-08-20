@@ -1163,6 +1163,48 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 continue;
         }
 
+        // Conforming films (fab-truth gap #5). Real LPI soldermask -- and the
+        // silkscreen ink printed on it -- DRAPES: over copper it rides the
+        // foil, and between traces it drops onto the laminate. A film
+        // extruded flat at one Z instead HOVERS a copper thickness above the
+        // laminate wherever no copper supports it, with silk riding the
+        // hover. Invisible at normal distance; at macro range with traced
+        // shadows the 35 um slit under the film reads as a dark line and
+        // every silk stroke casts a visibly displaced shadow. Split the film
+        // by the outer foil's copper and extrude the unsupported region a
+        // copper thickness closer to the core (a stepped drape -- the real
+        // thing has a smooth shoulder, but the step puts both regions at
+        // their true heights).
+        const Paths64* support = nullptr;
+        double filmDrop = 0.0;
+        if (al.kind == LayerKind::Soldermask ||
+            al.kind == LayerKind::Silkscreen) {
+            const ArtLayer* outer = nullptr;
+            for (const ArtLayer& c : art.layers) {
+                if (c.kind != LayerKind::Copper || c.art.empty()) continue;
+                if (!outer || (front ? c.z > outer->z : c.z < outer->z))
+                    outer = &c;
+            }
+            if (outer) {
+                support = &outer->art;
+                // Toward the core: down on the front, up on the back.
+                filmDrop = front ? art.copperThickness : -art.copperThickness;
+            }
+        }
+        // The split boundary is the copper edge INFLATED by a hair: splitting
+        // exactly at the edge would put the dropped film's side walls in the
+        // same plane as every trace's side walls, which z-fights into speckle
+        // (the via barrels learnt this first -- see their inset). The 20 um
+        // overhang doubles as the mask's shoulder over the trace edge.
+        Paths64 supportInflated;
+        if (support) {
+            ClipperOffset co;
+            co.ArcTolerance(kScale * 0.001);
+            co.AddPaths(*support, JoinType::Round, EndType::Polygon);
+            co.Execute(0.02 * kScale, supportInflated);
+            support = &supportInflated;
+        }
+
         // Runs one subject through the layer's clip (and the blind/buried
         // bores) and extrudes the result, tagging every triangle produced
         // with `net`. Copper calls this once per net; everything else once
@@ -1190,11 +1232,33 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 boring.Execute(ClipType::Difference, FillRule::NonZero, tree);
             }
 
-            std::vector<Shape> shapes;
-            collectShapes(tree, shapes);
             const size_t before = part.mesh.indices.size();
-            for (const Shape& shape : shapes)
-                extrude(shape, al.z, al.z + al.thickness, part.mesh);
+            if (!support) {
+                std::vector<Shape> shapes;
+                collectShapes(tree, shapes);
+                for (const Shape& shape : shapes)
+                    extrude(shape, al.z, al.z + al.thickness, part.mesh);
+            } else {
+                // Supported region at the layer's own Z; unsupported region
+                // dropped onto the laminate. Both closed solids, so the step
+                // boundary renders as two abutting walls.
+                const Paths64 film = PolyTreeToPaths64(tree);
+                for (int pass = 0; pass < 2; ++pass) {
+                    const bool over = pass == 0;
+                    Clipper64 sc;
+                    sc.AddSubject(film);
+                    sc.AddClip(*support);
+                    PolyTree64 pieceTree;
+                    sc.Execute(over ? ClipType::Intersection
+                                    : ClipType::Difference,
+                               FillRule::NonZero, pieceTree);
+                    std::vector<Shape> shapes;
+                    collectShapes(pieceTree, shapes);
+                    const double z0 = al.z - (over ? 0.0 : filmDrop);
+                    for (const Shape& shape : shapes)
+                        extrude(shape, z0, z0 + al.thickness, part.mesh);
+                }
+            }
             const size_t added = (part.mesh.indices.size() - before) / 3;
             part.triNet.insert(part.triNet.end(), added, net);
         };

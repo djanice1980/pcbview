@@ -1280,6 +1280,23 @@ Things we currently render differently from what the plant would produce:
    gold. Gerber packages have no finish to read -- a .gbrjob does not record
    one -- so they keep the gold default rather than guessing.
 
+5. ~~Soldermask and silkscreen rendered as flat films at one Z.~~ **FIXED
+   2026-08-16.** Real LPI mask conforms: over copper it rides the foil, and
+   between traces it drapes down onto the laminate; the ink prints on
+   whatever the mask surface locally is. The flat film left a
+   copper-thickness air slit under mask and silk wherever no copper
+   supported them -- invisible at normal distance, but at macro range with
+   traced shadows the slit reads as a dark line and every silk stroke casts
+   a visibly displaced shadow (found by a user camera move flying
+   millimetres above a flex board). The film is now split by the outer
+   foil's copper -- inflated 20 um first, because splitting exactly at the
+   edge puts the dropped film's side walls coplanar with every trace's side
+   walls, which is the z-fighting the via barrels already solved by
+   insetting -- and the unsupported region extrudes a copper thickness
+   closer to the core. A stepped drape rather than a smooth shoulder, but
+   both regions sit at their true heights, and the 20 um overhang doubles
+   as the shoulder over the trace edge.
+
 (The old entry 4, "No silkscreen", was stale: silkscreen with Newstroke stroke
 text has been rendered since phase 1.5.)
 
