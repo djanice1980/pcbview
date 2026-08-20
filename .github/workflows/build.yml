@@ -36,6 +36,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The version lives in five files; a bump that misses one ships a
+      # release whose platforms disagree about what version they are. Caught
+      # HERE, on every push, not at the tag.
+      - name: Version sites agree
+        shell: bash
+        run: packaging/check-versions.sh
+
       # Qt, matching the compiler. A MinGW kit is ABI-incompatible with MSVC,
       # which is why the architecture is pinned rather than left to default.
       - name: Install Qt

@@ -59,6 +59,9 @@ jobs:
           useradd -m builder
           chown -R builder: .
 
+      - name: Version sites agree
+        run: packaging/check-versions.sh
+
       - name: Build Arch package (runs the geometry tests as check())
         run: su builder -c 'cd packaging/linux && makepkg -f --noconfirm'
 
