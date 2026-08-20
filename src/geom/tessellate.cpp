@@ -1238,10 +1238,55 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 collectShapes(tree, shapes);
                 for (const Shape& shape : shapes)
                     extrude(shape, al.z, al.z + al.thickness, part.mesh);
+            } else if (al.kind == LayerKind::Soldermask) {
+                // Two OVERLAPPING solids, not a partition -- a partition's
+                // raised piece overhung the copper edge as a little roof with
+                // an open underside, which a macro view read as the mask
+                // peeling off the board.
+                //
+                // Base: the whole film at the DROPPED level, hugging the
+                // laminate and tunnelling straight through the copper where
+                // copper exists (harmless: it is buried inside an opaque
+                // solid). It has no wall at the copper boundary at all, so
+                // nothing is coplanar with anything.
+                //
+                // Climb: over copper only, extruded the FULL height from the
+                // base's bottom to the film's proper top -- so it encases the
+                // trace's top AND side walls in mask, which is exactly what
+                // conformal mask does, and its wall interpenetrates the base
+                // below the surface for a seamless shoulder.
+                const Paths64 film = PolyTreeToPaths64(tree);
+                const double baseZ0 = al.z - filmDrop;
+                {
+                    Clipper64 u;
+                    u.AddSubject(film);
+                    PolyTree64 t2;
+                    u.Execute(ClipType::Union, FillRule::NonZero, t2);
+                    std::vector<Shape> shapes;
+                    collectShapes(t2, shapes);
+                    for (const Shape& shape : shapes)
+                        extrude(shape, baseZ0, baseZ0 + al.thickness,
+                                part.mesh);
+                }
+                {
+                    Clipper64 sc;
+                    sc.AddSubject(film);
+                    sc.AddClip(*support);
+                    PolyTree64 t2;
+                    sc.Execute(ClipType::Intersection, FillRule::NonZero, t2);
+                    std::vector<Shape> shapes;
+                    collectShapes(t2, shapes);
+                    const double lo = std::min(al.z, baseZ0);
+                    const double hi = std::max(al.z + al.thickness,
+                                               baseZ0 + al.thickness);
+                    for (const Shape& shape : shapes)
+                        extrude(shape, lo, hi, part.mesh);
+                }
             } else {
-                // Supported region at the layer's own Z; unsupported region
-                // dropped onto the laminate. Both closed solids, so the step
-                // boundary renders as two abutting walls.
+                // Silkscreen: a partition is right here -- ink is opaque and
+                // sits ON the local mask surface, raised over copper, dropped
+                // between traces. The pieces' walls never overlap in Z
+                // (silk is thinner than copper), so nothing fights.
                 const Paths64 film = PolyTreeToPaths64(tree);
                 for (int pass = 0; pass < 2; ++pass) {
                     const bool over = pass == 0;
