@@ -1306,16 +1306,23 @@ Things we currently render differently from what the plant would produce:
    every trace shades as a continuous curve in every render mode. The
    base stops exactly where the skirt's footprint begins (the clipped rim
    stroked by the reach) and nowhere else: around a pad with mask
-   expansion the rim lies inside the opening, there is no skirt, and the
+   expansion the rim lies inside the opening, there is no fillet, and the
    film runs to the opening's edge. Silkscreen gets the same three pieces
    at its own thickness, so a stroke crossing a trace is one continuous
-   top riding the mask. Eight full-area terrace solids were tried first
-   and tripled the mask's vertex count while still reading as stair-steps
-   at macro range; the skirt is edge geometry only. A round fan fills
-   each convex corner (wound counter-clockwise from outside -- backwards
-   fans read as exits and showed as a serration of dark slivers along
-   every arc), and near-straight facets share columns so an arc shades as
-   one surface.
+   top riding the mask.
+
+   The fillet zone is built as a HEIGHT FIELD, not a sweep: the film is
+   partitioned in 2D by booleans into concentric bands between rim and
+   foot, each band a single-sided sheet whose vertices are lifted by the
+   profile at their measured distance from the rim (a uniform grid over
+   the rim's segments makes that a neighbourhood query -- a dense board's
+   rim is ~100k edges). Booleans clip the zone exactly to any outline and
+   take corners through Clipper's own round joins. Two constructions were
+   tried and rejected first: eight full-area terrace solids (stair-steps
+   at macro range, and triple the vertex count), then a skirt SWEPT
+   outward from the rim (its rectangles stuck out past obliquely crossing
+   silk edges as white tabs, and its convex-corner fans shaded as dark
+   wedges).
 
 (The old entry 4, "No silkscreen", was stale: silkscreen with Newstroke stroke
 text has been rendered since phase 1.5.)
