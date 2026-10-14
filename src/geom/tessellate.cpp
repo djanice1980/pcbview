@@ -1273,46 +1273,189 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // ...and as a MENISCUS rather than a cliff. Liquid mask wets
                 // the copper wall and cures with a concave fillet at its
                 // foot, so the surface RAMPS from the laminate up to the
-                // trace top instead of stepping. Terraces approximate that:
-                // each reaches further from the copper edge and rises less,
-                // on a quadratic profile (steep at the wall, flat at the
-                // foot). The innermost is the full-height climb that coats
-                // the walls. Every terrace overlaps the base and the one
-                // inside it, so no wall is coplanar with any other; the reach
-                // is ~1.5x the copper height, about what a 1 oz fillet spans.
-                // 8 terraces over a 1 oz fillet = ~4 um risers, below what a
-                // macro camera move resolves; PCBVIEW_MASK_TERRACES overrides
-                // (cost is one copper offset + boolean per terrace per side).
-                static const int kTerraces = [] {
-                    const char* v = std::getenv("PCBVIEW_MASK_TERRACES");
-                    const int n = v && v[0] ? std::atoi(v) : 8;
-                    return std::max(1, std::min(n, 32));
-                }();
+                // trace top. The climb coats the copper's top and walls at
+                // full height; the fillet is a lofted SKIRT swept along the
+                // climb's rim -- quad strips stepping outward and down on a
+                // quadratic profile (steep at the wall, flat at the foot),
+                // with normals from the profile's actual slope, so it shades
+                // as one continuous curve in every render mode (the path
+                // tracer interpolates vertex normals). Stair-stepped terraces
+                // were tried first: at macro range the risers read as bands,
+                // and eight full-area terrace solids tripled the mask's
+                // vertex count. The skirt is edge geometry only. Reach is
+                // ~1.5x the copper height, about what a 1 oz fillet spans.
                 const double reach = art.copperThickness * 1.5;
                 const double rise = std::fabs(filmDrop);
-                for (int k = 0; k <= kTerraces; ++k) {
-                    const double x = reach * k / kTerraces;
-                    const double frac = 1.0 - x / reach;
-                    const double lift = rise * frac * frac;
-                    if (k > 0 && lift < 1e-4) break;  // sub-micron: nothing to add
+                const bool frontSide = filmDrop > 0;
+                Paths64 rim;  // the climb's footprint: copper inflated 20 um
+                {
                     ClipperOffset co;
                     co.ArcTolerance(kScale * 0.001);
                     co.AddPaths(*supportRaw, JoinType::Round, EndType::Polygon);
-                    Paths64 grown;
-                    co.Execute((0.02 + x) * kScale, grown);
+                    co.Execute(0.02 * kScale, rim);
                     Clipper64 sc;
                     sc.AddSubject(film);
-                    sc.AddClip(grown);
+                    sc.AddClip(rim);
                     PolyTree64 t2;
                     sc.Execute(ClipType::Intersection, FillRule::NonZero, t2);
                     std::vector<Shape> shapes;
                     collectShapes(t2, shapes);
-                    const double lo = filmDrop > 0 ? baseZ0 : baseZ0 - lift;
-                    const double hi = filmDrop > 0
-                                          ? baseZ0 + al.thickness + lift
-                                          : baseZ0 + al.thickness;
+                    const double lo = frontSide ? baseZ0 : baseZ0 - rise;
+                    const double hi = frontSide ? baseZ0 + al.thickness + rise
+                                                : baseZ0 + al.thickness;
                     for (const Shape& shape : shapes)
                         extrude(shape, lo, hi, part.mesh);
+                }
+
+                // The skirt. The rim as OPEN paths clipped to the film, so it
+                // stops at mask openings and the board edge instead of
+                // draping over a bare pad; then one quad strip per profile
+                // step along every surviving polyline, with a round fan at
+                // each convex corner where the offsets diverge.
+                // PCBVIEW_MASK_FILLET_STEPS sets the profile resolution.
+                static const int kSteps = [] {
+                    const char* v = std::getenv("PCBVIEW_MASK_FILLET_STEPS");
+                    const int n = v && v[0] ? std::atoi(v) : 6;
+                    return std::max(1, std::min(n, 32));
+                }();
+                const auto lift = [&](double x) {
+                    const double f = 1.0 - x / reach;
+                    return rise * f * f;
+                };
+                // -d(lift)/dx: how steeply the surface descends outward.
+                const auto slope = [&](double x) {
+                    return 2.0 * rise * (1.0 - x / reach) / reach;
+                };
+                const auto outerZ = [&](double x) {
+                    return frontSide ? baseZ0 + al.thickness + lift(x)
+                                     : baseZ0 - lift(x);
+                };
+                const double zs = frontSide ? 1.0 : -1.0;
+                const auto pushV = [&](double x, double y, double z, double nx,
+                                       double ny, double sl) {
+                    // Normal from the profile: tilts outward by the slope,
+                    // away from the board in z.
+                    const double len = std::sqrt(sl * sl + 1.0);
+                    Vertex v{};
+                    v.position[0] = static_cast<float>(x);
+                    v.position[1] = static_cast<float>(y);
+                    v.position[2] = static_cast<float>(z);
+                    v.normal[0] = static_cast<float>(nx * sl / len);
+                    v.normal[1] = static_cast<float>(ny * sl / len);
+                    v.normal[2] = static_cast<float>(zs / len);
+                    part.mesh.vertices.push_back(v);
+                    return static_cast<uint32_t>(part.mesh.vertices.size() - 1);
+                };
+                // Wound counter-clockwise seen from outside the board; the
+                // back side mirrors.
+                const auto tri = [&](uint32_t a, uint32_t b, uint32_t c) {
+                    if (!frontSide) std::swap(b, c);
+                    part.mesh.indices.push_back(a);
+                    part.mesh.indices.push_back(b);
+                    part.mesh.indices.push_back(c);
+                };
+
+                Paths64 open;
+                for (const Path64& p : rim) {
+                    if (p.size() < 2) continue;
+                    Path64 o = p;
+                    o.push_back(p.front());
+                    open.push_back(std::move(o));
+                }
+                Clipper64 cc;
+                cc.AddOpenSubject(open);
+                cc.AddClip(film);
+                Paths64 closedOut, polylines;
+                cc.Execute(ClipType::Intersection, FillRule::NonZero, closedOut,
+                           polylines);
+
+                constexpr double kPi = 3.14159265358979323846;
+                // Profile rings: kSteps + 1 radial stations, shared between
+                // the strips on either side of each station.
+                std::vector<double> rx(kSteps + 1), rz(kSteps + 1), rsl(kSteps + 1);
+                for (int s = 0; s <= kSteps; ++s) {
+                    rx[s] = reach * s / kSteps;
+                    rz[s] = outerZ(rx[s]);
+                    rsl[s] = slope(rx[s]);
+                }
+                // One column of ring vertices at a point, along direction n.
+                const auto column = [&](double px, double py, double nx,
+                                        double ny, std::vector<uint32_t>& out) {
+                    out.resize(kSteps + 1);
+                    for (int s = 0; s <= kSteps; ++s)
+                        out[s] = pushV(px + nx * rx[s], py + ny * rx[s], rz[s],
+                                       nx, ny, rsl[s]);
+                };
+                // Strips between two columns, counter-clockwise seen from
+                // outside when `from` precedes `to` along a positively wound
+                // path with outward to the right.
+                const auto strips = [&](const std::vector<uint32_t>& from,
+                                        const std::vector<uint32_t>& to) {
+                    for (int s = 0; s < kSteps; ++s) {
+                        tri(from[s], to[s + 1], to[s]);
+                        tri(from[s], from[s + 1], to[s + 1]);
+                    }
+                };
+
+                std::vector<uint32_t> colA, colB, colPrev;
+                for (const Path64& pl : polylines) {
+                    bool havePrev = false;
+                    double pnx = 0.0, pny = 0.0;  // previous edge's normal
+                    for (size_t i = 0; i + 1 < pl.size(); ++i) {
+                        const double ax = toMm(pl[i].x), ay = toMm(pl[i].y);
+                        const double bx = toMm(pl[i + 1].x);
+                        const double by = toMm(pl[i + 1].y);
+                        double dx = bx - ax, dy = by - ay;
+                        const double len = std::sqrt(dx * dx + dy * dy);
+                        if (len < 1e-9) continue;
+                        dx /= len;
+                        dy /= len;
+                        // Offset polygons come out positively wound, so the
+                        // copper is on the LEFT of travel and outward is the
+                        // right-hand normal.
+                        const double nx = dy, ny = -dx;
+
+                        // Start column: reuse the previous edge's end column
+                        // when the turn is slight (under ~3 degrees -- an
+                        // arc's facets), which is what makes arcs shade as
+                        // one surface instead of a picket fence of facets.
+                        // Otherwise a fresh column on this edge's normal, with
+                        // a round fan filling the wedge at a convex corner.
+                        if (havePrev &&
+                            (pnx * nx + pny * ny) > 0.9986 /* cos 3 deg */) {
+                            colA = colPrev;
+                        } else {
+                            column(ax, ay, nx, ny, colA);
+                            if (havePrev) {
+                                const double turn = pnx * ny - pny * nx;  // >0: left
+                                if (turn > 1e-6) {
+                                    const double a0ang = std::atan2(pny, pnx);
+                                    double dAng = std::atan2(ny, nx) - a0ang;
+                                    while (dAng > kPi) dAng -= 2.0 * kPi;
+                                    while (dAng <= -kPi) dAng += 2.0 * kPi;
+                                    const int fan = std::max(
+                                        1, static_cast<int>(
+                                               std::ceil(dAng / (kPi / 12.0))));
+                                    std::vector<uint32_t> fprev = colPrev, fcur;
+                                    for (int f = 1; f <= fan; ++f) {
+                                        const double ang = a0ang + dAng * f / fan;
+                                        column(ax, ay, std::cos(ang), std::sin(ang),
+                                               fcur);
+                                        strips(fprev, fcur);
+                                        fprev = fcur;
+                                    }
+                                    // fprev now sits on this edge's normal;
+                                    // colA duplicates it. Harmless.
+                                }
+                            }
+                        }
+                        column(bx, by, nx, ny, colB);
+                        strips(colA, colB);
+                        colPrev = colB;
+                        pnx = nx;
+                        pny = ny;
+                        havePrev = true;
+                    }
                 }
             } else {
                 // Silkscreen: a partition is right here -- ink is opaque and

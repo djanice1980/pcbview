@@ -1684,18 +1684,38 @@ void Renderer::denoiseWorker(uint32_t w, uint32_t h, int samples) {
         // noisy guides reproduces that noise as blotches. Each aux image is
         // denoised in place first, and the main filter is told the aux are
         // clean (cleanAux).
+        // Network quality. OIDN's "fast" model is ~1.7x quicker than "high"
+        // on an integrated GPU (measured on a Radeon 8060S: 29 ms vs 50 ms
+        // per 1080p frame) for a difference a progressive converger refines
+        // away anyway -- so integrated defaults to fast, discrete and CPU
+        // keep high. PCBVIEW_OIDN_QUALITY=high|balanced|fast overrides.
+        static const OIDNQuality quality = [this] {
+            if (const char* v = std::getenv("PCBVIEW_OIDN_QUALITY")) {
+                const std::string s = v;
+                if (s == "fast") return OIDN_QUALITY_FAST;
+                if (s == "balanced") return OIDN_QUALITY_BALANCED;
+                if (s == "high") return OIDN_QUALITY_HIGH;
+            }
+            return device_.gpu.type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+                       ? OIDN_QUALITY_FAST
+                       : OIDN_QUALITY_HIGH;
+        }();
+
         OIDNFilter fa = oidnNewFilter(dev, "RT");
         oidnSetFilterImage(fa, "albedo", ba, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterImage(fa, "output", ba, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterInt(fa, "maxMemoryMB", 4096);
+        oidnSetFilterInt(fa, "quality", quality);
         oidnCommitFilter(fa);
         OIDNFilter fn = oidnNewFilter(dev, "RT");
         oidnSetFilterImage(fn, "normal", bn, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterImage(fn, "output", bn, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterInt(fn, "maxMemoryMB", 4096);
+        oidnSetFilterInt(fn, "quality", quality);
         oidnCommitFilter(fn);
 
         OIDNFilter f = oidnNewFilter(dev, "RT");
+        oidnSetFilterInt(f, "quality", quality);
         oidnSetFilterImage(f, "color", bc, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterImage(f, "albedo", ba, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);
         oidnSetFilterImage(f, "normal", bn, OIDN_FORMAT_FLOAT3, w, h, 0, px, row);

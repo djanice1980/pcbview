@@ -1293,9 +1293,18 @@ Things we currently render differently from what the plant would produce:
    edge puts the dropped film's side walls coplanar with every trace's side
    walls, which is the z-fighting the via barrels already solved by
    insetting -- and the unsupported region extrudes a copper thickness
-   closer to the core. A stepped drape rather than a smooth shoulder, but
-   both regions sit at their true heights, and the 20 um overhang doubles
-   as the shoulder over the trace edge.
+   closer to the core. The film is two overlapping solids (a dropped base
+   over everything, tunnelling through the copper; a full-height climb
+   over copper that coats the trace's top and walls) plus a lofted SKIRT:
+   quad strips swept along the climb's rim on a concave quadratic profile
+   with normals from the profile's slope, so the meniscus at the foot of
+   every trace shades as a continuous curve in every render mode. The
+   skirt is edge geometry only (~1.2M vertices on the cx4); eight
+   full-area terrace solids were tried first and tripled the mask's vertex
+   count while still reading as stair-steps at macro range. Open paths
+   clipped to the film keep the skirt out of mask openings; a round fan
+   fills each convex corner, and near-straight facets share columns so an
+   arc shades as one surface.
 
 (The old entry 4, "No silkscreen", was stale: silkscreen with Newstroke stroke
 text has been rendered since phase 1.5.)
