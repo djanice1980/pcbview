@@ -1298,9 +1298,13 @@ Things we currently render differently from what the plant would produce:
    translucent film as an independent alpha lottery (exits never commit),
    so two overlapping solids tint twice, which read as darker bands along
    every shoulder until the overlap was removed. A dropped base over
-   everything the other two do not cover; a hair-thick cap over copper
-   (to the rim, copper inflated 20 um -- the copper beneath is opaque, so
-   the cap's walls would only have been a second lottery); and a lofted
+   everything the other two do not cover; a cap over copper (to the rim,
+   copper inflated 20 um): a top sheet with walls down to the laminate
+   along its boundary and no underside -- from above a ray meets the
+   sheet and then opaque copper, one lottery, while the walls coat the
+   copper's flanks and the 20 um shoulder (a hair-thick cap was tried:
+   fine from above, but edge-on at a castellation it left bare copper
+   flank and bare laminate between the pad and the fillet); and a lofted
    SKIRT, quad strips swept along the rim on a concave quadratic profile
    with normals from the profile's slope, so the meniscus at the foot of
    every trace shades as a continuous curve in every render mode. The

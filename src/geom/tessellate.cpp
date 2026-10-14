@@ -476,7 +476,7 @@ struct SegmentGrid {
 // `front` picks the winding so faces point away from the board.
 template <class At, class FloorAt, class SkipWall>
 void sheet(const Shape& shape, bool front, At&& at, FloorAt&& floorAt,
-           SkipWall&& skipWall, Mesh& mesh) {
+           SkipWall&& skipWall, Mesh& mesh, bool underside = true) {
     std::vector<std::vector<std::array<double, 2>>> polygon;
     polygon.reserve(shape.rings.size());
     for (const Ring& ring : shape.rings) polygon.push_back(ring.pts);
@@ -513,20 +513,23 @@ void sheet(const Shape& shape, bool front, At&& at, FloorAt&& floorAt,
     for (size_t i = 0; i + 2 < tris.size(); i += 3)
         tri(top + tris[i], top + tris[i + 1], top + tris[i + 2]);
 
-    // Underside, facing into the board.
-    const uint32_t bot = static_cast<uint32_t>(mesh.vertices.size());
-    for (const auto& ring : polygon) {
-        for (const auto& p : ring) {
-            Vertex v{};
-            v.position[0] = static_cast<float>(p[0]);
-            v.position[1] = static_cast<float>(p[1]);
-            v.position[2] = static_cast<float>(floorAt(p[0], p[1]));
-            v.normal[2] = -zs;
-            mesh.vertices.push_back(v);
+    // Underside, facing into the board. The mask's cap over copper skips
+    // it: opaque copper sits directly beneath.
+    if (underside) {
+        const uint32_t bot = static_cast<uint32_t>(mesh.vertices.size());
+        for (const auto& ring : polygon) {
+            for (const auto& p : ring) {
+                Vertex v{};
+                v.position[0] = static_cast<float>(p[0]);
+                v.position[1] = static_cast<float>(p[1]);
+                v.position[2] = static_cast<float>(floorAt(p[0], p[1]));
+                v.normal[2] = -zs;
+                mesh.vertices.push_back(v);
+            }
         }
+        for (size_t i = 0; i + 2 < tris.size(); i += 3)
+            tri(bot + tris[i + 2], bot + tris[i + 1], bot + tris[i]);
     }
-    for (size_t i = 0; i + 2 < tris.size(); i += 3)
-        tri(bot + tris[i + 2], bot + tris[i + 1], bot + tris[i]);
 
     // Walls along the boundary edges the caller does not veto. Outward is
     // decided per ring by its winding, as extrude() does.
@@ -1537,15 +1540,41 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 for (const Shape& shape : clipShapes(film, foot, ClipType::Difference))
                     extrude(shape, baseZ0, baseZ0 + al.thickness, part.mesh);
 
-                // Cap: over copper, at the raised level.
+                // Cap: over copper, at the raised level. Silk is an opaque
+                // slab at its own thickness. The mask's cap is a top sheet
+                // with WALLS down to the laminate along its whole boundary
+                // but no underside: from above a ray meets the sheet and then
+                // opaque copper (one lottery), while the walls are what coat
+                // the copper's flanks and the 20 um shoulder beside them --
+                // seen edge-on at a castellation, a hair-thick cap left bare
+                // copper and bare laminate between the pad and the fillet.
                 {
                     const double top = frontSide ? baseZ0 + al.thickness + rise
                                                  : baseZ0 - rise;
-                    const double thick = isMask ? 0.0005 : al.thickness;
-                    const double lo = frontSide ? top - thick : top;
-                    const double hi = frontSide ? top : top + thick;
-                    for (const Shape& shape : clipShapes(film, rim, ClipType::Intersection))
-                        extrude(shape, lo, hi, part.mesh);
+                    if (!isMask) {
+                        const double lo = frontSide ? top - al.thickness : top;
+                        const double hi = frontSide ? top : top + al.thickness;
+                        for (const Shape& shape :
+                             clipShapes(film, rim, ClipType::Intersection))
+                            extrude(shape, lo, hi, part.mesh);
+                    } else {
+                        const auto capAt = [&](double, double, double& z, float n[3]) {
+                            z = top;
+                            n[0] = 0.0f;
+                            n[1] = 0.0f;
+                            n[2] = frontSide ? 1.0f : -1.0f;
+                        };
+                        const double capFloor =
+                            baseZ0 + (frontSide ? 0.0 : al.thickness);
+                        const auto floorConst = [&](double, double) { return capFloor; };
+                        const auto wallEverywhere = [](double, double, double, double) {
+                            return false;
+                        };
+                        for (const Shape& shape :
+                             clipShapes(film, rim, ClipType::Intersection))
+                            sheet(shape, frontSide, capAt, floorConst, wallEverywhere,
+                                  part.mesh, /*underside=*/false);
+                    }
                 }
 
                 // Bands: the zone, lifted by the profile at each vertex's
