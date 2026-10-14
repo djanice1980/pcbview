@@ -1280,7 +1280,14 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // the walls. Every terrace overlaps the base and the one
                 // inside it, so no wall is coplanar with any other; the reach
                 // is ~1.5x the copper height, about what a 1 oz fillet spans.
-                const int kTerraces = 4;
+                // 8 terraces over a 1 oz fillet = ~4 um risers, below what a
+                // macro camera move resolves; PCBVIEW_MASK_TERRACES overrides
+                // (cost is one copper offset + boolean per terrace per side).
+                static const int kTerraces = [] {
+                    const char* v = std::getenv("PCBVIEW_MASK_TERRACES");
+                    const int n = v && v[0] ? std::atoi(v) : 8;
+                    return std::max(1, std::min(n, 32));
+                }();
                 const double reach = art.copperThickness * 1.5;
                 const double rise = std::fabs(filmDrop);
                 for (int k = 0; k <= kTerraces; ++k) {
