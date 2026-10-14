@@ -2693,6 +2693,8 @@ void MainWindow::stopShowcase(const QString& reason) {
     showcaseIndex_ = -1;
     showcaseTimer_->stop();
     showcaseTimer_->disconnect();
+    // Stop means NOW: abandon the move in flight, not just the ones after it.
+    viewport_->cancelAnimations();
     // Hands the camera back the orientation it was rendered from, so stopping
     // never jumps the picture.
     viewport_->setRotationRoutedToBoard(false);

@@ -3492,6 +3492,21 @@ void VulkanWindow::wheelEvent(QWheelEvent* e) {
         return;
     }
 
+    // Past the dolly floor the wheel MAGNIFIES instead of moving: a
+    // perspective camera cannot go closer than the board's surface, but a
+    // microscope keeps zooming -- by narrowing its field of view. So a wheel
+    // step that would push the eye through the floor spends its remainder on
+    // the FOV (down to kFovMin, ~20x more than the default), and zooming out
+    // unwinds the magnification before it starts backing the camera off.
+    constexpr float kFovDefault = 45.0f;
+    constexpr float kFovMin = 2.0f;
+    const float factor = std::pow(0.88f, steps);  // < 1 zooms in
+    if (steps < 0.0f && camera_.fovDegrees < kFovDefault - 1e-3f) {
+        camera_.fovDegrees = std::min(kFovDefault, camera_.fovDegrees / factor);
+        requestUpdate();
+        return;
+    }
+
     // Accumulate into a TARGET and glide there (stepZoomAnimation) instead of
     // stepping the camera per click. Rapid wheel clicks compound into one smooth
     // dolly -- the same exponential-approach feel as the exploding view.
@@ -3500,7 +3515,7 @@ void VulkanWindow::wheelEvent(QWheelEvent* e) {
         zoomAnimating_ = true;
         zoomClock_.restart();
     }
-    zoomTarget_ *= std::pow(0.88f, steps);
+    zoomTarget_ *= factor;
     // The floor is wherever the EYE would touch the board at the end of the
     // glide, not a fixed distance: with a cursor anchor the target slides to
     // the surface point as the dolly closes, so the eye's height along the
@@ -3518,6 +3533,11 @@ void VulkanWindow::wheelEvent(QWheelEvent* e) {
             dmin = std::max(dmin, (topZ + kMargin - baseZ) / slope);
         else if (ez < -0.02f && slope < -1e-4f)
             dmin = std::max(dmin, (-kMargin - baseZ) / slope);
+    }
+    if (zoomTarget_ < dmin) {
+        // Through the floor: the remainder of this step is magnification.
+        camera_.fovDegrees =
+            std::max(kFovMin, camera_.fovDegrees * (zoomTarget_ / dmin));
     }
     zoomTarget_ = std::clamp(zoomTarget_, dmin, 5000.0f);
     // If a view preset is mid-glide it also eases distance; keep both targets
@@ -3590,6 +3610,16 @@ bool VulkanWindow::computeZoomAnchor(const QPointF& posDip) {
     zoomAnchorTarget0_ = target0;
     zoomAnchorDist0_ = camera_.distance;
     return true;
+}
+
+void VulkanWindow::cancelAnimations() {
+    cameraAnimating_ = false;
+    zoomAnimating_ = false;
+    zoomToCursor_ = false;
+    pathActive_ = false;
+    spinActive_ = false;
+    timedZoomActive_ = false;
+    requestUpdate();  // the next frame sees no motion and restores quality
 }
 
 float VulkanWindow::minOrbitDistance() const {

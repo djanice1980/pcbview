@@ -196,6 +196,10 @@ public:
     // clock explicitly between frames. Deterministic by construction -- the
     // same steppers run, just fed a fixed dt.
     void setAnimationsPaused(bool on) { animationsPaused_ = on; }
+    // Abandon every in-flight camera animation (preset glide, wheel glide,
+    // spin, recorded path, timed zoom) where it stands. The showcase's Stop
+    // stopped the PLAYLIST but let the current move run to its end.
+    void cancelAnimations();
     void advanceAnimationsBy(double dt);
 
     // Camera aspect override for offscreen video: the projection normally
