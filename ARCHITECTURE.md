@@ -1317,7 +1317,13 @@ Things we currently render differently from what the plant would produce:
    profile at their measured distance from the rim (a uniform grid over
    the rim's segments makes that a neighbourhood query -- a dense board's
    rim is ~100k edges). Booleans clip the zone exactly to any outline and
-   take corners through Clipper's own round joins. Two constructions were
+   take corners through Clipper's own round joins. Each band is a slab,
+   not a sheet: it has an underside on the laminate and walls along the
+   film's CUT edges (board outline, mask openings) but NOT along the rings
+   it shares with its neighbours -- so from above a ray still meets one
+   entering face, while a castellation seen edge-on shows a solid green
+   cross-section. A one-sided sheet there read as a clear membrane with a
+   hairline silhouette, because exit faces never commit. Two constructions were
    tried and rejected first: eight full-area terrace solids (stair-steps
    at macro range, and triple the vertex count), then a skirt SWEPT
    outward from the rim (its rectangles stuck out past obliquely crossing

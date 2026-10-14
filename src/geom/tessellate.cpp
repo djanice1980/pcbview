@@ -463,15 +463,37 @@ struct SegmentGrid {
 // position. The mask's meniscus is one of these: a height field over the
 // fillet zone, and ONE entering face to the path tracer's film lottery.
 // `front` picks the winding so the face points away from the board.
-template <class At>
-void sheet(const Shape& shape, bool front, At&& at, Mesh& mesh) {
+// A solid slab over a shape whose TOP is a height field: every top vertex's
+// height and normal come from `at`, the underside from `floorAt`, and the
+// side walls close the slab along every boundary edge the caller does not
+// veto. The mask's meniscus bands are these: `skipWall` vetoes the edges
+// shared with the neighbouring band (the concentric rings), so from above a
+// ray still meets exactly one entering face, while the film's CUT edges --
+// the board outline at a castellation, a mask opening -- get a real wall and
+// underside. Without them the band was a one-sided sheet, invisible from
+// behind (exit faces never commit), which at a cut edge read as the mask
+// turning into a clear membrane with a hairline silhouette.
+// `front` picks the winding so faces point away from the board.
+template <class At, class FloorAt, class SkipWall>
+void sheet(const Shape& shape, bool front, At&& at, FloorAt&& floorAt,
+           SkipWall&& skipWall, Mesh& mesh) {
     std::vector<std::vector<std::array<double, 2>>> polygon;
     polygon.reserve(shape.rings.size());
     for (const Ring& ring : shape.rings) polygon.push_back(ring.pts);
     const std::vector<uint32_t> tris = mapbox::earcut<uint32_t>(polygon);
     if (tris.empty()) return;
 
-    const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
+    const float zs = front ? 1.0f : -1.0f;
+    const auto tri = [&](uint32_t a, uint32_t b, uint32_t c) {
+        if (!front) std::swap(b, c);
+        mesh.indices.push_back(a);
+        mesh.indices.push_back(b);
+        mesh.indices.push_back(c);
+    };
+
+    // Top, per-vertex height field.
+    const uint32_t top = static_cast<uint32_t>(mesh.vertices.size());
+    std::vector<double> topZ;
     for (const auto& ring : polygon) {
         for (const auto& p : ring) {
             Vertex v{};
@@ -480,6 +502,7 @@ void sheet(const Shape& shape, bool front, At&& at, Mesh& mesh) {
             double z = 0.0;
             float n[3] = {0.0f, 0.0f, 1.0f};
             at(p[0], p[1], z, n);
+            topZ.push_back(z);
             v.position[2] = static_cast<float>(z);
             v.normal[0] = n[0];
             v.normal[1] = n[1];
@@ -487,16 +510,76 @@ void sheet(const Shape& shape, bool front, At&& at, Mesh& mesh) {
             mesh.vertices.push_back(v);
         }
     }
-    for (size_t i = 0; i + 2 < tris.size(); i += 3) {
-        if (front) {
-            mesh.indices.push_back(base + tris[i]);
-            mesh.indices.push_back(base + tris[i + 1]);
-            mesh.indices.push_back(base + tris[i + 2]);
-        } else {
-            mesh.indices.push_back(base + tris[i + 2]);
-            mesh.indices.push_back(base + tris[i + 1]);
-            mesh.indices.push_back(base + tris[i]);
+    for (size_t i = 0; i + 2 < tris.size(); i += 3)
+        tri(top + tris[i], top + tris[i + 1], top + tris[i + 2]);
+
+    // Underside, facing into the board.
+    const uint32_t bot = static_cast<uint32_t>(mesh.vertices.size());
+    for (const auto& ring : polygon) {
+        for (const auto& p : ring) {
+            Vertex v{};
+            v.position[0] = static_cast<float>(p[0]);
+            v.position[1] = static_cast<float>(p[1]);
+            v.position[2] = static_cast<float>(floorAt(p[0], p[1]));
+            v.normal[2] = -zs;
+            mesh.vertices.push_back(v);
         }
+    }
+    for (size_t i = 0; i + 2 < tris.size(); i += 3)
+        tri(bot + tris[i + 2], bot + tris[i + 1], bot + tris[i]);
+
+    // Walls along the boundary edges the caller does not veto. Outward is
+    // decided per ring by its winding, as extrude() does.
+    size_t offset = 0;
+    for (const auto& ring : polygon) {
+        const size_t n = ring.size();
+        if (n < 3) {
+            offset += n;
+            continue;
+        }
+        double area = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const auto& a = ring[i];
+            const auto& b = ring[(i + 1) % n];
+            area += a[0] * b[1] - b[0] * a[1];
+        }
+        const double dir = (area >= 0.0) ? 1.0 : -1.0;
+        for (size_t i = 0; i < n; ++i) {
+            const size_t j = (i + 1) % n;
+            const auto& a = ring[i];
+            const auto& b = ring[j];
+            if (skipWall(a[0], a[1], b[0], b[1])) continue;
+            double ex = b[0] - a[0], ey = b[1] - a[1];
+            const double len = std::sqrt(ex * ex + ey * ey);
+            if (len < 1e-9) continue;
+            // Outward normal of edge a->b for a CCW ring is its right-hand
+            // side; a CW (hole) ring flips.
+            const float nx = static_cast<float>(dir * ey / len);
+            const float ny = static_cast<float>(-dir * ex / len);
+            const uint32_t w = static_cast<uint32_t>(mesh.vertices.size());
+            const double za = topZ[offset + i], zb = topZ[offset + j];
+            const double fa = floorAt(a[0], a[1]), fb = floorAt(b[0], b[1]);
+            const double P[4][3] = {{a[0], a[1], za}, {b[0], b[1], zb},
+                                    {b[0], b[1], fb}, {a[0], a[1], fa}};
+            for (const auto& p : P) {
+                Vertex v{};
+                v.position[0] = static_cast<float>(p[0]);
+                v.position[1] = static_cast<float>(p[1]);
+                v.position[2] = static_cast<float>(p[2]);
+                v.normal[0] = nx;
+                v.normal[1] = ny;
+                mesh.vertices.push_back(v);
+            }
+            // CCW seen from outside (front): a-top, b-top, b-floor...
+            if (dir > 0.0) {
+                tri(w + 0, w + 3, w + 2);
+                tri(w + 0, w + 2, w + 1);
+            } else {
+                tri(w + 0, w + 1, w + 2);
+                tri(w + 0, w + 2, w + 3);
+            }
+        }
+        offset += n;
     }
 }
 
@@ -1483,11 +1566,36 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     n[1] = static_cast<float>(dy * sl / len);
                     n[2] = static_cast<float>(zs / len);
                 };
+                // The band's underside: for the mask, the laminate (the
+                // dropped level); for silk, the mask's surface beneath it.
+                const auto floorAt = [&](double x, double y) {
+                    if (isMask) return baseZ0 + (frontSide ? 0.0 : al.thickness);
+                    double z = 0.0;
+                    float n[3];
+                    at(x, y, z, n);
+                    return z - zs * al.thickness;
+                };
                 for (int k = 0; k < kSteps; ++k) {
                     const Paths64 band =
                         clipPaths(rings[k + 1], rings[k], ClipType::Difference);
+                    // An edge whose endpoints both sit on the same ring is
+                    // shared with the neighbouring band: no wall there, or a
+                    // ray from above would meet two entering faces. Anything
+                    // else is a cut edge of the film and gets closed.
+                    const double r0 = reach * k / kSteps;
+                    const double r1 = reach * (k + 1) / kSteps;
+                    const auto skipWall = [&](double ax, double ay, double bx,
+                                              double by) {
+                        double dx, dy;
+                        const double da = grid.nearest(ax, ay, dx, dy);
+                        const double db = grid.nearest(bx, by, dx, dy);
+                        constexpr double tol = 0.003;  // arc-chord sag + rounding
+                        const bool onR0 = std::abs(da - r0) < tol && std::abs(db - r0) < tol;
+                        const bool onR1 = std::abs(da - r1) < tol && std::abs(db - r1) < tol;
+                        return onR0 || onR1;
+                    };
                     for (const Shape& shape : clipShapes(film, band, ClipType::Intersection))
-                        sheet(shape, frontSide, at, part.mesh);
+                        sheet(shape, frontSide, at, floorAt, skipWall, part.mesh);
                 }
             }
             const size_t added = (part.mesh.indices.size() - before) / 3;
