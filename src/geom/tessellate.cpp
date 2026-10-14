@@ -1240,79 +1240,87 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 collectShapes(tree, shapes);
                 for (const Shape& shape : shapes)
                     extrude(shape, al.z, al.z + al.thickness, part.mesh);
-            } else if (al.kind == LayerKind::Soldermask) {
-                // Two OVERLAPPING solids, not a partition -- a partition's
-                // raised piece overhung the copper edge as a little roof with
-                // an open underside, which a macro view read as the mask
-                // peeling off the board.
+            } else {
+                // Conformal films, built so that a ray from outside crosses
+                // exactly ONE entering mask face anywhere on the board. That
+                // is the invariant the path tracer's stochastic alpha needs:
+                // every entering face of a translucent film is an independent
+                // commit lottery (exits never commit), so two overlapping
+                // solids tint twice -- which read as darker bands along every
+                // shoulder when the base film still ran under the skirt and
+                // the climb had walls inside it.
                 //
-                // Base: the whole film at the DROPPED level, hugging the
-                // laminate and tunnelling straight through the copper where
-                // copper exists (harmless: it is buried inside an opaque
-                // solid). It has no wall at the copper boundary at all, so
-                // nothing is coplanar with anything.
+                //   base   the film beyond the fillet FOOT, at the dropped
+                //          level, hugging the laminate;
+                //   cap    the film over copper (to the rim, copper inflated
+                //          20 um), a sheet at the raised level -- a hair thick,
+                //          so its walls are negligible, because the copper
+                //          beneath it is opaque and the skirt covers its sides;
+                //   skirt  one lofted sheet from the rim down to the foot on a
+                //          concave quadratic profile, normals from the
+                //          profile's slope, shading as a continuous meniscus
+                //          in every render mode (the tracer interpolates
+                //          vertex normals).
                 //
-                // Climb: over copper only, extruded the FULL height from the
-                // base's bottom to the film's proper top -- so it encases the
-                // trace's top AND side walls in mask, which is exactly what
-                // conformal mask does, and its wall interpenetrates the base
-                // below the surface for a seamless shoulder.
+                // Silkscreen (opaque) uses the same three pieces at its own
+                // thickness, so a stroke crossing a trace is one continuous
+                // top riding the mask's surface instead of two pieces with a
+                // cut between them. Reach ~1.5x the copper height, about what
+                // a 1 oz fillet spans. PCBVIEW_MASK_FILLET_STEPS sets the
+                // profile resolution.
                 const Paths64 film = PolyTreeToPaths64(tree);
                 const double baseZ0 = al.z - filmDrop;
-                {
-                    Clipper64 u;
-                    u.AddSubject(film);
-                    PolyTree64 t2;
-                    u.Execute(ClipType::Union, FillRule::NonZero, t2);
-                    std::vector<Shape> shapes;
-                    collectShapes(t2, shapes);
-                    for (const Shape& shape : shapes)
-                        extrude(shape, baseZ0, baseZ0 + al.thickness,
-                                part.mesh);
-                }
-                // ...and as a MENISCUS rather than a cliff. Liquid mask wets
-                // the copper wall and cures with a concave fillet at its
-                // foot, so the surface RAMPS from the laminate up to the
-                // trace top. The climb coats the copper's top and walls at
-                // full height; the fillet is a lofted SKIRT swept along the
-                // climb's rim -- quad strips stepping outward and down on a
-                // quadratic profile (steep at the wall, flat at the foot),
-                // with normals from the profile's actual slope, so it shades
-                // as one continuous curve in every render mode (the path
-                // tracer interpolates vertex normals). Stair-stepped terraces
-                // were tried first: at macro range the risers read as bands,
-                // and eight full-area terrace solids tripled the mask's
-                // vertex count. The skirt is edge geometry only. Reach is
-                // ~1.5x the copper height, about what a 1 oz fillet spans.
                 const double reach = art.copperThickness * 1.5;
                 const double rise = std::fabs(filmDrop);
                 const bool frontSide = filmDrop > 0;
-                Paths64 rim;  // the climb's footprint: copper inflated 20 um
-                {
+                const bool isMask = al.kind == LayerKind::Soldermask;
+
+                const auto inflate = [&](double d) {
                     ClipperOffset co;
                     co.ArcTolerance(kScale * 0.001);
                     co.AddPaths(*supportRaw, JoinType::Round, EndType::Polygon);
-                    co.Execute(0.02 * kScale, rim);
-                    Clipper64 sc;
-                    sc.AddSubject(film);
-                    sc.AddClip(rim);
+                    Paths64 r;
+                    co.Execute(d * kScale, r);
+                    return r;
+                };
+                const Paths64 rim = inflate(0.02);
+                const Paths64 foot = inflate(0.02 + reach);
+                const auto clipped = [&](const Paths64& subj, const Paths64& clip,
+                                         ClipType ct) {
+                    Clipper64 c;
+                    c.AddSubject(subj);
+                    c.AddClip(clip);
                     PolyTree64 t2;
-                    sc.Execute(ClipType::Intersection, FillRule::NonZero, t2);
+                    c.Execute(ct, FillRule::NonZero, t2);
                     std::vector<Shape> shapes;
                     collectShapes(t2, shapes);
-                    const double lo = frontSide ? baseZ0 : baseZ0 - rise;
-                    const double hi = frontSide ? baseZ0 + al.thickness + rise
-                                                : baseZ0 + al.thickness;
-                    for (const Shape& shape : shapes)
+                    return shapes;
+                };
+
+                // (The base is extruded below, once the skirt's footprint is
+                // known: it must stop exactly where the skirt begins, and
+                // nowhere else -- around a pad with mask expansion the rim
+                // lies inside the opening, there is no skirt, and the film
+                // has to run all the way to the opening's edge.)
+
+                // Cap: over copper, at the raised level. The mask's is a
+                // hair-thick sheet (one entering face, negligible walls);
+                // silk keeps its full thickness, being opaque.
+                {
+                    const double top = frontSide ? baseZ0 + al.thickness + rise
+                                                 : baseZ0 - rise;
+                    const double thick = isMask ? 0.0005 : al.thickness;
+                    const double lo = frontSide ? top - thick : top;
+                    const double hi = frontSide ? top : top + thick;
+                    for (const Shape& shape : clipped(film, rim, ClipType::Intersection))
                         extrude(shape, lo, hi, part.mesh);
                 }
 
-                // The skirt. The rim as OPEN paths clipped to the film, so it
-                // stops at mask openings and the board edge instead of
-                // draping over a bare pad; then one quad strip per profile
-                // step along every surviving polyline, with a round fan at
-                // each convex corner where the offsets diverge.
-                // PCBVIEW_MASK_FILLET_STEPS sets the profile resolution.
+                // Skirt. The rim as OPEN paths clipped to this film, so it
+                // stops at mask openings, the board edge, and (for silk) the
+                // ink's own outline; then one quad strip per profile step
+                // along every surviving polyline, with a round fan at each
+                // convex corner where the offsets diverge.
                 static const int kSteps = [] {
                     const char* v = std::getenv("PCBVIEW_MASK_FILLET_STEPS");
                     const int n = v && v[0] ? std::atoi(v) : 6;
@@ -1346,13 +1354,38 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     part.mesh.vertices.push_back(v);
                     return static_cast<uint32_t>(part.mesh.vertices.size() - 1);
                 };
-                // Wound counter-clockwise seen from outside the board; the
-                // back side mirrors.
+                // Wound counter-clockwise seen from outside the board, which
+                // is what makes these ENTERING faces to the tracer; the back
+                // side mirrors.
                 const auto tri = [&](uint32_t a, uint32_t b, uint32_t c) {
                     if (!frontSide) std::swap(b, c);
                     part.mesh.indices.push_back(a);
                     part.mesh.indices.push_back(b);
                     part.mesh.indices.push_back(c);
+                };
+
+                constexpr double kPi = 3.14159265358979323846;
+                // Profile rings: kSteps + 1 radial stations, shared between
+                // the strips on either side of each station.
+                std::vector<double> rx(kSteps + 1), rz(kSteps + 1), rsl(kSteps + 1);
+                for (int s = 0; s <= kSteps; ++s) {
+                    rx[s] = reach * s / kSteps;
+                    rz[s] = outerZ(rx[s]);
+                    rsl[s] = slope(rx[s]);
+                }
+                const auto column = [&](double px, double py, double nx,
+                                        double ny, std::vector<uint32_t>& out) {
+                    out.resize(kSteps + 1);
+                    for (int s = 0; s <= kSteps; ++s)
+                        out[s] = pushV(px + nx * rx[s], py + ny * rx[s], rz[s],
+                                       nx, ny, rsl[s]);
+                };
+                const auto strips = [&](const std::vector<uint32_t>& from,
+                                        const std::vector<uint32_t>& to) {
+                    for (int s = 0; s < kSteps; ++s) {
+                        tri(from[s], to[s + 1], to[s]);
+                        tri(from[s], from[s + 1], to[s + 1]);
+                    }
                 };
 
                 Paths64 open;
@@ -1369,38 +1402,48 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 cc.Execute(ClipType::Intersection, FillRule::NonZero, closedOut,
                            polylines);
 
-                constexpr double kPi = 3.14159265358979323846;
-                // Profile rings: kSteps + 1 radial stations, shared between
-                // the strips on either side of each station.
-                std::vector<double> rx(kSteps + 1), rz(kSteps + 1), rsl(kSteps + 1);
-                for (int s = 0; s <= kSteps; ++s) {
-                    rx[s] = reach * s / kSteps;
-                    rz[s] = outerZ(rx[s]);
-                    rsl[s] = slope(rx[s]);
-                }
-                // One column of ring vertices at a point, along direction n.
-                const auto column = [&](double px, double py, double nx,
-                                        double ny, std::vector<uint32_t>& out) {
-                    out.resize(kSteps + 1);
-                    for (int s = 0; s <= kSteps; ++s)
-                        out[s] = pushV(px + nx * rx[s], py + ny * rx[s], rz[s],
-                                       nx, ny, rsl[s]);
-                };
-                // Strips between two columns, counter-clockwise seen from
-                // outside when `from` precedes `to` along a positively wound
-                // path with outward to the right.
-                const auto strips = [&](const std::vector<uint32_t>& from,
-                                        const std::vector<uint32_t>& to) {
-                    for (int s = 0; s < kSteps; ++s) {
-                        tri(from[s], to[s + 1], to[s]);
-                        tri(from[s], from[s + 1], to[s + 1]);
+                // Base: the film minus what the cap and the skirt cover, at
+                // the dropped level. The skirt's footprint is the clipped rim
+                // stroked by the reach, kept to the zone between rim and foot
+                // (the stroke's inward half falls inside the rim and goes).
+                // Where the rim lies inside a mask opening -- every pad with
+                // mask expansion -- there is no skirt, and the film runs to
+                // the opening's edge as it should.
+                {
+                    Paths64 coverage;
+                    if (!polylines.empty()) {
+                        ClipperOffset so;
+                        so.ArcTolerance(kScale * 0.001);
+                        so.AddPaths(polylines, JoinType::Round, EndType::Butt);
+                        Paths64 stroke;
+                        so.Execute(reach * kScale, stroke);
+                        Clipper64 zc;
+                        zc.AddSubject(foot);
+                        zc.AddClip(rim);
+                        Paths64 zone;
+                        zc.Execute(ClipType::Difference, FillRule::NonZero, zone);
+                        Clipper64 cv;
+                        cv.AddSubject(stroke);
+                        cv.AddClip(zone);
+                        cv.Execute(ClipType::Intersection, FillRule::NonZero,
+                                   coverage);
                     }
-                };
+                    Clipper64 bc;
+                    bc.AddSubject(film);
+                    bc.AddClip(rim);
+                    if (!coverage.empty()) bc.AddClip(coverage);
+                    PolyTree64 bt;
+                    bc.Execute(ClipType::Difference, FillRule::NonZero, bt);
+                    std::vector<Shape> shapes;
+                    collectShapes(bt, shapes);
+                    for (const Shape& shape : shapes)
+                        extrude(shape, baseZ0, baseZ0 + al.thickness, part.mesh);
+                }
 
                 std::vector<uint32_t> colA, colB, colPrev;
                 for (const Path64& pl : polylines) {
                     bool havePrev = false;
-                    double pnx = 0.0, pny = 0.0;  // previous edge's normal
+                    double pnx = 0.0, pny = 0.0;
                     for (size_t i = 0; i + 1 < pl.size(); ++i) {
                         const double ax = toMm(pl[i].x), ay = toMm(pl[i].y);
                         const double bx = toMm(pl[i + 1].x);
@@ -1415,37 +1458,28 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                         // right-hand normal.
                         const double nx = dy, ny = -dx;
 
-                        // Start column: reuse the previous edge's end column
-                        // when the turn is slight (under ~3 degrees -- an
-                        // arc's facets), which is what makes arcs shade as
-                        // one surface instead of a picket fence of facets.
-                        // Otherwise a fresh column on this edge's normal, with
-                        // a round fan filling the wedge at a convex corner.
+                        // Reuse the previous end column across a slight turn
+                        // (under ~3 degrees -- an arc's facets), so arcs
+                        // shade as one surface; otherwise a fresh column, and
+                        // a round fan through the wedge at a convex corner.
                         if (havePrev &&
                             (pnx * nx + pny * ny) > 0.9986 /* cos 3 deg */) {
                             colA = colPrev;
                         } else {
                             column(ax, ay, nx, ny, colA);
-                            if (havePrev) {
-                                const double turn = pnx * ny - pny * nx;  // >0: left
-                                if (turn > 1e-6) {
-                                    const double a0ang = std::atan2(pny, pnx);
-                                    double dAng = std::atan2(ny, nx) - a0ang;
-                                    while (dAng > kPi) dAng -= 2.0 * kPi;
-                                    while (dAng <= -kPi) dAng += 2.0 * kPi;
-                                    const int fan = std::max(
-                                        1, static_cast<int>(
-                                               std::ceil(dAng / (kPi / 12.0))));
-                                    std::vector<uint32_t> fprev = colPrev, fcur;
-                                    for (int f = 1; f <= fan; ++f) {
-                                        const double ang = a0ang + dAng * f / fan;
-                                        column(ax, ay, std::cos(ang), std::sin(ang),
-                                               fcur);
-                                        strips(fprev, fcur);
-                                        fprev = fcur;
-                                    }
-                                    // fprev now sits on this edge's normal;
-                                    // colA duplicates it. Harmless.
+                            if (havePrev && (pnx * ny - pny * nx) > 1e-6) {
+                                const double a0ang = std::atan2(pny, pnx);
+                                double dAng = std::atan2(ny, nx) - a0ang;
+                                while (dAng > kPi) dAng -= 2.0 * kPi;
+                                while (dAng <= -kPi) dAng += 2.0 * kPi;
+                                const int fan = std::max(
+                                    1, static_cast<int>(std::ceil(dAng / (kPi / 12.0))));
+                                std::vector<uint32_t> fprev = colPrev, fcur;
+                                for (int f = 1; f <= fan; ++f) {
+                                    const double ang = a0ang + dAng * f / fan;
+                                    column(ax, ay, std::cos(ang), std::sin(ang), fcur);
+                                    strips(fprev, fcur);
+                                    fprev = fcur;
                                 }
                             }
                         }
@@ -1456,27 +1490,6 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                         pny = ny;
                         havePrev = true;
                     }
-                }
-            } else {
-                // Silkscreen: a partition is right here -- ink is opaque and
-                // sits ON the local mask surface, raised over copper, dropped
-                // between traces. The pieces' walls never overlap in Z
-                // (silk is thinner than copper), so nothing fights.
-                const Paths64 film = PolyTreeToPaths64(tree);
-                for (int pass = 0; pass < 2; ++pass) {
-                    const bool over = pass == 0;
-                    Clipper64 sc;
-                    sc.AddSubject(film);
-                    sc.AddClip(*support);
-                    PolyTree64 pieceTree;
-                    sc.Execute(over ? ClipType::Intersection
-                                    : ClipType::Difference,
-                               FillRule::NonZero, pieceTree);
-                    std::vector<Shape> shapes;
-                    collectShapes(pieceTree, shapes);
-                    const double z0 = al.z - (over ? 0.0 : filmDrop);
-                    for (const Shape& shape : shapes)
-                        extrude(shape, z0, z0 + al.thickness, part.mesh);
                 }
             }
             const size_t added = (part.mesh.indices.size() - before) / 3;
