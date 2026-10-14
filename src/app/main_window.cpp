@@ -3958,7 +3958,8 @@ void MainWindow::onFrameRendered() {
     // the status bar. Every 15th frame, same as the label.
     static const bool logPerf = qEnvironmentVariableIsSet("PCBVIEW_PERF_LOG");
     if (logPerf) {
-        std::printf("perf: %s\n", perf.toUtf8().constData());
+        std::printf("perf: %s  ·  gpu %.2f ms\n", perf.toUtf8().constData(),
+                    r->gpuMs());
         std::fflush(stdout);
     }
 }

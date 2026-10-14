@@ -623,6 +623,11 @@ private:
     // the focal plane through the pivot) when the wheel turns; stepZoomAnimation
     // slides the pivot to keep it fixed under the cursor as `distance` changes.
     bool computeZoomAnchor(const QPointF& posDip);
+    // Closest orbit distance that keeps the EYE outside the board at the
+    // current pitch and target: a camera inside the laminate (or a component
+    // body) starts every ray inside an opaque solid, which runs the path
+    // tracer and the RT shadow rays to full depth on every pixel.
+    float minOrbitDistance() const;
     bool zoomToCursor_ = false;
     glm::vec3 zoomAnchorK_{0.0f};        // pivot shift per unit distance change
     glm::vec3 zoomAnchorTarget0_{0.0f};  // pivot at the moment of anchoring

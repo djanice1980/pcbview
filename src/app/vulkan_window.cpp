@@ -34,6 +34,12 @@
 namespace pcbview::app {
 namespace {
 
+// Closest the orbit camera may come to its target, in mm. Was 0.5, which
+// stopped a macro inspection short of the mask meniscus (a 45 um feature);
+// 0.1 puts the eye a few film thicknesses off the surface. The near plane
+// tracks distance (max(d * 0.005, 0.02 mm)), so depth is not the limit.
+constexpr float kMinOrbitMm = 0.1f;
+
 struct Basis {
     glm::vec3 eye;
     glm::vec3 forward;  // eye -> target
@@ -1973,7 +1979,8 @@ void VulkanWindow::stepGamepad() {
             // perceived terms rather than crawling when close and rocketing
             // when far. Half their rate: this is the fine one.
             camera_.distance = std::clamp(
-                camera_.distance * std::exp(-pull * 0.8f * fdt), 0.5f, 5000.0f);
+                camera_.distance * std::exp(-pull * 0.8f * fdt),
+                minOrbitDistance(), 5000.0f);
             zoomAnimating_ = false;  // a wheel glide would fight this
             char s[96];
             std::snprintf(s, sizeof(s), "%s   %.1f mm away",
@@ -3494,7 +3501,25 @@ void VulkanWindow::wheelEvent(QWheelEvent* e) {
         zoomClock_.restart();
     }
     zoomTarget_ *= std::pow(0.88f, steps);
-    zoomTarget_ = std::clamp(zoomTarget_, 0.5f, 5000.0f);
+    // The floor is wherever the EYE would touch the board at the end of the
+    // glide, not a fixed distance: with a cursor anchor the target slides to
+    // the surface point as the dolly closes, so the eye's height along the
+    // glide is linear in distance and the bound solves directly.
+    float dmin = minOrbitDistance();
+    if (zoomToCursor_) {
+        constexpr float kMargin = 0.06f;
+        const float ez = std::sin(camera_.pitch);
+        const float topZ = mesh_ ? static_cast<float>(mesh_->boardTopZ) : 0.0f;
+        const float baseZ =
+            zoomAnchorTarget0_.z + zoomAnchorDist0_ * zoomAnchorK_.z;  // anchor z
+        const float slope = ez - zoomAnchorK_.z;  // d(eye.z)/d(distance)
+        dmin = kMinOrbitMm;
+        if (ez > 0.02f && slope > 1e-4f)
+            dmin = std::max(dmin, (topZ + kMargin - baseZ) / slope);
+        else if (ez < -0.02f && slope < -1e-4f)
+            dmin = std::max(dmin, (-kMargin - baseZ) / slope);
+    }
+    zoomTarget_ = std::clamp(zoomTarget_, dmin, 5000.0f);
     // If a view preset is mid-glide it also eases distance; keep both targets
     // agreed so the two animations pull the same way instead of fighting.
     if (cameraAnimating_) viewTarget_.distance = zoomTarget_;
@@ -3532,12 +3557,32 @@ bool VulkanWindow::computeZoomAnchor(const QPointF& posDip) {
     const glm::vec3 b = glm::vec3(h1) / h1.w;
     const glm::vec3 dir = glm::normalize(b - a);
 
+    // Last line of defence for every path that moves the camera (orbit after
+    // a close zoom, presets, recorded paths): never let the eye into the
+    // board. See minOrbitDistance.
+    camera_.distance = std::max(camera_.distance, minOrbitDistance());
     const Basis basis = cameraBasis(camera_);
     const glm::vec3 target0{camera_.targetX, camera_.targetY, camera_.targetZ};
-    const float denom = glm::dot(dir, basis.forward);
-    if (std::abs(denom) < 1e-4f) return false;  // ray parallel to focal plane
-    const float t = glm::dot(target0 - a, basis.forward) / denom;
-    const glm::vec3 pFocal = a + dir * t;
+    // Anchor on the board SURFACE under the cursor -- the face that faces the
+    // camera -- not on the focal plane. The focal plane passes through the
+    // target at mid-board depth, so a dolly toward a focal-plane point drove
+    // the eye INTO the laminate at the end of the glide: the zoom appeared to
+    // hit a wall (it had gone underground), and every ray then started inside
+    // an opaque solid and ran to full depth -- 5x the frame cost, read as
+    // "dragging gets slow when zoomed all the way in". The focal plane stays
+    // as the fallback for a ray that misses both faces.
+    glm::vec3 pFocal;
+    const float topZ = mesh_ ? static_cast<float>(mesh_->boardTopZ) : 0.0f;
+    const float faceZ = dir.z < 0.0f ? topZ : 0.0f;
+    const float tFace = std::abs(dir.z) > 1e-4f ? (faceZ - a.z) / dir.z : -1.0f;
+    if (tFace > 0.0f) {
+        pFocal = a + dir * tFace;
+    } else {
+        const float denom = glm::dot(dir, basis.forward);
+        if (std::abs(denom) < 1e-4f) return false;  // ray parallel to focal plane
+        const float t = glm::dot(target0 - a, basis.forward) / denom;
+        pFocal = a + dir * t;
+    }
 
     // pivot(distance) = target0 + (dist0 - distance) * K keeps pFocal fixed
     // under the cursor, where K = (pFocal - target0) / dist0.
@@ -3545,6 +3590,24 @@ bool VulkanWindow::computeZoomAnchor(const QPointF& posDip) {
     zoomAnchorTarget0_ = target0;
     zoomAnchorDist0_ = camera_.distance;
     return true;
+}
+
+float VulkanWindow::minOrbitDistance() const {
+    // eye.z = target.z + sin(pitch) * distance. Keep it a margin above the
+    // top face (viewing from above) or below the bottom face (from below);
+    // the margin clears the silk on the mask's shoulder. Edge-on there is no
+    // face to be clear of, so hold back a little instead.
+    constexpr float kMargin = 0.06f;
+    const float ez = std::sin(camera_.pitch);
+    const float topZ = mesh_ ? static_cast<float>(mesh_->boardTopZ) : 0.0f;
+    float dmin = kMinOrbitMm;
+    if (ez > 0.02f)
+        dmin = std::max(dmin, (topZ + kMargin - camera_.targetZ) / ez);
+    else if (ez < -0.02f)
+        dmin = std::max(dmin, (camera_.targetZ + kMargin) / -ez);
+    else
+        dmin = std::max(dmin, 1.0f);
+    return dmin;
 }
 
 bool VulkanWindow::stepZoomAnimation() {

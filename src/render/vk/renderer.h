@@ -235,6 +235,9 @@ public:
     // it the lighting would be pinned to the board and turn with it. Resets
     // accumulation when it changes, since the lighting genuinely differs.
     void setBoardRotationInverse(const float quatXyzw[4]);
+    // GPU time of the last frame's command buffer (timestamp pair), for the
+    // perf readout: splits GPU-bound from CPU-bound when a frame is slow.
+    double gpuMs() const { return gpuMs_; }
     int accumulatedSamples() const {
         return cpuMode_ && cpuTracer_ ? cpuTracer_->samples() : ptSampleCount_;
     }
