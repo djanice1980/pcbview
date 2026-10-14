@@ -471,7 +471,10 @@ sudo pacman -U ./pcbview-<version>-1-x86_64.pkg.tar.zst
 — or build the same package yourself; it resolves dependencies, installs
 the binary and launcher entry, and offers the optional pieces (KiCad +
 its 3D model library for component bodies, `vulkan-swrast` for CPU
-rendering, `ffmpeg` for video recording) as choices at install time:
+rendering, `ffmpeg` for video recording, `hip-runtime-amd` or `cuda`
+for **GPU-accelerated denoising** — without one, the path tracer's
+neural denoise silently runs on the CPU, and the status bar says so) as
+choices at install time:
 
 ```sh
 cd packaging/linux && makepkg -si

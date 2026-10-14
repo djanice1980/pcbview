@@ -36,6 +36,8 @@ makedepends=(
     shaderc
 )
 optdepends=(
+    'hip-runtime-amd: GPU-accelerated denoising on AMD (Open Image Denoise HIP device)'
+    'cuda: GPU-accelerated denoising on NVIDIA (Open Image Denoise CUDA device)'
     'kicad: 3D component bodies on KiCad boards (kicad-cli export)'
     'kicad-library-3d: the component 3D models kicad-cli exports from'
     'vulkan-swrast: CPU rendering device (no GPU required)'

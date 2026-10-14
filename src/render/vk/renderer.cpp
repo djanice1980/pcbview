@@ -896,15 +896,32 @@ void Renderer::createPathTracer() {
     // (CUDA on NVIDIA, HIP on AMD) when its device DLL + driver are present, else
     // the CPU. If a GPU device fails to commit, fall back to CPU so denoising
     // still works. Kept around for the process; filters are per-call.
-    OIDNDevice dev = oidnNewDevice(OIDN_DEVICE_TYPE_DEFAULT);
+    // PCBVIEW_OIDN_DEVICE=cpu|cuda|hip pins the choice: for verifying that a
+    // freshly installed compute runtime actually lights its device up, and
+    // for a docked laptop that would rather denoise on its own GPU than ship
+    // every frame across the cable to the faster one DEFAULT picks.
+    OIDNDeviceType want = OIDN_DEVICE_TYPE_DEFAULT;
+    if (const char* v = std::getenv("PCBVIEW_OIDN_DEVICE")) {
+        const std::string s = v;
+        if (s == "cpu") want = OIDN_DEVICE_TYPE_CPU;
+        else if (s == "cuda") want = OIDN_DEVICE_TYPE_CUDA;
+        else if (s == "hip") want = OIDN_DEVICE_TYPE_HIP;
+    }
+    OIDNDevice dev = oidnNewDevice(want);
     oidnCommitDevice(dev);
     const char* err = nullptr;
     if (oidnGetDeviceError(dev, &err) != OIDN_ERROR_NONE) {
+        std::printf("denoise: OIDN device unavailable (%s); falling back to CPU\n",
+                    err ? err : "unknown error");
         oidnReleaseDevice(dev);
         dev = oidnNewDevice(OIDN_DEVICE_TYPE_CPU);
         oidnCommitDevice(dev);
     }
     oidnDevice_ = dev;
+    // Which device OIDN settled on, for headless runs -- the GPU fallback to
+    // CPU is otherwise invisible outside the status bar.
+    std::printf("denoise: OIDN on %s\n", oidnDeviceName().c_str());
+    std::fflush(stdout);
 }
 
 void Renderer::destroyPathTracer() {

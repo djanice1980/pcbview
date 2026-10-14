@@ -2572,6 +2572,26 @@ void VulkanWindow::emitDeviceStatus() {
     else
         mode = "raster (no rays)";
     if (isCpu) mode += " — via Embree (CPU)";
+    if (pt && oidnEnabled_ && !isCpu) {
+        // WHERE the denoiser runs, and -- on a distro build -- what would
+        // move it to the GPU. The distro's OIDN loads its CUDA/HIP device
+        // libraries at runtime against the vendor compute runtime, which
+        // ships as a separate package; without it the fallback to CPU is
+        // silent, and CPU denoising is the slow part of every converged
+        // frame on a machine whose GPU could be doing it.
+        const std::string dn = renderer_->oidnDeviceName();
+        mode += QString(" [%1]").arg(QString::fromStdString(dn));
+#ifdef Q_OS_LINUX
+        if (dn == "CPU") {
+            const QString gpu = QString::fromStdString(device_.gpu.name);
+            if (gpu.contains("AMD", Qt::CaseInsensitive) ||
+                gpu.contains("Radeon", Qt::CaseInsensitive))
+                mode += "  —  GPU denoising needs hip-runtime-amd (ROCm)";
+            else if (gpu.contains("NVIDIA", Qt::CaseInsensitive))
+                mode += "  —  GPU denoising needs the cuda package";
+        }
+#endif
+    }
     emit statusMessage(QString("%1  |  %2  |  %3 triangles")
                            .arg(QString::fromStdString(device_.gpu.name))
                            .arg(mode)
