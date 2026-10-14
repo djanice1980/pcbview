@@ -3500,11 +3500,18 @@ void VulkanWindow::wheelEvent(QWheelEvent* e) {
     // unwinds the magnification before it starts backing the camera off.
     constexpr float kFovDefault = 45.0f;
     constexpr float kFovMin = 2.0f;
-    const float factor = std::pow(0.88f, steps);  // < 1 zooms in
-    if (steps < 0.0f && camera_.fovDegrees < kFovDefault - 1e-3f) {
-        camera_.fovDegrees = std::min(kFovDefault, camera_.fovDegrees / factor);
-        requestUpdate();
-        return;
+    float factor = std::pow(0.88f, steps);  // < 1 zooms in
+    if (factor > 1.0f && camera_.fovDegrees < kFovDefault - 1e-3f) {
+        // Widen the FOV by the step; whatever of the step is left once it
+        // reaches the default goes on to back the camera off.
+        const float widened = camera_.fovDegrees * factor;
+        if (widened < kFovDefault) {
+            camera_.fovDegrees = widened;
+            requestUpdate();
+            return;
+        }
+        factor = widened / kFovDefault;
+        camera_.fovDegrees = kFovDefault;
     }
 
     // Accumulate into a TARGET and glide there (stepZoomAnimation) instead of
