@@ -1175,7 +1175,8 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
         // copper thickness closer to the core (a stepped drape -- the real
         // thing has a smooth shoulder, but the step puts both regions at
         // their true heights).
-        const Paths64* support = nullptr;
+        const Paths64* support = nullptr;     // inflated 20 um (see below)
+        const Paths64* supportRaw = nullptr;  // the copper itself
         double filmDrop = 0.0;
         if (al.kind == LayerKind::Soldermask ||
             al.kind == LayerKind::Silkscreen) {
@@ -1187,6 +1188,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             }
             if (outer) {
                 support = &outer->art;
+                supportRaw = &outer->art;
                 // Toward the core: down on the front, up on the back.
                 filmDrop = front ? art.copperThickness : -art.copperThickness;
             }
@@ -1268,17 +1270,40 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                         extrude(shape, baseZ0, baseZ0 + al.thickness,
                                 part.mesh);
                 }
-                {
+                // ...and as a MENISCUS rather than a cliff. Liquid mask wets
+                // the copper wall and cures with a concave fillet at its
+                // foot, so the surface RAMPS from the laminate up to the
+                // trace top instead of stepping. Terraces approximate that:
+                // each reaches further from the copper edge and rises less,
+                // on a quadratic profile (steep at the wall, flat at the
+                // foot). The innermost is the full-height climb that coats
+                // the walls. Every terrace overlaps the base and the one
+                // inside it, so no wall is coplanar with any other; the reach
+                // is ~1.5x the copper height, about what a 1 oz fillet spans.
+                const int kTerraces = 4;
+                const double reach = art.copperThickness * 1.5;
+                const double rise = std::fabs(filmDrop);
+                for (int k = 0; k <= kTerraces; ++k) {
+                    const double x = reach * k / kTerraces;
+                    const double frac = 1.0 - x / reach;
+                    const double lift = rise * frac * frac;
+                    if (k > 0 && lift < 1e-4) break;  // sub-micron: nothing to add
+                    ClipperOffset co;
+                    co.ArcTolerance(kScale * 0.001);
+                    co.AddPaths(*supportRaw, JoinType::Round, EndType::Polygon);
+                    Paths64 grown;
+                    co.Execute((0.02 + x) * kScale, grown);
                     Clipper64 sc;
                     sc.AddSubject(film);
-                    sc.AddClip(*support);
+                    sc.AddClip(grown);
                     PolyTree64 t2;
                     sc.Execute(ClipType::Intersection, FillRule::NonZero, t2);
                     std::vector<Shape> shapes;
                     collectShapes(t2, shapes);
-                    const double lo = std::min(al.z, baseZ0);
-                    const double hi = std::max(al.z + al.thickness,
-                                               baseZ0 + al.thickness);
+                    const double lo = filmDrop > 0 ? baseZ0 : baseZ0 - lift;
+                    const double hi = filmDrop > 0
+                                          ? baseZ0 + al.thickness + lift
+                                          : baseZ0 + al.thickness;
                     for (const Shape& shape : shapes)
                         extrude(shape, lo, hi, part.mesh);
                 }
