@@ -351,6 +351,8 @@ public:
                        Qt::KeyboardModifiers mods);
     void handleWheel(const QPointF& pos, float steps, Qt::KeyboardModifiers mods);
     bool mouseDragging() const { return dragging_ || draggingInv_ || panning_; }
+    // The application lost focus mid-drag: the release will never come.
+    void endDrags();
 
 private:
     void keyPressEvent(QKeyEvent*) override;

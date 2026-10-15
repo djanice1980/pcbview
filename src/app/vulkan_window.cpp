@@ -3425,6 +3425,14 @@ void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
     handleRelease(e->button(), e->position(), e->modifiers());
 }
 
+void VulkanWindow::endDrags() {
+    if (!dragging_ && !draggingInv_ && !panning_) return;
+    dragging_ = draggingInv_ = panning_ = false;
+    clickCandidate_ = false;
+    if (QGuiApplication::platformName() == "xcb") setMouseGrabEnabled(false);
+    requestUpdate();
+}
+
 void VulkanWindow::handleMove(const QPointF& pos, Qt::MouseButtons held) {
     static const bool inputDebug = qEnvironmentVariableIsSet("PCBVIEW_INPUT_DEBUG");
     if (inputDebug && (dragging_ || draggingInv_ || panning_)) {
@@ -3433,17 +3441,13 @@ void VulkanWindow::handleMove(const QPointF& pos, Qt::MouseButtons held) {
                     static_cast<int>(QRectF(QPointF(), QSizeF(size())).contains(pos)));
         std::fflush(stdout);
     }
-    // A button released OUTSIDE the window can go undelivered (a native
-    // child window in a container does not always keep the implicit grab,
-    // notably on Wayland), which left the drag latched: the camera kept
-    // following the bare cursor. The move event carries the real button
-    // state, so believe it over our own bookkeeping.
-    if (dragging_ && !(held & Qt::LeftButton)) {
-        dragging_ = false;
-        clickCandidate_ = false;
-    }
-    if (draggingInv_ && !(held & Qt::RightButton)) draggingInv_ = false;
-    if (panning_ && !(held & Qt::MiddleButton)) panning_ = false;
+    // `held` is NOT trusted to end a drag: on Wayland the pointer crossing
+    // from this native window onto the surrounding widgets resets Qt's
+    // button state to none while the button is still down (the compositor
+    // sends leave/enter between surfaces), and judging by it ended every
+    // drag at the viewport's border. A drag ends on a real release, which
+    // does arrive, or when the application deactivates (see endDrags).
+    (void)held;
     const QPointF delta = pos - lastPos_;
     lastPos_ = pos;
     cursorPos_ = pos;

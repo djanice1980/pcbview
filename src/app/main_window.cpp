@@ -562,6 +562,7 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* ev) {
                     obj->objectName().toUtf8().constData());
         std::fflush(stdout);
     }
+    if (ev->type() == QEvent::ApplicationDeactivate) viewport_->endDrags();
     auto* w = qobject_cast<QWidget*>(obj);
     if (!w) return QMainWindow::eventFilter(obj, ev);
     const auto toViewport = [this](const QPointF& global) {
