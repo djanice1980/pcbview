@@ -1365,7 +1365,12 @@ Things we currently render differently from what the plant would produce:
    opening on the board outline (routed, a vertical cut) or on a copper
    edge (the mask meets the copper: the cliff). Costs ~30% more mask
    vertices and doubles the film's boolean work (import 5 s -> 10 s on
-   cx4). Silkscreen gets the same three pieces
+   cx4). Silkscreen is printed ON that surface: its pieces are the mask's
+   height field lifted by the ink's thickness -- meniscus, taper and all
+   -- and inside a mask opening (found from the same side's mask art) the
+   ink lies on the bare laminate or on the pad. It used to be built from
+   the copper alone, so across a pad's clearance ring it stayed at the
+   mask's level: a bridge in the air. Silkscreen gets the same three pieces
    at its own thickness, so a stroke crossing a trace is one continuous
    top riding the mask.
 

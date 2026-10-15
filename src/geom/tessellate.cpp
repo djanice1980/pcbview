@@ -1528,21 +1528,28 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 const bool frontSide = filmDrop > 0;
                 const double zs = frontSide ? 1.0 : -1.0;
                 const bool isMask = al.kind == LayerKind::Soldermask;
-                // The mask is `lam` thick on open laminate and al.thickness
-                // over copper; its crest over a trace rises `rise` above the
-                // thick film. Silk rides the mask, so its rise is the same
-                // number (already folded into its filmDrop).
-                const double lam = std::clamp(art.maskThicknessLaminate,
-                                              art.maskThickness,
-                                              art.copperThickness + art.maskThickness);
-                const double rise =
-                    isMask ? art.copperThickness + al.thickness - lam
-                           : std::fabs(filmDrop);
-                // Outer face of the film on open laminate: the level every
-                // lift is measured from.
-                const double level =
-                    frontSide ? baseZ0 + (isMask ? lam : al.thickness)
-                              : baseZ0 + al.thickness - (isMask ? lam : 0.0);
+                // Everything is measured from the laminate's face L. The mask
+                // is `lam` thick on open laminate and `mT` over copper; its
+                // crest over a trace rises `rise` above the thick film. Silk
+                // is printed ON the mask: its pieces are the same surface
+                // lifted by its own thickness `sT`, and where the mask has an
+                // opening it lies on the bare laminate or the pad itself.
+                const ArtLayer* maskAl = nullptr;
+                if (!isMask)
+                    for (const ArtLayer& other : art.layers)
+                        if (other.kind == LayerKind::Soldermask &&
+                            (other.name.rfind("F.", 0) == 0) == front)
+                            maskAl = &other;
+                const double cT = art.copperThickness;
+                const double mT = isMask ? al.thickness : art.maskThickness;
+                const double sT = isMask ? 0.0 : al.thickness;
+                const double lam = std::clamp(art.maskThicknessLaminate, mT, cT + mT);
+                const double rise = cT + mT - lam;
+                const double L = isMask ? (frontSide ? baseZ0 : baseZ0 + mT)
+                                 : maskAl ? (frontSide ? maskAl->z - cT
+                                                       : maskAl->z + cT + mT)
+                                          : (frontSide ? al.z - cT - mT
+                                                       : al.z + cT + mT);
                 static const int kSteps = [] {
                     const char* v = std::getenv("PCBVIEW_MASK_FILLET_STEPS");
                     const int n = v && v[0] ? std::atoi(v) : 8;
@@ -1668,9 +1675,11 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 std::vector<Paths64> tz;       // tz[0] = openings, tz[j] grown
                 std::vector<SegmentGrid> tzGrids;
                 std::unique_ptr<SegmentGrid> openGrid;
-                if (isMask && !al.art.empty()) {
+                const Paths64* openingsArt =
+                    isMask ? &al.art : (maskAl ? &maskAl->art : nullptr);
+                if (openingsArt && !openingsArt->empty()) {
                     const Paths64 openingsIn =
-                        clipPaths(al.art, art.outline, ClipType::Intersection);
+                        clipPaths(*openingsArt, art.outline, ClipType::Intersection);
                     const SegmentGrid outlineGrid(art.outline, 0.05);
                     Paths64 developed;
                     for (const Path64& path : openingsIn) {
@@ -1726,9 +1735,17 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // concave-only quadratic was steepest AT the copper edge, so
                 // the flat film met the slope in a sharp ridge with a shading
                 // crease along it). The taper scales all three.
+                // Set per region: inside a mask opening there is no film, so
+                // the surface is the laminate (or the pad's copper).
+                bool bare = false;
                 const auto filmAt = [&](int mode, double x, double y, double& h,
                                         double& gx, double& gy) {
-                    double H = mode == 1 ? al.thickness : lam;
+                    if (bare) {
+                        h = mode == 1 ? cT : 0.0;
+                        gx = gy = 0.0;
+                        return;
+                    }
+                    double H = mode == 1 ? mT : lam;
                     double Hx = 0.0, Hy = 0.0;
                     if (mode == 2) {
                         double dx = 0.0, dy = 0.0;
@@ -1743,7 +1760,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     }
                     double T, Tx, Ty;
                     taperAt(x, y, T, Tx, Ty);
-                    h = T * H;
+                    h = T * H + (mode == 1 ? cT : 0.0);
                     gx = Tx * H + T * Hx;
                     gy = Ty * H + T * Hy;
                 };
@@ -1773,42 +1790,37 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     }
                 };
 
-                // The laminate's face: what the mask's thickness is measured
-                // from. The copper's outer face, for the cap and the cliff.
-                const double lamFace = frontSide ? baseZ0 : baseZ0 + al.thickness;
-                const double copperFace =
-                    frontSide ? baseZ0 + art.copperThickness
-                              : baseZ0 + al.thickness - art.copperThickness;
-                const auto baseAt = [&](double x, double y, double& z, float n[3]) {
+                // The copper's outer face, for the cliff.
+                const double copperFace = L + zs * cT;
+                // Top of a piece: the mask's surface, lifted by the silk's
+                // thickness for silk. Its floor: the laminate for the mask
+                // (the film is measured from it), the mask's surface for silk.
+                const auto topOf = [&](int mode, double x, double y, double& z,
+                                       float n[3]) {
                     double h, gx, gy;
-                    filmAt(0, x, y, h, gx, gy);
-                    z = lamFace + zs * h;
+                    filmAt(mode, x, y, h, gx, gy);
+                    z = L + zs * (h + sT);
                     setNormal(n, gx, gy);
+                };
+                const auto floorOf = [&](int mode, double x, double y) {
+                    if (isMask) return L;
+                    double h, gx, gy;
+                    filmAt(mode, x, y, h, gx, gy);
+                    return L + zs * h;
+                };
+                const auto baseAt = [&](double x, double y, double& z, float n[3]) {
+                    topOf(0, x, y, z, n);
                 };
                 const auto capAt = [&](double x, double y, double& z, float n[3]) {
-                    double h, gx, gy;
-                    filmAt(1, x, y, h, gx, gy);
-                    z = copperFace + zs * h;
-                    setNormal(n, gx, gy);
+                    topOf(1, x, y, z, n);
                 };
-                // Bands: lifted by the profile at each vertex's distance from
-                // the rim. Silk rides the mask's surface at its own level.
                 const auto at = [&](double x, double y, double& z, float n[3]) {
-                    double h, gx, gy;
-                    filmAt(2, x, y, h, gx, gy);
-                    z = isMask ? lamFace + zs * h : level + zs * (h - lam);
-                    setNormal(n, gx, gy);
+                    topOf(2, x, y, z, n);
                 };
-                const auto lamFloor = [&](double, double) { return lamFace; };
-                // The band's underside: for the mask, the laminate; for silk,
-                // the mask's surface beneath it.
-                const auto floorAt = [&](double x, double y) {
-                    if (isMask) return lamFace;
-                    double z = 0.0;
-                    float n[3];
-                    at(x, y, z, n);
-                    return z - zs * al.thickness;
-                };
+                const auto baseFloor = [&](double x, double y) { return floorOf(0, x, y); };
+                const auto capFloor = [&](double x, double y) { return floorOf(1, x, y); };
+                const auto floorAt = [&](double x, double y) { return floorOf(2, x, y); };
+                const auto never = [](double, double, double, double) { return false; };
                 // Copper the film does not cover (an exposed pad). Band 0's
                 // inner edges there are not shared with a cap: the fillet's
                 // cross-section above the copper's top is a real cliff and
@@ -1851,8 +1863,12 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     regions.push_back(film);
                 }
 
-                for (const Paths64& region : regions) {
+                for (size_t ri = 0; ri < regions.size(); ++ri) {
+                    const Paths64& region = regions[ri];
                     if (region.empty()) continue;
+                    // The last region is inside the openings: for the mask a
+                    // closed hairline gap (film), for silk bare laminate/pad.
+                    bare = !isMask && taper && ri + 1 == regions.size();
                     // Base: beyond the foot, the thick film. Silk is an opaque
                     // slab; the mask's base is a sheet with walls only where
                     // the film is cut -- along the foot it abuts the last
@@ -1861,7 +1877,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     if (!isMask) {
                         for (const Shape& shape :
                              clipShapes(basePaths, region, ClipType::Intersection))
-                            extrude(shape, baseZ0, baseZ0 + al.thickness, part.mesh);
+                            sheet(shape, frontSide, baseAt, baseFloor, never, part.mesh);
                     } else {
                         const size_t from = part.mesh.indices.size();
                         const auto skipBase = [&](double ax, double ay, double bx,
@@ -1870,7 +1886,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                         };
                         for (const Shape& shape :
                              clipShapes(basePaths, region, ClipType::Intersection))
-                            sheet(shape, frontSide, baseAt, lamFloor, skipBase, part.mesh);
+                            sheet(shape, frontSide, baseAt, baseFloor, skipBase, part.mesh);
                         tagFilm(from, 0);
                     }
 
@@ -1887,12 +1903,9 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     {
                         const size_t from = part.mesh.indices.size();
                         if (!isMask) {
-                            const double top = level + zs * rise;
-                            const double lo = frontSide ? top - al.thickness : top;
-                            const double hi = frontSide ? top : top + al.thickness;
                             for (const Shape& shape :
                                  clipShapes(capPaths, region, ClipType::Intersection))
-                                extrude(shape, lo, hi, part.mesh);
+                                sheet(shape, frontSide, capAt, capFloor, never, part.mesh);
                         } else {
                             const auto skipCap = [&](double ax, double ay, double bx,
                                                      double by) {
@@ -1900,7 +1913,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                             };
                             for (const Shape& shape :
                                  clipShapes(capPaths, region, ClipType::Intersection))
-                                sheet(shape, frontSide, capAt, lamFloor, skipCap,
+                                sheet(shape, frontSide, capAt, capFloor, skipCap,
                                       part.mesh, /*underside=*/false);
                             tagFilm(from, 1);
                         }
