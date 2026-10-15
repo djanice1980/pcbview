@@ -1346,10 +1346,12 @@ Things we currently render differently from what the plant would produce:
    fillet rises to the opening's edge and stops dead beside a bare
    corridor. The film has TWO thicknesses -- the stackup's over copper,
    `maskThicknessLaminate` (20 um) on open laminate -- and every mask
-   triangle carries its thickness as a ratio of the thick film
-   (`Part::triFilm`, uploaded as a per-triangle buffer bound to the raster
-   fragment shaders and the path tracer, mirrored in the CPU tracer). The
-   three renderers turn it into opacity the same way, a = 1 - (1 - a0)^r,
+   VERTEX carries its thickness as a ratio of the thick film
+   (`Part::vertFilm`, uploaded per vertex; the raster vertex shader passes
+   it down as a varying, the path tracer and the CPU tracer interpolate it
+   by barycentrics). Per triangle it was a flat step per taper ring -- a
+   banded gradient at macro range. The three renderers turn it into
+   opacity the same way, a = 1 - (1 - a0)^r,
    so the slider's opacity is the thick film's and a trace shows through
    its thinner knee -- which is how a real LPI mask reads: deep in the
    valleys, lighter over the copper. The mask's OPENINGS get a developed
@@ -1369,9 +1371,11 @@ Things we currently render differently from what the plant would produce:
    height field lifted by the ink's thickness -- meniscus, taper and all
    -- and inside a mask opening (found from the same side's mask art) the
    ink lies on the bare laminate or on the pad, and at the pad's edge it
-   drapes up the 35 um step on the same S-curve (a square step left the
-   ink's end face hanging above the bare copper flank; a silk wall there
-   would be coplanar with the flank). It used to be built from the copper
+   drapes up the 35 um step on the same S-curve, over its own short
+   reach (2x the ink's thickness -- thin ink conforms tightly; on the
+   copper fillet's 52 um reach it floated on an air wedge). A square step
+   left the ink's end face hanging above the bare copper flank, and a silk
+   wall there would be coplanar with the flank. It used to be built from the copper
    alone, so across a pad's clearance ring it stayed at the mask's level:
    a bridge in the air. Silkscreen gets the same three pieces
    at its own thickness, so a stroke crossing a trace is one continuous
