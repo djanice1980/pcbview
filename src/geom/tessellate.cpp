@@ -474,9 +474,14 @@ struct SegmentGrid {
 // behind (exit faces never commit), which at a cut edge read as the mask
 // turning into a clear membrane with a hairline silhouette.
 // `front` picks the winding so faces point away from the board.
-template <class At, class FloorAt, class SkipWall>
+// `wallFloor(ax, ay, bx, by)` may give one wall a floor of its own (NaN keeps
+// `floorAt`): the fillet's cliff above an exposed pad stands on the copper's
+// top, not the laminate, because below the copper's top the copper's own
+// flank is the wall and a second one there would z-fight it.
+template <class At, class FloorAt, class SkipWall, class WallFloor>
 void sheet(const Shape& shape, bool front, At&& at, FloorAt&& floorAt,
-           SkipWall&& skipWall, Mesh& mesh, bool underside = true) {
+           SkipWall&& skipWall, Mesh& mesh, bool underside,
+           WallFloor&& wallFloor) {
     std::vector<std::vector<std::array<double, 2>>> polygon;
     polygon.reserve(shape.rings.size());
     for (const Ring& ring : shape.rings) polygon.push_back(ring.pts);
@@ -561,7 +566,9 @@ void sheet(const Shape& shape, bool front, At&& at, FloorAt&& floorAt,
             const float ny = static_cast<float>(-dir * ex / len);
             const uint32_t w = static_cast<uint32_t>(mesh.vertices.size());
             const double za = topZ[offset + i], zb = topZ[offset + j];
-            const double fa = floorAt(a[0], a[1]), fb = floorAt(b[0], b[1]);
+            double fa = floorAt(a[0], a[1]), fb = floorAt(b[0], b[1]);
+            const double own = wallFloor(a[0], a[1], b[0], b[1]);
+            if (!std::isnan(own)) fa = fb = own;
             const double P[4][3] = {{a[0], a[1], za}, {b[0], b[1], zb},
                                     {b[0], b[1], fb}, {a[0], a[1], fa}};
             for (const auto& p : P) {
@@ -584,6 +591,15 @@ void sheet(const Shape& shape, bool front, At&& at, FloorAt&& floorAt,
         }
         offset += n;
     }
+}
+
+template <class At, class FloorAt, class SkipWall>
+void sheet(const Shape& shape, bool front, At&& at, FloorAt&& floorAt,
+           SkipWall&& skipWall, Mesh& mesh, bool underside = true) {
+    sheet(shape, front, at, floorAt, skipWall, mesh, underside,
+          [](double, double, double, double) {
+              return std::numeric_limits<double>::quiet_NaN();
+          });
 }
 
 // Extrude one shape between zBottom and zTop, appending to mesh.
@@ -1464,7 +1480,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 //
                 // The film is PARTITIONED in 2D, by booleans, into:
                 //   base   beyond the fillet foot, at the dropped level;
-                //   cap    over copper to the rim (copper inflated 20 um), at
+                //   cap    over copper to the rim (the copper edge itself), at
                 //          the raised level -- for the mask a hair-thick
                 //          sheet, since the copper beneath is opaque and walls
                 //          would only be a second lottery;
@@ -1488,7 +1504,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // top. Reach ~1.5x the copper height, about what a 1 oz
                 // fillet spans. PCBVIEW_MASK_FILLET_STEPS sets the profile
                 // resolution.
-                const Paths64 film = PolyTreeToPaths64(tree);
+                Paths64 film = PolyTreeToPaths64(tree);
                 const double baseZ0 = al.z - filmDrop;
                 const double reach = art.copperThickness * 1.5;
                 const double rise = std::fabs(filmDrop);
@@ -1529,20 +1545,103 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     return r;
                 };
 
+                // Close the hairline gaps between the mask and its copper: a
+                // pad whose opening is drawn a couple of microns larger than
+                // the pad (the copper and mask arts chord the same arc
+                // differently) would otherwise get the full fillet lifted to
+                // the opening's edge, then a 45 um cliff and a bare corridor
+                // between it and the copper -- a sawn edge looks straight
+                // down that corridor. Nothing on a real board is registered
+                // to 5 um, so a gap that narrow is the mask meeting the
+                // copper. Only film-to-copper gaps: the fill must be within
+                // the snap of BOTH, so a real expansion is left open.
+                if (isMask) {
+                    constexpr double kSnap = 0.005;
+                    ClipperOffset co;
+                    co.ArcTolerance(kScale * 0.001);
+                    co.AddPaths(film, JoinType::Round, EndType::Polygon);
+                    Paths64 nearFilm;
+                    co.Execute(kSnap * kScale, nearFilm);
+                    const Paths64 nearCopper = inflate(kSnap);
+                    Paths64 gap = clipPaths(nearFilm, nearCopper, ClipType::Intersection);
+                    gap = clipPaths(gap, *supportRaw, ClipType::Difference);
+                    // Both dilations overhang a sawn edge; the film does not.
+                    gap = clipPaths(gap, art.outline, ClipType::Intersection);
+                    film = clipPaths(film, gap, ClipType::Union);
+                }
+
                 // Concentric rings: rings[0] is the rim, rings[kSteps] the foot.
+                // The rim is the copper edge ITSELF, so the meniscus starts at
+                // the copper's top edge and sweeps straight down (a 20 um
+                // shoulder at full height read as a squared-off ledge beside
+                // every pad, edge-on; and a 2 um hair was worse -- where the
+                // copper is clipped by the outline the hair's cut edge fell
+                // inside the shared-ring tolerance, lost its wall, and showed
+                // bare laminate). No mask wall stands on the rim any more, so
+                // nothing is coplanar with the copper's flanks.
                 std::vector<Paths64> rings(kSteps + 1);
-                for (int k = 0; k <= kSteps; ++k)
-                    rings[k] = inflate(0.02 + reach * k / kSteps);
+                rings[0] = clipPaths(*supportRaw, Paths64{}, ClipType::Union);
+                for (int k = 1; k <= kSteps; ++k)
+                    rings[k] = inflate(reach * k / kSteps);
                 const Paths64& rim = rings[0];
                 const Paths64& foot = rings[kSteps];
 
-                // Base: beyond the foot, full thickness, dropped.
-                for (const Shape& shape : clipShapes(film, foot, ClipType::Difference))
-                    extrude(shape, baseZ0, baseZ0 + al.thickness, part.mesh);
-
-                // Distance from the rim, for the meniscus profile and for
-                // telling a shared ring edge from a cut edge of the film.
+                // Distance from the rim, for the meniscus profile.
                 const SegmentGrid grid(rim, reach * 2.0 + 0.05);
+                // An edge that lies ON a ring polygon is shared with the
+                // neighbouring piece: no wall there, or a ray crossing it
+                // would meet a second entering face. Tested against the ring's
+                // own segments to half a micron -- the pieces are cut from the
+                // same paths, so a shared edge coincides to the nanometre,
+                // while a cut edge of the film can run parallel to a ring a
+                // couple of microns away (a mask opening hugging its pad) and
+                // must keep its wall: a distance-from-the-rim test with a
+                // chord-sag tolerance vetoed those too, and the opening's
+                // cliff went missing (bare laminate seen down the clearance).
+                // Endpoints AND midpoint: the outline between two neighbouring
+                // castellations runs from one pad's foot to the next pad's, so
+                // both its ends sit on the foot polygon while the edge itself
+                // is a cut edge that needs its wall.
+                const auto edgeOn = [](const SegmentGrid& g, double ax, double ay,
+                                       double bx, double by) {
+                    constexpr double kOn = 0.0005;
+                    double dx, dy;
+                    return g.nearest(ax, ay, dx, dy) < kOn &&
+                           g.nearest(bx, by, dx, dy) < kOn &&
+                           g.nearest(0.5 * (ax + bx), 0.5 * (ay + by), dx, dy) < kOn;
+                };
+                std::vector<SegmentGrid> ringGrids;
+                ringGrids.reserve(rings.size());
+                for (const Paths64& r : rings) ringGrids.emplace_back(r, 0.05);
+                const auto onRing = [&](int k, double ax, double ay, double bx,
+                                        double by) {
+                    return edgeOn(ringGrids[k], ax, ay, bx, by);
+                };
+
+                // Base: beyond the foot, full thickness, dropped. Silk is an
+                // opaque slab; the mask's base is a sheet with walls only where
+                // the film is cut -- along the foot it abuts the last band, and
+                // a wall there was an internal face (a dark stripe along the
+                // foot of every fillet, seen edge-on).
+                if (!isMask) {
+                    for (const Shape& shape : clipShapes(film, foot, ClipType::Difference))
+                        extrude(shape, baseZ0, baseZ0 + al.thickness, part.mesh);
+                } else {
+                    const double baseTop = frontSide ? baseZ0 + al.thickness : baseZ0;
+                    const auto baseAt = [&](double, double, double& z, float n[3]) {
+                        z = baseTop;
+                        n[0] = 0.0f;
+                        n[1] = 0.0f;
+                        n[2] = frontSide ? 1.0f : -1.0f;
+                    };
+                    const double baseFloor = frontSide ? baseZ0 : baseZ0 + al.thickness;
+                    const auto baseFloorAt = [&](double, double) { return baseFloor; };
+                    const auto onFoot = [&](double ax, double ay, double bx, double by) {
+                        return onRing(kSteps, ax, ay, bx, by);
+                    };
+                    for (const Shape& shape : clipShapes(film, foot, ClipType::Difference))
+                        sheet(shape, frontSide, baseAt, baseFloorAt, onFoot, part.mesh);
+                }
 
                 // Cap: over copper, at the raised level. Silk is an opaque
                 // slab at its own thickness. The mask's cap is a top sheet
@@ -1578,10 +1677,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                         const auto floorConst = [&](double, double) { return capFloor; };
                         const auto onRim = [&](double ax, double ay, double bx,
                                                double by) {
-                            double dx, dy;
-                            constexpr double tol = 0.003;  // arc-chord sag + rounding
-                            return grid.nearest(ax, ay, dx, dy) < tol &&
-                                   grid.nearest(bx, by, dx, dy) < tol;
+                            return onRing(0, ax, ay, bx, by);
                         };
                         for (const Shape& shape :
                              clipShapes(film, rim, ClipType::Intersection))
@@ -1616,6 +1712,20 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     at(x, y, z, n);
                     return z - zs * al.thickness;
                 };
+                // Copper the film does not cover (an exposed pad). Band 0's
+                // inner edges there are not shared with a cap: the fillet's
+                // cross-section above the copper's top is a real cliff and
+                // needs a wall, or a ray skimming over the pad slips into the
+                // band sideways, leaves through its free underside and lands
+                // on untinted laminate. Below the copper's top the copper's own
+                // flank closes the band, so the wall stands on the copper.
+                const Paths64 exposed = clipPaths(rings[0], film, ClipType::Difference);
+                const SegmentGrid exposedGrid(exposed, 0.05);
+                const auto onExposed = [&](double ax, double ay, double bx, double by) {
+                    return edgeOn(exposedGrid, ax, ay, bx, by);
+                };
+                const double copperFace =
+                    frontSide ? baseZ0 + rise : baseZ0 + al.thickness - rise;
                 for (int k = 0; k < kSteps; ++k) {
                     const Paths64 band =
                         clipPaths(rings[k + 1], rings[k], ClipType::Difference);
@@ -1623,20 +1733,23 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     // shared with the neighbouring band: no wall there, or a
                     // ray from above would meet two entering faces. Anything
                     // else is a cut edge of the film and gets closed.
-                    const double r0 = reach * k / kSteps;
-                    const double r1 = reach * (k + 1) / kSteps;
+                    const auto cliff = [&](double ax, double ay, double bx, double by) {
+                        return isMask && k == 0 && onRing(0, ax, ay, bx, by) &&
+                               onExposed(ax, ay, bx, by);
+                    };
                     const auto skipWall = [&](double ax, double ay, double bx,
                                               double by) {
-                        double dx, dy;
-                        const double da = grid.nearest(ax, ay, dx, dy);
-                        const double db = grid.nearest(bx, by, dx, dy);
-                        constexpr double tol = 0.003;  // arc-chord sag + rounding
-                        const bool onR0 = std::abs(da - r0) < tol && std::abs(db - r0) < tol;
-                        const bool onR1 = std::abs(da - r1) < tol && std::abs(db - r1) < tol;
-                        return onR0 || onR1;
+                        if (cliff(ax, ay, bx, by)) return false;
+                        return onRing(k, ax, ay, bx, by) || onRing(k + 1, ax, ay, bx, by);
+                    };
+                    const auto wallFloor = [&](double ax, double ay, double bx, double by) {
+                        return cliff(ax, ay, bx, by)
+                                   ? copperFace
+                                   : std::numeric_limits<double>::quiet_NaN();
                     };
                     for (const Shape& shape : clipShapes(film, band, ClipType::Intersection))
-                        sheet(shape, frontSide, at, floorAt, skipWall, part.mesh);
+                        sheet(shape, frontSide, at, floorAt, skipWall, part.mesh,
+                              /*underside=*/true, wallFloor);
                 }
             }
             const size_t added = (part.mesh.indices.size() - before) / 3;

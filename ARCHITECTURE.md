@@ -1294,36 +1294,45 @@ Things we currently render differently from what the plant would produce:
    traced shadows the slit reads as a dark line and every silk stroke casts
    a visibly displaced shadow (found by a user camera move flying
    millimetres above a flex board). The film is now split by the outer
-   foil's copper -- inflated 20 um first, because splitting exactly at the
-   edge puts the dropped film's side walls coplanar with every trace's side
-   walls, which is the z-fighting the via barrels already solved by
-   insetting -- and the unsupported region extrudes a copper thickness
-   closer to the core. The film is three NON-overlapping pieces -- that
+   foil's copper, exactly at its edge (it was inflated 20 um first, to keep
+   the dropped film's side walls off every trace's side walls -- the
+   z-fighting the via barrels solved by insetting -- but no film wall
+   stands on that edge any more, see below, and the 20 um read as a
+   squared-off ledge beside every pad at macro range), and the
+   unsupported region extrudes a copper thickness closer to the core. The film is three NON-overlapping pieces -- that
    is the invariant: the path tracer treats every ENTERING face of a
    translucent film as an independent alpha lottery (exits never commit),
    so two overlapping solids tint twice, which read as darker bands along
    every shoulder until the overlap was removed. A dropped base over
    everything the other two do not cover; a cap over copper (to the rim,
-   copper inflated 20 um): a top sheet with walls down to the laminate
-   where the film is CUT (the board outline, a mask opening) and no
-   underside -- from above a ray meets the sheet and then opaque copper,
-   one lottery, while the walls coat the copper's flanks and the 20 um
-   shoulder at a sawn edge. Along the rim ring itself the first fillet
-   band abuts the cap and there is deliberately no wall: that face is
-   internal, and a ray through the fillet's cross-section at a
-   castellation crossed it into the cap for a second lottery -- a dark
-   stripe beside every castellated pad. (A hair-thick cap with no walls
-   was tried before that: fine from above, but edge-on it left bare
-   copper flank and bare laminate between the pad and the fillet.) The
-   same rule the bands use between themselves: a boundary edge whose
-   endpoints both sit on a shared ring gets no wall; and a lofted
+   which is the copper edge itself): a top sheet with no underside --
+   from above a ray meets the sheet and then opaque copper, one lottery;
+   and a lofted
    SKIRT, quad strips swept along the rim on a concave quadratic profile
    with normals from the profile's slope, so the meniscus at the foot of
    every trace shades as a continuous curve in every render mode. The
    base stops exactly where the skirt's footprint begins (the clipped rim
    stroked by the reach) and nowhere else: around a pad with mask
    expansion the rim lies inside the opening, there is no fillet, and the
-   film runs to the opening's edge. Silkscreen gets the same three pieces
+   film runs to the opening's edge. Which boundary edges of a piece get a
+   WALL is the whole game, because every wall is an entering face: an
+   edge that lies on the ring polygon shared with the neighbouring piece
+   (endpoints AND midpoint on it, to half a micron -- the pieces are cut
+   from the same paths) gets none, since a ray crossing it sideways would
+   roll a second lottery (that stripe appeared three times: a cap wall on
+   the rim, the base's wall on the foot, and the rim set 20 um out so the
+   cut edge fell within a chord-sag tolerance); every other edge -- the
+   outline at a castellation, a mask opening -- is a cut edge of the film
+   and gets one, including the outline between two castellations, whose
+   two ENDS both touch the foot (hence the midpoint). Band 0's inner edge
+   along copper the film does not cover (an exposed pad) is a cliff, not a
+   shared edge: it gets a wall from the copper's TOP to the crest (below
+   that the copper's flank is the wall), or a ray skimming the pad slips
+   in sideways and lands on untinted laminate. Hairline gaps between the
+   film and its copper (an opening chorded 2 um wider than its pad) are
+   closed first, within 5 um of both and inside the outline, or the whole
+   fillet rises to the opening's edge and stops dead beside a bare
+   corridor. Silkscreen gets the same three pieces
    at its own thickness, so a stroke crossing a trace is one continuous
    top riding the mask.
 
