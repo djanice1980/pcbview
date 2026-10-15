@@ -1540,14 +1540,23 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 for (const Shape& shape : clipShapes(film, foot, ClipType::Difference))
                     extrude(shape, baseZ0, baseZ0 + al.thickness, part.mesh);
 
+                // Distance from the rim, for the meniscus profile and for
+                // telling a shared ring edge from a cut edge of the film.
+                const SegmentGrid grid(rim, reach * 2.0 + 0.05);
+
                 // Cap: over copper, at the raised level. Silk is an opaque
                 // slab at its own thickness. The mask's cap is a top sheet
-                // with WALLS down to the laminate along its whole boundary
-                // but no underside: from above a ray meets the sheet and then
-                // opaque copper (one lottery), while the walls are what coat
-                // the copper's flanks and the 20 um shoulder beside them --
-                // seen edge-on at a castellation, a hair-thick cap left bare
-                // copper and bare laminate between the pad and the fillet.
+                // with walls down to the laminate and no underside: from
+                // above a ray meets the sheet and then opaque copper (one
+                // lottery), while the walls coat the copper's flanks and the
+                // 20 um shoulder beside them where the film is CUT -- the
+                // board outline, a mask opening. Along the rim ring itself
+                // band 0 abuts the cap, and a wall there would be an internal
+                // face: a ray through the fillet's cross-section at a
+                // castellation crossed it into the cap for a second lottery
+                // (a dark stripe beside the pad). A hair-thick cap with no
+                // walls at all was tried before that: bare copper and bare
+                // laminate between the pad and the fillet.
                 {
                     const double top = frontSide ? baseZ0 + al.thickness + rise
                                                  : baseZ0 - rise;
@@ -1567,19 +1576,22 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                         const double capFloor =
                             baseZ0 + (frontSide ? 0.0 : al.thickness);
                         const auto floorConst = [&](double, double) { return capFloor; };
-                        const auto wallEverywhere = [](double, double, double, double) {
-                            return false;
+                        const auto onRim = [&](double ax, double ay, double bx,
+                                               double by) {
+                            double dx, dy;
+                            constexpr double tol = 0.003;  // arc-chord sag + rounding
+                            return grid.nearest(ax, ay, dx, dy) < tol &&
+                                   grid.nearest(bx, by, dx, dy) < tol;
                         };
                         for (const Shape& shape :
                              clipShapes(film, rim, ClipType::Intersection))
-                            sheet(shape, frontSide, capAt, floorConst, wallEverywhere,
+                            sheet(shape, frontSide, capAt, floorConst, onRim,
                                   part.mesh, /*underside=*/false);
                     }
                 }
 
                 // Bands: the zone, lifted by the profile at each vertex's
                 // distance from the rim.
-                const SegmentGrid grid(rim, reach * 2.0 + 0.05);
                 const double zs = frontSide ? 1.0 : -1.0;
                 const auto at = [&](double x, double y, double& z, float n[3]) {
                     double dx = 0.0, dy = 0.0;

@@ -1170,6 +1170,11 @@ interactive run. All are opt-in. Grouped by purpose:
   angles for views the three presets cannot express. A grazing pitch is how
   the board EDGE gets inspected, which is where the orthographic near-plane
   clip was finally reproduced.
+- `PCBVIEW_START_TARGET=x,y,z` / `PCBVIEW_START_FOV=<degrees>` — orbit pivot
+  (mm) and field of view. With yaw/pitch/distance these reproduce the pose a
+  recorded move ends at: read the last key of `showcasePathData` in
+  `~/.pcbview/settings.xml` (yaw, pitch, roll, distance, tx, ty, tz,
+  explode). The FOV is not recorded, so magnified views need it guessed.
 - `PCBVIEW_MEASURE=x1,y1,z1,x2,y2,z2` — pin a measurement between two world
   points in mm (mouse picks can't be synthesised).
 - `PCBVIEW_NET=<name>` — highlight a net by name (the picker dock and board
@@ -1300,11 +1305,18 @@ Things we currently render differently from what the plant would produce:
    every shoulder until the overlap was removed. A dropped base over
    everything the other two do not cover; a cap over copper (to the rim,
    copper inflated 20 um): a top sheet with walls down to the laminate
-   along its boundary and no underside -- from above a ray meets the
-   sheet and then opaque copper, one lottery, while the walls coat the
-   copper's flanks and the 20 um shoulder (a hair-thick cap was tried:
-   fine from above, but edge-on at a castellation it left bare copper
-   flank and bare laminate between the pad and the fillet); and a lofted
+   where the film is CUT (the board outline, a mask opening) and no
+   underside -- from above a ray meets the sheet and then opaque copper,
+   one lottery, while the walls coat the copper's flanks and the 20 um
+   shoulder at a sawn edge. Along the rim ring itself the first fillet
+   band abuts the cap and there is deliberately no wall: that face is
+   internal, and a ray through the fillet's cross-section at a
+   castellation crossed it into the cap for a second lottery -- a dark
+   stripe beside every castellated pad. (A hair-thick cap with no walls
+   was tried before that: fine from above, but edge-on it left bare
+   copper flank and bare laminate between the pad and the fillet.) The
+   same rule the bands use between themselves: a boundary edge whose
+   endpoints both sit on a shared ring gets no wall; and a lofted
    SKIRT, quad strips swept along the rim on a concave quadratic profile
    with normals from the profile's slope, so the meniscus at the foot of
    every trace shades as a continuous curve in every render mode. The

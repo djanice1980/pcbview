@@ -406,10 +406,25 @@ MainWindow::MainWindow(const QString& path) {
     // initialise()'s frameBoard() would clobber a pre-expose value (the usual
     // before-first-frame trap). Needed to reproduce artifacts that only show
     // when zoomed tight (the camera cannot be driven by synthetic input).
-    if (qEnvironmentVariableIsSet("PCBVIEW_START_DISTANCE")) {
-        const float d = qEnvironmentVariable("PCBVIEW_START_DISTANCE").toFloat();
-        QTimer::singleShot(600, this, [this, d] {
-            viewport_->camera().distance = d;
+    // PCBVIEW_START_TARGET=x,y,z (orbit pivot, mm) and PCBVIEW_START_FOV
+    // (degrees) ride the same timer: together with yaw/pitch/distance they
+    // reproduce any pose a recorded move ends at.
+    if (qEnvironmentVariableIsSet("PCBVIEW_START_DISTANCE") ||
+        qEnvironmentVariableIsSet("PCBVIEW_START_TARGET") ||
+        qEnvironmentVariableIsSet("PCBVIEW_START_FOV")) {
+        QTimer::singleShot(600, this, [this] {
+            Camera& c = viewport_->camera();
+            if (qEnvironmentVariableIsSet("PCBVIEW_START_DISTANCE"))
+                c.distance = qEnvironmentVariable("PCBVIEW_START_DISTANCE").toFloat();
+            const QStringList t =
+                qEnvironmentVariable("PCBVIEW_START_TARGET").split(',');
+            if (t.size() == 3) {
+                c.targetX = t[0].toFloat();
+                c.targetY = t[1].toFloat();
+                c.targetZ = t[2].toFloat();
+            }
+            if (qEnvironmentVariableIsSet("PCBVIEW_START_FOV"))
+                c.fovDegrees = qEnvironmentVariable("PCBVIEW_START_FOV").toFloat();
             viewport_->requestUpdate();
         });
     }
