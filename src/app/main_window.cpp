@@ -549,6 +549,19 @@ MainWindow::MainWindow(const QString& path) {
 // window zooms, unless it is over something that scrolls or spins itself.
 bool MainWindow::eventFilter(QObject* obj, QEvent* ev) {
     if (!viewport_) return QMainWindow::eventFilter(obj, ev);
+    static const bool inputDebug = qEnvironmentVariableIsSet("PCBVIEW_INPUT_DEBUG");
+    if (inputDebug && viewport_->mouseDragging() &&
+        (ev->type() == QEvent::MouseMove || ev->type() == QEvent::MouseButtonRelease ||
+         ev->type() == QEvent::Leave || ev->type() == QEvent::Enter)) {
+        std::printf("filter: %s -> %s(%s)\n",
+                    ev->type() == QEvent::MouseMove          ? "move"
+                    : ev->type() == QEvent::MouseButtonRelease ? "release"
+                    : ev->type() == QEvent::Leave              ? "leave"
+                                                               : "enter",
+                    obj->metaObject()->className(),
+                    obj->objectName().toUtf8().constData());
+        std::fflush(stdout);
+    }
     auto* w = qobject_cast<QWidget*>(obj);
     if (!w) return QMainWindow::eventFilter(obj, ev);
     const auto toViewport = [this](const QPointF& global) {

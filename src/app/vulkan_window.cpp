@@ -3375,11 +3375,18 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
     // once it leaves the viewport -- over the docks, or outside the window.
     // Honoured on X11; Wayland allows no explicit grabs, so there the main
     // window's event filter redirects the moves it still receives.
-    setMouseGrabEnabled(true);
+    // (Wayland allows no explicit grabs and says so on every press.)
+    if (QGuiApplication::platformName() == "xcb") setMouseGrabEnabled(true);
 }
 
 void VulkanWindow::handleRelease(Qt::MouseButton button, const QPointF& pos,
                                  Qt::KeyboardModifiers mods) {
+    static const bool inputDebug = qEnvironmentVariableIsSet("PCBVIEW_INPUT_DEBUG");
+    if (inputDebug) {
+        std::printf("release: button=%d at %.0f,%.0f\n", static_cast<int>(button),
+                    pos.x(), pos.y());
+        std::fflush(stdout);
+    }
     if (button == Qt::LeftButton) {
         dragging_ = false;
         if (clickCandidate_) {
@@ -3409,7 +3416,7 @@ void VulkanWindow::handleRelease(Qt::MouseButton button, const QPointF& pos,
     // fast-movement downgrade would never get the frame that restores PT/RT once
     // the button comes up.
     if (!dragging_ && !draggingInv_ && !panning_) {
-        setMouseGrabEnabled(false);
+        if (QGuiApplication::platformName() == "xcb") setMouseGrabEnabled(false);
         requestUpdate();
     }
 }
@@ -3419,6 +3426,13 @@ void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
 }
 
 void VulkanWindow::handleMove(const QPointF& pos, Qt::MouseButtons held) {
+    static const bool inputDebug = qEnvironmentVariableIsSet("PCBVIEW_INPUT_DEBUG");
+    if (inputDebug && (dragging_ || draggingInv_ || panning_)) {
+        std::printf("move: %.0f,%.0f buttons=0x%x inside=%d\n", pos.x(), pos.y(),
+                    static_cast<unsigned>(held),
+                    static_cast<int>(QRectF(QPointF(), QSizeF(size())).contains(pos)));
+        std::fflush(stdout);
+    }
     // A button released OUTSIDE the window can go undelivered (a native
     // child window in a container does not always keep the implicit grab,
     // notably on Wayland), which left the drag latched: the camera kept
