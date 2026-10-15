@@ -122,6 +122,8 @@ struct LayerArt {
     double thickness = 1.6;
     double copperThickness = 0.035;
     double maskThickness = 0.010;
+    // Film thickness on open laminate (see BoardModel::maskThicknessLaminate).
+    double maskThicknessLaminate = 0.020;
     // The pad-to-mask clearance the openings were actually built with: the
     // board's own expansion or the fab floor (TessellateOptions::maskRelief),
     // whichever is larger. Reported, so the Properties dock can say which.

@@ -21,6 +21,10 @@ layout(std430, set = 0, binding = 3) readonly buffer TriMat { uint triMat[]; };
 // other triangle report a float's bit pattern as its net index -- which
 // lights up unrelated copper all over the board.
 layout(std430, set = 0, binding = 8) readonly buffer TriNet { int triNet[]; };
+// Mask film thickness per triangle as a ratio of the thick film on open
+// laminate (0 = not a film). Beer-Lambert: the material's opacity is the thick
+// film's, and thinner film passes more -- 1 - (1 - a)^ratio.
+layout(std430, set = 0, binding = 15) readonly buffer TriFilm { float triFilm[]; };
 // The highlighted net as an area light: 3 corners per triangle, v0.w = area.
 layout(std430, set = 0, binding = 9) readonly buffer NetLights { vec4 netLit[]; };
 // Per-net glow colour; a = 1 when highlighted. Indexed by net id.
@@ -219,6 +223,8 @@ const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
 float effAlpha(uint prim) {
     Mat m = mats[triMat[prim]];
     float a = m.albedo.a;
+    float film = triFilm[prim];
+    if (film > 0.0 && a < 0.999) a = 1.0 - pow(1.0 - a, film);
     if (m.params.w > 0.5) a = mix(a, pc.misc.w, pc.misc.x);
     return a;
 }

@@ -188,6 +188,10 @@ struct BoardModel {
     // KiCad defaults; dielectric is derived in buildLayerStack().
     double copperThickness = 0.035;
     double maskThickness = 0.010;
+    // LPI mask on OPEN laminate is thicker than over copper: the liquid levels
+    // toward a flat surface, so it is ~20 um in the valleys and ~10 um over a
+    // trace's knee. Not in any stackup table, so a typical value.
+    double maskThicknessLaminate = 0.020;
 
     // The explicit stackup, when the board carries `(setup (stackup ...))`.
     // KiCad lists it TOP-DOWN and gives each film its own thickness, so an

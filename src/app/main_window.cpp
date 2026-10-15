@@ -3751,6 +3751,7 @@ void MainWindow::populateProperties() {
         mm(th, 3) + " mm" + (thicknessOverride_ > 0.0 ? " (override)" : ""));
     add("Copper foil", mm(board_.copperThickness, 4) + " mm");
     add("Mask film", mm(board_.maskThickness, 4) + " mm");
+    add("Mask on laminate", mm(baseArt_.maskThicknessLaminate, 4) + " mm");
     add("Mask clearance",
         mm(baseArt_.maskClearance, 3) + " mm" +
             (baseArt_.maskClearance > board_.padToMaskClearance ? " (fab floor)"

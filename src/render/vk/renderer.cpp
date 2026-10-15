@@ -71,6 +71,9 @@ constexpr uint32_t kNetBinding = 2;
 constexpr uint32_t kNetColorBinding = 3;
 // Per-net origin + inverse span, so the chase is evaluated per fragment.
 constexpr uint32_t kNetSpanBinding = 4;
+// Per-triangle mask film ratio (thickness / thick film). Both fragment shaders
+// and the path tracer turn it into opacity: a = 1 - (1 - a)^ratio.
+constexpr uint32_t kFilmBinding = 5;
 
 struct PtPush {
     float eye[4];    // xyz, w = sampleIndex
@@ -230,6 +233,7 @@ Renderer::~Renderer() {
     destroyBuffer(materialBuffer_);
     destroyBuffer(triMaterialBuffer_);
     destroyBuffer(triNetBuffer_);
+    destroyBuffer(triFilmBuffer_);
     destroyBuffer(netColorBuffer_);
     destroyBuffer(netSpanBuffer_);
     destroyBuffer(netLightBuffer_);
@@ -722,8 +726,10 @@ void Renderer::createPathTracer() {
     // estimation), so it actually illuminates its surroundings.
     // 11 = first-hit net phase, written as an AOV so the chase animation can
     // run as a display-time modulation without disturbing accumulation.
-    VkDescriptorSetLayoutBinding b[15]{};
-    for (uint32_t i = 0; i < 15; ++i) {
+    // 15 = per-triangle mask film ratio (thin over a trace, thick on open
+    // laminate), for the thickness-dependent lottery.
+    VkDescriptorSetLayoutBinding b[16]{};
+    for (uint32_t i = 0; i < 16; ++i) {
         b[i].binding = i;
         b[i].descriptorCount = 1;
         b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -737,6 +743,7 @@ void Renderer::createPathTracer() {
     b[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // 12 = per-net origin + inverse span, for the per-fragment chase phase.
     b[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     // 13 = first-hit world position, the anchor for temporal reuse.
     b[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     // 14 = deterministic first-hit normal, for edge-stopping that does not
@@ -744,7 +751,7 @@ void Renderer::createPathTracer() {
     b[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     VkDescriptorSetLayoutCreateInfo li{
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    li.bindingCount = 15;
+    li.bindingCount = 16;
     li.pBindings = b;
     check(vkCreateDescriptorSetLayout(device_.handle, &li, nullptr, &ptSetLayout_),
           "pt set layout");
@@ -768,7 +775,7 @@ void Renderer::createPathTracer() {
 
     VkDescriptorPoolSize sizes[] = {
         {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8},  // + netColour, netSpan
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 9},  // + netColour, netSpan, film
         // 6 pt (accum, albedo, normal, net phase, first-hit pos, first-hit
         // normal) + 3 tonemap. Was 7 -- undercounted when bindings 11/13/14
         // were added. Windows drivers don't enforce pool sizes so it never
@@ -1018,12 +1025,13 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorBufferInfo tri{triMaterialBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo mat{materialBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo net{triNetBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo film{triFilmBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo acc{VK_NULL_HANDLE, ptAccum_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
 
-    VkWriteDescriptorSet w[15]{};
-    for (int i = 0; i < 15; ++i) {
+    VkWriteDescriptorSet w[16]{};
+    for (int i = 0; i < 16; ++i) {
         w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w[i].dstSet = ptSet_;
         w[i].dstBinding = i;
@@ -1063,7 +1071,8 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorImageInfo gnrm{VK_NULL_HANDLE, ptGeoNormal_.view,
                                VK_IMAGE_LAYOUT_GENERAL};
     w[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[14].pImageInfo = &gnrm;
-    vkUpdateDescriptorSets(device_.handle, 15, w, 0, nullptr);
+    w[15].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[15].pBufferInfo = &film;
+    vkUpdateDescriptorSets(device_.handle, 16, w, 0, nullptr);
 
     VkDescriptorImageInfo den{VK_NULL_HANDLE, ptDenoised_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet tw[3]{};
@@ -3207,6 +3216,8 @@ void Renderer::createDescriptors() {
         bindings.push_back(net);
         net.binding = kNetSpanBinding;
         bindings.push_back(net);
+        net.binding = kFilmBinding;
+        bindings.push_back(net);
     }
 
     VkDescriptorSetLayoutCreateInfo info{
@@ -3217,7 +3228,7 @@ void Renderer::createDescriptors() {
           "vkCreateDescriptorSetLayout");
 
     std::vector<VkDescriptorPoolSize> sizes{
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};  // materials, triNet, colour, span
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5}};  // materials, triNet, colour, span, film
     if (rtSupported_)
         sizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1});
     VkDescriptorPoolCreateInfo pool{
@@ -3939,6 +3950,7 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     std::vector<MaterialGpu> materials;
     std::vector<uint32_t> triMaterial;  // per global triangle: material index (path tracer)
     std::vector<int32_t> triNet;        // per global triangle: net index, -1 none
+    std::vector<float> triFilm;         // per global triangle: mask film ratio, 0 none
     std::vector<uint32_t> vertexMat;    // per global vertex: material index (explode bake)
     std::vector<float> centreZ;  // per material, for explode ranking
     std::vector<int> mount;      // per material: 0 board layer, +/-1 component side
@@ -4084,6 +4096,7 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         for (uint32_t t = 0; t < triCount; ++t) {
             triMaterial.push_back(item.material);
             triNet.push_back(t < part.triNet.size() ? part.triNet[t] : -1);
+            triFilm.push_back(t < part.triFilm.size() ? part.triFilm[t] : 0.0f);
         }
 
         stats_.trianglesTotal += static_cast<uint32_t>(part.mesh.triangleCount());
@@ -4365,6 +4378,15 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         uploadViaStaging(triNetBuffer_, triNet.data(), nsize);
+
+        destroyBuffer(triFilmBuffer_);
+        if (triFilm.empty()) triFilm.push_back(0.0f);
+        const VkDeviceSize fsize = triFilm.size() * sizeof(float);
+        triFilmBuffer_ = createBuffer(
+            fsize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        uploadViaStaging(triFilmBuffer_, triFilm.data(), fsize);
     }
 
     const VkDeviceSize msize = materials.size() * sizeof(MaterialGpu);
@@ -4378,7 +4400,8 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     VkDescriptorBufferInfo bufferInfo{materialBuffer_.handle, 0, msize};
     VkDescriptorBufferInfo netInfo{triNetBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo spanInfo{netSpanBuffer_.handle, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet writes[3]{};
+    VkDescriptorBufferInfo filmInfo{triFilmBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet writes[4]{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = materialSet_;
     writes[0].dstBinding = 0;
@@ -4397,7 +4420,13 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     writes[2].descriptorCount = 1;
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     writes[2].pBufferInfo = &spanInfo;
-    vkUpdateDescriptorSets(device_.handle, 3, writes, 0, nullptr);
+    writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    writes[3].dstSet = materialSet_;
+    writes[3].dstBinding = kFilmBinding;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[3].pBufferInfo = &filmInfo;
+    vkUpdateDescriptorSets(device_.handle, 4, writes, 0, nullptr);
 
     // Build the RT acceleration structure over this geometry and point binding 1
     // at it. Rebuilt every upload -- a new board / thickness changes the buffers.

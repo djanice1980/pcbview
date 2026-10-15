@@ -212,6 +212,7 @@ private:
     std::vector<uint32_t> indices_;    // 3 per triangle, global
     std::vector<Material> materials_;  // one per part with geometry
     std::vector<uint32_t> triMat_;     // per triangle -> materials_ index
+    std::vector<float> triFilm_;       // per triangle: mask film ratio, 0 none
 
     // Per-part explode/visibility data (mesh.parts order, empties skipped), to
     // re-bake the peel exactly like the GPU path.

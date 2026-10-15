@@ -1182,6 +1182,11 @@ interactive run. All are opt-in. Grouped by purpose:
 
 **Appearance (mirror the Appearance dialog, which input synthesis can't drive)**
 - `PCBVIEW_THICKNESS=<mm>` — finished-board thickness override.
+- `PCBVIEW_MASK_LAMINATE=<mm>` — mask film thickness on OPEN laminate (default
+  0.020; the stackup's mask thickness is the film over copper). The liquid
+  levels, so it is thicker in the valleys than over a trace's knee; opacity
+  follows thickness per triangle (Beer-Lambert), so the "Soldermask opacity"
+  slider sets the thick film's and traces show through their thinner one.
 - `PCBVIEW_MASK_RELIEF=<mm>` — the fab's minimum pad-to-mask clearance
   (default 0.05; 0 renders the artwork's openings literally). KiCad boards
   usually carry a 0 expansion and rely on the fab to add this, so without it
@@ -1339,7 +1344,15 @@ Things we currently render differently from what the plant would produce:
    film and its copper (an opening chorded 2 um wider than its pad) are
    closed first, within 5 um of both and inside the outline, or the whole
    fillet rises to the opening's edge and stops dead beside a bare
-   corridor. Silkscreen gets the same three pieces
+   corridor. The film has TWO thicknesses -- the stackup's over copper,
+   `maskThicknessLaminate` (20 um) on open laminate -- and every mask
+   triangle carries its thickness as a ratio of the thick film
+   (`Part::triFilm`, uploaded as a per-triangle buffer bound to the raster
+   fragment shaders and the path tracer, mirrored in the CPU tracer). The
+   three renderers turn it into opacity the same way, a = 1 - (1 - a0)^r,
+   so the slider's opacity is the thick film's and a trace shows through
+   its thinner knee -- which is how a real LPI mask reads: deep in the
+   valleys, lighter over the copper. Silkscreen gets the same three pieces
    at its own thickness, so a stroke crossing a trace is one continuous
    top riding the mask.
 

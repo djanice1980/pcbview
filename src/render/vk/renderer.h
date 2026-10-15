@@ -743,6 +743,7 @@ private:
     // triangle order as the index buffer; the raster fragment shader reaches
     // it via MaterialGpu::extra[0] + gl_PrimitiveID.
     Buffer triNetBuffer_;
+    Buffer triFilmBuffer_;  // per global triangle: mask film ratio (0 = not a film)
     // The highlighted net as a SAMPLEABLE light: one entry per triangle on
     // that net (three corners + its area), rebuilt whenever the highlight
     // changes. Next-event estimation samples these directly instead of hoping
@@ -840,7 +841,7 @@ private:
     float substrateOpacity_ = 1.0f;
     float peelAlpha_ = 0.02f;  // fully-peeled substrate opacity
     std::array<float, 3> maskColor_ = {0.05f, 0.29f, 0.12f};  // green
-    float maskOpacity_ = 0.72f;  // mask albedo.a; drives raster blend + PT show-through
+    float maskOpacity_ = 0.88f;  // mask albedo.a at the THICK film; drives raster blend + PT show-through
     float componentShine_ = 0.0f;  // 0 matte .. 1 chrome (stylised effect)
     float padShine_ = 0.94f;       // maps to copper roughness 0.5 .. 0.02
     float shadowSoftness_ = 0.15f; // sun radius = s * 8 deg (default 1.2 deg)

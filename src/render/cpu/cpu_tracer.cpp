@@ -108,7 +108,7 @@ Material makeMaterial(const geom::Part& part) {
             return {{0.72f, 0.61f, 0.38f, 1.0f}, 0.85f, 0.0f, 1.0f};
         case geom::Material::Soldermask:
             // Industry green #19882C (linear), semi-gloss (see renderer.cpp).
-            return {{0.010f, 0.246f, 0.025f, 0.72f}, 0.20f, 0.0f, 0.0f};
+            return {{0.010f, 0.246f, 0.025f, 0.88f}, 0.20f, 0.0f, 0.0f};
         case geom::Material::Silkscreen:
             return {{0.90f, 0.90f, 0.87f, 1.0f}, 0.80f, 0.0f, 0.0f};
         case geom::Material::Component:
@@ -182,6 +182,7 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
     triNet_.clear();
     materials_.clear();
     triMat_.clear();
+    triFilm_.clear();
     partSpans_.clear();
     maxRank_ = 0.0f;
     peel_ = 0.0f;
@@ -196,6 +197,7 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
     normals_.reserve(nv * 3);
     indices_.reserve(nt * 3);
     triMat_.reserve(nt);
+    triFilm_.reserve(nt);
     triNet_.reserve(nt);
 
     // Per-part data for the explode-rank computation, mirroring the GPU path's
@@ -228,6 +230,7 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
             indices_.push_back(base + part.mesh.indices[i + 1]);
             indices_.push_back(base + part.mesh.indices[i + 2]);
             triMat_.push_back(matId);
+            triFilm_.push_back(i / 3 < part.triFilm.size() ? part.triFilm[i / 3] : 0.0f);
             // Net id in the SAME order, filled by the same loop that emits the
             // triangle. The renderer builds its own copy in a DIFFERENT order
             // (it hoists films to the end of the index buffer), so taking that
@@ -396,6 +399,7 @@ struct Ctx {
     const float* norms;   // 3 floats/vertex
     const Material* mats;
     const uint32_t* triMat;
+    const float* triFilm;  // mask film ratio per triangle, 0 = not a film
     float peel;       // substrate fade amount (0 at rest)
     float peelAlpha;  // opacity a fully peeled slab fades to
     bool preview;     // RT preview: sun shadow + AO, no GI bounces
@@ -448,6 +452,10 @@ inline V3 vnrm(const Ctx& c, uint32_t i) {
 inline float effAlpha(const Ctx& c, uint32_t prim) {
     const Material& m = c.mats[c.triMat[prim]];
     float a = m.albedo[3];
+    // Thickness-dependent film: the opacity is the thick film's, thinner
+    // film over a trace passes more (Beer-Lambert).
+    const float film = c.triFilm[prim];
+    if (film > 0.0f && a < 0.999f) a = 1.0f - std::pow(1.0f - a, film);
     if (m.fade > 0.5f) a = a * (1.0f - c.peel) + c.peelAlpha * c.peel;
     return a;
 }
@@ -1111,6 +1119,7 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
     c.norms = normals_.data();
     c.mats = materials_.data();
     c.triMat = triMat_.data();
+    c.triFilm = triFilm_.data();
     c.peel = peel_;  // substrate fade while exploded
     c.peelAlpha = peelAlpha_;
     c.preview = preview_;

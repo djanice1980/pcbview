@@ -68,6 +68,11 @@ struct Part {
     // layer into a part per net would multiply the draw calls by the net
     // count for no visual gain.
     std::vector<int32_t> triNet;
+    // Per triangle, soldermask parts only: film thickness as a ratio of the
+    // thickness on open laminate (1 = the thick film, ~0.5 over a trace). The
+    // renderers turn it into opacity by Beer-Lambert, so thin film reads
+    // clearer than thick -- as on a real board. Empty on every other part.
+    std::vector<float> triFilm;
 };
 
 struct Bounds {

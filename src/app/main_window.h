@@ -217,7 +217,10 @@ private:
     // Persisted ("peelAlpha"); adjustable in the Board appearance dialog.
     float peelAlpha_ = 0.02f;
     std::array<float, 3> maskColor_ = {0.010f, 0.246f, 0.025f};
-    float maskOpacity_ = 0.72f;
+    // Opacity of the THICK film on open laminate; thinner film over copper
+    // passes more (Beer-Lambert, per triangle). 0.88 reads as a real LPI
+    // mask: deep green in the valleys, traces showing through their knees.
+    float maskOpacity_ = 0.88f;
     // Effects menu (stylised, persisted; 0-100 slider values).
     int fxComponentShine_ = 0;
     int fxPadShine_ = 94;
