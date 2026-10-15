@@ -21,10 +21,11 @@ layout(std430, set = 0, binding = 3) readonly buffer TriMat { uint triMat[]; };
 // other triangle report a float's bit pattern as its net index -- which
 // lights up unrelated copper all over the board.
 layout(std430, set = 0, binding = 8) readonly buffer TriNet { int triNet[]; };
-// Mask film thickness per triangle as a ratio of the thick film on open
-// laminate (0 = not a film). Beer-Lambert: the material's opacity is the thick
-// film's, and thinner film passes more -- 1 - (1 - a)^ratio.
-layout(std430, set = 0, binding = 15) readonly buffer TriFilm { float triFilm[]; };
+// Mask film thickness per VERTEX as a ratio of the thick film on open
+// laminate (0 = not a film), interpolated by barycentrics. Beer-Lambert: the
+// material's opacity is the thick film's, and thinner film passes more --
+// 1 - (1 - a)^ratio.
+layout(std430, set = 0, binding = 15) readonly buffer VertFilm { float vertFilm[]; };
 // The highlighted net as an area light: 3 corners per triangle, v0.w = area.
 layout(std430, set = 0, binding = 9) readonly buffer NetLights { vec4 netLit[]; };
 // Per-net glow colour; a = 1 when highlighted. Indexed by net id.
@@ -220,15 +221,17 @@ const vec3 kNetGlow = vec3(1.0, 0.09, 0.06);
 
 // the substrate (params.w > 0.5) is opaque at rest and fades toward
 // kSubstratePeelAlpha as the board peels (pc.misc.x).
-float effAlpha(uint prim) {
+float effAlpha(uint prim, vec2 b) {
     Mat m = mats[triMat[prim]];
     float a = m.albedo.a;
-    float film = triFilm[prim];
+    float film = vertFilm[idx[3u * prim]] * (1.0 - b.x - b.y) +
+                 vertFilm[idx[3u * prim + 1u]] * b.x +
+                 vertFilm[idx[3u * prim + 2u]] * b.y;
     if (film > 0.0 && a < 0.999) a = 1.0 - pow(1.0 - a, film);
     if (m.params.w > 0.5) a = mix(a, pc.misc.w, pc.misc.x);
     return a;
 }
-bool opaquePrim(uint prim) { return effAlpha(prim) >= 0.99; }
+bool opaquePrim(uint prim, vec2 b) { return effAlpha(prim, b) >= 0.99; }
 
 // Shadow test that ignores the translucent coating -- the thin mask must not cast
 // a shadow on the copper it sits on, or every masked trace goes dim.
@@ -246,7 +249,7 @@ bool occluded(vec3 o, vec3 d, float tmax) {
         uint cp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
         if (rayQueryGetIntersectionGeometryIndexEXT(rq, false) == 1)
             cp += pc.counts.x;
-        if (opaquePrim(cp)) rayQueryConfirmIntersectionEXT(rq);
+        if (opaquePrim(cp, rayQueryGetIntersectionBarycentricsEXT(rq, false))) rayQueryConfirmIntersectionEXT(rq);
         // translucent candidate: leave uncommitted so the ray passes through.
     }
     return rayQueryGetIntersectionTypeEXT(rq, true) !=
@@ -407,7 +410,7 @@ void main() {
             uint cp = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
             if (rayQueryGetIntersectionGeometryIndexEXT(rq, false) == 1)
                 cp += pc.counts.x;
-            if (opaquePrim(cp)) {
+            if (opaquePrim(cp, rayQueryGetIntersectionBarycentricsEXT(rq, false))) {
                 rayQueryConfirmIntersectionEXT(rq);
                 continue;
             }
@@ -428,11 +431,11 @@ void main() {
                 if (ct < coatT) {
                     coatT = ct;
                     coatAlbedo = mats[triMat[cp]].albedo.rgb;
-                    coatAlpha = effAlpha(cp);
+                    coatAlpha = effAlpha(cp, rayQueryGetIntersectionBarycentricsEXT(rq, false));
                 }
             }
             if (float(hashu(diceSeed ^ cp)) * (1.0 / 4294967296.0) <
-                effAlpha(cp)) {
+                effAlpha(cp, rayQueryGetIntersectionBarycentricsEXT(rq, false))) {
                 rayQueryConfirmIntersectionEXT(rq);
             }
         }
@@ -502,7 +505,7 @@ void main() {
         // scattering. What shows through blurs, and transmitted light diffuses.
         // Does not consume path depth (the counter guards runaway).
         if (m.params.w > 0.5) {
-            float ea = effAlpha(prim);
+            float ea = effAlpha(prim, bary);
             // The CAMERA segment dices the slab with a per-pixel STRATIFIED
             // sequence rather than white noise. An emissive highlighted net
             // behind a translucent slab is a binary bright/dark signal; with

@@ -71,8 +71,9 @@ constexpr uint32_t kNetBinding = 2;
 constexpr uint32_t kNetColorBinding = 3;
 // Per-net origin + inverse span, so the chase is evaluated per fragment.
 constexpr uint32_t kNetSpanBinding = 4;
-// Per-triangle mask film ratio (thickness / thick film). Both fragment shaders
-// and the path tracer turn it into opacity: a = 1 - (1 - a)^ratio.
+// Per-vertex mask film ratio (thickness / thick film), interpolated across the
+// triangle. The vertex shader passes it down; both fragment shaders and the
+// path tracer turn it into opacity: a = 1 - (1 - a)^ratio.
 constexpr uint32_t kFilmBinding = 5;
 
 struct PtPush {
@@ -233,7 +234,7 @@ Renderer::~Renderer() {
     destroyBuffer(materialBuffer_);
     destroyBuffer(triMaterialBuffer_);
     destroyBuffer(triNetBuffer_);
-    destroyBuffer(triFilmBuffer_);
+    destroyBuffer(vertFilmBuffer_);
     destroyBuffer(netColorBuffer_);
     destroyBuffer(netSpanBuffer_);
     destroyBuffer(netLightBuffer_);
@@ -726,7 +727,7 @@ void Renderer::createPathTracer() {
     // estimation), so it actually illuminates its surroundings.
     // 11 = first-hit net phase, written as an AOV so the chase animation can
     // run as a display-time modulation without disturbing accumulation.
-    // 15 = per-triangle mask film ratio (thin over a trace, thick on open
+    // 15 = per-vertex mask film ratio (thin over a trace, thick on open
     // laminate), for the thickness-dependent lottery.
     VkDescriptorSetLayoutBinding b[16]{};
     for (uint32_t i = 0; i < 16; ++i) {
@@ -1025,7 +1026,7 @@ void Renderer::updatePathTraceDescriptors() {
     VkDescriptorBufferInfo tri{triMaterialBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo mat{materialBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo net{triNetBuffer_.handle, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo film{triFilmBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo film{vertFilmBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorImageInfo acc{VK_NULL_HANDLE, ptAccum_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo alb{VK_NULL_HANDLE, ptAlbedo_.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorImageInfo nrm{VK_NULL_HANDLE, ptNormal_.view, VK_IMAGE_LAYOUT_GENERAL};
@@ -3217,6 +3218,7 @@ void Renderer::createDescriptors() {
         net.binding = kNetSpanBinding;
         bindings.push_back(net);
         net.binding = kFilmBinding;
+        net.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         bindings.push_back(net);
     }
 
@@ -3950,7 +3952,7 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     std::vector<MaterialGpu> materials;
     std::vector<uint32_t> triMaterial;  // per global triangle: material index (path tracer)
     std::vector<int32_t> triNet;        // per global triangle: net index, -1 none
-    std::vector<float> triFilm;         // per global triangle: mask film ratio, 0 none
+    std::vector<float> vertFilm;        // per global vertex: mask film ratio, 0 none
     std::vector<uint32_t> vertexMat;    // per global vertex: material index (explode bake)
     std::vector<float> centreZ;  // per material, for explode ranking
     std::vector<int> mount;      // per material: 0 board layer, +/-1 component side
@@ -4078,6 +4080,8 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         // to, as a flat parallel array. Filled with the real rank after ranks are
         // computed below -- for now record the material index.
         vertexMat.insert(vertexMat.end(), part.mesh.vertices.size(), item.material);
+        for (size_t vi = 0; vi < part.mesh.vertices.size(); ++vi)
+            vertFilm.push_back(vi < part.vertFilm.size() ? part.vertFilm[vi] : 0.0f);
         indices.reserve(indices.size() + part.mesh.indices.size());
         for (uint32_t li : part.mesh.indices) indices.push_back(vbase + li);
 
@@ -4096,7 +4100,6 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         for (uint32_t t = 0; t < triCount; ++t) {
             triMaterial.push_back(item.material);
             triNet.push_back(t < part.triNet.size() ? part.triNet[t] : -1);
-            triFilm.push_back(t < part.triFilm.size() ? part.triFilm[t] : 0.0f);
         }
 
         stats_.trianglesTotal += static_cast<uint32_t>(part.mesh.triangleCount());
@@ -4379,14 +4382,14 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         uploadViaStaging(triNetBuffer_, triNet.data(), nsize);
 
-        destroyBuffer(triFilmBuffer_);
-        if (triFilm.empty()) triFilm.push_back(0.0f);
-        const VkDeviceSize fsize = triFilm.size() * sizeof(float);
-        triFilmBuffer_ = createBuffer(
+        destroyBuffer(vertFilmBuffer_);
+        if (vertFilm.empty()) vertFilm.push_back(0.0f);
+        const VkDeviceSize fsize = vertFilm.size() * sizeof(float);
+        vertFilmBuffer_ = createBuffer(
             fsize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        uploadViaStaging(triFilmBuffer_, triFilm.data(), fsize);
+        uploadViaStaging(vertFilmBuffer_, vertFilm.data(), fsize);
     }
 
     const VkDeviceSize msize = materials.size() * sizeof(MaterialGpu);
@@ -4400,7 +4403,7 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
     VkDescriptorBufferInfo bufferInfo{materialBuffer_.handle, 0, msize};
     VkDescriptorBufferInfo netInfo{triNetBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo spanInfo{netSpanBuffer_.handle, 0, VK_WHOLE_SIZE};
-    VkDescriptorBufferInfo filmInfo{triFilmBuffer_.handle, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo filmInfo{vertFilmBuffer_.handle, 0, VK_WHOLE_SIZE};
     VkWriteDescriptorSet writes[4]{};
     writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[0].dstSet = materialSet_;

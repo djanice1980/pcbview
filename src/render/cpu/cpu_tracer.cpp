@@ -182,7 +182,7 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
     triNet_.clear();
     materials_.clear();
     triMat_.clear();
-    triFilm_.clear();
+    vertFilm_.clear();
     partSpans_.clear();
     maxRank_ = 0.0f;
     peel_ = 0.0f;
@@ -197,7 +197,7 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
     normals_.reserve(nv * 3);
     indices_.reserve(nt * 3);
     triMat_.reserve(nt);
-    triFilm_.reserve(nt);
+    vertFilm_.reserve(nv);
     triNet_.reserve(nt);
 
     // Per-part data for the explode-rank computation, mirroring the GPU path's
@@ -215,6 +215,8 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
         materials_.push_back(makeMaterial(part));
 
         double sz = 0.0;
+        for (size_t vi = 0; vi < part.mesh.vertices.size(); ++vi)
+            vertFilm_.push_back(vi < part.vertFilm.size() ? part.vertFilm[vi] : 0.0f);
         for (const geom::Vertex& v : part.mesh.vertices) {
             vertsPadded_.push_back(v.position[0]);
             vertsPadded_.push_back(v.position[1]);
@@ -230,7 +232,6 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
             indices_.push_back(base + part.mesh.indices[i + 1]);
             indices_.push_back(base + part.mesh.indices[i + 2]);
             triMat_.push_back(matId);
-            triFilm_.push_back(i / 3 < part.triFilm.size() ? part.triFilm[i / 3] : 0.0f);
             // Net id in the SAME order, filled by the same loop that emits the
             // triangle. The renderer builds its own copy in a DIFFERENT order
             // (it hoists films to the end of the index buffer), so taking that
@@ -399,7 +400,7 @@ struct Ctx {
     const float* norms;   // 3 floats/vertex
     const Material* mats;
     const uint32_t* triMat;
-    const float* triFilm;  // mask film ratio per triangle, 0 = not a film
+    const float* vertFilm;  // mask film ratio per vertex, 0 = not a film
     float peel;       // substrate fade amount (0 at rest)
     float peelAlpha;  // opacity a fully peeled slab fades to
     bool preview;     // RT preview: sun shadow + AO, no GI bounces
@@ -449,18 +450,20 @@ inline V3 vpos(const Ctx& c, uint32_t i) {
 inline V3 vnrm(const Ctx& c, uint32_t i) {
     return {c.norms[3u * i], c.norms[3u * i + 1u], c.norms[3u * i + 2u]};
 }
-inline float effAlpha(const Ctx& c, uint32_t prim) {
+inline float effAlpha(const Ctx& c, uint32_t prim, float u, float v) {
     const Material& m = c.mats[c.triMat[prim]];
     float a = m.albedo[3];
     // Thickness-dependent film: the opacity is the thick film's, thinner
-    // film over a trace passes more (Beer-Lambert).
-    const float film = c.triFilm[prim];
+    // film over a trace passes more (Beer-Lambert). Per vertex, interpolated.
+    const float film = c.vertFilm[c.idx[3u * prim]] * (1.0f - u - v) +
+                       c.vertFilm[c.idx[3u * prim + 1u]] * u +
+                       c.vertFilm[c.idx[3u * prim + 2u]] * v;
     if (film > 0.0f && a < 0.999f) a = 1.0f - std::pow(1.0f - a, film);
     if (m.fade > 0.5f) a = a * (1.0f - c.peel) + c.peelAlpha * c.peel;
     return a;
 }
-inline bool opaquePrim(const Ctx& c, uint32_t prim) {
-    return effAlpha(c, prim) >= 0.99f;
+inline bool opaquePrim(const Ctx& c, uint32_t prim, float u, float v) {
+    return effAlpha(c, prim, u, v) >= 0.99f;
 }
 
 void setupRay(RTCRayHit& rh, V3 o, V3 d, float tnear, float tfar) {
@@ -517,7 +520,7 @@ void intersectFilter(const RTCFilterFunctionNArguments* a) {
     RayCtx* rc = reinterpret_cast<RayCtx*>(a->context);
     const Ctx& c = *rc->c;
     const uint32_t prim = RTCHitN_primID(a->hit, 1, 0);
-    if (opaquePrim(c, prim)) return;  // accept
+    if (opaquePrim(c, prim, RTCHitN_u(a->hit, 1, 0), RTCHitN_v(a->hit, 1, 0))) return;  // accept
 
     const V3 dir = {RTCRayN_dir_x(a->ray, 1, 0), RTCRayN_dir_y(a->ray, 1, 0),
                     RTCRayN_dir_z(a->ray, 1, 0)};
@@ -539,7 +542,7 @@ void intersectFilter(const RTCFilterFunctionNArguments* a) {
             rc->coatT = t;
             const Material& fm = c.mats[c.triMat[prim]];
             rc->coatAlbedo = {fm.albedo[0], fm.albedo[1], fm.albedo[2]};
-            rc->coatAlpha = effAlpha(c, prim);
+            rc->coatAlpha = effAlpha(c, prim, RTCHitN_u(a->hit, 1, 0), RTCHitN_v(a->hit, 1, 0));
             rc->coatRough = fm.roughness;
         }
     }
@@ -555,7 +558,7 @@ void intersectFilter(const RTCFilterFunctionNArguments* a) {
             const Material& fm = c.mats[c.triMat[prim]];
             RayCtx::FilmHit& f = rc->films[rc->filmCount++];
             f.t = RTCRayN_tfar(a->ray, 1, 0);
-            f.alpha = effAlpha(c, prim);
+            f.alpha = effAlpha(c, prim, RTCHitN_u(a->hit, 1, 0), RTCHitN_v(a->hit, 1, 0));
             f.rough = fm.roughness;
             f.albedo = {fm.albedo[0], fm.albedo[1], fm.albedo[2]};
             f.n = normalize(ng);  // entering face: already facing the ray
@@ -565,14 +568,16 @@ void intersectFilter(const RTCFilterFunctionNArguments* a) {
     }
     const float xi =
         hashu(rc->diceSeed ^ prim) * (1.0f / 4294967296.0f);
-    if (xi >= effAlpha(c, prim)) a->valid[0] = 0;  // pass through
+    if (xi >= effAlpha(c, prim, RTCHitN_u(a->hit, 1, 0), RTCHitN_v(a->hit, 1, 0))) a->valid[0] = 0;  // pass through
 }
 
 // Occlusion filter: films never cast shadows; only opaque hits count.
 void occludedFilter(const RTCFilterFunctionNArguments* a) {
     if (a->N != 1) return;
     RayCtx* rc = reinterpret_cast<RayCtx*>(a->context);
-    if (!opaquePrim(*rc->c, RTCHitN_primID(a->hit, 1, 0))) a->valid[0] = 0;
+    if (!opaquePrim(*rc->c, RTCHitN_primID(a->hit, 1, 0), RTCHitN_u(a->hit, 1, 0),
+                    RTCHitN_v(a->hit, 1, 0)))
+        a->valid[0] = 0;
 }
 
 bool occluded(const Ctx& c, V3 o, V3 d, float tmax);
@@ -770,7 +775,7 @@ V3 trace(const Ctx& c, V3 origin, V3 dir, Rng& rng, V3& firstAlbedo,
         // scatter into a small cone, tint by the resin, continue -- the cheap
         // stand-in for FR4 subsurface scattering. Does not consume path depth.
         if (!c.preview && m.fade > 0.5f) {
-            const float ea = effAlpha(c, prim);
+            const float ea = effAlpha(c, prim, bx, by);
             // Camera-segment slab dice is STRATIFIED per pixel (golden-ratio
             // sequence over the sample index): an emissive net behind a
             // translucent slab is a binary bright/dark signal whose white-
@@ -1119,7 +1124,7 @@ void CpuTracer::accumulate(const TraceCamera& cam, uint32_t width,
     c.norms = normals_.data();
     c.mats = materials_.data();
     c.triMat = triMat_.data();
-    c.triFilm = triFilm_.data();
+    c.vertFilm = vertFilm_.data();
     c.peel = peel_;  // substrate fade while exploded
     c.peelAlpha = peelAlpha_;
     c.preview = preview_;

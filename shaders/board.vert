@@ -58,8 +58,15 @@ layout(std430, set = 0, binding = 0) readonly buffer Materials {
 layout(location = 0) out vec3 outNormal;
 layout(location = 1) out vec3 outWorldPos;
 layout(location = 2) flat out uint outMaterial;
+// Mask film thickness ratio at this vertex (0 = not a film), interpolated
+// across the triangle for the fragment's thickness-dependent opacity.
+layout(location = 3) out float outFilm;
+layout(std430, set = 0, binding = 5) readonly buffer VertFilms {
+    float ratio[];
+} vertFilmTable;
 
 void main() {
+    outFilm = vertFilmTable.ratio[gl_VertexIndex];
     // RT-readiness rule 3: the material is addressed by instance ID, never by a
     // per-draw binding. A closest-hit shader gets gl_InstanceCustomIndexEXT and
     // nothing else, so the raster path resolves materials the same way now --

@@ -3,6 +3,7 @@
 layout(location = 0) in vec3 inNormal;
 layout(location = 1) in vec3 inWorldPos;
 layout(location = 2) flat in uint inMaterial;
+layout(location = 3) in float inFilm;
 
 layout(location = 0) out vec4 outColor;
 
@@ -30,11 +31,6 @@ layout(std430, set = 0, binding = 0) readonly buffer Materials {
 layout(std430, set = 0, binding = 2) readonly buffer TriNets {
     int nets[];
 } triNetTable;
-// Per-triangle mask film thickness as a ratio of the thick film (0 = not a
-// film): a = 1 - (1 - a)^ratio, so the thin film over a trace reads clearer.
-layout(std430, set = 0, binding = 5) readonly buffer TriFilms {
-    float ratio[];
-} triFilmTable;
 
 // Per-NET glow colour: rgb, with a = 1 when that net is highlighted. Looking
 // the colour up per net (rather than comparing against one index) is what
@@ -294,12 +290,11 @@ void main() {
     // Materials flagged to fade (the substrate) go from fully solid at rest to
     // partly transparent as the stack peels, so the inner copper is visible
     // through the laminate. At peel 0 this is exactly 1.0, i.e. unchanged.
+    // Mask film thickness ratio, interpolated from the vertices (0 = not a
+    // film): a = 1 - (1 - a)^ratio, so thin film over a trace reads clearer
+    // and a developed edge fades smoothly.
     float base = m.albedo.a;
-    {
-        const uint ftri = m.extra.x + uint(gl_PrimitiveID);
-        const float film = triFilmTable.ratio[ftri];
-        if (film > 0.0 && base < 0.999) base = 1.0 - pow(1.0 - base, film);
-    }
+    if (inFilm > 0.0 && base < 0.999) base = 1.0 - pow(1.0 - base, inFilm);
     float alpha = mix(base, mix(base, float(m.extra.y) * 0.001, push.params.w),
                       m.params.w);
 

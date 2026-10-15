@@ -743,7 +743,7 @@ private:
     // triangle order as the index buffer; the raster fragment shader reaches
     // it via MaterialGpu::extra[0] + gl_PrimitiveID.
     Buffer triNetBuffer_;
-    Buffer triFilmBuffer_;  // per global triangle: mask film ratio (0 = not a film)
+    Buffer vertFilmBuffer_;  // per global vertex: mask film ratio (0 = not a film)
     // The highlighted net as a SAMPLEABLE light: one entry per triangle on
     // that net (three corners + its area), rebuilt whenever the highlight
     // changes. Next-event estimation samples these directly instead of hoping

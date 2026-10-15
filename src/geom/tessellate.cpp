@@ -1545,6 +1545,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 const double sT = isMask ? 0.0 : al.thickness;
                 const double lam = std::clamp(art.maskThicknessLaminate, mT, cT + mT);
                 const double rise = cT + mT - lam;
+                const double reachInk = std::max(2.0 * sT, 0.01);
                 const double L = isMask ? (frontSide ? baseZ0 : baseZ0 + mT)
                                  : maskAl ? (frontSide ? maskAl->z - cT
                                                        : maskAl->z + cT + mT)
@@ -1744,13 +1745,17 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     // edge) and its gradient, for a unit rise.
                     double S = 0.0, Sx = 0.0, Sy = 0.0;
                     if (mode == 2) {
+                        // Ink draping a bare pad's edge is thin and conforms
+                        // tightly: its own, short reach (the copper fillet's
+                        // left an air wedge under the stroke).
+                        const double rx = bare ? reachInk : reach;
                         double dx = 0.0, dy = 0.0;
                         double d = grid.nearest(x, y, dx, dy);
-                        d = std::max(0.0, std::min(reach, d));
-                        const double f = 1.0 - d / reach;
+                        d = std::max(0.0, std::min(rx, d));
+                        const double f = 1.0 - d / rx;
                         S = f * f * (3.0 - 2.0 * f);
                         // How steeply S descends outward.
-                        const double sl = 6.0 * f * (1.0 - f) / reach;
+                        const double sl = 6.0 * f * (1.0 - f) / rx;
                         Sx = -dx * sl;
                         Sy = -dy * sl;
                     }
@@ -1779,23 +1784,19 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     n[1] = static_cast<float>(-gy / len);
                     n[2] = static_cast<float>(zs / len);
                 };
-                // Tag the mask triangles emitted since `from` with their film
-                // thickness at the centroid, as a ratio of the thick film (see
-                // Part::triFilm).
+                // Tag the mask vertices emitted since `from` with the film
+                // thickness at their position, as a ratio of the thick film
+                // (see Part::vertFilm). Interpolated across each triangle by
+                // the renderers, so a taper fades without steps.
                 const auto tagFilm = [&](size_t from, int mode) {
                     if (!isMask) return;
-                    const size_t n = part.mesh.indices.size() / 3;
-                    part.triFilm.resize(n, 1.0f);
-                    for (size_t i = from / 3; i < n; ++i) {
-                        double x = 0.0, y = 0.0;
-                        for (int c = 0; c < 3; ++c) {
-                            const Vertex& v = part.mesh.vertices[part.mesh.indices[3 * i + c]];
-                            x += v.position[0];
-                            y += v.position[1];
-                        }
+                    const size_t n = part.mesh.vertices.size();
+                    part.vertFilm.resize(n, 1.0f);
+                    for (size_t i = from; i < n; ++i) {
+                        const Vertex& v = part.mesh.vertices[i];
                         double h, gx, gy;
-                        filmAt(mode, x / 3.0, y / 3.0, h, gx, gy);
-                        part.triFilm[i] = static_cast<float>(std::max(0.02, h / lam));
+                        filmAt(mode, v.position[0], v.position[1], h, gx, gy);
+                        part.vertFilm[i] = static_cast<float>(std::max(0.0, h / lam));
                     }
                 };
 
@@ -1888,7 +1889,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                              clipShapes(basePaths, region, ClipType::Intersection))
                             sheet(shape, frontSide, baseAt, baseFloor, never, part.mesh);
                     } else {
-                        const size_t from = part.mesh.indices.size();
+                        const size_t from = part.mesh.vertices.size();
                         const auto skipBase = [&](double ax, double ay, double bx,
                                                   double by) {
                             return onRing(kSteps, ax, ay, bx, by) || onTz(ax, ay, bx, by);
@@ -1910,7 +1911,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     // castellation crossed it into the cap for a second
                     // lottery (a dark stripe beside the pad).
                     {
-                        const size_t from = part.mesh.indices.size();
+                        const size_t from = part.mesh.vertices.size();
                         if (!isMask) {
                             for (const Shape& shape :
                                  clipShapes(capPaths, region, ClipType::Intersection))
@@ -1950,7 +1951,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                                        ? copperFace
                                        : std::numeric_limits<double>::quiet_NaN();
                         };
-                        const size_t from = part.mesh.indices.size();
+                        const size_t from = part.mesh.vertices.size();
                         for (const Shape& shape :
                              clipShapes(bandPaths[k], region, ClipType::Intersection))
                             sheet(shape, frontSide, at, floorAt, skipWall, part.mesh,
@@ -1973,8 +1974,8 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             // Mask, silkscreen, and any copper with no net breakdown.
             clipAndExtrude(*subject, -1);
         }
-        if (part.material == Material::Soldermask && !part.triFilm.empty())
-            part.triFilm.resize(part.mesh.indices.size() / 3, 1.0f);
+        if (part.material == Material::Soldermask && !part.vertFilm.empty())
+            part.vertFilm.resize(part.mesh.vertices.size(), 1.0f);
         if (!part.mesh.indices.empty()) out.parts.push_back(std::move(part));
     }
 
