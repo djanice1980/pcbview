@@ -1182,6 +1182,11 @@ interactive run. All are opt-in. Grouped by purpose:
 
 **Appearance (mirror the Appearance dialog, which input synthesis can't drive)**
 - `PCBVIEW_THICKNESS=<mm>` — finished-board thickness override.
+- `PCBVIEW_MASK_RELIEF=<mm>` — the fab's minimum pad-to-mask clearance
+  (default 0.05; 0 renders the artwork's openings literally). KiCad boards
+  usually carry a 0 expansion and rely on the fab to add this, so without it
+  the mask sits flush against every pad and stands proud of it at the edge.
+  Shown in Properties as "Mask clearance … (fab floor)" when it applied.
 - `PCBVIEW_SUBSTRATE=r,g,b,opacity` — substrate colour + translucency (0..1 each).
 - `PCBVIEW_MASK=r,g,b[,opacity]` — soldermask colour, optionally its opacity
   (drives both the raster blend and the path tracer's show-through).

@@ -123,6 +123,14 @@ struct BoardMesh {
 struct TessellateOptions {
     // Segments used to approximate a full circle.
     int circleSegments = 32;
+    // Minimum clearance between the soldermask and any pad that has an
+    // opening, in mm. KiCad's default mask expansion is 0 and designers leave
+    // it there because every fab grows the openings by its own 50-75 um before
+    // making the film (registration); the artwork is not the mask the board
+    // gets. This is the exception to "the file is what the file says": a
+    // literal 0 draws mask flush against every pad, which no board has.
+    // Openings already wider than this are left alone. 0 renders the artwork.
+    double maskRelief = 0.05;
     // Skip inner copper layers, which are invisible inside the substrate.
     bool innerLayers = true;
     // Emit soldermask parts.

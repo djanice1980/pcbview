@@ -1059,6 +1059,10 @@ void MainWindow::applyAppearance() {
 // changes GEOMETRY, so callers must re-assemble rather than just redraw.
 geom::TessellateOptions MainWindow::tessellateOptions() const {
     geom::TessellateOptions o;
+    // PCBVIEW_MASK_RELIEF=<mm>: the fab's minimum pad-to-mask clearance
+    // (0 renders the artwork's openings literally).
+    if (qEnvironmentVariableIsSet("PCBVIEW_MASK_RELIEF"))
+        o.maskRelief = qEnvironmentVariable("PCBVIEW_MASK_RELIEF").toDouble();
     o.subtractMaskFromSilk = subtractMaskFromSilk_;
     return o;
 }
@@ -3747,6 +3751,10 @@ void MainWindow::populateProperties() {
         mm(th, 3) + " mm" + (thicknessOverride_ > 0.0 ? " (override)" : ""));
     add("Copper foil", mm(board_.copperThickness, 4) + " mm");
     add("Mask film", mm(board_.maskThickness, 4) + " mm");
+    add("Mask clearance",
+        mm(baseArt_.maskClearance, 3) + " mm" +
+            (baseArt_.maskClearance > board_.padToMaskClearance ? " (fab floor)"
+                                                                 : ""));
     add("Dielectric", mm(board_.dielectricThickness, 4) + " mm");
     add("Copper layers", QString::number(board_.copperLayers().size()));
     add("Tracks", QString::number(board_.tracks.size()));

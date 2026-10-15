@@ -1023,6 +1023,9 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
     // free: a tented via carries no mask layer, so it contributes no opening and
     // the film simply closes over it.
     if (opts.soldermask && !art.outline.empty()) {
+        const double clearance =
+            std::max(board.padToMaskClearance, std::max(0.0, opts.maskRelief));
+        art.maskClearance = clearance;
         for (const char* name : {"F.Mask", "B.Mask"}) {
             const int layerIndex = board.layerIndex(name);
             if (layerIndex < 0) continue;
@@ -1038,15 +1041,16 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
                 ++openingCount;
                 Paths64 shape = padPaths(pad, opts.circleSegments);
 
-                // The opening is the pad grown by pad_to_mask_clearance. Zero on
-                // many boards, in which case the opening is the pad exactly.
-                if (board.padToMaskClearance > 0.0) {
+                // The opening is the pad grown by pad_to_mask_clearance -- or
+                // by the fab's floor when the board's own is smaller (zero on
+                // most KiCad boards; see TessellateOptions::maskRelief).
+                if (clearance > 0.0) {
                     normalizeWinding(shape);
                     ClipperOffset co;
                     co.ArcTolerance(kScale * 0.001);
                     co.AddPaths(shape, JoinType::Round, EndType::Polygon);
                     Paths64 grown;
-                    co.Execute(board.padToMaskClearance * kScale, grown);
+                    co.Execute(clearance * kScale, grown);
                     shape = std::move(grown);
                 }
                 openings.insert(openings.end(), shape.begin(), shape.end());

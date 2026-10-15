@@ -122,6 +122,10 @@ struct LayerArt {
     double thickness = 1.6;
     double copperThickness = 0.035;
     double maskThickness = 0.010;
+    // The pad-to-mask clearance the openings were actually built with: the
+    // board's own expansion or the fab floor (TessellateOptions::maskRelief),
+    // whichever is larger. Reported, so the Properties dock can say which.
+    double maskClearance = 0.0;
 
     // Surface finish on exposed copper, from KiCad's `(copper_finish ...)`.
     // Empty when unknown (every Gerber package -- a .gbrjob does not record
