@@ -150,9 +150,11 @@ struct TessellateOptions {
     // defaults to off, so a gerber normally contains ink over pads and pcbview
     // renders it faithfully. But many fabs clip it anyway -- ink will not
     // adhere to solder and contaminates the joint -- so this shows the board
-    // as a clipping house would actually build it. Off by default: the file is
-    // what the file says.
-    bool subtractMaskFromSilk = false;
+    // as a clipping house would actually build it. On by default since the
+    // mask itself is built as the fab builds it (maskRelief): ink that lands
+    // in an opening -- on the pad or on the bare clearance ring -- has nothing
+    // to stick to and is wiped. Off renders the file as drawn.
+    bool subtractMaskFromSilk = true;
 };
 
 // BoardModel -> LayerArt. Resolves KiCad's semantics (tracks, pads, vias, zones,

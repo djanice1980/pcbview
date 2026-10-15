@@ -159,7 +159,7 @@ private:
 
     geom::TessellateOptions tessellateOptions() const;
     // Clip silkscreen off exposed copper. Persisted; changes geometry.
-    bool subtractMaskFromSilk_ = false;
+    bool subtractMaskFromSilk_ = true;
     void reassemble();  // rebuild mesh_ from baseArt_ + current thickness override
     // Derive nets from copper connectivity for a package with no netlist.
     void inferNetsFromCopper();

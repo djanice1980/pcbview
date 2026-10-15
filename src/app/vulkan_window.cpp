@@ -3406,6 +3406,18 @@ void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
 }
 
 void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
+    // A button released OUTSIDE the window can go undelivered (a native
+    // child window in a container does not always keep the implicit grab,
+    // notably on Wayland), which left the drag latched: the camera kept
+    // following the bare cursor. The move event carries the real button
+    // state, so believe it over our own bookkeeping.
+    const Qt::MouseButtons held = e->buttons();
+    if (dragging_ && !(held & Qt::LeftButton)) {
+        dragging_ = false;
+        clickCandidate_ = false;
+    }
+    if (draggingInv_ && !(held & Qt::RightButton)) draggingInv_ = false;
+    if (panning_ && !(held & Qt::MiddleButton)) panning_ = false;
     const QPointF delta = e->position() - lastPos_;
     lastPos_ = e->position();
     cursorPos_ = e->position();

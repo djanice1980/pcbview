@@ -457,9 +457,12 @@ MainWindow::MainWindow(const QString& path) {
     // this point in the constructor it has already been built once with the
     // default. Same pattern as PCBVIEW_THICKNESS above.
     {
+        // On by default: ink in a mask opening has nothing to stick to.
+        // PCBVIEW_SILK_CLIP=0|1 overrides the saved choice for a run.
         const bool clipSilk =
-            appSettings().value("subtractMaskFromSilk", false).toBool() ||
-            qEnvironmentVariable("PCBVIEW_SILK_CLIP").toInt() != 0;
+            qEnvironmentVariableIsSet("PCBVIEW_SILK_CLIP")
+                ? qEnvironmentVariable("PCBVIEW_SILK_CLIP").toInt() != 0
+                : appSettings().value("subtractMaskFromSilk", true).toBool();
         if (clipSilk != subtractMaskFromSilk_) {
             subtractMaskFromSilk_ = clipSilk;
             reassemble();
@@ -1816,10 +1819,10 @@ void MainWindow::buildMenus() {
         viewport_->setCameraHud(on);
     }
     // Silkscreen clipping. KiCad's own (subtractmaskfromsilk) decides what is
-    // PLOTTED and defaults to off, so by default we draw the ink the file
-    // carries -- including over pads. Many fabs clip it anyway, because ink
-    // will not stick to solder, so this shows the board as such a house builds
-    // it. Changing it re-tessellates.
+    // PLOTTED and defaults to off, but ink that lands in a mask opening has
+    // nothing to stick to and is wiped, and fabs clip it from the openings
+    // anyway -- so on by default, as the board is built. Off draws the ink
+    // the file carries, including over pads. Changing it re-tessellates.
     {
         auto* clip = view->addAction("Clip silkscreen off pads");
         clip->setCheckable(true);
