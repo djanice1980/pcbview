@@ -35,6 +35,10 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QWheelEvent>
+#include <QAbstractSlider>
+#include <QAbstractSpinBox>
+#include <QAbstractScrollArea>
 #include <QMovie>
 #include <QPainterPath>
 #include <QPushButton>
@@ -536,12 +540,66 @@ MainWindow::MainWindow(const QString& path) {
     }
 }
 
+// The viewport is a native QWindow in a container, so a drag that leaves it
+// stops getting moves (the implicit grab does not follow the pointer onto the
+// surrounding widgets, notably on Wayland) and the wheel only zooms while the
+// pointer is over it. Watch the whole application instead: while a drag is in
+// progress every move and release, whichever widget it landed on, is mapped
+// into the viewport and steers it; and a wheel turn anywhere in the active
+// window zooms, unless it is over something that scrolls or spins itself.
+bool MainWindow::eventFilter(QObject* obj, QEvent* ev) {
+    if (!viewport_) return QMainWindow::eventFilter(obj, ev);
+    auto* w = qobject_cast<QWidget*>(obj);
+    if (!w) return QMainWindow::eventFilter(obj, ev);
+    const auto toViewport = [this](const QPointF& global) {
+        return QPointF(viewport_->mapFromGlobal(global.toPoint()));
+    };
+    switch (ev->type()) {
+        case QEvent::MouseMove:
+            if (viewport_->mouseDragging()) {
+                auto* me = static_cast<QMouseEvent*>(ev);
+                viewport_->handleMove(toViewport(me->globalPosition()), me->buttons());
+                return true;
+            }
+            break;
+        case QEvent::MouseButtonRelease:
+            if (viewport_->mouseDragging()) {
+                auto* me = static_cast<QMouseEvent*>(ev);
+                viewport_->handleRelease(me->button(), toViewport(me->globalPosition()),
+                                         me->modifiers());
+                return true;
+            }
+            break;
+        case QEvent::Wheel: {
+            if (!isActiveWindow() || w->window() != this) break;
+            for (QWidget* a = w; a; a = a->parentWidget()) {
+                if (qobject_cast<QAbstractScrollArea*>(a) ||
+                    qobject_cast<QAbstractSpinBox*>(a) ||
+                    qobject_cast<QAbstractSlider*>(a) ||
+                    qobject_cast<QComboBox*>(a) || qobject_cast<QMenu*>(a))
+                    return QMainWindow::eventFilter(obj, ev);
+            }
+            auto* we = static_cast<QWheelEvent*>(ev);
+            viewport_->handleWheel(toViewport(we->globalPosition()),
+                                   static_cast<float>(we->angleDelta().y()) / 120.0f,
+                                   we->modifiers());
+            return true;
+        }
+        default:
+            break;
+    }
+    return QMainWindow::eventFilter(obj, ev);
+}
+
 void MainWindow::buildViewport() {
     viewport_ = new VulkanWindow(loaded_ ? &mesh_ : nullptr);
     viewportContainer_ = QWidget::createWindowContainer(viewport_, this);
     viewportContainer_->setMinimumSize(480, 360);
     viewportContainer_->setFocusPolicy(Qt::StrongFocus);
     stack_->insertWidget(1, viewportContainer_);  // placeholder stays index 0
+    // The viewport is a native window: mouse events stop at its border. See
+    // eventFilter -- the application filter hands the ones that matter back.
+    qApp->installEventFilter(this);
 
     connect(viewport_, &VulkanWindow::frameRendered, this,
             &MainWindow::onFrameRendered);

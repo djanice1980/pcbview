@@ -339,6 +339,20 @@ protected:
     void mouseReleaseEvent(QMouseEvent*) override;
     void mouseMoveEvent(QMouseEvent*) override;
     void wheelEvent(QWheelEvent*) override;
+
+public:
+    // The gesture handlers behind the events, callable from outside: the main
+    // window redirects moves, releases and wheel turns that landed on other
+    // widgets here, so a drag that leaves the viewport keeps steering and the
+    // wheel zooms from anywhere in the active window. `pos` is in this
+    // window's device-independent pixels.
+    void handleMove(const QPointF& pos, Qt::MouseButtons held);
+    void handleRelease(Qt::MouseButton button, const QPointF& pos,
+                       Qt::KeyboardModifiers mods);
+    void handleWheel(const QPointF& pos, float steps, Qt::KeyboardModifiers mods);
+    bool mouseDragging() const { return dragging_ || draggingInv_ || panning_; }
+
+private:
     void keyPressEvent(QKeyEvent*) override;
     bool event(QEvent*) override;
 

@@ -3371,15 +3371,21 @@ void VulkanWindow::mousePressEvent(QMouseEvent* e) {
     // request: the right button covers the rotation left-drag can't do.
     if (e->button() == Qt::RightButton) draggingInv_ = true;
     if (e->button() == Qt::MiddleButton) panning_ = true;
+    // Hold the pointer for the whole drag so it keeps steering the camera
+    // once it leaves the viewport -- over the docks, or outside the window.
+    // Honoured on X11; Wayland allows no explicit grabs, so there the main
+    // window's event filter redirects the moves it still receives.
+    setMouseGrabEnabled(true);
 }
 
-void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
-    if (e->button() == Qt::LeftButton) {
+void VulkanWindow::handleRelease(Qt::MouseButton button, const QPointF& pos,
+                                 Qt::KeyboardModifiers mods) {
+    if (button == Qt::LeftButton) {
         dragging_ = false;
         if (clickCandidate_) {
             clickCandidate_ = false;
             if (measureMode_) {
-                handleMeasureClick(e->position());
+                handleMeasureClick(pos);
                 updateReadout();
             } else {
                 // Net pick: snap points, the nearest track segment, or (deep)
@@ -3390,41 +3396,47 @@ void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
                 glm::vec3 p;
                 bool snapped = false;
                 int net = -1;
-                screenToBoard(e->position(), p, snapped, net, /*deep=*/true);
+                screenToBoard(pos, p, snapped, net, /*deep=*/true);
                 // Ctrl adds to the selection instead of replacing it.
                 emit netPicked(net,
-                               (e->modifiers() & Qt::ControlModifier) != 0);
+                               (mods & Qt::ControlModifier) != 0);
             }
         }
     }
-    if (e->button() == Qt::RightButton) draggingInv_ = false;
-    if (e->button() == Qt::MiddleButton) panning_ = false;
+    if (button == Qt::RightButton) draggingInv_ = false;
+    if (button == Qt::MiddleButton) panning_ = false;
     // A drag has no easing animation to keep the loop alive, so without this the
     // fast-movement downgrade would never get the frame that restores PT/RT once
     // the button comes up.
-    if (!dragging_ && !draggingInv_ && !panning_) requestUpdate();
+    if (!dragging_ && !draggingInv_ && !panning_) {
+        setMouseGrabEnabled(false);
+        requestUpdate();
+    }
 }
 
-void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
+void VulkanWindow::mouseReleaseEvent(QMouseEvent* e) {
+    handleRelease(e->button(), e->position(), e->modifiers());
+}
+
+void VulkanWindow::handleMove(const QPointF& pos, Qt::MouseButtons held) {
     // A button released OUTSIDE the window can go undelivered (a native
     // child window in a container does not always keep the implicit grab,
     // notably on Wayland), which left the drag latched: the camera kept
     // following the bare cursor. The move event carries the real button
     // state, so believe it over our own bookkeeping.
-    const Qt::MouseButtons held = e->buttons();
     if (dragging_ && !(held & Qt::LeftButton)) {
         dragging_ = false;
         clickCandidate_ = false;
     }
     if (draggingInv_ && !(held & Qt::RightButton)) draggingInv_ = false;
     if (panning_ && !(held & Qt::MiddleButton)) panning_ = false;
-    const QPointF delta = e->position() - lastPos_;
-    lastPos_ = e->position();
-    cursorPos_ = e->position();
+    const QPointF delta = pos - lastPos_;
+    lastPos_ = pos;
+    cursorPos_ = pos;
 
     // A real drag cancels the measure-click candidacy.
     if (clickCandidate_ &&
-        (e->position() - pressPos_).manhattanLength() > 4.0) {
+        (pos - pressPos_).manhattanLength() > 4.0) {
         clickCandidate_ = false;
     }
     // Hover pick for the rubber band / snap highlight, only while no button
@@ -3495,10 +3507,14 @@ void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
     }
 }
 
-void VulkanWindow::wheelEvent(QWheelEvent* e) {
-    const float steps = static_cast<float>(e->angleDelta().y()) / 120.0f;
+void VulkanWindow::mouseMoveEvent(QMouseEvent* e) {
+    handleMove(e->position(), e->buttons());
+}
 
-    if (e->modifiers() & Qt::ControlModifier) {
+void VulkanWindow::handleWheel(const QPointF& pos, float steps,
+                               Qt::KeyboardModifiers mods) {
+
+    if (mods & Qt::ControlModifier) {
         // ~3 wheel clicks per stage: two to lift the ring, one of dwell.
         setExplodeProgress(explodeProgress_ + steps * 0.34f);
         return;
@@ -3567,8 +3583,13 @@ void VulkanWindow::wheelEvent(QWheelEvent* e) {
     // event (even mid-glide) keeps it continuous -- at the instant of capture
     // distance == anchor distance, so the pivot shift is zero and there is no
     // jump. A view preset drives the pivot itself, so defer to it there.
-    zoomToCursor_ = !cameraAnimating_ && computeZoomAnchor(e->position());
+    zoomToCursor_ = !cameraAnimating_ && computeZoomAnchor(pos);
     requestUpdate();
+}
+
+void VulkanWindow::wheelEvent(QWheelEvent* e) {
+    handleWheel(e->position(), static_cast<float>(e->angleDelta().y()) / 120.0f,
+                e->modifiers());
 }
 
 // Capture the world point under the cursor for zoom-to-cursor. It is taken on

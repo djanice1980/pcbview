@@ -43,6 +43,8 @@ class MainWindow : public QMainWindow {
     Q_OBJECT
 
 public:
+    bool eventFilter(QObject* obj, QEvent* ev) override;
+
     explicit MainWindow(const QString& path = {});
 
     // Import + tessellate + upload. Returns false and shows a dialog on failure,
