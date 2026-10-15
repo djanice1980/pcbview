@@ -1352,7 +1352,20 @@ Things we currently render differently from what the plant would produce:
    three renderers turn it into opacity the same way, a = 1 - (1 - a0)^r,
    so the slider's opacity is the thick film's and a trace shows through
    its thinner knee -- which is how a real LPI mask reads: deep in the
-   valleys, lighter over the copper. Silkscreen gets the same three pieces
+   valleys, lighter over the copper. The mask's OPENINGS get a developed
+   edge: developing a tack-dried LPI film leaves a sloped sidewall that
+   the final cure rounds off, so over about one film thickness (20 um)
+   before an opening the film tapers to a lip (8%). A second ring family
+   grown from the openings (4 rings) splits every piece; the whole height
+   field is scaled by a smoothstep T(distance to the nearest developed
+   edge), normals from the combined gradient, and the per-triangle film
+   ratio is evaluated from the real thickness at each centroid -- so the
+   rim thins AND fades, the soft lighter ring around every pad in a
+   macro photograph. Edges excluded from the taper: any stretch of an
+   opening on the board outline (routed, a vertical cut) or on a copper
+   edge (the mask meets the copper: the cliff). Costs ~30% more mask
+   vertices and doubles the film's boolean work (import 5 s -> 10 s on
+   cx4). Silkscreen gets the same three pieces
    at its own thickness, so a stroke crossing a trace is one continuous
    top riding the mask.
 

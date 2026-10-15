@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <map>
 #include <numbers>
 #include <queue>
@@ -1542,15 +1543,6 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 const double level =
                     frontSide ? baseZ0 + (isMask ? lam : al.thickness)
                               : baseZ0 + al.thickness - (isMask ? lam : 0.0);
-                // Tag the mask triangles emitted since `from` with their film
-                // thickness, as a ratio of the thick film (see Part::triFilm).
-                const auto tagFilm = [&](size_t from, double thickness) {
-                    if (!isMask) return;
-                    const size_t n = part.mesh.indices.size() / 3;
-                    part.triFilm.resize(n, 1.0f);
-                    const float r = static_cast<float>(thickness / lam);
-                    for (size_t i = from / 3; i < n; ++i) part.triFilm[i] = r;
-                };
                 static const int kSteps = [] {
                     const char* v = std::getenv("PCBVIEW_MASK_FILLET_STEPS");
                     const int n = v && v[0] ? std::atoi(v) : 8;
@@ -1659,102 +1651,159 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     return edgeOn(ringGrids[k], ax, ay, bx, by);
                 };
 
-                // Base: beyond the foot, full thickness, dropped. Silk is an
-                // opaque slab; the mask's base is a sheet with walls only where
-                // the film is cut -- along the foot it abuts the last band, and
-                // a wall there was an internal face (a dark stripe along the
-                // foot of every fillet, seen edge-on).
-                if (!isMask) {
-                    for (const Shape& shape : clipShapes(film, foot, ClipType::Difference))
-                        extrude(shape, baseZ0, baseZ0 + al.thickness, part.mesh);
-                } else {
-                    const size_t from = part.mesh.indices.size();
-                    const auto baseAt = [&](double, double, double& z, float n[3]) {
-                        z = level;
-                        n[0] = 0.0f;
-                        n[1] = 0.0f;
-                        n[2] = frontSide ? 1.0f : -1.0f;
-                    };
-                    const double baseFloor = frontSide ? baseZ0 : baseZ0 + al.thickness;
-                    const auto baseFloorAt = [&](double, double) { return baseFloor; };
-                    const auto onFoot = [&](double ax, double ay, double bx, double by) {
-                        return onRing(kSteps, ax, ay, bx, by);
-                    };
-                    for (const Shape& shape : clipShapes(film, foot, ClipType::Difference))
-                        sheet(shape, frontSide, baseAt, baseFloorAt, onFoot, part.mesh);
-                    tagFilm(from, lam);
-                }
-
-                // Cap: over copper, at the raised level. Silk is an opaque
-                // slab at its own thickness. The mask's cap is a top sheet
-                // with walls down to the laminate and no underside: from
-                // above a ray meets the sheet and then opaque copper (one
-                // lottery), while the walls coat the copper's flanks and the
-                // 20 um shoulder beside them where the film is CUT -- the
-                // board outline, a mask opening. Along the rim ring itself
-                // band 0 abuts the cap, and a wall there would be an internal
-                // face: a ray through the fillet's cross-section at a
-                // castellation crossed it into the cap for a second lottery
-                // (a dark stripe beside the pad). A hair-thick cap with no
-                // walls at all was tried before that: bare copper and bare
-                // laminate between the pad and the fillet.
-                {
-                    const double top = level + zs * rise;
-                    const size_t from = part.mesh.indices.size();
-                    if (!isMask) {
-                        const double lo = frontSide ? top - al.thickness : top;
-                        const double hi = frontSide ? top : top + al.thickness;
-                        for (const Shape& shape :
-                             clipShapes(film, rim, ClipType::Intersection))
-                            extrude(shape, lo, hi, part.mesh);
-                    } else {
-                        const auto capAt = [&](double, double, double& z, float n[3]) {
-                            z = top;
-                            n[0] = 0.0f;
-                            n[1] = 0.0f;
-                            n[2] = frontSide ? 1.0f : -1.0f;
-                        };
-                        const double capFloor =
-                            baseZ0 + (frontSide ? 0.0 : al.thickness);
-                        const auto floorConst = [&](double, double) { return capFloor; };
-                        const auto onRim = [&](double ax, double ay, double bx,
-                                               double by) {
-                            return onRing(0, ax, ay, bx, by);
-                        };
-                        for (const Shape& shape :
-                             clipShapes(film, rim, ClipType::Intersection))
-                            sheet(shape, frontSide, capAt, floorConst, onRim,
-                                  part.mesh, /*underside=*/false);
-                        tagFilm(from, al.thickness);
+                // Developed edges. Developing a tack-dried LPI film leaves a
+                // sloped sidewall that the final cure rounds off: over about
+                // one film thickness before an opening the mask tapers from
+                // full thickness to a lip. The edges that get it are the
+                // openings' boundaries, minus any stretch on the board outline
+                // (routed: a true vertical cut) or on a copper edge (the mask
+                // meets the copper there -- the cliff). A second ring family
+                // grown from the openings splits every piece, the height
+                // field is scaled by T(distance), and with the thickness goes
+                // the tint (per-triangle film), so the rim reads soft and
+                // lighter, as on a real board, not as a hard line.
+                const double taperReach = lam;
+                constexpr int kTaperSteps = 4;
+                constexpr double kLip = 0.08;  // film left at the edge, fraction
+                std::vector<Paths64> tz;       // tz[0] = openings, tz[j] grown
+                std::vector<SegmentGrid> tzGrids;
+                std::unique_ptr<SegmentGrid> openGrid;
+                if (isMask && !al.art.empty()) {
+                    const Paths64 openingsIn =
+                        clipPaths(al.art, art.outline, ClipType::Intersection);
+                    const SegmentGrid outlineGrid(art.outline, 0.05);
+                    Paths64 developed;
+                    for (const Path64& path : openingsIn) {
+                        const size_t n = path.size();
+                        for (size_t i = 0; i < n; ++i) {
+                            const Point64& a = path[i];
+                            const Point64& b = path[(i + 1) % n];
+                            const double mx = 0.5 * (toMm(a.x) + toMm(b.x));
+                            const double my = 0.5 * (toMm(a.y) + toMm(b.y));
+                            double dx, dy;
+                            if (outlineGrid.nearest(mx, my, dx, dy) < 0.001) continue;
+                            if (ringGrids[0].nearest(mx, my, dx, dy) < 0.001) continue;
+                            developed.push_back(Path64{a, b});
+                        }
+                    }
+                    if (!developed.empty()) {
+                        openGrid = std::make_unique<SegmentGrid>(developed, 0.05);
+                        tz.resize(kTaperSteps + 1);
+                        tz[0] = openingsIn;
+                        for (int j = 1; j <= kTaperSteps; ++j) {
+                            ClipperOffset co;
+                            co.ArcTolerance(kScale * 0.001);
+                            co.AddPaths(openingsIn, JoinType::Round, EndType::Polygon);
+                            co.Execute(taperReach * j / kTaperSteps * kScale, tz[j]);
+                        }
+                        tzGrids.reserve(tz.size());
+                        for (const Paths64& r : tz) tzGrids.emplace_back(r, 0.05);
                     }
                 }
-
-                // Bands: the zone, lifted by the profile at each vertex's
-                // distance from the rim.
-                const auto at = [&](double x, double y, double& z, float n[3]) {
-                    double dx = 0.0, dy = 0.0;
-                    double d = grid.nearest(x, y, dx, dy);
-                    d = std::max(0.0, std::min(reach, d));
-                    const double f = 1.0 - d / reach;
-                    // A settled liquid: convex over the copper's top corner,
-                    // concave into the laminate, horizontal at both ends. The
-                    // smoothstep gives that S with its steepest point (45 deg)
-                    // mid-way. A concave-only quadratic was steepest AT the
-                    // copper edge, so the flat film met the slope in a sharp
-                    // ridge -- a cusp with a shading crease along it.
-                    const double lift = rise * f * f * (3.0 - 2.0 * f);
-                    // -d(lift)/dx: how steeply the surface descends outward.
-                    const double sl = 6.0 * rise * f * (1.0 - f) / reach;
-                    z = level + zs * lift;
-                    const double len = std::sqrt(sl * sl + 1.0);
-                    n[0] = static_cast<float>(dx * sl / len);
-                    n[1] = static_cast<float>(dy * sl / len);
+                const bool taper = openGrid != nullptr;
+                // T in [kLip, 1] and its gradient: smoothstep over taperReach
+                // from the nearest developed edge.
+                const auto taperAt = [&](double x, double y, double& T, double& gx,
+                                         double& gy) {
+                    T = 1.0;
+                    gx = gy = 0.0;
+                    if (!taper) return;
+                    double ox = 0.0, oy = 0.0;
+                    const double d = openGrid->nearest(x, y, ox, oy);
+                    if (d >= taperReach) return;
+                    const double u = std::max(0.0, d / taperReach);
+                    T = kLip + (1.0 - kLip) * u * u * (3.0 - 2.0 * u);
+                    const double dT = (1.0 - kLip) * 6.0 * u * (1.0 - u) / taperReach;
+                    gx = dT * ox;
+                    gy = dT * oy;
+                };
+                // Film thickness h and its gradient at (x, y). mode 0: the
+                // base (the thick film); 1: the cap over copper (the thin
+                // film); 2: a band (thick film plus the meniscus lift -- a
+                // settled liquid: convex over the copper's top corner, concave
+                // into the laminate, horizontal at both ends; the smoothstep
+                // gives that S with its steepest point, 45 deg, mid-way. A
+                // concave-only quadratic was steepest AT the copper edge, so
+                // the flat film met the slope in a sharp ridge with a shading
+                // crease along it). The taper scales all three.
+                const auto filmAt = [&](int mode, double x, double y, double& h,
+                                        double& gx, double& gy) {
+                    double H = mode == 1 ? al.thickness : lam;
+                    double Hx = 0.0, Hy = 0.0;
+                    if (mode == 2) {
+                        double dx = 0.0, dy = 0.0;
+                        double d = grid.nearest(x, y, dx, dy);
+                        d = std::max(0.0, std::min(reach, d));
+                        const double f = 1.0 - d / reach;
+                        H += rise * f * f * (3.0 - 2.0 * f);
+                        // How steeply the surface descends outward.
+                        const double sl = 6.0 * rise * f * (1.0 - f) / reach;
+                        Hx = -dx * sl;
+                        Hy = -dy * sl;
+                    }
+                    double T, Tx, Ty;
+                    taperAt(x, y, T, Tx, Ty);
+                    h = T * H;
+                    gx = Tx * H + T * Hx;
+                    gy = Ty * H + T * Hy;
+                };
+                const auto setNormal = [&](float n[3], double gx, double gy) {
+                    const double len = std::sqrt(gx * gx + gy * gy + 1.0);
+                    n[0] = static_cast<float>(-gx / len);
+                    n[1] = static_cast<float>(-gy / len);
                     n[2] = static_cast<float>(zs / len);
                 };
-                // The band's underside: for the mask, the laminate (the
-                // dropped level); for silk, the mask's surface beneath it.
+                // Tag the mask triangles emitted since `from` with their film
+                // thickness at the centroid, as a ratio of the thick film (see
+                // Part::triFilm).
+                const auto tagFilm = [&](size_t from, int mode) {
+                    if (!isMask) return;
+                    const size_t n = part.mesh.indices.size() / 3;
+                    part.triFilm.resize(n, 1.0f);
+                    for (size_t i = from / 3; i < n; ++i) {
+                        double x = 0.0, y = 0.0;
+                        for (int c = 0; c < 3; ++c) {
+                            const Vertex& v = part.mesh.vertices[part.mesh.indices[3 * i + c]];
+                            x += v.position[0];
+                            y += v.position[1];
+                        }
+                        double h, gx, gy;
+                        filmAt(mode, x / 3.0, y / 3.0, h, gx, gy);
+                        part.triFilm[i] = static_cast<float>(std::max(0.02, h / lam));
+                    }
+                };
+
+                // The laminate's face: what the mask's thickness is measured
+                // from. The copper's outer face, for the cap and the cliff.
+                const double lamFace = frontSide ? baseZ0 : baseZ0 + al.thickness;
+                const double copperFace =
+                    frontSide ? baseZ0 + art.copperThickness
+                              : baseZ0 + al.thickness - art.copperThickness;
+                const auto baseAt = [&](double x, double y, double& z, float n[3]) {
+                    double h, gx, gy;
+                    filmAt(0, x, y, h, gx, gy);
+                    z = lamFace + zs * h;
+                    setNormal(n, gx, gy);
+                };
+                const auto capAt = [&](double x, double y, double& z, float n[3]) {
+                    double h, gx, gy;
+                    filmAt(1, x, y, h, gx, gy);
+                    z = copperFace + zs * h;
+                    setNormal(n, gx, gy);
+                };
+                // Bands: lifted by the profile at each vertex's distance from
+                // the rim. Silk rides the mask's surface at its own level.
+                const auto at = [&](double x, double y, double& z, float n[3]) {
+                    double h, gx, gy;
+                    filmAt(2, x, y, h, gx, gy);
+                    z = isMask ? lamFace + zs * h : level + zs * (h - lam);
+                    setNormal(n, gx, gy);
+                };
+                const auto lamFloor = [&](double, double) { return lamFace; };
+                // The band's underside: for the mask, the laminate; for silk,
+                // the mask's surface beneath it.
                 const auto floorAt = [&](double x, double y) {
-                    if (isMask) return baseZ0 + (frontSide ? 0.0 : al.thickness);
+                    if (isMask) return lamFace;
                     double z = 0.0;
                     float n[3];
                     at(x, y, z, n);
@@ -1772,37 +1821,120 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 const auto onExposed = [&](double ax, double ay, double bx, double by) {
                     return edgeOn(exposedGrid, ax, ay, bx, by);
                 };
-                const double copperFace =
-                    frontSide ? baseZ0 + art.copperThickness
-                              : baseZ0 + al.thickness - art.copperThickness;
-                for (int k = 0; k < kSteps; ++k) {
-                    const Paths64 band =
-                        clipPaths(rings[k + 1], rings[k], ClipType::Difference);
-                    // An edge whose endpoints both sit on the same ring is
-                    // shared with the neighbouring band: no wall there, or a
-                    // ray from above would meet two entering faces. Anything
-                    // else is a cut edge of the film and gets closed.
-                    const auto cliff = [&](double ax, double ay, double bx, double by) {
-                        return isMask && k == 0 && onRing(0, ax, ay, bx, by) &&
-                               onExposed(ax, ay, bx, by);
-                    };
-                    const auto skipWall = [&](double ax, double ay, double bx,
-                                              double by) {
-                        if (cliff(ax, ay, bx, by)) return false;
-                        return onRing(k, ax, ay, bx, by) || onRing(k + 1, ax, ay, bx, by);
-                    };
-                    const auto wallFloor = [&](double ax, double ay, double bx, double by) {
-                        return cliff(ax, ay, bx, by)
-                                   ? copperFace
-                                   : std::numeric_limits<double>::quiet_NaN();
-                    };
-                    const size_t from = part.mesh.indices.size();
-                    for (const Shape& shape : clipShapes(film, band, ClipType::Intersection))
-                        sheet(shape, frontSide, at, floorAt, skipWall, part.mesh,
-                              /*underside=*/true, wallFloor);
-                    // Mid-band thickness: the thick film plus the lift there.
-                    const double fm = 1.0 - (k + 0.5) / kSteps;
-                    tagFilm(from, lam + rise * fm * fm * (3.0 - 2.0 * fm));
+                // Shared with a neighbouring taper region: no wall. tz[0] is
+                // the developed edge itself, where only the lip is left.
+                const auto onTz = [&](double ax, double ay, double bx, double by) {
+                    for (const SegmentGrid& g : tzGrids)
+                        if (edgeOn(g, ax, ay, bx, by)) return true;
+                    return false;
+                };
+
+                // The three pieces, then each split by the taper regions:
+                // outside the taper zone, each taper ring, and inside the
+                // openings (empty but for a closed hairline gap).
+                const Paths64 basePaths = clipPaths(film, foot, ClipType::Difference);
+                const Paths64 capPaths = clipPaths(film, rim, ClipType::Intersection);
+                std::vector<Paths64> bandPaths(kSteps);
+                for (int k = 0; k < kSteps; ++k)
+                    bandPaths[k] = clipPaths(
+                        film, clipPaths(rings[k + 1], rings[k], ClipType::Difference),
+                        ClipType::Intersection);
+                std::vector<Paths64> regions;
+                if (taper) {
+                    regions.push_back(clipPaths(film, tz[kTaperSteps], ClipType::Difference));
+                    for (int j = 0; j < kTaperSteps; ++j)
+                        regions.push_back(clipPaths(
+                            film, clipPaths(tz[j + 1], tz[j], ClipType::Difference),
+                            ClipType::Intersection));
+                    regions.push_back(clipPaths(film, tz[0], ClipType::Intersection));
+                } else {
+                    regions.push_back(film);
+                }
+
+                for (const Paths64& region : regions) {
+                    if (region.empty()) continue;
+                    // Base: beyond the foot, the thick film. Silk is an opaque
+                    // slab; the mask's base is a sheet with walls only where
+                    // the film is cut -- along the foot it abuts the last
+                    // band, and a wall there was an internal face (a dark
+                    // stripe along the foot of every fillet, seen edge-on).
+                    if (!isMask) {
+                        for (const Shape& shape :
+                             clipShapes(basePaths, region, ClipType::Intersection))
+                            extrude(shape, baseZ0, baseZ0 + al.thickness, part.mesh);
+                    } else {
+                        const size_t from = part.mesh.indices.size();
+                        const auto skipBase = [&](double ax, double ay, double bx,
+                                                  double by) {
+                            return onRing(kSteps, ax, ay, bx, by) || onTz(ax, ay, bx, by);
+                        };
+                        for (const Shape& shape :
+                             clipShapes(basePaths, region, ClipType::Intersection))
+                            sheet(shape, frontSide, baseAt, lamFloor, skipBase, part.mesh);
+                        tagFilm(from, 0);
+                    }
+
+                    // Cap: over copper, the thin film. Silk is an opaque slab
+                    // at its own thickness. The mask's cap is a top sheet with
+                    // walls down to the laminate where the film is CUT and no
+                    // underside: from above a ray meets the sheet and then
+                    // opaque copper (one lottery), while the walls coat the
+                    // copper's flanks at a sawn edge. Along the rim band 0
+                    // abuts the cap and a wall there would be an internal
+                    // face: a ray through the fillet's cross-section at a
+                    // castellation crossed it into the cap for a second
+                    // lottery (a dark stripe beside the pad).
+                    {
+                        const size_t from = part.mesh.indices.size();
+                        if (!isMask) {
+                            const double top = level + zs * rise;
+                            const double lo = frontSide ? top - al.thickness : top;
+                            const double hi = frontSide ? top : top + al.thickness;
+                            for (const Shape& shape :
+                                 clipShapes(capPaths, region, ClipType::Intersection))
+                                extrude(shape, lo, hi, part.mesh);
+                        } else {
+                            const auto skipCap = [&](double ax, double ay, double bx,
+                                                     double by) {
+                                return onRing(0, ax, ay, bx, by) || onTz(ax, ay, bx, by);
+                            };
+                            for (const Shape& shape :
+                                 clipShapes(capPaths, region, ClipType::Intersection))
+                                sheet(shape, frontSide, capAt, lamFloor, skipCap,
+                                      part.mesh, /*underside=*/false);
+                            tagFilm(from, 1);
+                        }
+                    }
+
+                    // Bands: the meniscus zone in kSteps concentric rings.
+                    for (int k = 0; k < kSteps; ++k) {
+                        // An edge on a ring shared with the neighbouring band
+                        // or taper region gets no wall, or a ray crossing it
+                        // would meet two entering faces. Anything else is a
+                        // cut edge of the film and gets closed.
+                        const auto cliff = [&](double ax, double ay, double bx, double by) {
+                            return isMask && k == 0 && onRing(0, ax, ay, bx, by) &&
+                                   onExposed(ax, ay, bx, by);
+                        };
+                        const auto skipWall = [&](double ax, double ay, double bx,
+                                                  double by) {
+                            if (cliff(ax, ay, bx, by)) return false;
+                            return onRing(k, ax, ay, bx, by) ||
+                                   onRing(k + 1, ax, ay, bx, by) || onTz(ax, ay, bx, by);
+                        };
+                        const auto wallFloor = [&](double ax, double ay, double bx,
+                                                   double by) {
+                            return cliff(ax, ay, bx, by)
+                                       ? copperFace
+                                       : std::numeric_limits<double>::quiet_NaN();
+                        };
+                        const size_t from = part.mesh.indices.size();
+                        for (const Shape& shape :
+                             clipShapes(bandPaths[k], region, ClipType::Intersection))
+                            sheet(shape, frontSide, at, floorAt, skipWall, part.mesh,
+                                  /*underside=*/true, wallFloor);
+                        tagFilm(from, 2);
+                    }
                 }
             }
             const size_t added = (part.mesh.indices.size() - before) / 3;
