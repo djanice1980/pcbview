@@ -1671,7 +1671,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // lighter, as on a real board, not as a hard line.
                 const double taperReach = lam;
                 constexpr int kTaperSteps = 4;
-                constexpr double kLip = 0.08;  // film left at the edge, fraction
+                constexpr double kLip = 0.0;  // the edge thins to nothing
                 std::vector<Paths64> tz;       // tz[0] = openings, tz[j] grown
                 std::vector<SegmentGrid> tzGrids;
                 std::unique_ptr<SegmentGrid> openGrid;
@@ -1740,24 +1740,33 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 bool bare = false;
                 const auto filmAt = [&](int mode, double x, double y, double& h,
                                         double& gx, double& gy) {
-                    if (bare) {
-                        h = mode == 1 ? cT : 0.0;
-                        gx = gy = 0.0;
-                        return;
-                    }
-                    double H = mode == 1 ? mT : lam;
-                    double Hx = 0.0, Hy = 0.0;
+                    // The meniscus shape S (0 at the foot, 1 at the copper
+                    // edge) and its gradient, for a unit rise.
+                    double S = 0.0, Sx = 0.0, Sy = 0.0;
                     if (mode == 2) {
                         double dx = 0.0, dy = 0.0;
                         double d = grid.nearest(x, y, dx, dy);
                         d = std::max(0.0, std::min(reach, d));
                         const double f = 1.0 - d / reach;
-                        H += rise * f * f * (3.0 - 2.0 * f);
-                        // How steeply the surface descends outward.
-                        const double sl = 6.0 * rise * f * (1.0 - f) / reach;
-                        Hx = -dx * sl;
-                        Hy = -dy * sl;
+                        S = f * f * (3.0 - 2.0 * f);
+                        // How steeply S descends outward.
+                        const double sl = 6.0 * f * (1.0 - f) / reach;
+                        Sx = -dx * sl;
+                        Sy = -dy * sl;
                     }
+                    if (bare) {
+                        // No film here: the surface is the laminate, the pad's
+                        // copper, or -- for ink crossing the pad's edge -- the
+                        // ink's own drape up the 35 um step, on the same
+                        // S-curve. (A square step left the ink's end face
+                        // hanging above the bare copper flank.)
+                        h = mode == 1 ? cT : cT * S;
+                        gx = cT * Sx;
+                        gy = cT * Sy;
+                        return;
+                    }
+                    const double H = (mode == 1 ? mT : lam) + rise * S;
+                    const double Hx = rise * Sx, Hy = rise * Sy;
                     double T, Tx, Ty;
                     taperAt(x, y, T, Tx, Ty);
                     h = T * H + (mode == 1 ? cT : 0.0);

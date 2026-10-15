@@ -1355,7 +1355,7 @@ Things we currently render differently from what the plant would produce:
    valleys, lighter over the copper. The mask's OPENINGS get a developed
    edge: developing a tack-dried LPI film leaves a sloped sidewall that
    the final cure rounds off, so over about one film thickness (20 um)
-   before an opening the film tapers to a lip (8%). A second ring family
+   before an opening the film tapers to nothing. A second ring family
    grown from the openings (4 rings) splits every piece; the whole height
    field is scaled by a smoothstep T(distance to the nearest developed
    edge), normals from the combined gradient, and the per-triangle film
@@ -1368,9 +1368,12 @@ Things we currently render differently from what the plant would produce:
    cx4). Silkscreen is printed ON that surface: its pieces are the mask's
    height field lifted by the ink's thickness -- meniscus, taper and all
    -- and inside a mask opening (found from the same side's mask art) the
-   ink lies on the bare laminate or on the pad. It used to be built from
-   the copper alone, so across a pad's clearance ring it stayed at the
-   mask's level: a bridge in the air. Silkscreen gets the same three pieces
+   ink lies on the bare laminate or on the pad, and at the pad's edge it
+   drapes up the 35 um step on the same S-curve (a square step left the
+   ink's end face hanging above the bare copper flank; a silk wall there
+   would be coplanar with the flank). It used to be built from the copper
+   alone, so across a pad's clearance ring it stayed at the mask's level:
+   a bridge in the air. Silkscreen gets the same three pieces
    at its own thickness, so a stroke crossing a trace is one continuous
    top riding the mask.
 
