@@ -1487,8 +1487,8 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 //   bands  the fillet zone between rim and foot, in kSteps
                 //          concentric rings, each a single-sided SHEET whose
                 //          vertices are lifted by the meniscus profile at
-                //          their measured distance from the rim: concave
-                //          quadratic, steep at the wall, flat at the foot,
+                //          their measured distance from the rim:
+                //          an S-curve (smoothstep), level at the crest and the foot,
                 //          with normals from the profile's slope, so it shades
                 //          as one continuous curve in every render mode.
                 // Booleans clip the zone exactly to any outline -- a mask
@@ -1512,7 +1512,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 const bool isMask = al.kind == LayerKind::Soldermask;
                 static const int kSteps = [] {
                     const char* v = std::getenv("PCBVIEW_MASK_FILLET_STEPS");
-                    const int n = v && v[0] ? std::atoi(v) : 6;
+                    const int n = v && v[0] ? std::atoi(v) : 8;
                     return std::max(1, std::min(n, 32));
                 }();
 
@@ -1694,9 +1694,15 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                     double d = grid.nearest(x, y, dx, dy);
                     d = std::max(0.0, std::min(reach, d));
                     const double f = 1.0 - d / reach;
-                    const double lift = rise * f * f;
+                    // A settled liquid: convex over the copper's top corner,
+                    // concave into the laminate, horizontal at both ends. The
+                    // smoothstep gives that S with its steepest point (45 deg)
+                    // mid-way. A concave-only quadratic was steepest AT the
+                    // copper edge, so the flat film met the slope in a sharp
+                    // ridge -- a cusp with a shading crease along it.
+                    const double lift = rise * f * f * (3.0 - 2.0 * f);
                     // -d(lift)/dx: how steeply the surface descends outward.
-                    const double sl = 2.0 * rise * f / reach;
+                    const double sl = 6.0 * rise * f * (1.0 - f) / reach;
                     z = frontSide ? baseZ0 + al.thickness + lift : baseZ0 - lift;
                     const double len = std::sqrt(sl * sl + 1.0);
                     n[0] = static_cast<float>(dx * sl / len);

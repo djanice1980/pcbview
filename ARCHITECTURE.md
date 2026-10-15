@@ -1308,7 +1308,9 @@ Things we currently render differently from what the plant would produce:
    which is the copper edge itself): a top sheet with no underside --
    from above a ray meets the sheet and then opaque copper, one lottery;
    and a lofted
-   SKIRT, quad strips swept along the rim on a concave quadratic profile
+   SKIRT, quad strips swept along the rim on a smoothstep S-profile (level
+   at the crest and the foot -- a concave-only quadratic cusped at the
+   copper edge)
    with normals from the profile's slope, so the meniscus at the foot of
    every trace shades as a continuous curve in every render mode. The
    base stops exactly where the skirt's footprint begins (the clipped rim
