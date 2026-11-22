@@ -212,6 +212,7 @@ void auditUnhandledNodes(const Node& root, BoardModel& board) {
         "image",       // bitmap decoration
         "target",      // fab alignment marks, not part of the board
         "gr_bbox",     // a bounding hint
+        "point",       // KiCad 10 reference-point marker: a drawing symbol
     };
 
     // Inside a footprint is where most geometry lives, so the same audit runs
@@ -220,6 +221,8 @@ void auditUnhandledNodes(const Node& root, BoardModel& board) {
         "pad", "fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly",
         "fp_curve", "fp_text", "property", "at", "layer", "uuid", "tstamp",
         "tedit",  // KiCad 5: last-edit timestamp
+        "point",  // KiCad 10 reference-point marker (seen on F.Fab): a
+                  // drawing symbol with no copper, mask or silk
         "descr", "tags", "attr", "path", "model", "sheetname", "sheetfile",
         "autoplace_cost90", "autoplace_cost180", "solder_mask_margin",
         "solder_paste_margin", "solder_paste_ratio", "clearance",
