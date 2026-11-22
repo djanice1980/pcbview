@@ -687,6 +687,7 @@ geom::LayerArt importPackage(const std::string& path) {
 
         GerberImage img = parseGerber(f.text, f.name);
         for (const std::string& w : img.warnings) art.warnings.push_back(w);
+        for (const std::string& n : img.notes) art.notes.push_back(n);
         if (!img.ok) continue;
 
         FileFunction fn = img.function;

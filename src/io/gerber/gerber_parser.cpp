@@ -506,6 +506,8 @@ private:
     bool hasFunction_ = false;
     std::vector<std::string> warnings_;
 
+    int operations = 0;  // see GerberImage::operations
+
     void warn(const std::string& w) {
         for (const std::string& e : warnings_) if (e == w) return;
         warnings_.push_back(w);
@@ -906,6 +908,7 @@ private:
     }
 
     void operationDraw(double x, double y, double i, double j, bool hasIJ) {
+        ++operations;
         // Record draws on a net as graph segments: the same track-endpoint
         // graph the KiCad path builds, and what lets the measure tool report
         // distance ALONG a net rather than through the air. Region fills are
@@ -996,6 +999,7 @@ private:
     }
 
     void operationFlash(double x, double y) {
+        ++operations;
         auto it = apertures_.find(currentAperture_);
         flashes_.push_back({x, y, currentNet_});
         if (srActive_ && !srReplaying_)
@@ -1005,7 +1009,10 @@ private:
     }
 
     void endRegion() {
-        if (regionContour_.size() >= 3) regionContours_.push_back(regionContour_);
+        if (regionContour_.size() >= 3) {
+            regionContours_.push_back(regionContour_);
+            ++operations;
+        }
         regionContour_.clear();
         if (!regionContours_.empty()) {
             if (!currentNet_.empty()) regionNets_.insert(currentNet_);
@@ -1024,8 +1031,15 @@ FileFunction parseFileFunctionPublic(const std::string& value) {
 GerberImage parseGerber(const std::string& text, const std::string& name) {
     Parser parser(name);
     GerberImage img = parser.run(text);
+    img.operations = parser.operations;
     if (img.dark.empty() && img.ok) {
-        img.warnings.push_back(name + ": parsed but produced no geometry");
+        // A layer with nothing drawn on it is not a problem -- KiCad writes a
+        // header-only Gerber for every requested layer, used or not. Only
+        // commands that yielded nothing are worth a warning.
+        if (img.operations == 0)
+            img.notes.push_back(name + ": empty layer, nothing drawn on it");
+        else
+            img.warnings.push_back(name + ": parsed but produced no geometry");
     }
     return img;
 }

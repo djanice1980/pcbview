@@ -80,6 +80,14 @@ struct GerberImage {
     std::vector<Flash> flashes;
 
     std::vector<std::string> warnings;
+    // Recognised and harmless: an empty layer, say. Not a disagreement with
+    // the board, so the report lists these apart from the warnings.
+    std::vector<std::string> notes;
+    // Drawing operations the file carried: D01 draws, D03 flashes, closed
+    // regions. Zero means the layer is legitimately empty (KiCad writes a
+    // header-only Gerber for a layer with nothing on it); non-zero with no
+    // resulting geometry means something was not understood.
+    int operations = 0;
     bool ok = false;  // false if a fatal parse error left the image unusable
 };
 
