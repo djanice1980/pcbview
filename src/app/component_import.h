@@ -15,6 +15,9 @@
 // touches user paths -- Qt (QProcess/QStandardPaths) rather than the Qt-free io
 // parsers.
 
+#include <QString>
+#include <QStringList>
+
 #include <string>
 #include <vector>
 
@@ -28,6 +31,27 @@ struct ComponentImport {
     std::string message;            // status / reason, for the status bar
 };
 
+// The import in two halves, so the window can run kicad-cli WITHOUT blocking:
+// a cold STEP tessellation of a full board takes minutes the first time, and
+// a synchronous wait froze the window and then gave up at two minutes with
+// the board left bare and no explanation.
+struct ComponentExportPlan {
+    QString cli;          // empty: kicad-cli not found (message says so)
+    QStringList args;     // the export command, when it needs running
+    QString cache;        // the GLB this board resolves to
+    bool cached = false;  // the GLB already exists: no process needed
+    std::string message;  // set when cli is empty
+};
+ComponentExportPlan planComponentExport(const std::string& pcbPath);
+
+// After the export ran (`ran` = a process was started; its exit code, whether
+// it exited normally, and its stderr), or straight away on a cache hit.
+ComponentImport finishComponentImport(const ComponentExportPlan& plan, bool ran,
+                                      int exitCode, bool normalExit,
+                                      const QString& stderrText,
+                                      const geom::Bounds& boardBounds);
+
+// Both halves, synchronously (headless captures, which wait for everything).
 // Never throws. On any failure (no kicad-cli, export error, empty board)
 // returns available=false with `message` explaining why and parts empty, so the
 // board still renders without components. `boardBounds` is the assembled board's

@@ -7,6 +7,8 @@
 #include <QStringList>
 #include <QTreeWidget>
 
+class QProcess;
+
 #include <array>
 #include <functional>
 #include <map>
@@ -205,6 +207,8 @@ private:
     // every reassemble so a thickness change keeps them. Empty on the Gerber
     // path -- gerbers carry no component identity.
     std::vector<geom::Part> componentParts_;
+    // The kicad-cli export of the current board's bodies, while it runs.
+    QProcess* componentProc_ = nullptr;
     QString path_;
     bool loaded_ = false;
     bool fromGerber_ = false;

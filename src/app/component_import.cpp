@@ -267,48 +267,56 @@ std::vector<geom::Part> loadGlb(const QString& glbPath,
 
 }  // namespace
 
-ComponentImport importComponents(const std::string& pcbPath,
-                                 const geom::Bounds& boardBounds) {
-    ComponentImport result;
+ComponentExportPlan planComponentExport(const std::string& pcbPath) {
+    ComponentExportPlan plan;
     const QString board = QString::fromStdString(pcbPath);
-
-    const QString cli = findKicadCli();
-    if (cli.isEmpty()) {
-        result.message =
+    plan.cli = findKicadCli();
+    if (plan.cli.isEmpty()) {
+        plan.message =
             "components skipped: kicad-cli not found (install KiCad, or set "
             "PCBVIEW_KICAD_CLI)";
+        return plan;
+    }
+    plan.cache = cachePathFor(board);
+    plan.cached = QFileInfo::exists(plan.cache);
+    plan.args = QStringList{"pcb",     "export",         "glb",
+                            "--no-board-body",  // we render our own board
+                            "--subst-models",   // use STEP where no VRML exists
+                            "--no-dnp",         // fab does not place DNP parts
+                            "--force",   "-o",  plan.cache,   board};
+    return plan;
+}
+
+ComponentImport finishComponentImport(const ComponentExportPlan& plan, bool ran,
+                                      int exitCode, bool normalExit,
+                                      const QString& stderrText,
+                                      const geom::Bounds& boardBounds) {
+    ComponentImport result;
+    if (plan.cli.isEmpty()) {
+        result.message = plan.message;
+        return result;
+    }
+    const QString exportErrOut = stderrText.trimmed();
+    if (ran && (!normalExit || exitCode != 0 || !QFileInfo::exists(plan.cache))) {
+        // Say what kicad-cli said: "export failed" alone sent people hunting
+        // through the wrong things.
+        QString msg = "components skipped: kicad-cli export failed";
+        if (!exportErrOut.isEmpty()) {
+            // Its last lines are the ones that matter; the first are wx noise.
+            const QStringList lines = exportErrOut.split('\n', Qt::SkipEmptyParts);
+            QStringList tail;
+            for (int i = std::max(0, static_cast<int>(lines.size()) - 3);
+                 i < lines.size(); ++i)
+                if (!lines[i].contains("image handler")) tail << lines[i].trimmed();
+            if (!tail.isEmpty()) msg += " (" + tail.join(" | ").left(300) + ")";
+        }
+        result.message = msg.toStdString();
+        QFile::remove(plan.cache);  // never cache a failure
         return result;
     }
 
-    const QString cache = cachePathFor(board);
-    QString exportErrOut;  // kicad-cli's stderr, kept for the empty-GLB case
-    if (!QFileInfo::exists(cache)) {
-        QProcess proc;
-        QStringList args{"pcb",     "export",         "glb",
-                         "--no-board-body",  // we render our own board
-                         "--subst-models",   // use STEP where no VRML exists
-                         "--no-dnp",         // fab does not place DNP parts
-                         "--force",   "-o",  cache,   board};
-        proc.start(cli, args);
-        if (!proc.waitForStarted(10000)) {
-            result.message = "components skipped: could not start kicad-cli";
-            return result;
-        }
-        // STEP tessellation of a full board can take a few seconds.
-        proc.waitForFinished(120000);
-        exportErrOut =
-            QString::fromLocal8Bit(proc.readAllStandardError()).trimmed();
-        if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0 ||
-            !QFileInfo::exists(cache)) {
-            QString msg = "components skipped: kicad-cli export failed";
-            if (!exportErrOut.isEmpty()) msg += " (" + exportErrOut.left(200) + ")";
-            result.message = msg.toStdString();
-            return result;
-        }
-    }
-
     std::string err;
-    result.parts = loadGlb(cache, boardBounds, err);
+    result.parts = loadGlb(plan.cache, boardBounds, err);
     if (result.parts.empty()) {
         // The usual cause of a syntactically valid but EMPTY export: kicad-cli
         // ran, but the 3D model library its footprints point into is not
@@ -324,7 +332,7 @@ ComponentImport importComponents(const std::string& pcbPath,
                 "Reload the board after installing.";
             // Do NOT leave the empty export behind as a cache hit: with the
             // models installed, an unchanged board must re-export.
-            QFile::remove(cache);
+            QFile::remove(plan.cache);
             return result;
         }
         result.message = err.empty() ? "no components" : ("components: " + err);
@@ -335,7 +343,44 @@ ComponentImport importComponents(const std::string& pcbPath,
     for (const geom::Part& p : result.parts) tris += p.mesh.triangleCount();
     result.available = true;
     result.message = "components: " + std::to_string(tris) + " triangles";
+    // Models kicad-cli could not find are worth a word: the board renders
+    // with those parts missing and nothing else says so.
+    int missing = 0;
+    for (const QString& line : exportErrOut.split('\n'))
+        if (line.contains("Could not add 3D model")) ++missing;
+    if (missing > 0)
+        result.message += " (" + std::to_string(missing) +
+                          " footprint model(s) not found in the 3D library)";
     return result;
+}
+
+ComponentImport importComponents(const std::string& pcbPath,
+                                 const geom::Bounds& boardBounds) {
+    const ComponentExportPlan plan = planComponentExport(pcbPath);
+    if (plan.cli.isEmpty() || plan.cached)
+        return finishComponentImport(plan, false, 0, true, QString(), boardBounds);
+
+    QProcess proc;
+    proc.start(plan.cli, plan.args);
+    if (!proc.waitForStarted(10000)) {
+        ComponentImport result;
+        result.message = "components skipped: could not start kicad-cli";
+        return result;
+    }
+    // A cold STEP tessellation of a full board can take minutes; headless runs
+    // wait for it (an interactive open does not block -- see MainWindow).
+    if (!proc.waitForFinished(600000)) {
+        proc.kill();
+        proc.waitForFinished(5000);
+        ComponentImport result;
+        result.message = "components skipped: kicad-cli export took longer than 10 minutes";
+        QFile::remove(plan.cache);
+        return result;
+    }
+    const QString err = QString::fromLocal8Bit(proc.readAllStandardError());
+    return finishComponentImport(plan, true, proc.exitCode(),
+                                 proc.exitStatus() == QProcess::NormalExit, err,
+                                 boardBounds);
 }
 
 }  // namespace pcbview::app

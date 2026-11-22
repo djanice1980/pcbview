@@ -35,6 +35,7 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QProcess>
 #include <QWheelEvent>
 #include <QAbstractSlider>
 #include <QAbstractSpinBox>
@@ -1029,12 +1030,58 @@ bool MainWindow::loadBoard(const QString& path) {
     // still shows and the reason lands in the status bar.
     componentParts_.clear();
     hiddenComponents_.clear();  // a fresh board starts fully populated
+    if (componentProc_) {  // the previous board's export is still running
+        componentProc_->disconnect(this);
+        componentProc_->kill();
+        componentProc_->deleteLater();
+        componentProc_ = nullptr;
+    }
     QString componentMsg;
     if (isKicad && qEnvironmentVariableIsEmpty("PCBVIEW_NO_COMPONENTS")) {
-        ComponentImport ci =
-            importComponents(path.toStdString(), mesh_.bounds);
-        componentParts_ = std::move(ci.parts);
-        componentMsg = QString::fromStdString(ci.message);
+        const ComponentExportPlan plan = planComponentExport(path.toStdString());
+        // A headless run captures on a timer, so it waits for the export. An
+        // interactive open shows the bare board at once and the bodies land
+        // when kicad-cli is done: a cold STEP tessellation of a full board
+        // takes minutes the first time, and waiting for it froze the window
+        // and then gave up at two minutes with the board left bare.
+        const bool headless = qEnvironmentVariableIsSet("PCBVIEW_CAPTURE") ||
+                              qEnvironmentVariableIsSet("PCBVIEW_RECORD");
+        if (plan.cli.isEmpty() || plan.cached || headless) {
+            ComponentImport ci = importComponents(path.toStdString(), mesh_.bounds);
+            componentParts_ = std::move(ci.parts);
+            componentMsg = QString::fromStdString(ci.message);
+        } else {
+            componentMsg = "components: exporting 3D models through kicad-cli…";
+            auto* proc = new QProcess(this);
+            componentProc_ = proc;
+            const geom::Bounds bounds = mesh_.bounds;
+            connect(proc, &QProcess::finished, this,
+                    [this, proc, plan, bounds](int code, QProcess::ExitStatus st) {
+                        const QString err =
+                            QString::fromLocal8Bit(proc->readAllStandardError());
+                        proc->deleteLater();
+                        if (proc != componentProc_) return;  // superseded
+                        componentProc_ = nullptr;
+                        ComponentImport ci = finishComponentImport(
+                            plan, true, code, st == QProcess::NormalExit, err, bounds);
+                        componentParts_ = std::move(ci.parts);
+                        appendComponents();
+                        populateComponents();
+                        viewport_->setMesh(&mesh_);
+                        statusBar()->showMessage(QString::fromStdString(ci.message),
+                                                 10000);
+                    });
+            connect(proc, &QProcess::errorOccurred, this,
+                    [this, proc](QProcess::ProcessError e) {
+                        if (e != QProcess::FailedToStart || proc != componentProc_)
+                            return;
+                        componentProc_ = nullptr;
+                        proc->deleteLater();
+                        statusBar()->showMessage(
+                            "components skipped: could not start kicad-cli", 10000);
+                    });
+            proc->start(plan.cli, plan.args);
+        }
     }
     appendComponents();
     populateComponents();
