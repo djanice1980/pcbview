@@ -348,6 +348,8 @@ class Parser {
 public:
     explicit Parser(const std::string& name) : name_(name) {}
 
+    int operationCount() const { return operations; }
+
     GerberImage run(const std::string& text) {
         // Split into commands. Extended commands are delimited by '%'; ordinary
         // ones end with '*'. This tokeniser walks the whole file once.
@@ -1031,7 +1033,7 @@ FileFunction parseFileFunctionPublic(const std::string& value) {
 GerberImage parseGerber(const std::string& text, const std::string& name) {
     Parser parser(name);
     GerberImage img = parser.run(text);
-    img.operations = parser.operations;
+    img.operations = parser.operationCount();
     if (img.dark.empty() && img.ok) {
         // A layer with nothing drawn on it is not a problem -- KiCad writes a
         // header-only Gerber for every requested layer, used or not. Only
