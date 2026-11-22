@@ -1,5 +1,6 @@
 #include "geom/tessellate.h"
 #include <cstdlib>
+#include <cstdio>
 
 #include <algorithm>
 #include <array>
@@ -1001,39 +1002,75 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
         // Zones the file left unfilled (an EasyEDA "KiCad 5" export carries
         // the outline only): pour them here, after every other copper on the
         // layer is known. Fill = outline, kept a clearance inside the board
-        // edge, minus every OTHER net's copper grown by the zone's clearance.
-        // Same-net copper simply unions in. No thermal reliefs and no island
-        // removal -- a plain pour, which is what the viewer needs to show
-        // where the plane is.
-        for (const ZoneFill& zone : board.zones) {
-            if (zone.layer != layerIndex || !zone.unfilled) continue;
-            const int zoneNet = netOf(zone.net);
-            Paths64 outline;
-            for (const Polygon& poly : zone.outline) {
-                Path64 path;
-                for (const Vec2& p : poly.outer) path.push_back(toClipper(p));
-                if (path.size() >= 3) outline.push_back(std::move(path));
+        // edge, minus every OTHER net's copper grown by the zone's clearance
+        // -- tracks, pads, vias and the file's own fills, but NOT other pours:
+        // KiCad's rule is that a HIGHER-priority zone of another net owns its
+        // outline (the lower one keeps clear of it), while equal priorities
+        // both fill, overlapping, and its DRC flags that. Poured highest
+        // priority first so the order in the file cannot decide who wins (it
+        // did: a GND plane listed before a V-IN island carved the island
+        // out of itself by luck of ordering). Same-net copper unions in. No
+        // thermal reliefs and no island removal -- a plain pour, which is
+        // what the viewer needs to show where the plane is.
+        {
+            std::map<int, Paths64> baseByNet = byNet;  // before any pour
+            std::vector<const ZoneFill*> pours;
+            for (const ZoneFill& zone : board.zones)
+                if (zone.layer == layerIndex && zone.unfilled) pours.push_back(&zone);
+            std::stable_sort(pours.begin(), pours.end(),
+                             [](const ZoneFill* a, const ZoneFill* b) {
+                                 return a->priority > b->priority;
+                             });
+            for (const ZoneFill* zp : pours) {
+                const ZoneFill& zone = *zp;
+                const int zoneNet = netOf(zone.net);
+                Paths64 outline;
+                for (const Polygon& poly : zone.outline) {
+                    Path64 path;
+                    for (const Vec2& p : poly.outer) path.push_back(toClipper(p));
+                    if (path.size() >= 3) outline.push_back(std::move(path));
+                }
+                if (outline.empty()) continue;
+                normalizeWinding(outline);
+                Paths64 keepOut;
+                for (const auto& [ni, paths] : baseByNet) {
+                    if (ni == zoneNet && ni >= 0) continue;
+                    keepOut.insert(keepOut.end(), paths.begin(), paths.end());
+                }
+                for (const ZoneFill* op : pours) {
+                    const ZoneFill& other = *op;
+                    if (&other == &zone || other.priority <= zone.priority) continue;
+                    if (netOf(other.net) == zoneNet && zoneNet >= 0) continue;
+                    for (const Polygon& poly : other.outline) {
+                        Path64 path;
+                        for (const Vec2& p : poly.outer) path.push_back(toClipper(p));
+                        if (path.size() >= 3) keepOut.push_back(std::move(path));
+                    }
+                }
+                normalizeWinding(keepOut);
+                const double grow = zone.clearance * kScale;
+                Paths64 fill = InflatePaths(
+                    Intersect(outline, art.outline, FillRule::NonZero),
+                    -grow, JoinType::Round, EndType::Polygon);
+                if (!keepOut.empty()) {
+                    const Paths64 grown =
+                        InflatePaths(keepOut, grow, JoinType::Round, EndType::Polygon);
+                    fill = Difference(fill, grown, FillRule::NonZero);
+                }
+                if (std::getenv("PCBVIEW_ZONE_DEBUG")) {
+                    double area = 0.0;
+                    for (const Path64& pth : fill) area += std::abs(Area(pth));
+                    std::fprintf(stderr,
+                                 "[zone] %s net '%s' (#%d) priority %d: keep-out %zu "
+                                 "paths, fill %zu paths %.1f mm2\n",
+                                 layer.name.c_str(), zone.net.c_str(), zoneNet,
+                                 zone.priority, keepOut.size(), fill.size(),
+                                 area / (kScale * kScale));
+                }
+                if (fill.empty()) continue;
+                if (zoneNet >= 0) art.nets[zoneNet].hasPlane = true;
+                addCopper(std::move(fill), zone.net);
             }
-            if (outline.empty()) continue;
-            normalizeWinding(outline);
-            Paths64 keepOut;
-            for (const auto& [ni, paths] : byNet) {
-                if (ni == zoneNet && ni >= 0) continue;
-                keepOut.insert(keepOut.end(), paths.begin(), paths.end());
-            }
-            normalizeWinding(keepOut);
-            const double grow = zone.clearance * kScale;
-            Paths64 fill = InflatePaths(
-                Intersect(outline, art.outline, FillRule::NonZero),
-                -grow, JoinType::Round, EndType::Polygon);
-            if (!keepOut.empty()) {
-                const Paths64 grown =
-                    InflatePaths(keepOut, grow, JoinType::Round, EndType::Polygon);
-                fill = Difference(fill, grown, FillRule::NonZero);
-            }
-            if (fill.empty()) continue;
-            if (zoneNet >= 0) art.nets[zoneNet].hasPlane = true;
-            addCopper(std::move(fill), zone.net);
         }
         if (copper.empty()) continue;
 

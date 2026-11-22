@@ -860,6 +860,7 @@ void readZone(const Node& zoneNode, BoardModel& board) {
             const int idx = board.layerIndex(zoneLayer);
             if (idx >= 0) layers.push_back(idx);
         }
+        const int priority = static_cast<int>(zoneNode.childNum("priority", 0.0));
         for (int layer : layers) {
             ZoneFill fill;
             fill.layer = layer;
@@ -868,6 +869,7 @@ void readZone(const Node& zoneNode, BoardModel& board) {
             fill.outline = outlines;
             fill.clearance = clearance;
             fill.unfilled = true;
+            fill.priority = priority;
             board.zones.push_back(std::move(fill));
         }
     }

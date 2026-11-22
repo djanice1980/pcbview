@@ -119,6 +119,10 @@ struct ZoneFill {
     std::vector<Polygon> outline;
     double clearance = 0.508;
     bool unfilled = false;
+    // KiCad's zone priority: a higher-priority zone carves its outline, grown
+    // by the clearance, out of lower-priority zones of other nets. Equal
+    // priorities both fill (and KiCad's DRC flags the overlap).
+    int priority = 0;
 };
 
 struct Drill {
