@@ -633,6 +633,33 @@ Format coverage: KiCad 10 (`20260206`) and KiCad 8 (`20240108`) both import clea
 KiCad 6 untested — the only file on hand is a 50-byte empty stub, which is
 correctly rejected for having no layers block.
 
+**KiCad 5 (`20171130`) — and everything that exports "KiCad 5 format", EasyEDA
+included.** Tested on two EasyEDA exports (JAMMA breakout, rear AV port). Four
+differences mattered, all handled in the importer and the tessellator:
+
+- Footprints are `(module …)`, not `(footprint …)`. Both spellings are read.
+- Arcs are centre/end/angle: `(start)` is the CENTRE, `(end)` one endpoint,
+  the other is `end` swept by `(angle)` about the centre. pcbnew 5's
+  `GetArcEnd()` is `RotatePoint(end, centre, -angle)` with
+  `RotatePoint(x, y, a) = (x cos a + y sin a, -x sin a + y cos a)`, so the
+  sweep by `-angle` is the plain rotation matrix `R(angle)` in the file's own
+  y-down coordinates. `readArc` yields start/mid/end from either spelling,
+  for graphics, pad primitives and the outline.
+- Zone `filled_polygon`s carry no `(layer)`; the zone's applies. And EasyEDA
+  writes **no fills at all** — the zone outline only, leaving filling to
+  KiCad on load. Such a zone is kept as `ZoneFill::unfilled` with its outline
+  and `connect_pads` clearance, and the tessellator pours it after all other
+  copper on the layer is known: outline kept a clearance inside the board
+  edge, minus every other net's copper grown by the clearance; same-net
+  copper unions in. No thermal reliefs, no island removal — enough to show
+  where the plane is.
+- The outlines do not close: EasyEDA's exporter left gaps of 0.025 mm and
+  0.51 mm in Edge.Cuts on the two boards. The stitcher retries with looser
+  endpoint tolerances (0.05, 0.6, 1.5 mm) and notes the gap in the warnings
+  — KiCad itself would only complain, but with no outline there is no
+  substrate, no mask and no silk. Edge.Cuts arcs are now chorded into the
+  segment soup too (they were skipped before, in any format).
+
 ### Via type vs layer span — we follow the drill file
 
 `cx4multicart_v3` carries a genuine data oddity, and KiCad contradicts itself on it:

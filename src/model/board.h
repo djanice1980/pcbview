@@ -109,7 +109,16 @@ struct ZoneFill {
     int layer = -1;
     std::string net;
     std::string name;
+    // The poured copper, as the file carries it.
     std::vector<Polygon> polygons;
+    // When the file carries NO fill -- EasyEDA's "KiCad 5" export writes the
+    // zone outline only and leaves filling to KiCad on load -- the outline
+    // and the zone's clearance, so the tessellator can pour a plain fill:
+    // outline, inside the board, minus other nets' copper grown by the
+    // clearance. No thermal reliefs, no island removal.
+    std::vector<Polygon> outline;
+    double clearance = 0.508;
+    bool unfilled = false;
 };
 
 struct Drill {

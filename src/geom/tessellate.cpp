@@ -983,7 +983,7 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
                       via.net);
         }
         for (const ZoneFill& zone : board.zones) {
-            if (zone.layer != layerIndex) continue;
+            if (zone.layer != layerIndex || zone.unfilled) continue;
             // A zone fill is pour copper: the net can be "joined through the
             // plane" where its track graph has no route.
             {
@@ -996,6 +996,43 @@ LayerArt buildLayerArt(const BoardModel& board, const TessellateOptions& opts) {
                 for (const Vec2& p : poly.outer) path.push_back(toClipper(p));
                 if (path.size() >= 3) fill.push_back(std::move(path));
             }
+            addCopper(std::move(fill), zone.net);
+        }
+        // Zones the file left unfilled (an EasyEDA "KiCad 5" export carries
+        // the outline only): pour them here, after every other copper on the
+        // layer is known. Fill = outline, kept a clearance inside the board
+        // edge, minus every OTHER net's copper grown by the zone's clearance.
+        // Same-net copper simply unions in. No thermal reliefs and no island
+        // removal -- a plain pour, which is what the viewer needs to show
+        // where the plane is.
+        for (const ZoneFill& zone : board.zones) {
+            if (zone.layer != layerIndex || !zone.unfilled) continue;
+            const int zoneNet = netOf(zone.net);
+            Paths64 outline;
+            for (const Polygon& poly : zone.outline) {
+                Path64 path;
+                for (const Vec2& p : poly.outer) path.push_back(toClipper(p));
+                if (path.size() >= 3) outline.push_back(std::move(path));
+            }
+            if (outline.empty()) continue;
+            normalizeWinding(outline);
+            Paths64 keepOut;
+            for (const auto& [ni, paths] : byNet) {
+                if (ni == zoneNet && ni >= 0) continue;
+                keepOut.insert(keepOut.end(), paths.begin(), paths.end());
+            }
+            normalizeWinding(keepOut);
+            const double grow = zone.clearance * kScale;
+            Paths64 fill = InflatePaths(
+                Intersect(outline, art.outline, FillRule::NonZero),
+                -grow, JoinType::Round, EndType::Polygon);
+            if (!keepOut.empty()) {
+                const Paths64 grown =
+                    InflatePaths(keepOut, grow, JoinType::Round, EndType::Polygon);
+                fill = Difference(fill, grown, FillRule::NonZero);
+            }
+            if (fill.empty()) continue;
+            if (zoneNet >= 0) art.nets[zoneNet].hasPlane = true;
             addCopper(std::move(fill), zone.net);
         }
         if (copper.empty()) continue;

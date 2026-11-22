@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <set>
 #include <map>
 #include <numbers>
@@ -21,6 +22,42 @@ constexpr double kStitchTolerance = 0.001;  // mm
 
 Vec2 readXY(const Node& node, size_t first = 1) {
     return Vec2{node.num(first), node.num(first + 1)};
+}
+
+// An arc as three points -- start, mid, end -- from either spelling.
+//
+// KiCad 6+ writes (start) (mid) (end). KiCad 5 -- and everything that still
+// exports "KiCad 5 format", EasyEDA included -- writes (start) (end) (angle),
+// where `start` is the CENTRE, `end` one endpoint, and the other endpoint is
+// `end` swept by `angle` degrees about the centre: pcbnew 5's GetArcEnd() is
+// RotatePoint(end, centre, -angle), and its RotatePoint(x, y, a) is
+// x' = x cos a + y sin a, y' = -x sin a + y cos a, so the sweep by -angle is
+// the plain rotation matrix R(angle) in the file's own (y-down) coordinates.
+// Returns false when the node is neither.
+bool readArc(const Node& node, Vec2& start, Vec2& mid, Vec2& end) {
+    const Node* s = node.child("start");
+    const Node* e = node.child("end");
+    if (!s || !e) return false;
+    if (const Node* m = node.child("mid")) {
+        start = readXY(*s);
+        mid = readXY(*m);
+        end = readXY(*e);
+        return true;
+    }
+    const Node* a = node.child("angle");
+    if (!a) return false;
+    const Vec2 c = readXY(*s);
+    const Vec2 p = readXY(*e);
+    const double angle = a->num(1, 0.0) * std::numbers::pi / 180.0;
+    const auto rot = [&](double t) {
+        const double dx = p.x - c.x, dy = p.y - c.y;
+        return Vec2{c.x + dx * std::cos(t) - dy * std::sin(t),
+                    c.y + dx * std::sin(t) + dy * std::cos(t)};
+    };
+    start = p;
+    mid = rot(angle * 0.5);
+    end = rot(angle);
+    return true;
 }
 
 LayerKind classifyLayer(std::string_view name) {
@@ -164,7 +201,7 @@ bool buildLayerStackFromBlock(BoardModel& board) {
 void auditUnhandledNodes(const Node& root, BoardModel& board) {
     static const std::set<std::string_view> kHandled = {
         // Geometry we read.
-        "footprint", "zone", "segment", "arc", "via", "gr_line", "gr_rect",
+        "footprint", "module", "zone", "segment", "arc", "via", "gr_line", "gr_rect",
         "gr_circle", "gr_arc", "gr_poly", "gr_curve", "gr_text", "gr_text_box", "dimension",
         // Structure and metadata: no geometry to lose.
         "version", "generator", "generator_version", "general", "paper",
@@ -182,6 +219,7 @@ void auditUnhandledNodes(const Node& root, BoardModel& board) {
     static const std::set<std::string_view> kHandledFp = {
         "pad", "fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly",
         "fp_curve", "fp_text", "property", "at", "layer", "uuid", "tstamp",
+        "tedit",  // KiCad 5: last-edit timestamp
         "descr", "tags", "attr", "path", "model", "sheetname", "sheetfile",
         "autoplace_cost90", "autoplace_cost180", "solder_mask_margin",
         "solder_paste_margin", "solder_paste_ratio", "clearance",
@@ -213,6 +251,8 @@ void auditUnhandledNodes(const Node& root, BoardModel& board) {
     scan(root, kHandled, "");
     for (const Node* fp : root.childList("footprint"))
         scan(*fp, kHandledFp, "footprint > ");
+    for (const Node* fp : root.childList("module"))
+        scan(*fp, kHandledFp, "module > ");
 
     for (const auto& [name, count] : unknown) {
         board.warnings.push_back(
@@ -366,9 +406,11 @@ void readPadPrimitives(const Node& padNode, Pad& pad) {
             if (const Node* e = kid.child("end")) p.pts.push_back(readXY(*e));
         } else if (head == "gr_arc") {
             p.kind = Pad::Primitive::Kind::Arc;
-            if (const Node* a = kid.child("start")) p.pts.push_back(readXY(*a));
-            if (const Node* m = kid.child("mid")) p.arcMid = readXY(*m);
-            if (const Node* b = kid.child("end")) p.pts.push_back(readXY(*b));
+            Vec2 a, m, b;
+            if (!readArc(kid, a, m, b)) continue;
+            p.pts.push_back(a);
+            p.arcMid = m;
+            p.pts.push_back(b);
             p.filled = false;
         } else {
             continue;
@@ -548,13 +590,11 @@ void readGraphics(const Node& parent, const Component* comp, BoardModel& board) 
                 g.start = place(readXY(*c));
                 g.end = place(readXY(*e));
             } else if (spec.kind == GraphicKind::Arc) {
-                const Node* s = node->child("start");
-                const Node* m = node->child("mid");
-                const Node* e = node->child("end");
-                if (!s || !m || !e) continue;
-                g.start = place(readXY(*s));
-                g.mid = place(readXY(*m));
-                g.end = place(readXY(*e));
+                Vec2 a, m, b;
+                if (!readArc(*node, a, m, b)) continue;
+                g.start = place(a);
+                g.mid = place(m);
+                g.end = place(b);
             } else if (spec.kind == GraphicKind::Rect) {
                 const Node* s = node->child("start");
                 const Node* e = node->child("end");
@@ -755,8 +795,12 @@ void readZone(const Node& zoneNode, BoardModel& board) {
     // several layers. Group them so one ZoneFill exists per layer.
     std::map<int, ZoneFill> byLayer;
 
+    // KiCad 6+ puts a layer on every filled_polygon (a zone can span several);
+    // KiCad 5 puts one (layer) on the zone and none on its fills.
+    const std::string zoneLayer(zoneNode.childStr("layer", ""));
     for (const Node* filled : zoneNode.childList("filled_polygon")) {
-        const int layer = board.layerIndex(filled->childStr("layer", ""));
+        const std::string_view fl = filled->childStr("layer", "");
+        const int layer = board.layerIndex(fl.empty() ? zoneLayer : std::string(fl));
         if (layer < 0) {
             board.warnings.push_back("zone fill on unknown layer '" +
                                      std::string(filled->childStr("layer", "?")) +
@@ -781,6 +825,49 @@ void readZone(const Node& zoneNode, BoardModel& board) {
     }
 
     for (auto& [layer, fill] : byLayer) board.zones.push_back(std::move(fill));
+
+    // No fill in the file at all: keep the outline so the tessellator can
+    // pour it (see ZoneFill::unfilled). KiCad 6+ names several layers with
+    // (layers ...); KiCad 5 one with (layer).
+    if (byLayer.empty()) {
+        std::vector<Polygon> outlines;
+        for (const Node* polyNode : zoneNode.childList("polygon")) {
+            const Node* pts = polyNode->child("pts");
+            if (!pts) continue;
+            Polygon poly;
+            for (const Node* xy : pts->childList("xy")) poly.outer.push_back(readXY(*xy));
+            if (poly.outer.size() >= 3) outlines.push_back(std::move(poly));
+        }
+        if (outlines.empty()) return;
+        double clearance = 0.508;
+        if (const Node* cp = zoneNode.child("connect_pads"))
+            clearance = cp->childNum("clearance", clearance);
+        std::vector<int> layers;
+        if (const Node* ls = zoneNode.child("layers")) {
+            for (size_t i = 1; i < ls->kids.size(); ++i) {
+                const std::string_view ln = ls->kids[i].atom;
+                if (ln == "*.Cu" || ln == "F&B.Cu") {
+                    for (int idx : board.copperLayers()) layers.push_back(idx);
+                } else {
+                    const int idx = board.layerIndex(ln);
+                    if (idx >= 0) layers.push_back(idx);
+                }
+            }
+        } else if (!zoneLayer.empty()) {
+            const int idx = board.layerIndex(zoneLayer);
+            if (idx >= 0) layers.push_back(idx);
+        }
+        for (int layer : layers) {
+            ZoneFill fill;
+            fill.layer = layer;
+            fill.net = net.empty() ? std::string(zoneNode.childStr("net", "")) : net;
+            fill.name = name;
+            fill.outline = outlines;
+            fill.clearance = clearance;
+            fill.unfilled = true;
+            board.zones.push_back(std::move(fill));
+        }
+    }
 }
 
 // --- Board outline -------------------------------------------------------
@@ -794,11 +881,6 @@ struct Seg {
     bool used = false;
 };
 
-bool nearly(Vec2 p, Vec2 q) {
-    return std::abs(p.x - q.x) < kStitchTolerance &&
-           std::abs(p.y - q.y) < kStitchTolerance;
-}
-
 std::vector<Vec2> circlePoints(Vec2 center, double radius, int segments = 64) {
     std::vector<Vec2> pts;
     pts.reserve(segments);
@@ -810,7 +892,13 @@ std::vector<Vec2> circlePoints(Vec2 center, double radius, int segments = 64) {
     return pts;
 }
 
-void stitchOutline(std::vector<Seg>& segs, BoardModel& board) {
+// One pass at `tol`. Returns the number of open chains it had to drop.
+int stitchOutlineAt(std::vector<Seg>& segs, BoardModel& board, double tol,
+                    bool warn) {
+    int dropped = 0;
+    const auto near = [&](Vec2 p, Vec2 q) {
+        return std::abs(p.x - q.x) < tol && std::abs(p.y - q.y) < tol;
+    };
     for (size_t i = 0; i < segs.size(); ++i) {
         if (segs[i].used) continue;
 
@@ -820,15 +908,15 @@ void stitchOutline(std::vector<Seg>& segs, BoardModel& board) {
         Vec2 cursor = segs[i].b;
 
         for (;;) {
-            if (nearly(cursor, poly.outer.front())) break;  // loop closed
+            if (near(cursor, poly.outer.front())) break;  // loop closed
 
             bool advanced = false;
             for (size_t j = 0; j < segs.size(); ++j) {
                 if (segs[j].used) continue;
-                if (nearly(segs[j].a, cursor)) {
+                if (near(segs[j].a, cursor)) {
                     poly.outer.push_back(cursor);
                     cursor = segs[j].b;
-                } else if (nearly(segs[j].b, cursor)) {
+                } else if (near(segs[j].b, cursor)) {
                     poly.outer.push_back(cursor);
                     cursor = segs[j].a;
                 } else {
@@ -839,15 +927,41 @@ void stitchOutline(std::vector<Seg>& segs, BoardModel& board) {
                 break;
             }
             if (!advanced) {
-                board.warnings.push_back(
-                    "Edge.Cuts outline does not close; open chain of " +
-                    std::to_string(poly.outer.size()) + " points dropped");
+                if (warn)
+                    board.warnings.push_back(
+                        "Edge.Cuts outline does not close; open chain of " +
+                        std::to_string(poly.outer.size()) + " points dropped");
                 poly.outer.clear();
+                ++dropped;
                 break;
             }
         }
 
         if (poly.outer.size() >= 3) board.outline.push_back(std::move(poly));
+    }
+    return dropped;
+}
+
+// Stitch at the exact tolerance first; if a chain stays open, retry with the
+// endpoints allowed to miss by more. EasyEDA's "KiCad 5" exporter leaves real
+// gaps in Edge.Cuts (0.025 mm and 0.5 mm on two boards seen), and KiCad
+// itself would only complain -- but with no outline there is no substrate,
+// no mask and no silk, so a closed outline with a noted gap beats none.
+void stitchOutline(std::vector<Seg>& segs, BoardModel& board) {
+    const double tols[] = {kStitchTolerance, 0.05, 0.6, 1.5};
+    for (size_t k = 0; k < std::size(tols); ++k) {
+        const bool last = k + 1 == std::size(tols);
+        std::vector<Seg> trial = segs;
+        std::vector<Polygon> before = board.outline;
+        const int dropped = stitchOutlineAt(trial, board, tols[k], last);
+        if (dropped == 0 || last) {
+            if (k > 0 && dropped == 0)
+                board.warnings.push_back(
+                    "Edge.Cuts outline had gaps; closed with endpoints up to " +
+                    std::to_string(tols[k]).substr(0, 5) + " mm apart");
+            return;
+        }
+        board.outline = std::move(before);  // retry from scratch, looser
     }
 }
 
@@ -859,6 +973,44 @@ void readOutline(const Node& root, BoardModel& board) {
         const Node* start = line->child("start");
         const Node* end = line->child("end");
         if (start && end) segs.push_back(Seg{readXY(*start), readXY(*end)});
+    }
+
+    // Arcs (rounded corners, slots) are chorded into the same segment soup,
+    // so the stitcher needs no notion of a curve. Either spelling.
+    for (const Node* arc : root.childList("gr_arc")) {
+        if (arc->childStr("layer", "") != "Edge.Cuts") continue;
+        Vec2 a, m, b;
+        if (!readArc(*arc, a, m, b)) continue;
+        // Circumcircle of the three points; collinear falls back to a chord.
+        const double d = 2.0 * (a.x * (m.y - b.y) + m.x * (b.y - a.y) + b.x * (a.y - m.y));
+        if (std::abs(d) < 1e-9) {
+            segs.push_back(Seg{a, b});
+            continue;
+        }
+        const double a2 = a.x * a.x + a.y * a.y, m2 = m.x * m.x + m.y * m.y,
+                     b2 = b.x * b.x + b.y * b.y;
+        const Vec2 c{(a2 * (m.y - b.y) + m2 * (b.y - a.y) + b2 * (a.y - m.y)) / d,
+                     (a2 * (b.x - m.x) + m2 * (a.x - b.x) + b2 * (m.x - a.x)) / d};
+        const double r = std::hypot(a.x - c.x, a.y - c.y);
+        double t0 = std::atan2(a.y - c.y, a.x - c.x);
+        double tm = std::atan2(m.y - c.y, m.x - c.x);
+        double t1 = std::atan2(b.y - c.y, b.x - c.x);
+        // Sweep from a through m to b, whichever way round that is.
+        auto fwd = [](double from, double to) {
+            double s = to - from;
+            while (s < 0) s += 2.0 * std::numbers::pi;
+            return s;
+        };
+        double sweep = fwd(t0, t1);
+        if (fwd(t0, tm) > sweep) sweep -= 2.0 * std::numbers::pi;  // the other way
+        const int n = std::max(4, static_cast<int>(std::ceil(std::abs(sweep) / (std::numbers::pi / 24))));
+        Vec2 prev = a;
+        for (int i = 1; i <= n; ++i) {
+            const double t = t0 + sweep * i / n;
+            const Vec2 q = i == n ? b : Vec2{c.x + r * std::cos(t), c.y + r * std::sin(t)};
+            segs.push_back(Seg{prev, q});
+            prev = q;
+        }
     }
 
     for (const Node* rect : root.childList("gr_rect")) {
@@ -1065,6 +1217,8 @@ BoardModel importPcb(const std::string& path) {
     }
 
     for (const Node* fp : root.childList("footprint")) readFootprint(*fp, board);
+    // KiCad 5 spelling (and every "KiCad 5 format" exporter, EasyEDA included).
+    for (const Node* fp : root.childList("module")) readFootprint(*fp, board);
     for (const Node* zone : root.childList("zone")) readZone(*zone, board);
     readGraphics(root, nullptr, board);
     for (const Node* txt : root.childList("gr_text")) readText(*txt, 1, nullptr, board);
