@@ -1,4 +1,6 @@
 #include "geom/tessellate.h"
+#include <chrono>
+#include <future>
 #include <cstdlib>
 #include <cstdio>
 
@@ -1378,7 +1380,33 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
     }
 
     // --- One part per art layer ---
-    for (const ArtLayer& al : art.layers) {
+    // PCBVIEW_TIMING=1 prints where a slow open spends its time, per stage.
+    //
+    // The layers are built CONCURRENTLY, one task each. They are independent
+    // -- every task reads `art`, `boardArea` and `bores` and writes only its
+    // own slot -- and the two mask films plus the silk are ~95% of a board's
+    // tessellation time (measured on a dense 6-layer board: masks 13 s and
+    // 10 s, silk 3.6 s and 2.7 s, all six coppers 1.5 s together), so the
+    // wall time drops to the slowest single layer. Parts are appended in
+    // layer order afterwards, so the mesh is identical to a serial build.
+    // PCBVIEW_TESS_SERIAL=1 builds them one after another (debugging).
+    static const bool kTiming = std::getenv("PCBVIEW_TIMING") != nullptr;
+    std::vector<Part> layerParts(art.layers.size());
+    const auto buildLayer = [&](size_t layerIndex) {
+        const ArtLayer& al = art.layers[layerIndex];
+        struct LayerTimer {
+            const ArtLayer& al;
+            std::chrono::steady_clock::time_point t0 =
+                std::chrono::steady_clock::now();
+            ~LayerTimer() {
+                if (!kTiming) return;
+                const double ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() - t0)
+                                      .count();
+                std::fprintf(stderr, "timing:   layer %-10s %8.0f ms\n",
+                             al.name.c_str(), ms);
+            }
+        } layerTimer{al};
         ClipType op = ClipType::Union;
         Material material = Material::Copper;
         const bool front = al.name.rfind("F.", 0) == 0;
@@ -1425,7 +1453,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // whole meaning of tenting. Subtracting drills here would make
                 // tenting impossible and render every via as a punched dot.
                 material = Material::Soldermask;
-                if (art.outline.empty()) continue;
+                if (art.outline.empty()) return;  // skips this layer
                 subject = &art.outline;
                 if (!al.art.empty()) {
                     clip = &al.art;
@@ -1440,7 +1468,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
                 // to off, so by default we render the ink exactly as the file
                 // carries it -- including over pads.
                 material = Material::Silkscreen;
-                if (art.outline.empty()) continue;
+                if (art.outline.empty()) return;  // skips this layer
                 clip = &art.outline;
                 op = ClipType::Intersection;
                 if (opts.subtractMaskFromSilk) {
@@ -1473,7 +1501,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             }
 
             default:
-                continue;
+                return;  // skips this layer
         }
 
         // Conforming films (fab-truth gap #5). Real LPI soldermask -- and the
@@ -2052,8 +2080,22 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
         }
         if (part.material == Material::Soldermask && !part.vertFilm.empty())
             part.vertFilm.resize(part.mesh.vertices.size(), 1.0f);
-        if (!part.mesh.indices.empty()) out.parts.push_back(std::move(part));
+        if (!part.mesh.indices.empty()) layerParts[layerIndex] = std::move(part);
+    };
+    if (std::getenv("PCBVIEW_TESS_SERIAL")) {
+        for (size_t i = 0; i < art.layers.size(); ++i) buildLayer(i);
+    } else {
+        std::vector<std::future<void>> jobs;
+        jobs.reserve(art.layers.size());
+        for (size_t i = 0; i < art.layers.size(); ++i)
+            jobs.push_back(std::async(std::launch::async, buildLayer, i));
+        // get() rethrows a task's exception; wait for ALL of them first so no
+        // task is still writing its slot while the stack unwinds.
+        for (auto& j : jobs) j.wait();
+        for (auto& j : jobs) j.get();
     }
+    for (Part& p : layerParts)
+        if (!p.mesh.indices.empty()) out.parts.push_back(std::move(p));
 
     // --- Via barrels: each plated hole lined with a copper tube. Full-stack
     // drills collect into ONE part ("vias") spanning the whole copper stack,
@@ -2251,7 +2293,18 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
 }
 
 BoardMesh tessellate(const BoardModel& board, const TessellateOptions& opts) {
-    return assemble(buildLayerArt(board, opts), opts);
+    const auto t0 = std::chrono::steady_clock::now();
+    const LayerArt art = buildLayerArt(board, opts);
+    const auto t1 = std::chrono::steady_clock::now();
+    BoardMesh mesh = assemble(art, opts);
+    if (std::getenv("PCBVIEW_TIMING")) {
+        const auto ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::fprintf(stderr, "timing: buildLayerArt %.0f ms, assemble %.0f ms\n",
+                     ms(t0, t1), ms(t1, std::chrono::steady_clock::now()));
+    }
+    return mesh;
 }
 
 // Dijkstra over one net's segment graph. Nodes are segment endpoints

@@ -6,6 +6,7 @@
 //   pcbview                 -- GPU capability report
 //   pcbview <board.kicad_pcb>  -- import and dump the board
 
+#include <chrono>
 #include <clipper2/clipper.h>
 
 #include <cstdio>
@@ -198,7 +199,13 @@ const char* padTypeName(pcbview::PadType t) {
 int tessellateBoard(const std::string& path, const std::string& objPath,
                     const std::string& previewPath, bool fromBottom,
                     bool noMirror) {
+    const auto tImport = std::chrono::steady_clock::now();
     const pcbview::BoardModel board = pcbview::kicad::importPcb(path);
+    if (std::getenv("PCBVIEW_TIMING"))
+        std::fprintf(stderr, "timing: importPcb %.0f ms\n",
+                     std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - tImport)
+                         .count());
     const pcbview::geom::BoardMesh mesh = pcbview::geom::tessellate(board);
 
     std::printf("%s\n\n", path.c_str());
