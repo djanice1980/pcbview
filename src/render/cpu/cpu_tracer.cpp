@@ -248,8 +248,10 @@ void CpuTracer::setScene(const geom::BoardMesh& mesh) {
         span.name = part.name;
         span.kind = part.material;
         partSpans_.push_back(span);
-        centreZ.push_back(static_cast<float>(
-            sz / std::max<size_t>(part.mesh.vertices.size(), 1)));
+        centreZ.push_back(
+            std::isnan(part.planeZ)
+                ? static_cast<float>(sz / std::max<size_t>(part.mesh.vertices.size(), 1))
+                : static_cast<float>(part.planeZ));
         mount.push_back(part.material == geom::Material::Component ? part.mountSide
                                                                    : 0);
         isVia.push_back(part.name == "vias");

@@ -4069,7 +4069,11 @@ void Renderer::uploadBoard(const geom::BoardMesh& mesh) {
         item.centre[0] = static_cast<float>(sx / n);
         item.centre[1] = static_cast<float>(sy / n);
         item.centre[2] = static_cast<float>(sz / n);
-        centreZ.push_back(item.centre[2]);
+        // Rank by the layer's nominal plane when the tessellator gave one; the
+        // mean vertex Z misranks a mask that is mostly thin film on the
+        // laminate (see Part::planeZ).
+        centreZ.push_back(std::isnan(part.planeZ) ? item.centre[2]
+                                                  : static_cast<float>(part.planeZ));
         mount.push_back(part.material == geom::Material::Component ? part.mountSide
                                                                    : 0);
 

@@ -1369,6 +1369,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
             Part part;
             part.material = Material::Substrate;
             part.name = "substrate";
+            part.planeZ = 0.5 * (span.first + span.second);
             for (const Shape& shape : *slabShapes) {
                 extrude(shape, span.first, span.second, part.mesh);
             }
@@ -1537,6 +1538,7 @@ BoardMesh assemble(const LayerArt& art, const TessellateOptions& opts) {
         part.material = material;
         part.name = al.name;
         part.maskOpenings = al.openings;
+        part.planeZ = al.z + 0.5 * al.thickness;
 
         const auto clipAndExtrude = [&](const Paths64& subj, int net) {
             if (subj.empty()) return;

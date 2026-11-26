@@ -8,6 +8,7 @@
 // right-handed space. Flipping later would invert winding and every normal.
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,16 @@ struct Part {
     // renderers rank it by its centre Z rather than parking it at the barrel
     // plane.
     bool partialBarrel = false;
+
+    // Board-layer parts: the Z of the layer's NOMINAL plane (bottom of the
+    // film + half its nominal thickness; a substrate slab's mid-span). The
+    // exploded view ranks parts by this, not by the mesh's mean vertex Z. The
+    // mean lies: a mask film is mostly the thin sheet ON THE LAMINATE, which
+    // sits below the copper's top, so on a trace-only layer the mask averaged
+    // LOWER than its own copper and the peel put it inside the stack (seen on
+    // a 6-layer board, 2026-11-26). NaN = no nominal plane (components, via
+    // barrels); the renderers fall back to the mean for those.
+    double planeZ = std::numeric_limits<double>::quiet_NaN();
 
     // Per-TRIANGLE net index (into BoardMesh::nets), -1 for none. Empty on a
     // part with no net information at all. Per triangle rather than per part

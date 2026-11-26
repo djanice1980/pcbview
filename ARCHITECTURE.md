@@ -550,7 +550,7 @@ Everything here was verified against real files, not recalled.
   named `"substrate"`, so the exploded view shows an inner trace layer in its true
   position between two dielectric slabs instead of the inner copper sliding
   through a single monolithic block. Each slab sorts to its own explode rank by
-  centre Z, so it interleaves with the foils for free.
+  its mid-span Z (`Part::planeZ`), so it interleaves with the foils for free.
   - **Cut at the foil CENTRE, not its faces.** Cutting at the faces leaves a
     copper-thickness gap between slabs that shows as a line on the *collapsed*
     board's edge (empty, or a z-fighting copper edge). Cutting at the centre makes
@@ -944,10 +944,16 @@ worse: layers smear past each other and there is no natural place to stop.
 The model:
 
 - A part's **rank** is baked into the material table (`params.z`) at upload,
-  derived from where its geometry actually sits in Z — not from layer names, so
-  it is right for any stackup and handles the substrate and masks, which have no
-  stack index. Ranks are signed and centred; rank 0 never moves and anchors the
-  board.
+  derived from where the part sits in Z — not from layer names, so it is right
+  for any stackup and handles the substrate and masks, which have no stack
+  index. The Z used is the tessellator's **nominal plane** (`Part::planeZ`:
+  film bottom + half its nominal thickness; a slab's mid-span), NOT the mesh's
+  mean vertex Z. The mean lied once the mask became a film that mostly lies on
+  the laminate (1.27.0): on a trace-only layer the mask's vertices averaged
+  BELOW its own copper's (F.Mask 1.567 vs F.Cu 1.573 on a 6-layer board) and
+  the peel put the mask inside the stack, under the copper. Components and via
+  barrels carry no plane (NaN) and still fall back to the mean. Ranks are
+  signed and centred; rank 0 never moves and anchors the board.
 - Its **ring** is `|rank|` — distance from the mid-plane. Ring `maxRank` (the
   outermost) starts moving at progress 0; each ring inwards waits one more stage:
 
