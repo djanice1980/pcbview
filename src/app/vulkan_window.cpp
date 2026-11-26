@@ -2152,7 +2152,7 @@ void VulkanWindow::stepGamepad() {
     if (moved || acted) requestUpdate();
 }
 
-void VulkanWindow::setMesh(const geom::BoardMesh* mesh) {
+void VulkanWindow::setMesh(const geom::BoardMesh* mesh, bool keepView) {
     mesh_ = mesh;
     if (!renderer_ || !mesh_) return;
     // The GPU may still be reading the old buffers.
@@ -2161,7 +2161,7 @@ void VulkanWindow::setMesh(const geom::BoardMesh* mesh) {
     // maxRank changes with the board, so re-clamp and re-push. Snap: a new board
     // should not animate its way open.
     setExplodeProgress(explodeTarget_, /*snap=*/true);
-    frameBoard(/*snap=*/true);
+    if (!keepView) frameBoard(/*snap=*/true);
     requestUpdate();
 }
 

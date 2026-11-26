@@ -60,6 +60,7 @@
 #include <QWidgetAction>
 
 #include <functional>
+#include <QElapsedTimer>
 
 #include <algorithm>
 #include <cmath>
@@ -298,7 +299,7 @@ MainWindow::MainWindow(const QString& path) {
                 }
             }
             if (componentsChanged) {
-                reassemble();
+                refreshComponents();
                 populateComponents();
             }
             // Keep the stackup checkboxes honest about what is showing.
@@ -823,6 +824,14 @@ bool MainWindow::loadBoard(const QString& path) {
     // swap.
     stopShowcase();
     QApplication::setOverrideCursor(Qt::WaitCursor);
+    // PCBVIEW_TIMING=1: where an open spends its time, stage by stage.
+    QElapsedTimer loadTimer;
+    loadTimer.start();
+    const auto lap = [&loadTimer](const char* stage) {
+        if (qEnvironmentVariableIsSet("PCBVIEW_TIMING"))
+            std::fprintf(stderr, "timing: load %-22s %6lld ms\n", stage,
+                         static_cast<long long>(loadTimer.restart()));
+    };
 
     // A .kicad_pcb has full semantics; an ODB++ job resolves to LayerArt with
     // real nets from eda/data; anything else (a .zip, a folder, a .gbrjob) is
@@ -1016,6 +1025,7 @@ bool MainWindow::loadBoard(const QString& path) {
 
     // A new board keeps any thickness override the user set, unless it is now
     // nonsensical; the override applies on top of baseArt_.
+    lap("import + layer art");
     mesh_ = thicknessOverride_ > 0.0
                 ? [&] {
                       geom::LayerArt a = baseArt_;
@@ -1023,6 +1033,8 @@ bool MainWindow::loadBoard(const QString& path) {
                       return geom::assemble(a, tessellateOptions());
                   }()
                 : geom::assemble(baseArt_, tessellateOptions());
+    boardBounds_ = mesh_.bounds;
+    lap("tessellate");
 
     // Component bodies, KiCad only. Sourced through kicad-cli (which owns the
     // STEP tessellation) into a cached GLB -- see component_import. Gerbers have
@@ -1065,9 +1077,11 @@ bool MainWindow::loadBoard(const QString& path) {
                         ComponentImport ci = finishComponentImport(
                             plan, true, code, st == QProcess::NormalExit, err, bounds);
                         componentParts_ = std::move(ci.parts);
-                        appendComponents();
                         populateComponents();
-                        viewport_->setMesh(&mesh_);
+                        // Bodies land minutes into a session: keep the view
+                        // and the layers the user has hidden, and give the
+                        // stackup its Components row now that there are some.
+                        refreshComponents();
                         statusBar()->showMessage(QString::fromStdString(ci.message),
                                                  10000);
                     });
@@ -1085,9 +1099,11 @@ bool MainWindow::loadBoard(const QString& path) {
     }
     appendComponents();
     populateComponents();
+    lap("component bodies");
 
     stack_->setCurrentIndex(1);  // reveal the viewport
     viewport_->setMesh(&mesh_);
+    lap("upload to the GPU");
     setWindowTitle(QString("pcbview  —  %1").arg(QFileInfo(path).fileName()));
 
     populateStackup();
@@ -1194,10 +1210,87 @@ void MainWindow::reassemble() {
     geom::LayerArt a = baseArt_;
     if (thicknessOverride_ > 0.0) geom::applyThickness(a, thicknessOverride_);
     mesh_ = geom::assemble(a, tessellateOptions());
+    boardBounds_ = mesh_.bounds;
     appendComponents();          // survive the rebuild; ride the new surface
-    viewport_->setMesh(&mesh_);  // re-uploads; substrate appearance persists
+    // Same board, new geometry: keep the camera, and re-apply the stackup's
+    // hidden layers -- the upload brings every part back visible.
+    viewport_->setMesh(&mesh_, /*keepView=*/true);
+    applyStackupVisibility();
+    ensureComponentsRow();
     updateStatus();
     populateProperties();
+}
+
+void MainWindow::refreshComponents() {
+    if (!loaded_) return;
+    QElapsedTimer timer;
+    timer.start();
+    // Drop the old bodies, keep everything the tessellator built.
+    mesh_.parts.erase(
+        std::remove_if(mesh_.parts.begin(), mesh_.parts.end(),
+                       [](const geom::Part& p) {
+                           return p.material == geom::Material::Component;
+                       }),
+        mesh_.parts.end());
+    mesh_.bounds = boardBounds_;
+    appendComponents();
+    const qint64 swapMs = timer.restart();
+    viewport_->setMesh(&mesh_, /*keepView=*/true);
+    applyStackupVisibility();
+    ensureComponentsRow();
+    updateStatus();
+    if (qEnvironmentVariableIsSet("PCBVIEW_TIMING"))
+        std::fprintf(stderr, "timing: component swap %lld ms, upload %lld ms\n",
+                     static_cast<long long>(swapMs),
+                     static_cast<long long>(timer.elapsed()));
+}
+
+void MainWindow::applyStackupVisibility() {
+    if (!stackup_ || !viewport_->renderer()) return;
+    const std::function<void(QTreeWidgetItem*)> walk = [&](QTreeWidgetItem* item) {
+        const QString name = item->data(0, Qt::UserRole).toString();
+        if (!name.isEmpty() && item->checkState(0) != Qt::Checked)
+            viewport_->renderer()->setPartVisible(name.toStdString(), false);
+        for (int i = 0; i < item->childCount(); ++i) walk(item->child(i));
+    };
+    for (int i = 0; i < stackup_->topLevelItemCount(); ++i)
+        walk(stackup_->topLevelItem(i));
+    viewport_->requestUpdate();
+}
+
+void MainWindow::ensureComponentsRow() {
+    if (!stackup_ || !loaded_) return;
+    const QSignalBlocker block(stackup_);
+    QTreeWidgetItem* row = nullptr;
+    for (int i = 0; i < stackup_->topLevelItemCount(); ++i) {
+        QTreeWidgetItem* it = stackup_->topLevelItem(i);
+        if (it->data(0, Qt::UserRole).toString() == QLatin1String("Components"))
+            row = it;
+    }
+    if (componentParts_.empty()) {
+        delete row;  // Gerber package, or no bodies available
+        return;
+    }
+    if (!row) {
+        row = new QTreeWidgetItem(stackup_, {"Components"});
+        row->setCheckState(0, Qt::Checked);
+        row->setData(0, Qt::UserRole, QStringLiteral("Components"));
+        row->setIcon(0, swatchIcon(QColor(90, 90, 95)));
+    }
+    std::set<std::string> refs;
+    size_t tris = 0;
+    for (const geom::Part& p : componentParts_) {
+        refs.insert(p.name);
+        if (!hiddenComponents_.count(p.name)) tris += p.mesh.triangleCount();
+    }
+    size_t shown = 0;
+    for (const std::string& r : refs) shown += hiddenComponents_.count(r) ? 0 : 1;
+    row->setToolTip(0, QString("Show or hide every component body at once.\n"
+                               "%1 of %2 selected in the Components panel  ·  "
+                               "%3 triangles")
+                           .arg(shown)
+                           .arg(refs.size())
+                           .arg(tris));
 }
 
 void MainWindow::appendComponents() {
@@ -2149,15 +2242,11 @@ void MainWindow::populateStackup() {
 
     // Ordered top-to-bottom the way the board is physically built, not the way
     // KiCad numbers layers -- see ARCHITECTURE.md on layer ordinals lying.
-    size_t componentTris = 0;
     bool addedSubstrate = false;
     for (const geom::Part& part : mesh_.parts) {
         // All component parts share the name "Components" and collapse into one
         // toggle row below -- keep them out of the per-layer list.
-        if (part.material == geom::Material::Component) {
-            componentTris += part.mesh.triangleCount();
-            continue;
-        }
+        if (part.material == geom::Material::Component) continue;
         // The substrate is now several dielectric slabs (one between each pair of
         // copper foils), all named "substrate". One toggle row drives them all.
         if (part.material == geom::Material::Substrate) {
@@ -2181,13 +2270,10 @@ void MainWindow::populateStackup() {
     drills->setFlags(drills->flags() & ~Qt::ItemIsUserCheckable);
 
     // Components: one checkable top-level row driving every colour/side part.
-    if (componentTris > 0) {
-        QTreeWidgetItem* comp = new QTreeWidgetItem(stackup_, {"Components"});
-        comp->setCheckState(0, Qt::Checked);
-        comp->setData(0, Qt::UserRole, QStringLiteral("Components"));
-        comp->setIcon(0, swatchIcon(QColor(90, 90, 95)));
-        comp->setToolTip(0, QString("%1 triangles").arg(componentTris));
-    }
+    // Keyed on the board HAVING bodies, not on any being in the mesh right
+    // now -- with every refdes unticked in the Components panel there are
+    // none, and the row vanishing then is what made it look missing.
+    ensureComponentsRow();
 }
 
 void MainWindow::buildPropertiesDock() {
@@ -2348,7 +2434,7 @@ void MainWindow::buildComponentDock() {
             const QSignalBlocker block(componentList_);
             it->setCheckState(shown ? Qt::Checked : Qt::Unchecked);
         }
-        if (changed) reassemble();
+        if (changed) refreshComponents();
     };
     auto* allBtn = new QPushButton("All");
     allBtn->setToolTip("Show every component the filter matches");
@@ -2369,7 +2455,7 @@ void MainWindow::buildComponentDock() {
                 const bool hide = it->checkState() != Qt::Checked;
                 const bool changed = hide ? hiddenComponents_.insert(ref).second
                                           : hiddenComponents_.erase(ref) > 0;
-                if (changed) reassemble();
+                if (changed) refreshComponents();
             });
     connect(componentFilter_, &QLineEdit::textChanged, this,
             [this](const QString& t) {

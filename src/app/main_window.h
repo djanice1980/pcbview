@@ -184,10 +184,25 @@ private:
     // Skips components in hiddenComponents_ and merges the rest into a few
     // (colour, side) batches, so per-refdes visibility costs no draw calls.
     void appendComponents();
+    // Swap ONLY the component bodies on mesh_ and re-upload: the board's own
+    // parts are kept as tessellated. Showing or hiding a component used to
+    // call reassemble(), which re-tessellates the whole board -- 30 s on a
+    // dense 6-layer board, per checkbox -- and then reset every layer to
+    // visible and re-framed the camera. This keeps all three.
+    void refreshComponents();
+    // The renderer forgets part visibility on every upload (all parts come
+    // back visible); the stackup tree is the truth. Push it again.
+    void applyStackupVisibility();
+    // The stackup's "Components" master row: present exactly when the board
+    // has component bodies, however late they arrived.
+    void ensureComponentsRow();
+    // mesh_.bounds before any component grew it, so bodies can be swapped
+    // without re-tessellating to learn the board's own extent.
+    geom::Bounds boardBounds_;
 
     // Per-component visibility (KiCad boards). Session state, reset on load:
-    // refdes in the set = hidden. Toggling reassembles, same as a thickness
-    // change.
+    // refdes in the set = hidden. Toggling swaps the bodies only
+    // (refreshComponents), never the board.
     void buildComponentDock();
     void populateComponents();
     std::set<std::string> hiddenComponents_;

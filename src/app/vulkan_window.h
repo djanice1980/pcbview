@@ -97,7 +97,12 @@ public:
     // Swap the board. Re-uploads and re-frames if the renderer already exists;
     // otherwise the mesh is picked up when the window is first exposed. The
     // pointer must outlive the window -- MainWindow owns the mesh.
-    void setMesh(const geom::BoardMesh* mesh);
+    //
+    // keepView: the SAME board with its geometry changed underneath (component
+    // bodies shown/hidden or just arrived, a thickness or silk option) -- the
+    // camera stays where the user put it. A re-frame there threw away the view
+    // every time a component checkbox was ticked.
+    void setMesh(const geom::BoardMesh* mesh, bool keepView = false);
 
     // Enter or leave the headset.
     //

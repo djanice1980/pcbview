@@ -1202,7 +1202,14 @@ interactive run. All are opt-in. Grouped by purpose:
 - `PCBVIEW_START_YAW` / `PCBVIEW_START_PITCH=<radians>` — explicit orbit
   angles for views the three presets cannot express. A grazing pitch is how
   the board EDGE gets inspected, which is where the orthographic near-plane
-  clip was finally reproduced.
+  clip was finally reproduced. **RADIANS.** `PITCH=35` is not 35 degrees: it
+  wraps to 205 degrees, an upside-down view of the BOTTOM face, and an hour
+  went into "hiding F.Mask does nothing" before the silkscreen labels gave it
+  away. From above at 40 degrees is `0.7`.
+- `PCBVIEW_TIMING=1` — where an open spends its time: import, tessellation
+  (per layer), component bodies, GPU upload, and each component swap.
+- `PCBVIEW_TESS_SERIAL=1` — build the layers one after another instead of
+  concurrently (see "Tessellation runs one task per layer").
 - `PCBVIEW_START_TARGET=x,y,z` / `PCBVIEW_START_FOV=<degrees>` — orbit pivot
   (mm) and field of view. With yaw/pitch/distance these reproduce the pose a
   recorded move ends at: read the last key of `showcasePathData` in
@@ -1710,6 +1717,40 @@ part of the stack. The importer already excluded them from `board.drills`
   as separate per-span drill FILES (KiCad exports e.g. `-F_Cu-In1_Cu.drl`),
   which the Gerber importer does not yet map to spans — those drills are
   currently treated as full-stack. Follow-up work.
+
+## Tessellation runs one task per layer
+
+`assemble()` builds every art layer in its own `std::async` task. The layers
+are independent (each reads `art`, `boardArea`, `bores` and writes only its
+own slot) and the parts are appended in layer order afterwards, so the mesh is
+byte-identical to a serial build -- checked with `--obj` both ways. Measured
+on a dense 6-layer board (8.3 M triangles): the two mask films take 13 s and
+10 s, the two silks 3.6 s and 2.7 s, all six coppers 1.5 s together; serial
+that is 32 s, concurrent it is the slowest layer, 14 s. What remains is the
+mask film itself, split about evenly between Clipper booleans (the piece and
+region splitting) and `SegmentGrid::nearest` (the per-vertex height field).
+There is no single cheap hotspot left in it; the next step would be inside
+one film (parallel regions) or an on-disk mesh cache keyed like the GLB one.
+
+## Changing components never re-tessellates the board
+
+Showing or hiding a component used to call `reassemble()`: re-tessellate the
+whole board (the 32 s above, per checkbox), re-upload, and -- because the
+upload brings every part back visible and re-frames the camera -- silently
+un-hide every layer the stackup showed as unticked and throw the view away.
+`refreshComponents()` strips the `Material::Component` parts off `mesh_`,
+restores the board's own bounds (`boardBounds_`), appends the bodies again and
+uploads with `setMesh(mesh, keepView=true)`. About 1 s on that board, all of
+it the upload. Two rules that fall out of it:
+
+- **The stackup tree is the truth for layer visibility.** The renderer forgets
+  it on every upload, so every same-board upload is followed by
+  `applyStackupVisibility()`. `reassemble()` does the same now.
+- **The stackup's Components row exists whenever the board has bodies**
+  (`ensureComponentsRow()`), not whenever some are in the mesh. Since 1.27.1
+  the bodies can arrive from a background kicad-cli export minutes after the
+  tree was built, and with every refdes unticked there are none in the mesh
+  at all -- both left the left-hand panel with no Components checkbox.
 
 ## Component rendering (KiCad only) — via kicad-cli GLB
 
